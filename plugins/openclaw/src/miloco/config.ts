@@ -3,9 +3,10 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { resolveGatewayAuth } from "openclaw/plugin-sdk/gateway-runtime";
 import { getPluginConfig, type MilocoPluginConfig } from "../config.js";
 import { resolveGatewayUrl } from "../utils/gateway.js";
-import { readTextFileSync, writeTextFileSync } from "../utils/io.js";
+import { readTextFileSync } from "../utils/io.js";
 import { createParser } from "../utils/schema.js";
 import { milocoConfigFile } from "./paths.js";
+import { transactSharedConfig } from "./shared_config_transaction.js";
 
 /**
  * 与 backend/miloco/src/miloco/config/settings.schema.json 对齐的 miloco 用户配置契约。
@@ -198,22 +199,10 @@ function sharedConfigPath(): string {
 export function loadSharedConfig(api: OpenClawPluginApi): MilocoSharedConfig {
   const plugin = getPluginConfig(api);
   const filePath = sharedConfigPath();
-
-  const existingText = readTextOrUndefined(filePath);
-  const existing = safeJsonParse(existingText);
-  const raw: Record<string, unknown> = isRecord(existing)
-    ? { ...existing }
-    : {};
-
-  mergePluginIntoRaw(raw, plugin);
-  ensureAgentEssentials(raw, api);
-
-  // 仅在合并后的内容与磁盘不同才落盘，避免每次 load 都产生冗余 IO / mtime 抖动。
-  // 首次启动（文件缺失）或人工手改过格式时会执行一次归一化写入，之后稳态零写入。
-  const serialized = `${JSON.stringify(raw, null, 2)}\n`;
-  if (serialized !== existingText) {
-    writeTextFileSync(filePath, serialized);
-  }
+  const raw = transactSharedConfig(filePath, {
+    patch: pluginConfigPatch(plugin),
+    ensureAgent: agentEssentials(api),
+  });
   return parseSharedConfig(raw);
 }
 
@@ -222,33 +211,26 @@ export function loadSharedConfig(api: OpenClawPluginApi): MilocoSharedConfig {
  *   - ``debug``：``undefined`` 视为未设置，其它（含 ``false``）覆盖；
  *   - ``omni_*``：空字符串视为未设置，保留现有值；其它覆盖。
  */
-function mergePluginIntoRaw(
-  raw: Record<string, unknown>,
-  plugin: MilocoPluginConfig,
-): void {
-  if (plugin.debug !== undefined) raw.debug = plugin.debug;
+function pluginConfigPatch(plugin: MilocoPluginConfig): Record<string, unknown> {
+  const patch: Record<string, unknown> = {};
+  if (plugin.debug !== undefined) patch.debug = plugin.debug;
 
   if (plugin.omni_model || plugin.omni_base_url || plugin.omni_api_key) {
-    const model = isRecord(raw.model) ? { ...raw.model } : {};
-    const omni = isRecord(model.omni) ? { ...model.omni } : {};
+    const model: Record<string, unknown> = {};
+    const omni: Record<string, unknown> = {};
     if (plugin.omni_model) omni.model = plugin.omni_model;
     if (plugin.omni_base_url) omni.base_url = plugin.omni_base_url;
     if (plugin.omni_api_key) omni.api_key = plugin.omni_api_key;
     model.omni = omni;
-    raw.model = model;
+    patch.model = model;
   }
+  return patch;
 }
 
-function ensureAgentEssentials(
-  raw: Record<string, unknown>,
-  api: OpenClawPluginApi,
-): void {
-  const agent = isRecord(raw.agent) ? { ...raw.agent } : {};
-
-  if (typeof agent.webhook_url !== "string" || agent.webhook_url.length === 0) {
-    agent.webhook_url = `${resolveGatewayUrl(api)}/miloco/webhook`;
-  }
-
+function agentEssentials(api: OpenClawPluginApi): {
+  webhookUrl: string;
+  authBearer: string;
+} {
   // resolveGatewayAuth 方法依赖 openclaw >= v2026.4.27-beta.1
   // https://github.com/openclaw/openclaw/commit/af7f651db36f9b5c827713035ab14a80803dd9a8
   const authConfig = api.config.gateway?.auth ?? undefined;
@@ -259,9 +241,10 @@ function ensureAgentEssentials(
       : resolved.mode === "password"
         ? resolved.password
         : undefined;
-  agent.auth_bearer = bearer ?? "";
-
-  raw.agent = agent;
+  return {
+    webhookUrl: `${resolveGatewayUrl(api)}/miloco/webhook`,
+    authBearer: bearer ?? "",
+  };
 }
 
 type DeepPartial<T> = T extends object
@@ -277,18 +260,7 @@ export function updateSharedConfig(
 ): MilocoSharedConfig {
   const filePath = sharedConfigPath();
 
-  const existingText = readTextOrUndefined(filePath);
-  const existing = safeJsonParse(existingText);
-  const raw: Record<string, unknown> = isRecord(existing)
-    ? { ...existing }
-    : {};
-
-  deepMerge(raw, partial);
-
-  const serialized = `${JSON.stringify(raw, null, 2)}\n`;
-  if (serialized !== existingText) {
-    writeTextFileSync(filePath, serialized);
-  }
+  const raw = transactSharedConfig(filePath, { patch: partial });
   return parseSharedConfig(raw);
 }
 
