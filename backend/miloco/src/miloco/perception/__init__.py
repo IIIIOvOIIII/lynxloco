@@ -10,6 +10,7 @@ from miloco.database.perception_repo import PerceptionLogRepo
 from miloco.perception.client import PerceptionEngineProxy
 from miloco.perception.collect.camera_adapter import CameraDeviceAdapter
 from miloco.perception.collect.collector import MultimodalCollector
+from miloco.perception.collect.miot_camera_source import MiotCameraSource
 from miloco.perception.processor import PipelineProcessor
 
 logger = logging.getLogger(__name__)
@@ -33,10 +34,14 @@ async def init_perception_module(miot_proxy, kv_repo):
     loop = asyncio.get_running_loop()
     window_ready_event = asyncio.Event()
 
+    def mark_window_ready() -> None:
+        loop.call_soon_threadsafe(window_ready_event.set)
+
     # 3. 初始化相机适配器
+    miot_source = MiotCameraSource(miot_proxy)
     camera_adapter = CameraDeviceAdapter(
-        miot_proxy,
-        on_window_ready=lambda: loop.call_soon_threadsafe(window_ready_event.set),
+        sources=[miot_source],
+        on_window_ready=mark_window_ready,
     )
 
     # 4. 初始化多模态收集器
