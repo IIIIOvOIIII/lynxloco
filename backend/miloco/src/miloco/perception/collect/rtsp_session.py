@@ -8,6 +8,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from typing import Literal, Protocol, cast
 
@@ -84,6 +85,8 @@ class RtspSession:
         self._media_ready: asyncio.Event | None = None
         self._packet_ready: asyncio.Event | None = None
         self._producer_done = False
+        self._listener_executor: ThreadPoolExecutor | None = None
+        self._listener_future: asyncio.Future[None] | None = None
 
     async def start(
         self, video_cb: VideoFrameCallback, audio_cb: AudioFrameCallback
@@ -105,6 +108,10 @@ class RtspSession:
             self._stop_thread.clear()
             self._producer_done = False
             self._clear_ingress()
+            self._listener_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="miloco-rtsp-listener",
+            )
             self._task = asyncio.create_task(self._main())
 
     async def stop(self) -> None:
@@ -171,6 +178,7 @@ class RtspSession:
                 return_exceptions=True,
             )
             self._clear_ingress()
+            self._shutdown_listener_executor()
 
     async def _run_reconnect_loop(self) -> None:
         attempt = 0
@@ -406,9 +414,7 @@ class RtspSession:
                         stream_ts=self._timestamp_ms(
                             resampled,
                             fallback_frame=audio_frame,
-                            fallback_time_base=getattr(
-                                packet.stream, "time_base", None
-                            ),
+                            fallback_stream=packet,
                         ),
                         recv_unix_ms=recv_unix_ms,
                         decoded_unix_ms=decoded_unix_ms,
@@ -424,12 +430,20 @@ class RtspSession:
         *,
         fallback_frame: object | None = None,
         fallback_time_base: object | None = None,
+        fallback_stream: object | None = None,
     ) -> int:
+        if fallback_frame is not None:
+            for candidate in (frame, fallback_frame, fallback_stream):
+                if candidate is None:
+                    continue
+                candidate_pts = getattr(candidate, "pts", None)
+                candidate_time_base = getattr(candidate, "time_base", None)
+                if candidate_pts is not None and candidate_time_base is not None:
+                    return int(candidate_pts * candidate_time_base * 1000)
+            return 0
+
         pts = getattr(frame, "pts", None)
         time_base = getattr(frame, "time_base", None)
-        if pts is None and fallback_frame is not None:
-            pts = getattr(fallback_frame, "pts", None)
-            time_base = getattr(fallback_frame, "time_base", None)
         if time_base is None:
             time_base = fallback_time_base
         if pts is None:
@@ -568,11 +582,56 @@ class RtspSession:
                     if self._producer_done:
                         return
                     break
-                for listener in self._listeners:
-                    try:
-                        await asyncio.to_thread(listener, packet)
-                    except Exception:
-                        pass
+                listeners = self._listeners
+                if listeners:
+                    await self._run_packet_listeners(packet, listeners)
+                if self._stop_thread.is_set():
+                    return
+
+    async def _run_packet_listeners(
+        self,
+        packet: object,
+        listeners: tuple[PacketListener, ...],
+    ) -> None:
+        executor = self._listener_executor
+        if executor is None:
+            return
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(
+            executor,
+            self._notify_packet_listeners_sync,
+            packet,
+            listeners,
+        )
+        self._listener_future = future
+        try:
+            await asyncio.shield(future)
+        except asyncio.CancelledError:
+            try:
+                await asyncio.shield(future)
+            except Exception:
+                pass
+            raise
+        finally:
+            if self._listener_future is future:
+                self._listener_future = None
+
+    @staticmethod
+    def _notify_packet_listeners_sync(
+        packet: object,
+        listeners: tuple[PacketListener, ...],
+    ) -> None:
+        for listener in listeners:
+            try:
+                listener(packet)
+            except Exception:
+                pass
+
+    def _shutdown_listener_executor(self) -> None:
+        executor = self._listener_executor
+        self._listener_executor = None
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=False)
 
     def _clear_ingress(self) -> None:
         with self._ingress_lock:

@@ -151,6 +151,26 @@ class _BlockingContainer(_Container):
         self.released.set()
 
 
+class _YieldThenBlockContainer(_Container):
+    def __init__(self, packet: _Packet) -> None:
+        super().__init__([packet])
+        self.blocked = threading.Event()
+        self.release = threading.Event()
+
+    def demux(self):
+        packets, self._packets = self._packets, []
+        try:
+            yield from packets
+            self.blocked.set()
+            self.release.wait(timeout=2.0)
+        finally:
+            packets.clear()
+
+    def close(self) -> None:
+        super().close()
+        self.release.set()
+
+
 class _BurstContainer(_Container):
     def __init__(self, packets: list[_Packet]) -> None:
         super().__init__(packets)
@@ -229,6 +249,16 @@ class _BlockingOpenSequence:
         finally:
             with self._lock:
                 self.active -= 1
+
+
+class _CyclingOpener:
+    def __init__(self, containers: list[_YieldThenBlockContainer]) -> None:
+        self._containers = iter(containers)
+        self.calls = 0
+
+    def __call__(self, *_args: object, **_kwargs: object) -> object:
+        self.calls += 1
+        return next(self._containers)
 
 
 async def _wait_until(predicate: Callable[[], bool], timeout: float = 1.0) -> None:
@@ -616,6 +646,75 @@ async def test_slow_packet_listener_never_blocks_owner_event_loop(
 
 
 @pytest.mark.asyncio
+async def test_listener_worker_is_joined_before_repeated_stop_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_module = _rtsp_session()
+    packets = [
+        _Packet(_stream("video", "h264"), [_VideoFrame(value)]) for value in range(3)
+    ]
+    packet_refs = [weakref.ref(packet) for packet in packets]
+    containers = [_YieldThenBlockContainer(packet) for packet in packets]
+    del packets
+    opener = _CyclingOpener(containers)
+    monkeypatch.setattr(session_module.av, "open", opener)
+    started = [threading.Event() for _ in containers]
+    releases = [threading.Event() for _ in containers]
+    listener_lock = threading.Lock()
+    listener_calls = 0
+    active = 0
+    max_active = 0
+
+    def finite_listener(_packet: object) -> None:
+        nonlocal listener_calls, active, max_active
+        with listener_lock:
+            call = listener_calls
+            listener_calls += 1
+            active += 1
+            max_active = max(max_active, active)
+        started[call].set()
+        releases[call].wait(timeout=2.0)
+        with listener_lock:
+            active -= 1
+
+    session = session_module.RtspSession(_source())
+    session.add_packet_listener(finite_listener)
+    stop_waited: list[bool] = []
+    await session.start(_unused_video_cb, _unused_audio_cb)
+    try:
+        for cycle in range(3):
+            assert await asyncio.to_thread(started[cycle].wait, 0.5)
+            heartbeat = asyncio.Event()
+            asyncio.get_running_loop().call_soon(heartbeat.set)
+            await asyncio.wait_for(heartbeat.wait(), timeout=0.1)
+
+            stopping = asyncio.create_task(session.stop())
+            restarting = (
+                asyncio.create_task(session.start(_unused_video_cb, _unused_audio_cb))
+                if cycle < 2
+                else None
+            )
+            await asyncio.sleep(0.05)
+            stop_waited.append(not stopping.done())
+            releases[cycle].set()
+            await asyncio.wait_for(stopping, timeout=0.5)
+            if restarting is not None:
+                await asyncio.wait_for(restarting, timeout=0.5)
+            gc.collect()
+            assert packet_refs[cycle]() is None
+    finally:
+        for release in releases:
+            release.set()
+        await session.stop()
+
+    gc.collect()
+    assert stop_waited == [True, True, True]
+    assert max_active == 1
+    assert opener.calls == 3
+    assert all(reference() is None for reference in packet_refs)
+
+
+@pytest.mark.asyncio
 async def test_callback_failure_isolated_from_later_frames(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -824,6 +923,67 @@ async def test_frame_timestamps_are_milliseconds_and_recv_precedes_decode(
     assert decode_started_ms == [2000]
     assert audio_result == [(100, 4000, 5000)]
     assert video_result[0][1] < decode_started_ms[0] < video_result[0][2]
+    await session.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("output_pts", "output_time_base"),
+    [
+        (1600, None),
+        (None, Fraction(1, 16_000)),
+    ],
+)
+async def test_partial_resampled_timestamp_pair_falls_back_to_input_pair(
+    monkeypatch: pytest.MonkeyPatch,
+    output_pts: int | None,
+    output_time_base: Fraction | None,
+) -> None:
+    session_module = _rtsp_session()
+    video_packet = _Packet(_stream("video", "h264"), [_VideoFrame(1)])
+    audio_packet = _Packet(_stream("audio", "aac"), [_audio_frame()])
+
+    class PartialResampled:
+        pts = output_pts
+        time_base = output_time_base
+
+        @staticmethod
+        def to_ndarray() -> np.ndarray:
+            return np.ones((1, 320), dtype=np.int16)
+
+    class PartialResampler:
+        def resample(self, _frame: object) -> list[PartialResampled]:
+            return [PartialResampled()]
+
+    monkeypatch.setattr(
+        session_module.av, "AudioResampler", lambda **_kw: PartialResampler()
+    )
+    monkeypatch.setattr(
+        session_module.av,
+        "open",
+        _SequenceOpener(
+            _Container([video_packet, audio_packet]),
+            _terminal_error(),
+        ),
+    )
+    monkeypatch.setattr(session_module, "reconnect_delay", lambda *_a, **_kw: 0.0)
+    timestamps: list[int] = []
+    done = asyncio.Event()
+
+    async def audio_cb(
+        _did: str,
+        _frame: np.ndarray,
+        stream_ts: int,
+        *_rest: object,
+    ) -> None:
+        timestamps.append(stream_ts)
+        done.set()
+
+    session = session_module.RtspSession(_source())
+    await session.start(_unused_video_cb, audio_cb)
+    await asyncio.wait_for(done.wait(), timeout=0.5)
+
+    assert timestamps == [10]
     await session.stop()
 
 
