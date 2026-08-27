@@ -3,16 +3,34 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
+import av
 import pytest
 from miloco.camera.h264 import H264AnnexBNormalizer, H264Compatibility
 from miloco.camera.stream import EncodedVideoPacket
 
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "rtsp"
 START_CODE = b"\x00\x00\x00\x01"
-SPS = bytes.fromhex("6742c01fda014016ec0440000003004000000c83c60c6580")
-PPS = bytes.fromhex("68ce3c80")
+SPS = bytes.fromhex("6742c01eda11ec0440000003004000000523c58ba8")
+PPS = bytes.fromhex("68ce0fc8")
 P_SLICE = bytes.fromhex("419a22")
-IDR_SLICE = bytes.fromhex("658884")
+AVCC = bytes.fromhex("0142c01effe10015") + SPS + bytes.fromhex("010004") + PPS
+
+
+def _length_prefixed_nals(data: bytes, length_size: int = 4) -> list[bytes]:
+    nals: list[bytes] = []
+    offset = 0
+    while offset < len(data):
+        size = int.from_bytes(data[offset : offset + length_size], "big")
+        offset += length_size
+        nals.append(data[offset : offset + size])
+        offset += size
+    return nals
+
+
+REAL_AVCC_PACKET = (FIXTURES / "h264_avcc_packets.bin").read_bytes()
+REAL_PACKET_NALS = _length_prefixed_nals(REAL_AVCC_PACKET)
+IDR_SLICE = next(nal for nal in REAL_PACKET_NALS if nal[0] & 0x1F == 5)
+REAL_NON_VCL = tuple(nal for nal in REAL_PACKET_NALS if nal[0] & 0x1F not in {1, 5})
 
 
 def _avcc_extradata(
@@ -20,22 +38,60 @@ def _avcc_extradata(
     sps: bytes = SPS,
     pps: bytes = PPS,
     profile: int = 0x42,
-    level: int = 0x1F,
+    profile_compatibility: int = 0xC0,
+    level: int = 0x1E,
     length_size: int = 4,
 ) -> bytes:
     assert length_size in {1, 2, 4}
     configured_sps = bytearray(sps)
     configured_sps[1] = profile
+    configured_sps[2] = profile_compatibility
     configured_sps[3] = level
     sps = bytes(configured_sps)
     return b"".join(
         (
-            bytes((1, profile, 0xC0, level, 0xFC | (length_size - 1), 0xE1)),
+            bytes(
+                (
+                    1,
+                    profile,
+                    profile_compatibility,
+                    level,
+                    0xFC | (length_size - 1),
+                    0xE1,
+                )
+            ),
             len(sps).to_bytes(2, "big"),
             sps,
             b"\x01",
             len(pps).to_bytes(2, "big"),
             pps,
+        )
+    )
+
+
+def _avcc_with_parameter_sets(
+    sps: tuple[bytes, ...],
+    pps: tuple[bytes, ...],
+    *,
+    profile: int,
+    profile_compatibility: int,
+    level: int,
+) -> bytes:
+    return b"".join(
+        (
+            bytes(
+                (
+                    1,
+                    profile,
+                    profile_compatibility,
+                    level,
+                    0xFF,
+                    0xE0 | len(sps),
+                )
+            ),
+            *(len(nal).to_bytes(2, "big") + nal for nal in sps),
+            bytes((len(pps),)),
+            *(len(nal).to_bytes(2, "big") + nal for nal in pps),
         )
     )
 
@@ -66,7 +122,7 @@ def test_annexb_input_is_preserved_and_slice_bytes_are_unchanged() -> None:
     compatibility = normalizer.inspect(_packet(payload, keyframe=True))
     output = normalizer.push(_packet(payload, keyframe=True))
 
-    assert compatibility == H264Compatibility(True, 0x42, 0x1F, "compatible")
+    assert compatibility == H264Compatibility(True, 0x42, 0x1E, "compatible")
     assert output == [payload]
     assert IDR_SLICE in output[0]
 
@@ -79,7 +135,15 @@ def test_avcc_length_prefixes_are_converted_without_changing_nal_payloads() -> N
         _packet(payload, keyframe=True, extradata=_avcc_extradata())
     )
 
-    assert output == [START_CODE + SPS + START_CODE + PPS + START_CODE + IDR_SLICE]
+    assert output == [
+        START_CODE
+        + SPS
+        + START_CODE
+        + PPS
+        + b"".join(START_CODE + nal for nal in REAL_NON_VCL)
+        + START_CODE
+        + IDR_SLICE
+    ]
 
 
 def test_avcc_extradata_supplies_safe_annexb_decoder_configuration() -> None:
@@ -91,12 +155,12 @@ def test_avcc_extradata_supplies_safe_annexb_decoder_configuration() -> None:
     )
 
     assert normalizer.inspect(packet) == H264Compatibility(
-        True, 0x42, 0x1F, "compatible"
+        True, 0x42, 0x1E, "compatible"
     )
-    assert normalizer.decoder_config() == START_CODE + SPS + START_CODE + PPS
     assert normalizer.push(packet) == [
         START_CODE + SPS + START_CODE + PPS + START_CODE + IDR_SLICE
     ]
+    assert normalizer.decoder_config() == START_CODE + SPS + START_CODE + PPS
 
 
 def test_new_viewer_waits_for_idr_then_receives_decoder_config_first() -> None:
@@ -129,6 +193,8 @@ def test_new_viewer_waits_for_idr_then_receives_decoder_config_first() -> None:
         (START_CODE + b"", b""),
         (START_CODE + b"\x00bad", b""),
         (START_CODE + b"\x80bad", b""),
+        (START_CODE + b"\x67\x42\xc0\x1e" + START_CODE + PPS, b""),
+        (START_CODE + SPS + START_CODE + b"\x68", b""),
         (START_CODE + SPS, _avcc_extradata()[:-1]),
         (b"\x00\x00\x10\x00x", _avcc_extradata()),
     ],
@@ -177,17 +243,180 @@ def test_non_h264_packet_is_rejected() -> None:
     assert compatibility == H264Compatibility(False, None, None, "codec_not_h264")
 
 
+def test_inspect_is_pure_and_does_not_prime_decoder_configuration() -> None:
+    normalizer = H264AnnexBNormalizer()
+    packet = _packet(
+        (FIXTURES / "h264_avcc_packets.bin").read_bytes(),
+        keyframe=True,
+        extradata=AVCC,
+    )
+
+    assert normalizer.inspect(packet).passthrough is True
+    assert normalizer.decoder_config() == b""
+
+
+@pytest.mark.parametrize(
+    "extradata",
+    [
+        bytes((1, 0x42, 0xC0, 0x1E, 0xFB, 0xE1))
+        + len(SPS).to_bytes(2, "big")
+        + SPS
+        + b"\x01"
+        + len(PPS).to_bytes(2, "big")
+        + PPS,
+        bytes((1, 0x42, 0xC0, 0x1E, 0xFF, 0xC1))
+        + len(SPS).to_bytes(2, "big")
+        + SPS
+        + b"\x01"
+        + len(PPS).to_bytes(2, "big")
+        + PPS,
+        _avcc_extradata(profile_compatibility=0xC1),
+        bytes((1, 0x42, 0x80, 0x1E)) + AVCC[4:],
+    ],
+)
+def test_reserved_constraint_bits_and_avcc_header_mismatch_are_rejected(
+    extradata: bytes,
+) -> None:
+    compatibility = H264AnnexBNormalizer().inspect(
+        _packet(
+            (FIXTURES / "h264_avcc_packets.bin").read_bytes(),
+            keyframe=True,
+            extradata=extradata,
+        )
+    )
+
+    assert compatibility == H264Compatibility(False, None, None, "malformed_h264")
+
+
+def test_pps_must_reference_a_present_sps() -> None:
+    # ue(0) PPS id followed by ue(1) referenced SPS id, then rbsp stop bit.
+    pps_referencing_sps_one = b"\x68\xa0"
+    compatibility = H264AnnexBNormalizer().inspect(
+        _packet(
+            (FIXTURES / "h264_avcc_packets.bin").read_bytes(),
+            keyframe=True,
+            extradata=_avcc_extradata(pps=pps_referencing_sps_one),
+        )
+    )
+
+    assert compatibility.reason == "malformed_h264"
+
+
+def test_all_sps_must_have_one_supported_non_conflicting_format() -> None:
+    unsupported_sps_zero = b"\x67\x6e\xc0\x1e\x80"
+    unsupported_sps_one = b"\x67\x6e\xc0\x1e\x50"
+    mixed_main_sps_one = b"\x67\x4d\xc0\x1e\x50"
+    pps_zero_to_sps_zero = b"\x68\xc0"
+    packet = (FIXTURES / "h264_avcc_packets.bin").read_bytes()
+
+    unsupported = _avcc_with_parameter_sets(
+        (unsupported_sps_zero, unsupported_sps_one),
+        (pps_zero_to_sps_zero,),
+        profile=0x6E,
+        profile_compatibility=0xC0,
+        level=0x1E,
+    )
+    conflicting = _avcc_with_parameter_sets(
+        (SPS, mixed_main_sps_one),
+        (pps_zero_to_sps_zero,),
+        profile=0x42,
+        profile_compatibility=0xC0,
+        level=0x1E,
+    )
+
+    assert H264AnnexBNormalizer().inspect(
+        _packet(packet, keyframe=True, extradata=unsupported)
+    ) == H264Compatibility(False, 0x6E, 0x1E, "profile_unsupported")
+    assert (
+        H264AnnexBNormalizer()
+        .inspect(_packet(packet, keyframe=True, extradata=conflicting))
+        .reason
+        == "malformed_h264"
+    )
+
+
+def test_bad_packet_resets_viewer_until_a_new_idr() -> None:
+    normalizer = H264AnnexBNormalizer()
+    idr = (FIXTURES / "h264_avcc_packets.bin").read_bytes()
+
+    assert normalizer.push(_packet(idr, keyframe=True, extradata=AVCC))
+    assert normalizer.push(_packet(b"\x00\x00\x00\xffbad")) == []
+    assert normalizer.push(_packet(len(P_SLICE).to_bytes(4, "big") + P_SLICE)) == []
+    recovered = normalizer.push(_packet(idr, keyframe=True))
+    assert recovered and recovered[0].startswith(normalizer.decoder_config())
+
+
+def test_unsupported_configuration_resets_viewer_until_a_new_idr() -> None:
+    normalizer = H264AnnexBNormalizer()
+    idr = (FIXTURES / "h264_avcc_packets.bin").read_bytes()
+
+    assert normalizer.push(_packet(idr, keyframe=True, extradata=AVCC))
+    assert (
+        normalizer.push(
+            _packet(
+                len(P_SLICE).to_bytes(4, "big") + P_SLICE,
+                extradata=_avcc_extradata(profile=0x6E),
+            )
+        )
+        == []
+    )
+    assert normalizer.push(_packet(len(P_SLICE).to_bytes(4, "big") + P_SLICE)) == []
+    assert normalizer.push(_packet(idr, keyframe=True))
+
+
+def test_decoder_configuration_change_waits_for_idr_and_injects_new_config() -> None:
+    normalizer = H264AnnexBNormalizer()
+    idr = (FIXTURES / "h264_avcc_packets.bin").read_bytes()
+    new_sps = bytearray(SPS)
+    new_sps[-1] ^= 0x01
+    new_extradata = _avcc_extradata(sps=bytes(new_sps))
+
+    assert normalizer.push(_packet(idr, keyframe=True, extradata=AVCC))
+    assert (
+        normalizer.push(
+            _packet(
+                len(P_SLICE).to_bytes(4, "big") + P_SLICE,
+                extradata=new_extradata,
+            )
+        )
+        == []
+    )
+    recovered = normalizer.push(_packet(idr, keyframe=True))
+    assert recovered and recovered[0].startswith(
+        START_CODE + bytes(new_sps) + START_CODE + PPS
+    )
+
+
+def test_real_annexb_fixture_decodes_at_least_one_frame_with_public_pyav() -> None:
+    decoder = av.CodecContext.create("h264", "r")
+    frames: list[av.VideoFrame] = []
+
+    for packet in decoder.parse((FIXTURES / "h264_annexb_packets.bin").read_bytes()):
+        frames.extend(decoder.decode(packet))
+    for packet in decoder.parse(b""):
+        frames.extend(decoder.decode(packet))
+    frames.extend(decoder.decode(None))
+
+    assert frames
+    assert frames[0].width == 64
+    assert frames[0].height == 48
+
+
 @pytest.mark.parametrize(
     ("extradata", "expected"),
     [
         (b"", H264Compatibility(False, None, None, "configuration_missing")),
         (
             _avcc_extradata(profile=0x6E),
-            H264Compatibility(False, 0x6E, 0x1F, "profile_unsupported"),
+            H264Compatibility(False, 0x6E, 0x1E, "profile_unsupported"),
         ),
         (
             _avcc_extradata(level=0x29),
             H264Compatibility(False, 0x42, 0x29, "level_unsupported"),
+        ),
+        (
+            _avcc_extradata(level=0),
+            H264Compatibility(False, 0x42, 0, "level_unsupported"),
         ),
     ],
 )
