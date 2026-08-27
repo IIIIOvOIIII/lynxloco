@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Literal
 
@@ -51,6 +52,24 @@ class _RecordingSource:
 
     async def shutdown(self) -> None:
         self.shutdown_count += 1
+
+
+class _FailOnceConnectSource(_RecordingSource):
+    def __init__(self, devices: dict[str, PerceptionDevice]) -> None:
+        super().__init__("rtsp", devices)
+        self.connect_attempts = 0
+
+    async def connect_device(self, did: str, video_cb, audio_cb) -> None:
+        self.connect_attempts += 1
+        if self.connect_attempts == 1:
+            raise RuntimeError("temporary connect failure")
+        await super().connect_device(did, video_cb, audio_cb)
+
+
+class _FailingShutdownSource(_RecordingSource):
+    async def shutdown(self) -> None:
+        self.shutdown_count += 1
+        raise RuntimeError("sensitive shutdown details")
 
 
 def test_camera_source_state_has_safe_disconnected_defaults() -> None:
@@ -117,3 +136,40 @@ async def test_adapter_rejects_duplicate_dids_across_sources() -> None:
         match="Duplicate camera DID 'shared'.*miot.*rtsp",
     ):
         await adapter.discover_devices()
+
+
+@pytest.mark.asyncio
+async def test_failed_connect_removes_state_and_next_sync_retries() -> None:
+    source = _FailOnceConnectSource({"flaky": _device("flaky")})
+    adapter = CameraDeviceAdapter(sources=[source])  # type: ignore[arg-type]
+
+    await adapter.sync_devices()
+
+    assert adapter.get_connected_devices() == {}
+    assert source.connect_attempts == 1
+
+    await adapter.sync_devices()
+
+    assert set(adapter.get_connected_devices()) == {"flaky"}
+    assert source.connect_attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_shutdown_logs_source_failure_and_continues(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    failing = _FailingShutdownSource("miot", {})
+    healthy = _RecordingSource("rtsp", {})
+    adapter = CameraDeviceAdapter(
+        sources=[failing, healthy]  # type: ignore[list-item]
+    )
+
+    with caplog.at_level(
+        logging.ERROR, logger="miloco.perception.collect.camera_adapter"
+    ):
+        await adapter.shutdown()
+
+    assert failing.shutdown_count == 1
+    assert healthy.shutdown_count == 1
+    assert "Failed to shutdown camera source miot (RuntimeError)" in caplog.text
+    assert "sensitive shutdown details" not in caplog.text

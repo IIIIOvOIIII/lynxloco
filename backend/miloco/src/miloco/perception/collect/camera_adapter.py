@@ -255,13 +255,19 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
             ),
         )
         self._devices[did] = state
-        await camera_source.connect_device(
-            did,
-            self._make_decoded_video_callback(did),
-            self._make_decoded_audio_callback(did),
-        )
+        try:
+            await camera_source.connect_device(
+                did,
+                self._make_decoded_video_callback(did),
+                self._make_decoded_audio_callback(did),
+            )
+        except Exception:
+            self._devices.pop(did, None)
+            state.sync_buffer.clear()
+            raise
         if not camera_source.get_state(did).connected:
             self._devices.pop(did, None)
+            state.sync_buffer.clear()
 
     async def disconnect_device(self, did: str) -> None:
         state = self._devices.pop(did, None)
@@ -281,7 +287,14 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
     async def shutdown(self) -> None:
         await super().shutdown()
         for camera_source in self._sources:
-            await camera_source.shutdown()
+            try:
+                await camera_source.shutdown()
+            except Exception as error:  # noqa: BLE001
+                logger.error(
+                    "Failed to shutdown camera source %s (%s)",
+                    camera_source.source_type,
+                    type(error).__name__,
+                )
 
     def collect(self, did: str, *, drain: bool = True) -> DeviceData | None:
         """Collect multimodal data from the device's sync buffer.
