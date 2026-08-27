@@ -75,6 +75,7 @@ temp
 
 # IDE
 .vscode
+.worktrees/
 .claude/*
 .mimocode
 CLAUDE.md
