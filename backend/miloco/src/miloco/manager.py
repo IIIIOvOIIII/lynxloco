@@ -8,6 +8,7 @@ Service manager module
 import logging
 import uuid
 
+from miloco.camera.service import CameraService
 from miloco.config import get_settings
 from miloco.database.kv_repo import KVRepo, SystemConfigKeys
 from miloco.database.person_repo import PersonRepo
@@ -103,6 +104,11 @@ class Manager:
                 self._miot_proxy, self._kv_repo
             )
 
+        self._camera_service = CameraService(
+            self._miot_service,
+            self._perception_service,
+        )
+
         self._task_service = TaskService(rule_service=self._rule_service)
 
         self._initialized = True
@@ -135,6 +141,10 @@ class Manager:
     @property
     def perception_service(self) -> PerceptionService:
         return self._perception_service
+
+    @property
+    def camera_service(self) -> CameraService:
+        return self._camera_service
 
     @property
     def task_service(self) -> TaskService:
