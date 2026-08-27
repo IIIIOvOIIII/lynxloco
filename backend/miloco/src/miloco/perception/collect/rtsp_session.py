@@ -6,6 +6,7 @@ import asyncio
 import random
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Literal, Protocol, cast
@@ -33,7 +34,8 @@ _JITTER_BOUND = 0.2
 
 
 def reconnect_delay(attempt: int, *, jitter: float) -> float:
-    base = min(60.0, float(2 ** max(0, attempt)))
+    bounded_attempt = min(6, max(0, attempt))
+    base = min(60.0, float(2**bounded_attempt))
     return max(0.0, base * (1.0 + jitter))
 
 
@@ -62,46 +64,72 @@ class RtspSession:
         self._queue_size = queue_size
         self._state = CameraSourceState(connected=False)
         self._task: asyncio.Task[None] | None = None
-        self._events: asyncio.Queue[_DecodedEvent | None] | None = None
+        self._lifecycle_lock = asyncio.Lock()
         self._stop_async: asyncio.Event | None = None
         self._stop_thread = threading.Event()
         self._connection_had_frame = threading.Event()
         self._active_container: av.container.InputContainer | None = None
+        self._open_worker: asyncio.Task[av.container.InputContainer] | None = None
+        self._decode_worker: asyncio.Task[bool] | None = None
         self._video_cb: VideoFrameCallback | None = None
         self._audio_cb: AudioFrameCallback | None = None
         self._listeners: tuple[PacketListener, ...] = ()
+        self._ingress_lock = threading.Lock()
+        self._media_ingress: deque[_DecodedEvent] = deque()
+        self._packet_ingress: deque[object] = deque()
+        self._media_drain_scheduled = False
+        self._packet_drain_scheduled = False
+        self._dropped_frames = 0
+        self._dropped_packets = 0
+        self._media_ready: asyncio.Event | None = None
+        self._packet_ready: asyncio.Event | None = None
+        self._producer_done = False
 
     async def start(
         self, video_cb: VideoFrameCallback, audio_cb: AudioFrameCallback
     ) -> None:
-        if self._task is not None and not self._task.done():
-            return
-        if self._task is not None:
-            await self._task
+        async with self._lifecycle_lock:
+            existing = self._task
+            if existing is not None and not existing.done():
+                if not self._stop_thread.is_set():
+                    return
+                await asyncio.gather(existing, return_exceptions=True)
+            elif existing is not None:
+                await asyncio.gather(existing, return_exceptions=True)
 
-        self._video_cb = video_cb
-        self._audio_cb = audio_cb
-        self._events = asyncio.Queue(maxsize=self._queue_size)
-        self._stop_async = asyncio.Event()
-        self._stop_thread.clear()
-        self._task = asyncio.create_task(self._main())
+            self._video_cb = video_cb
+            self._audio_cb = audio_cb
+            self._media_ready = asyncio.Event()
+            self._packet_ready = asyncio.Event()
+            self._stop_async = asyncio.Event()
+            self._stop_thread.clear()
+            self._producer_done = False
+            self._clear_ingress()
+            self._task = asyncio.create_task(self._main())
 
     async def stop(self) -> None:
-        task = self._task
-        if task is None:
-            self._state = replace(self._state, connected=False)
-            return
+        async with self._lifecycle_lock:
+            task = self._task
+            if task is None:
+                self._state = replace(self._state, connected=False)
+                self._clear_ingress()
+                return
 
-        self._stop_thread.set()
-        if self._stop_async is not None:
-            self._stop_async.set()
-        await self._close_active_container()
-        await task
-        if self._task is task:
-            self._task = None
+            self._stop_thread.set()
+            if self._stop_async is not None:
+                self._stop_async.set()
+            await self._close_active_container()
+            await asyncio.gather(task, return_exceptions=True)
+            if self._task is task:
+                self._task = None
+            self._clear_ingress()
 
     def state(self) -> CameraSourceState:
-        return self._state
+        with self._ingress_lock:
+            dropped_frames = self._dropped_frames
+        if self._state.dropped_frames == dropped_frames:
+            return self._state
+        return replace(self._state, dropped_frames=dropped_frames)
 
     def add_packet_listener(self, listener: PacketListener) -> Callable[[], None]:
         if listener not in self._listeners:
@@ -122,18 +150,27 @@ class RtspSession:
         return _unsubscribe
 
     async def _main(self) -> None:
-        assert self._events is not None
-        consumer = asyncio.create_task(self._consume_events())
+        media_consumer = asyncio.create_task(self._consume_media_ingress())
+        packet_consumer = asyncio.create_task(self._consume_packet_ingress())
         try:
             await self._run_reconnect_loop()
         finally:
             self._state = replace(self._state, connected=False)
+            self._producer_done = True
             if self._stop_thread.is_set():
-                consumer.cancel()
-                await asyncio.gather(consumer, return_exceptions=True)
+                media_consumer.cancel()
+                packet_consumer.cancel()
             else:
-                await self._events.put(None)
-                await consumer
+                assert self._media_ready is not None
+                assert self._packet_ready is not None
+                self._media_ready.set()
+                self._packet_ready.set()
+            await asyncio.gather(
+                media_consumer,
+                packet_consumer,
+                return_exceptions=True,
+            )
+            self._clear_ingress()
 
     async def _run_reconnect_loop(self) -> None:
         attempt = 0
@@ -153,10 +190,8 @@ class RtspSession:
                     return
                 self._active_container = container
                 self._connection_had_frame.clear()
-                saw_frame = await asyncio.to_thread(
-                    self._decode_container_sync,
-                    container,
-                    asyncio.get_running_loop(),
+                saw_frame = await self._decode_until_stopped(
+                    container, asyncio.get_running_loop()
                 )
                 if self._stop_thread.is_set():
                     return
@@ -199,47 +234,70 @@ class RtspSession:
 
     async def _open_until_stopped(self) -> av.container.InputContainer | None:
         assert self._stop_async is not None
-        loop = asyncio.get_running_loop()
         opener = asyncio.create_task(
             asyncio.to_thread(
                 self._open_container_sync,
                 self._source,
             )
         )
+        self._open_worker = opener
         stopper = asyncio.create_task(self._stop_async.wait())
         try:
             done, _ = await asyncio.wait(
                 {opener, stopper}, return_when=asyncio.FIRST_COMPLETED
             )
         except asyncio.CancelledError:
-            self._close_late_open(opener, loop)
             stopper.cancel()
             await asyncio.gather(stopper, return_exceptions=True)
+            await self._reap_stopped_opener(opener)
             raise
+        try:
+            if stopper in done:
+                await self._reap_stopped_opener(opener)
+                return None
 
-        if stopper in done:
-            self._close_late_open(opener, loop)
-            return None
+            stopper.cancel()
+            await asyncio.gather(stopper, return_exceptions=True)
+            return await opener
+        finally:
+            if self._open_worker is opener:
+                self._open_worker = None
 
-        stopper.cancel()
-        await asyncio.gather(stopper, return_exceptions=True)
-        return await opener
-
-    def _close_late_open(
-        self,
-        opener: asyncio.Task[av.container.InputContainer],
-        loop: asyncio.AbstractEventLoop,
+    async def _reap_stopped_opener(
+        self, opener: asyncio.Task[av.container.InputContainer]
     ) -> None:
-        def _close_when_ready(
-            done: asyncio.Task[av.container.InputContainer],
-        ) -> None:
-            try:
-                container = done.result()
-            except BaseException:
-                return
-            loop.create_task(asyncio.to_thread(self._close_container_sync, container))
+        container: av.container.InputContainer | None = None
+        try:
+            container = await asyncio.shield(opener)
+        except BaseException:
+            pass
+        finally:
+            if self._open_worker is opener:
+                self._open_worker = None
+        if container is not None:
+            await asyncio.to_thread(self._close_container_sync, container)
 
-        opener.add_done_callback(_close_when_ready)
+    async def _decode_until_stopped(
+        self,
+        container: av.container.InputContainer,
+        loop: asyncio.AbstractEventLoop,
+    ) -> bool:
+        worker = asyncio.create_task(
+            asyncio.to_thread(self._decode_container_sync, container, loop)
+        )
+        self._decode_worker = worker
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            await self._close_active_container()
+            try:
+                await asyncio.shield(worker)
+            except BaseException:
+                pass
+            raise
+        finally:
+            if self._decode_worker is worker:
+                self._decode_worker = None
 
     async def _wait_for_stop(self, delay: float) -> bool:
         assert self._stop_async is not None
@@ -300,7 +358,7 @@ class RtspSession:
             if self._stop_thread.is_set():
                 break
             if self._listeners:
-                loop.call_soon_threadsafe(self._notify_packet_listeners, packet)
+                self._enqueue_packet_from_thread(packet, loop)
 
             stream_type = getattr(packet.stream, "type", None)
             if stream_type == "audio" and not self._source.audio_enabled:
@@ -308,10 +366,10 @@ class RtspSession:
             if stream_type not in {"video", "audio"}:
                 continue
 
+            recv_unix_ms = int(time.time() * 1000)
             for frame in packet.decode():
                 if self._stop_thread.is_set():
                     break
-                recv_unix_ms = int(time.time() * 1000)
                 if stream_type == "video":
                     video_frame = cast(av.VideoFrame, frame)
                     image = video_frame.to_ndarray(format="bgr24").astype(
@@ -321,11 +379,16 @@ class RtspSession:
                     event = _DecodedEvent(
                         kind="video",
                         frame=image,
-                        stream_ts=int(video_frame.pts or 0),
+                        stream_ts=self._timestamp_ms(
+                            video_frame,
+                            fallback_time_base=getattr(
+                                packet.stream, "time_base", None
+                            ),
+                        ),
                         recv_unix_ms=recv_unix_ms,
                         decoded_unix_ms=decoded_unix_ms,
                     )
-                    loop.call_soon_threadsafe(self._enqueue_event, event)
+                    self._enqueue_media_from_thread(event, loop)
                     self._connection_had_frame.set()
                     saw_frame = True
                     continue
@@ -340,14 +403,40 @@ class RtspSession:
                     event = _DecodedEvent(
                         kind="audio",
                         frame=pcm,
-                        stream_ts=int(audio_frame.pts or 0),
+                        stream_ts=self._timestamp_ms(
+                            resampled,
+                            fallback_frame=audio_frame,
+                            fallback_time_base=getattr(
+                                packet.stream, "time_base", None
+                            ),
+                        ),
                         recv_unix_ms=recv_unix_ms,
                         decoded_unix_ms=decoded_unix_ms,
                     )
-                    loop.call_soon_threadsafe(self._enqueue_event, event)
+                    self._enqueue_media_from_thread(event, loop)
                     self._connection_had_frame.set()
                     saw_frame = True
         return saw_frame
+
+    @staticmethod
+    def _timestamp_ms(
+        frame: object,
+        *,
+        fallback_frame: object | None = None,
+        fallback_time_base: object | None = None,
+    ) -> int:
+        pts = getattr(frame, "pts", None)
+        time_base = getattr(frame, "time_base", None)
+        if pts is None and fallback_frame is not None:
+            pts = getattr(fallback_frame, "pts", None)
+            time_base = getattr(fallback_frame, "time_base", None)
+        if time_base is None:
+            time_base = fallback_time_base
+        if pts is None:
+            return 0
+        if time_base is None:
+            return int(pts)
+        return int(pts * time_base * 1000)
 
     def _mark_connected(
         self,
@@ -369,35 +458,78 @@ class RtspSession:
             error_message=None,
         )
 
-    def _enqueue_event(self, event: _DecodedEvent) -> None:
-        if self._stop_thread.is_set() or self._events is None:
+    def _enqueue_media_from_thread(
+        self, event: _DecodedEvent, loop: asyncio.AbstractEventLoop
+    ) -> None:
+        if self._stop_thread.is_set():
             return
-        dropped = self._state.dropped_frames
-        if self._events.full():
-            try:
-                self._events.get_nowait()
-                self._events.task_done()
-                dropped += 1
-            except asyncio.QueueEmpty:
-                pass
-        self._events.put_nowait(event)
+        schedule_drain = False
+        with self._ingress_lock:
+            if len(self._media_ingress) >= self._queue_size:
+                self._media_ingress.popleft()
+                self._dropped_frames += 1
+            self._media_ingress.append(event)
+            if not self._media_drain_scheduled:
+                self._media_drain_scheduled = True
+                schedule_drain = True
+        if schedule_drain:
+            loop.call_soon_threadsafe(self._wake_media_consumer)
+
+    def _enqueue_packet_from_thread(
+        self, packet: object, loop: asyncio.AbstractEventLoop
+    ) -> None:
+        if self._stop_thread.is_set():
+            return
+        schedule_drain = False
+        with self._ingress_lock:
+            if len(self._packet_ingress) >= self._queue_size:
+                self._packet_ingress.popleft()
+                self._dropped_packets += 1
+            self._packet_ingress.append(packet)
+            if not self._packet_drain_scheduled:
+                self._packet_drain_scheduled = True
+                schedule_drain = True
+        if schedule_drain:
+            loop.call_soon_threadsafe(self._wake_packet_consumer)
+
+    def _wake_media_consumer(self) -> None:
+        if self._media_ready is not None:
+            self._media_ready.set()
+
+    def _wake_packet_consumer(self) -> None:
+        if self._packet_ready is not None:
+            self._packet_ready.set()
+
+    def _mark_frame(self, event: _DecodedEvent) -> None:
+        with self._ingress_lock:
+            dropped_frames = self._dropped_frames
         self._state = replace(
             self._state,
             connected=True,
             last_frame_unix_ms=event.decoded_unix_ms,
             reconnect_attempt=0,
-            dropped_frames=dropped,
+            dropped_frames=dropped_frames,
             error_code=None,
             error_message=None,
         )
 
-    async def _consume_events(self) -> None:
-        assert self._events is not None
+    async def _consume_media_ingress(self) -> None:
+        assert self._media_ready is not None
         while True:
-            event = await self._events.get()
-            try:
+            await self._media_ready.wait()
+            self._media_ready.clear()
+            while True:
+                with self._ingress_lock:
+                    if self._media_ingress:
+                        event = self._media_ingress.popleft()
+                    else:
+                        self._media_drain_scheduled = False
+                        event = None
                 if event is None:
-                    return
+                    if self._producer_done:
+                        return
+                    break
+                self._mark_frame(event)
                 try:
                     if event.kind == "video" and self._video_cb is not None:
                         await self._video_cb(
@@ -419,15 +551,35 @@ class RtspSession:
                         )
                 except Exception:
                     pass
-            finally:
-                self._events.task_done()
 
-    def _notify_packet_listeners(self, packet: object) -> None:
-        for listener in self._listeners:
-            try:
-                listener(packet)
-            except Exception:
-                pass
+    async def _consume_packet_ingress(self) -> None:
+        assert self._packet_ready is not None
+        while True:
+            await self._packet_ready.wait()
+            self._packet_ready.clear()
+            while True:
+                with self._ingress_lock:
+                    if self._packet_ingress:
+                        packet = self._packet_ingress.popleft()
+                    else:
+                        self._packet_drain_scheduled = False
+                        packet = None
+                if packet is None:
+                    if self._producer_done:
+                        return
+                    break
+                for listener in self._listeners:
+                    try:
+                        await asyncio.to_thread(listener, packet)
+                    except Exception:
+                        pass
+
+    def _clear_ingress(self) -> None:
+        with self._ingress_lock:
+            self._media_ingress.clear()
+            self._packet_ingress.clear()
+            self._media_drain_scheduled = False
+            self._packet_drain_scheduled = False
 
     def _record_error(self, error: RtspSourceError, *, reconnect_attempt: int) -> None:
         self._state = replace(

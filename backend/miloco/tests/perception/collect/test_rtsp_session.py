@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import importlib
 import logging
 import threading
+import time as stdlib_time
+import weakref
 from collections.abc import Callable
 from fractions import Fraction
 from types import ModuleType, SimpleNamespace
@@ -40,9 +43,16 @@ def _source(**overrides: object) -> RtspSourceSettings:
 
 
 class _VideoFrame:
-    def __init__(self, value: int, *, pts: int | None = None) -> None:
+    def __init__(
+        self,
+        value: int,
+        *,
+        pts: int | None = None,
+        time_base: Fraction | None = None,
+    ) -> None:
         self.value = value
         self.pts = value if pts is None else pts
+        self.time_base = time_base
         self.width = 4
         self.height = 3
         self.formats: list[str] = []
@@ -50,6 +60,15 @@ class _VideoFrame:
     def to_ndarray(self, *, format: str) -> np.ndarray:
         self.formats.append(format)
         return np.full((3, 4, 3), self.value, dtype=np.uint8)
+
+
+class _TrackingVideoFrame(_VideoFrame):
+    created: list[weakref.ReferenceType[np.ndarray]] = []
+
+    def to_ndarray(self, *, format: str) -> np.ndarray:
+        image = super().to_ndarray(format=format)
+        self.created.append(weakref.ref(image))
+        return image
 
 
 def _audio_frame() -> av.AudioFrame:
@@ -132,6 +151,24 @@ class _BlockingContainer(_Container):
         self.released.set()
 
 
+class _BurstContainer(_Container):
+    def __init__(self, packets: list[_Packet]) -> None:
+        super().__init__(packets)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.finished = threading.Event()
+
+    def demux(self):
+        self.entered.set()
+        self.release.wait(timeout=2.0)
+        packets, self._packets = self._packets, []
+        try:
+            yield from packets
+        finally:
+            packets.clear()
+            self.finished.set()
+
+
 class _FailAfterPacketsContainer(_Container):
     def demux(self):
         yield from self._packets
@@ -163,6 +200,35 @@ class _SequenceOpener:
         if isinstance(result, BaseException):
             raise result
         return result
+
+
+class _BlockingOpenSequence:
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.second_started = threading.Event()
+        self.late_container = _Container([], video_stream=_stream("video", "h264"))
+        self.calls = 0
+        self.active = 0
+        self.max_active = 0
+        self._lock = threading.Lock()
+
+    def __call__(self, *_args: object, **_kwargs: object) -> object:
+        with self._lock:
+            self.calls += 1
+            call = self.calls
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        try:
+            if call == 1:
+                self.started.set()
+                self.release.wait(timeout=2.0)
+                return self.late_container
+            self.second_started.set()
+            raise _terminal_error()
+        finally:
+            with self._lock:
+                self.active -= 1
 
 
 async def _wait_until(predicate: Callable[[], bool], timeout: float = 1.0) -> None:
@@ -200,6 +266,13 @@ def test_reconnect_delay_applies_deterministic_jitter_without_going_negative() -
     assert session_module.reconnect_delay(3, jitter=0.25) == 10.0
     assert session_module.reconnect_delay(3, jitter=-0.25) == 6.0
     assert session_module.reconnect_delay(3, jitter=-2.0) == 0.0
+
+
+def test_reconnect_delay_clamps_before_exponentiation_for_huge_attempts() -> None:
+    session_module = _rtsp_session()
+
+    assert session_module.reconnect_delay(1024, jitter=0.0) == 60.0
+    assert session_module.reconnect_delay(100_000, jitter=0.25) == 75.0
 
 
 @pytest.mark.asyncio
@@ -456,6 +529,93 @@ async def test_queue_size_three_drops_oldest_while_callback_is_slow(
 
 
 @pytest.mark.asyncio
+async def test_thread_ingress_stays_bounded_while_owner_loop_is_frozen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_module = _rtsp_session()
+    _TrackingVideoFrame.created = []
+    packets = [
+        _Packet(_stream("video", "h264"), [_TrackingVideoFrame(value)])
+        for value in range(50)
+    ]
+    packet_refs = [weakref.ref(packet) for packet in packets]
+    container = _BurstContainer(packets)
+    del packets
+    monkeypatch.setattr(
+        session_module.av,
+        "open",
+        _SequenceOpener(container, _terminal_error()),
+    )
+    monkeypatch.setattr(session_module, "reconnect_delay", lambda *_a, **_kw: 0.0)
+    session = session_module.RtspSession(_source(), queue_size=3)
+    session.add_packet_listener(lambda _packet: None)
+    loop = asyncio.get_running_loop()
+    real_call_soon_threadsafe = loop.call_soon_threadsafe
+    wake_calls = {"media": 0, "packet": 0}
+
+    def counting_call_soon_threadsafe(callback, *args, **kwargs):
+        if callback == session._wake_media_consumer:
+            wake_calls["media"] += 1
+        elif callback == session._wake_packet_consumer:
+            wake_calls["packet"] += 1
+        return real_call_soon_threadsafe(callback, *args, **kwargs)
+
+    monkeypatch.setattr(loop, "call_soon_threadsafe", counting_call_soon_threadsafe)
+
+    await session.start(_unused_video_cb, _unused_audio_cb)
+    assert await asyncio.to_thread(container.entered.wait, 0.5)
+    container.release.set()
+    assert container.finished.wait(timeout=0.5)
+    gc.collect()
+
+    live_images = sum(
+        reference() is not None for reference in _TrackingVideoFrame.created
+    )
+    live_packets = sum(reference() is not None for reference in packet_refs)
+    assert live_images <= 3
+    assert live_packets <= 3
+    assert session.state().dropped_frames == 47
+    assert session._dropped_packets == 47
+    assert wake_calls == {"media": 1, "packet": 1}
+    await session.stop()
+
+
+@pytest.mark.asyncio
+async def test_slow_packet_listener_never_blocks_owner_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_module = _rtsp_session()
+    packet = _Packet(_stream("video", "h264"), [_VideoFrame(1)])
+    monkeypatch.setattr(
+        session_module.av,
+        "open",
+        _SequenceOpener(_Container([packet]), _terminal_error()),
+    )
+    monkeypatch.setattr(session_module, "reconnect_delay", lambda *_a, **_kw: 0.0)
+    listener_started = threading.Event()
+    listener_release = threading.Event()
+
+    def slow_listener(_packet: object) -> None:
+        listener_started.set()
+        listener_release.wait(timeout=1.0)
+
+    session = session_module.RtspSession(_source())
+    session.add_packet_listener(slow_listener)
+    release_timer = threading.Timer(0.4, listener_release.set)
+    release_timer.start()
+    started_at = stdlib_time.monotonic()
+    try:
+        await session.start(_unused_video_cb, _unused_audio_cb)
+        assert await asyncio.to_thread(listener_started.wait, 0.5)
+        elapsed = stdlib_time.monotonic() - started_at
+        assert elapsed < 0.2
+    finally:
+        listener_release.set()
+        release_timer.cancel()
+        await session.stop()
+
+
+@pytest.mark.asyncio
 async def test_callback_failure_isolated_from_later_frames(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -528,6 +688,176 @@ async def test_external_session_cancellation_closes_and_joins_decode_worker(
     assert container.closed is True
     assert container.exited.is_set()
     assert session.state().connected is False
+    await session.stop()
+    assert session._task is None
+
+
+@pytest.mark.asyncio
+async def test_stop_blocks_restart_until_late_open_returns_and_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_module = _rtsp_session()
+    opener = _BlockingOpenSequence()
+    monkeypatch.setattr(session_module.av, "open", opener)
+    session = session_module.RtspSession(_source())
+
+    await session.start(_unused_video_cb, _unused_audio_cb)
+    assert await asyncio.to_thread(opener.started.wait, 0.5)
+    stopping = asyncio.create_task(session.stop())
+    await asyncio.sleep(0)
+    restarting = asyncio.create_task(session.start(_unused_video_cb, _unused_audio_cb))
+    await asyncio.sleep(0.05)
+
+    assert opener.second_started.is_set() is False
+    assert stopping.done() is False
+    opener.release.set()
+    await asyncio.wait_for(stopping, timeout=0.5)
+    await asyncio.wait_for(restarting, timeout=0.5)
+    await _wait_until(lambda: opener.second_started.is_set())
+
+    assert opener.late_container.closed is True
+    assert opener.max_active == 1
+    await session.stop()
+
+
+@pytest.mark.asyncio
+async def test_cancel_then_stop_blocks_restart_until_open_worker_is_reaped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_module = _rtsp_session()
+    opener = _BlockingOpenSequence()
+    monkeypatch.setattr(session_module.av, "open", opener)
+    session = session_module.RtspSession(_source())
+
+    await session.start(_unused_video_cb, _unused_audio_cb)
+    assert await asyncio.to_thread(opener.started.wait, 0.5)
+    task = session._task
+    assert task is not None
+    task.cancel()
+    stopping = asyncio.create_task(session.stop())
+    restarting = asyncio.create_task(session.start(_unused_video_cb, _unused_audio_cb))
+    await asyncio.sleep(0.05)
+
+    assert opener.second_started.is_set() is False
+    opener.release.set()
+    await asyncio.wait_for(stopping, timeout=0.5)
+    await asyncio.wait_for(restarting, timeout=0.5)
+    await _wait_until(lambda: opener.second_started.is_set())
+
+    assert opener.late_container.closed is True
+    assert opener.max_active == 1
+    await session.stop()
+
+
+@pytest.mark.asyncio
+async def test_frame_timestamps_are_milliseconds_and_recv_precedes_decode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_module = _rtsp_session()
+    clock_values = iter([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    decode_started_ms: list[int] = []
+
+    class TimingPacket(_Packet):
+        def decode(self) -> list[object]:
+            decode_started_ms.append(int(session_module.time.time() * 1000))
+            return super().decode()
+
+    video = _VideoFrame(1, pts=3, time_base=Fraction(1, 25))
+    video_packet = TimingPacket(_stream("video", "h264"), [video])
+    audio = _audio_frame()
+    audio_packet = _Packet(_stream("audio", "aac"), [audio])
+    container = _Container([video_packet, audio_packet])
+
+    class Resampled:
+        pts = 1600
+        time_base = Fraction(1, 16_000)
+
+        @staticmethod
+        def to_ndarray() -> np.ndarray:
+            return np.ones((1, 320), dtype=np.int16)
+
+    class Resampler:
+        def resample(self, _frame: object) -> list[Resampled]:
+            return [Resampled()]
+
+    monkeypatch.setattr(session_module.time, "time", lambda: next(clock_values))
+    monkeypatch.setattr(session_module.av, "AudioResampler", lambda **_kw: Resampler())
+    monkeypatch.setattr(
+        session_module.av,
+        "open",
+        _SequenceOpener(container, _terminal_error()),
+    )
+    monkeypatch.setattr(session_module, "reconnect_delay", lambda *_a, **_kw: 0.0)
+    video_result: list[tuple[int, int, int]] = []
+    audio_result: list[tuple[int, int, int]] = []
+    done = asyncio.Event()
+
+    async def video_cb(
+        _did: str,
+        _frame: np.ndarray,
+        ts: int,
+        _ch: int,
+        recv_ms: int,
+        decoded_ms: int,
+    ) -> None:
+        video_result.append((ts, recv_ms, decoded_ms))
+        if audio_result:
+            done.set()
+
+    async def audio_cb(
+        _did: str,
+        _frame: np.ndarray,
+        ts: int,
+        _ch: int,
+        recv_ms: int,
+        decoded_ms: int,
+    ) -> None:
+        audio_result.append((ts, recv_ms, decoded_ms))
+        if video_result:
+            done.set()
+
+    session = session_module.RtspSession(_source())
+    await session.start(video_cb, audio_cb)
+    await asyncio.wait_for(done.wait(), timeout=1.0)
+
+    assert video_result == [(120, 1000, 3000)]
+    assert decode_started_ms == [2000]
+    assert audio_result == [(100, 4000, 5000)]
+    assert video_result[0][1] < decode_started_ms[0] < video_result[0][2]
+    await session.stop()
+
+
+@pytest.mark.asyncio
+async def test_stop_releases_all_queued_ndarrays(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_module = _rtsp_session()
+    _TrackingVideoFrame.created = []
+    packets = [
+        _Packet(_stream("video", "h264"), [_TrackingVideoFrame(value)])
+        for value in range(20)
+    ]
+    callback_started = asyncio.Event()
+    callback_release = asyncio.Event()
+
+    async def blocked_callback(*_args: object) -> None:
+        callback_started.set()
+        await callback_release.wait()
+
+    monkeypatch.setattr(
+        session_module.av,
+        "open",
+        _SequenceOpener(_Container(packets), _terminal_error()),
+    )
+    monkeypatch.setattr(session_module, "reconnect_delay", lambda *_a, **_kw: 0.0)
+    session = session_module.RtspSession(_source(), queue_size=3)
+    await session.start(blocked_callback, _unused_audio_cb)
+    await asyncio.wait_for(callback_started.wait(), timeout=0.5)
+    await session.stop()
+    packets.clear()
+    gc.collect()
+
+    assert all(reference() is None for reference in _TrackingVideoFrame.created)
 
 
 @pytest.mark.asyncio
