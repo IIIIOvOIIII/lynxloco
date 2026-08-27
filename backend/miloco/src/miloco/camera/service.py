@@ -96,6 +96,21 @@ class CameraService:
                 raise CameraConflictError(
                     "camera_unavailable", "Camera stream is unavailable"
                 )
+            is_active = getattr(session, "is_active", None)
+            is_terminal = getattr(session, "is_terminal", None)
+            try:
+                inactive = callable(is_active) and is_active() is not True
+                terminal = callable(is_terminal) and is_terminal() is True
+            except Exception as error:  # noqa: BLE001
+                logger.warning(
+                    "Camera stream lifecycle read failed (%s)", type(error).__name__
+                )
+                inactive = True
+                terminal = False
+            if inactive or terminal:
+                raise CameraConflictError(
+                    "camera_unavailable", "Camera stream is unavailable"
+                )
             state = registry.get_state(camera_id)
             return LiveStreamSource(
                 camera_id=camera_id,

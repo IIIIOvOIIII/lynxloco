@@ -38,6 +38,12 @@ class PacketSource(Protocol):
     ) -> Callable[[], None]: ...
 
 
+class SourceLifecycle(Protocol):
+    def add_close_listener(
+        self, listener: Callable[[str | None], None]
+    ) -> Callable[[], None]: ...
+
+
 @dataclass(frozen=True)
 class LiveStreamSource:
     """An already-owned source backend resolved without connection material."""
@@ -63,8 +69,9 @@ class _Subscriber:
 @dataclass
 class _CameraFeed:
     source: LiveStreamSource
-    detach: Callable[[], None]
     subscribers: dict[int, _Subscriber]
+    packet_detach: Callable[[], None] = lambda: None
+    lifecycle_detach: Callable[[], None] = lambda: None
     dropped_packets: int = 0
 
 
@@ -100,7 +107,7 @@ class LiveStreamHub:
             if feed is None:
                 self._states[camera_id] = self._idle_state()
                 return
-            feed.detach()
+            self._detach_source(feed)
             for subscriber in feed.subscribers.values():
                 subscriber.closed = True
                 subscriber.packets.clear()
@@ -145,13 +152,36 @@ class LiveStreamHub:
                     )
                     raise RuntimeError("Camera stream backend is unavailable")
                 loop = asyncio.get_running_loop()
+                feed = _CameraFeed(source, {})
+                self._feeds[camera_id] = feed
 
                 def receive(packet: EncodedVideoPacket) -> None:
-                    loop.call_soon_threadsafe(self._publish, camera_id, packet)
+                    loop.call_soon_threadsafe(self._publish, camera_id, feed, packet)
 
-                detach = listener_adder(receive)
-                feed = _CameraFeed(source, detach, {})
-                self._feeds[camera_id] = feed
+                def source_closed(error_code: str | None) -> None:
+                    loop.call_soon_threadsafe(
+                        self._source_closed, camera_id, feed, error_code
+                    )
+
+                try:
+                    feed.packet_detach = listener_adder(receive)
+                    close_adder = getattr(source.backend, "add_close_listener", None)
+                    if callable(close_adder):
+                        feed.lifecycle_detach = close_adder(source_closed)
+                except Exception:
+                    if self._feeds.get(camera_id) is feed:
+                        self._feeds.pop(camera_id, None)
+                    self._detach_source(feed)
+                    self._states[camera_id] = LiveStreamState(
+                        viewer_count=0,
+                        mode="error",
+                        input_codec=source.input_codec,
+                        output_codec=None,
+                        queue_depth=0,
+                        dropped_packets=0,
+                        error_code="stream_unavailable",
+                    )
+                    raise
 
             subscriber_id = self._next_subscriber_id
             self._next_subscriber_id += 1
@@ -172,14 +202,19 @@ class LiveStreamHub:
             if feed.subscribers:
                 return
             self._feeds.pop(camera_id, None)
-            feed.detach()
+            self._detach_source(feed)
             self._states[camera_id] = self._idle_state(
                 dropped_packets=feed.dropped_packets
             )
 
-    def _publish(self, camera_id: str, packet: EncodedVideoPacket) -> None:
+    def _publish(
+        self,
+        camera_id: str,
+        source_feed: _CameraFeed,
+        packet: EncodedVideoPacket,
+    ) -> None:
         feed = self._feeds.get(camera_id)
-        if feed is None or not isinstance(packet, EncodedVideoPacket):
+        if feed is not source_feed or not isinstance(packet, EncodedVideoPacket):
             return
         for subscriber in tuple(feed.subscribers.values()):
             try:
@@ -189,6 +224,49 @@ class LiveStreamHub:
                 subscriber.closed = True
                 subscriber.packets.clear()
                 subscriber.ready.set()
+
+    def _source_closed(
+        self,
+        camera_id: str,
+        source_feed: _CameraFeed,
+        error_code: str | None,
+    ) -> None:
+        feed = self._feeds.get(camera_id)
+        if feed is not source_feed:
+            return
+        self._feeds.pop(camera_id, None)
+        self._detach_source(feed)
+        for subscriber in feed.subscribers.values():
+            subscriber.closed = True
+            subscriber.packets.clear()
+            subscriber.ready.set()
+        if error_code is None:
+            self._states[camera_id] = self._idle_state(
+                dropped_packets=feed.dropped_packets
+            )
+        else:
+            self._states[camera_id] = LiveStreamState(
+                viewer_count=0,
+                mode="error",
+                input_codec=feed.source.input_codec,
+                output_codec=None,
+                queue_depth=0,
+                dropped_packets=feed.dropped_packets,
+                error_code=error_code,
+            )
+
+    @staticmethod
+    def _detach_source(feed: _CameraFeed) -> None:
+        packet_detach, feed.packet_detach = feed.packet_detach, lambda: None
+        lifecycle_detach, feed.lifecycle_detach = (
+            feed.lifecycle_detach,
+            lambda: None,
+        )
+        for detach in (packet_detach, lifecycle_detach):
+            try:
+                detach()
+            except Exception:
+                pass
 
     def _enqueue(
         self,

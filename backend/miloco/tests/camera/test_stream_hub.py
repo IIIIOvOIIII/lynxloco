@@ -27,12 +27,18 @@ def _packet(value: int, *, keyframe: bool = False) -> EncodedVideoPacket:
 class _PacketBackend:
     def __init__(self) -> None:
         self.listeners: list[Callable[[EncodedVideoPacket], None]] = []
+        self.all_listeners: list[Callable[[EncodedVideoPacket], None]] = []
+        self.close_listeners: list[Callable[[str | None], None]] = []
         self.detach_count = 0
+        self.close_detach_count = 0
+        self.active = True
+        self.terminal = False
 
     def add_packet_listener(
         self, listener: Callable[[EncodedVideoPacket], None]
     ) -> Callable[[], None]:
         self.listeners.append(listener)
+        self.all_listeners.append(listener)
         detached = False
 
         def detach() -> None:
@@ -44,6 +50,35 @@ class _PacketBackend:
             self.listeners.remove(listener)
 
         return detach
+
+    def add_close_listener(
+        self, listener: Callable[[str | None], None]
+    ) -> Callable[[], None]:
+        self.close_listeners.append(listener)
+        detached = False
+
+        def detach() -> None:
+            nonlocal detached
+            if detached:
+                return
+            detached = True
+            self.close_detach_count += 1
+            if listener in self.close_listeners:
+                self.close_listeners.remove(listener)
+
+        return detach
+
+    def stop(self, error_code: str | None = None) -> None:
+        self.active = False
+        self.terminal = error_code is not None
+        for listener in tuple(self.close_listeners):
+            listener(error_code)
+
+    def is_active(self) -> bool:
+        return self.active
+
+    def is_terminal(self) -> bool:
+        return self.terminal
 
     def emit(self, packet: EncodedVideoPacket) -> None:
         for listener in tuple(self.listeners):
@@ -176,6 +211,103 @@ async def test_close_camera_stops_subscribers_and_detaches_source() -> None:
 
 
 @pytest.mark.asyncio
+async def test_late_packet_from_closed_generation_cannot_reach_replacement() -> None:
+    old_backend = _PacketBackend()
+    replacement_backend = _PacketBackend()
+    backends = iter((old_backend, replacement_backend))
+
+    async def resolve(_camera_id: str) -> LiveStreamSource:
+        return _source(next(backends))
+
+    hub = LiveStreamHub(resolve)
+    old_stream = hub.subscribe("rtsp:camera")
+    old_pending = asyncio.create_task(_next(old_stream))
+    await asyncio.sleep(0)
+    stale_listener = old_backend.all_listeners[0]
+    await hub.close_camera("rtsp:camera")
+    with pytest.raises(StopAsyncIteration):
+        await old_pending
+
+    replacement = hub.subscribe("rtsp:camera")
+    replacement_pending = asyncio.create_task(_next(replacement))
+    await asyncio.sleep(0)
+    stale_listener(_packet(90, keyframe=True))
+    await asyncio.sleep(0)
+
+    assert not replacement_pending.done()
+    assert hub.state("rtsp:camera").queue_depth == 0
+    replacement_backend.emit(_packet(91, keyframe=True))
+    assert await replacement_pending == b"["
+    await replacement.aclose()
+
+
+@pytest.mark.asyncio
+async def test_source_shutdown_ends_waiting_viewers_without_hanging() -> None:
+    backend = _PacketBackend()
+
+    async def resolve(_camera_id: str) -> LiveStreamSource:
+        return _source(backend)
+
+    hub = LiveStreamHub(resolve)
+    stream = hub.subscribe("rtsp:camera")
+    pending = asyncio.create_task(_next(stream))
+    await asyncio.sleep(0)
+
+    backend.stop()
+
+    with pytest.raises(StopAsyncIteration):
+        await pending
+    assert hub.state("rtsp:camera").mode == "idle"
+    assert backend.detach_count == 1
+    assert backend.close_detach_count == 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_source_ends_viewers_with_safe_error_state() -> None:
+    backend = _PacketBackend()
+
+    async def resolve(_camera_id: str) -> LiveStreamSource:
+        return _source(backend)
+
+    hub = LiveStreamHub(resolve)
+    stream = hub.subscribe("rtsp:camera")
+    pending = asyncio.create_task(_next(stream))
+    await asyncio.sleep(0)
+
+    backend.stop("authentication_failed")
+
+    with pytest.raises(StopAsyncIteration):
+        await pending
+    state = hub.state("rtsp:camera")
+    assert state.mode == "error"
+    assert state.error_code == "authentication_failed"
+
+
+class _StopsDuringLifecycleAttach(_PacketBackend):
+    def add_close_listener(
+        self, listener: Callable[[str | None], None]
+    ) -> Callable[[], None]:
+        detach = super().add_close_listener(listener)
+        self.stop("resource_not_found")
+        return detach
+
+
+@pytest.mark.asyncio
+async def test_source_stop_during_attach_closes_new_subscription() -> None:
+    backend = _StopsDuringLifecycleAttach()
+
+    async def resolve(_camera_id: str) -> LiveStreamSource:
+        return _source(backend)
+
+    hub = LiveStreamHub(resolve)
+    stream = hub.subscribe("rtsp:camera")
+
+    with pytest.raises(StopAsyncIteration):
+        await _next(stream)
+    assert hub.state("rtsp:camera").error_code == "resource_not_found"
+
+
+@pytest.mark.asyncio
 async def test_broken_subscriber_cleanup_does_not_affect_other_viewers() -> None:
     backend = _PacketBackend()
 
@@ -295,3 +427,25 @@ async def test_camera_service_rejects_missing_disabled_or_inactive_sources() -> 
     with pytest.raises(CameraConflictError) as unavailable:
         await inactive.resolve_live_stream("rtsp:camera")
     assert unavailable.value.code == "camera_unavailable"
+
+    stopped_backend = _PacketBackend()
+    stopped_backend.stop()
+    stopped = CameraService(
+        _Miot(),
+        _Perception(_RtspRegistry(stopped_backend)),
+        settings_loader=_settings,
+    )
+    with pytest.raises(CameraConflictError) as stopped_error:
+        await stopped.resolve_live_stream("rtsp:camera")
+    assert stopped_error.value.code == "camera_unavailable"
+
+    terminal_backend = _PacketBackend()
+    terminal_backend.stop("authentication_failed")
+    terminal = CameraService(
+        _Miot(),
+        _Perception(_RtspRegistry(terminal_backend)),
+        settings_loader=_settings,
+    )
+    with pytest.raises(CameraConflictError) as terminal_error:
+        await terminal.resolve_live_stream("rtsp:camera")
+    assert terminal_error.value.code == "camera_unavailable"

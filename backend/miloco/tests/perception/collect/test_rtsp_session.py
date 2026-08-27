@@ -1185,6 +1185,35 @@ async def test_packet_snapshot_and_decode_share_one_open_session(
     assert opener.calls == 1
 
 
+@pytest.mark.asyncio
+async def test_close_listener_reports_manual_and_terminal_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_module = _rtsp_session()
+    container = _BlockingContainer()
+    monkeypatch.setattr(session_module.av, "open", _SequenceOpener(container))
+    session = session_module.RtspSession(_source())
+    manual: list[str | None] = []
+
+    await session.start(_unused_video_cb, _unused_audio_cb)
+    await asyncio.to_thread(container.entered.wait, 0.5)
+    detach = session.add_close_listener(manual.append)
+    await session.stop()
+    detach()
+    detach()
+
+    assert manual == [None]
+
+    monkeypatch.setattr(session_module.av, "open", _SequenceOpener(_terminal_error()))
+    terminal = session_module.RtspSession(_source())
+    terminal_codes: list[str | None] = []
+    await terminal.start(_unused_video_cb, _unused_audio_cb)
+    terminal.add_close_listener(terminal_codes.append)
+    await _wait_until(lambda: terminal.is_terminal())
+    await _wait_until(lambda: terminal_codes == ["authentication_failed"])
+    await terminal.stop()
+
+
 async def _unused_video_cb(*_args: object) -> None:
     return None
 

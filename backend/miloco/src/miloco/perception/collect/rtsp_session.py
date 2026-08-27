@@ -47,6 +47,12 @@ class PacketListener(Protocol):
     def __call__(self, packet: EncodedVideoPacket) -> None: ...
 
 
+class CloseListener(Protocol):
+    """A source lifecycle hook carrying only a stable terminal error code."""
+
+    def __call__(self, error_code: str | None) -> None: ...
+
+
 @dataclass(frozen=True)
 class _DecodedEvent:
     kind: Literal["video", "audio"]
@@ -77,6 +83,7 @@ class RtspSession:
         self._video_cb: VideoFrameCallback | None = None
         self._audio_cb: AudioFrameCallback | None = None
         self._listeners: tuple[PacketListener, ...] = ()
+        self._close_listeners: tuple[CloseListener, ...] = ()
         self._ingress_lock = threading.Lock()
         self._media_ingress: deque[_DecodedEvent] = deque()
         self._packet_ingress: deque[EncodedVideoPacket] = deque()
@@ -168,6 +175,38 @@ class RtspSession:
 
         return _unsubscribe
 
+    def add_close_listener(self, listener: CloseListener) -> Callable[[], None]:
+        """Notify once when this active producer stops or becomes terminal."""
+        notified = False
+
+        def notify_once(error_code: str | None) -> None:
+            nonlocal notified
+            if notified:
+                return
+            notified = True
+            try:
+                listener(error_code)
+            except Exception:
+                pass
+
+        if not self.is_active():
+            notify_once(self._state.error_code if self._terminal else None)
+            return lambda: None
+
+        self._close_listeners = (*self._close_listeners, notify_once)
+
+        def unsubscribe() -> None:
+            self._close_listeners = tuple(
+                registered
+                for registered in self._close_listeners
+                if registered is not notify_once
+            )
+
+        if not self.is_active():
+            unsubscribe()
+            notify_once(self._state.error_code if self._terminal else None)
+        return unsubscribe
+
     async def _main(self) -> None:
         media_consumer = asyncio.create_task(self._consume_media_ingress())
         packet_consumer = asyncio.create_task(self._consume_packet_ingress())
@@ -176,6 +215,7 @@ class RtspSession:
         finally:
             self._state = replace(self._state, connected=False)
             self._producer_done = True
+            self._notify_close_listeners()
             if self._stop_thread.is_set():
                 media_consumer.cancel()
                 packet_consumer.cancel()
@@ -191,6 +231,15 @@ class RtspSession:
             )
             self._clear_ingress()
             self._shutdown_listener_executor()
+
+    def _notify_close_listeners(self) -> None:
+        listeners, self._close_listeners = self._close_listeners, ()
+        error_code = self._state.error_code if self._terminal else None
+        for listener in listeners:
+            try:
+                listener(error_code)
+            except Exception:
+                pass
 
     async def _run_reconnect_loop(self) -> None:
         attempt = 0
