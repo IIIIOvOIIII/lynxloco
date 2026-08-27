@@ -16,6 +16,7 @@ import click
 from miloco_cli.commands.account import account_group
 from miloco_cli.commands.actions import actions_group
 from miloco_cli.commands.admin import admin_group
+from miloco_cli.commands.camera import camera_group
 from miloco_cli.commands.config import config_group
 from miloco_cli.commands.cron import cron_group
 from miloco_cli.commands.dashboard import dashboard_cmd
@@ -89,6 +90,7 @@ cli.add_command(identity_group)
 cli.add_command(home_profile_group)
 cli.add_command(habit_group)
 cli.add_command(admin_group)
+cli.add_command(camera_group)
 cli.add_command(service_group)
 cli.add_command(config_group)
 cli.add_command(debug_group)
@@ -130,13 +132,35 @@ def _debug_log_invocation() -> None:
         return
     log_file = miloco_home() / "log" / "miloco-cli.log"
     ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-    line = f"{ts} [DEBUG] {' '.join(sys.argv)}\n"
+    line = f"{ts} [DEBUG] {' '.join(_redact_debug_argv(sys.argv))}\n"
     try:
         log_file.parent.mkdir(parents=True, exist_ok=True)
         with log_file.open("a", encoding="utf-8") as f:
             f.write(line)
     except OSError:
         pass
+
+
+def _redact_debug_argv(argv: list[str]) -> list[str]:
+    """Hide credential-bearing camera option values from the debug log."""
+    sensitive_options = {"--password", "--uri", "--username"}
+    redacted: list[str] = []
+    redact_next = False
+    for argument in argv:
+        if redact_next:
+            redacted.append("[REDACTED]")
+            redact_next = False
+            continue
+        option, separator, _value = argument.partition("=")
+        if option in sensitive_options:
+            if separator:
+                redacted.append(f"{option}=[REDACTED]")
+            else:
+                redacted.append(argument)
+                redact_next = True
+            continue
+        redacted.append(argument)
+    return redacted
 
 
 def main() -> None:

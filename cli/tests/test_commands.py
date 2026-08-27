@@ -81,6 +81,12 @@ def test_version_pretty(runner):
     assert "\n" in result.output
 
 
+def test_camera_command_group_is_discoverable(runner):
+    result = runner.invoke(cli, ["camera", "--help"])
+    assert result.exit_code == 0
+    assert "rtsp" in result.output
+
+
 # ─── config show / get / set ──────────────────────────────────────────────────
 
 
