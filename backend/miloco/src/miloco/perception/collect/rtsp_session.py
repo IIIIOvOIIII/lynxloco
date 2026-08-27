@@ -84,6 +84,7 @@ class RtspSession:
         self._audio_cb: AudioFrameCallback | None = None
         self._listeners: tuple[PacketListener, ...] = ()
         self._close_listeners: tuple[CloseListener, ...] = ()
+        self._close_listener_lock = threading.Lock()
         self._ingress_lock = threading.Lock()
         self._media_ingress: deque[_DecodedEvent] = deque()
         self._packet_ingress: deque[EncodedVideoPacket] = deque()
@@ -93,7 +94,7 @@ class RtspSession:
         self._dropped_packets = 0
         self._media_ready: asyncio.Event | None = None
         self._packet_ready: asyncio.Event | None = None
-        self._producer_done = False
+        self._producer_done = True
         self._listener_executor: ThreadPoolExecutor | None = None
         self._listener_future: asyncio.Future[None] | None = None
 
@@ -116,7 +117,8 @@ class RtspSession:
             self._stop_async = asyncio.Event()
             self._stop_thread.clear()
             self._terminal = False
-            self._producer_done = False
+            with self._close_listener_lock:
+                self._producer_done = False
             self._clear_ingress()
             self._listener_executor = ThreadPoolExecutor(
                 max_workers=1,
@@ -178,33 +180,35 @@ class RtspSession:
     def add_close_listener(self, listener: CloseListener) -> Callable[[], None]:
         """Notify once when this active producer stops or becomes terminal."""
         notified = False
+        notify_lock = threading.Lock()
 
         def notify_once(error_code: str | None) -> None:
             nonlocal notified
-            if notified:
-                return
-            notified = True
+            with notify_lock:
+                if notified:
+                    return
+                notified = True
             try:
                 listener(error_code)
             except Exception:
                 pass
 
-        if not self.is_active():
-            notify_once(self._state.error_code if self._terminal else None)
-            return lambda: None
-
-        self._close_listeners = (*self._close_listeners, notify_once)
+        with self._close_listener_lock:
+            already_closed = self._producer_done or not self.is_active()
+            error_code = self._state.error_code if self._terminal else None
+            if not already_closed:
+                self._close_listeners = (*self._close_listeners, notify_once)
 
         def unsubscribe() -> None:
-            self._close_listeners = tuple(
-                registered
-                for registered in self._close_listeners
-                if registered is not notify_once
-            )
+            with self._close_listener_lock:
+                self._close_listeners = tuple(
+                    registered
+                    for registered in self._close_listeners
+                    if registered is not notify_once
+                )
 
-        if not self.is_active():
-            unsubscribe()
-            notify_once(self._state.error_code if self._terminal else None)
+        if already_closed:
+            notify_once(error_code)
         return unsubscribe
 
     async def _main(self) -> None:
@@ -214,7 +218,6 @@ class RtspSession:
             await self._run_reconnect_loop()
         finally:
             self._state = replace(self._state, connected=False)
-            self._producer_done = True
             self._notify_close_listeners()
             if self._stop_thread.is_set():
                 media_consumer.cancel()
@@ -233,8 +236,10 @@ class RtspSession:
             self._shutdown_listener_executor()
 
     def _notify_close_listeners(self) -> None:
-        listeners, self._close_listeners = self._close_listeners, ()
-        error_code = self._state.error_code if self._terminal else None
+        with self._close_listener_lock:
+            self._producer_done = True
+            listeners, self._close_listeners = self._close_listeners, ()
+            error_code = self._state.error_code if self._terminal else None
         for listener in listeners:
             try:
                 listener(error_code)

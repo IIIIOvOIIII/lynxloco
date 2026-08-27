@@ -1214,6 +1214,71 @@ async def test_close_listener_reports_manual_and_terminal_shutdown(
     await terminal.stop()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("open_results", "expected_code"),
+    [
+        ("manual", None),
+        ("terminal", "authentication_failed"),
+    ],
+)
+async def test_close_listener_registration_after_notification_is_immediate_once(
+    monkeypatch: pytest.MonkeyPatch,
+    open_results: str,
+    expected_code: str | None,
+) -> None:
+    session_module = _rtsp_session()
+    packet = _Packet(_stream("video", "h264"), [_VideoFrame(1)])
+    listener_entered = threading.Event()
+    release_listener = threading.Event()
+
+    def blocked_packet_listener(_packet: EncodedVideoPacket) -> None:
+        listener_entered.set()
+        release_listener.wait(timeout=2.0)
+
+    if open_results == "manual":
+        container: _Container = _YieldThenBlockContainer(packet)
+        opener = _SequenceOpener(container)
+    else:
+        container = _FailAfterPacketsContainer([packet])
+        opener = _SequenceOpener(container, _terminal_error())
+        monkeypatch.setattr(session_module, "reconnect_delay", lambda *_a, **_kw: 0.0)
+    monkeypatch.setattr(session_module.av, "open", opener)
+    session = session_module.RtspSession(_source())
+    session.add_packet_listener(blocked_packet_listener)
+    await session.start(_unused_video_cb, _unused_audio_cb)
+    assert await asyncio.to_thread(listener_entered.wait, 0.5)
+
+    stop_task: asyncio.Task[None] | None = None
+    if open_results == "manual":
+        stop_task = asyncio.create_task(session.stop())
+    await _wait_until(lambda: session._producer_done)
+    assert session.is_active() is True
+
+    deliveries: list[list[str | None]] = [[] for _ in range(12)]
+
+    def register(index: int) -> Callable[[], None]:
+        return session.add_close_listener(deliveries[index].append)
+
+    detachers = await asyncio.gather(
+        *(asyncio.to_thread(register, index) for index in range(len(deliveries)))
+    )
+
+    assert deliveries == [[expected_code] for _ in deliveries]
+    assert session._close_listeners == ()
+    for detach in detachers:
+        detach()
+        detach()
+
+    release_listener.set()
+    if stop_task is not None:
+        await stop_task
+    else:
+        await session.stop()
+
+    assert deliveries == [[expected_code] for _ in deliveries]
+
+
 async def _unused_video_cb(*_args: object) -> None:
     return None
 
