@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator, Callable
+from fractions import Fraction
 from pathlib import Path
 from typing import Literal
 
@@ -145,6 +146,30 @@ def _annexb_nals(data: bytes) -> list[bytes]:
         ]
         for position, (start, size) in enumerate(starts)
     ]
+
+
+def _libx264_keyframe(profile: Literal["baseline", "high"], value: int) -> bytes:
+    codec = av.CodecContext.create("libx264", "w")
+    codec.width = 64
+    codec.height = 64
+    codec.pix_fmt = "yuv420p"
+    codec.time_base = Fraction(1, 15)
+    codec.framerate = Fraction(15, 1)
+    codec.max_b_frames = 0
+    codec.options = {
+        "profile": profile,
+        "preset": "medium",
+        "tune": "zerolatency",
+        "repeat-headers": "1",
+        "annexb": "1",
+    }
+    codec.open()
+    frame = av.VideoFrame.from_ndarray(
+        np.full((64, 64, 3), value, dtype=np.uint8), format="bgr24"
+    ).reformat(format="yuv420p")
+    frame.pts = 0
+    frame.time_base = codec.time_base
+    return b"".join(bytes(packet) for packet in codec.encode(frame))
 
 
 @pytest.mark.asyncio
@@ -754,6 +779,99 @@ async def test_h264_overflow_rearms_decoder_config_before_next_idr() -> None:
     decoder = av.CodecContext.create("h264", "r")
     assert decoder.decode(av.Packet(recovered_chunk))
     assert hub.state("rtsp:camera").dropped_packets == 3
+    await viewer.aclose()
+
+
+@pytest.mark.asyncio
+async def test_h264_config_change_overflow_rearms_with_current_config() -> None:
+    backend = _PacketBackend()
+
+    async def resolve(_camera_id: str) -> LiveStreamSource:
+        return _source(backend, source_type="rtsp")
+
+    baseline = _libx264_keyframe("baseline", 32)
+    high = _libx264_keyframe("high", 192)
+    baseline_nals = _annexb_nals(baseline)
+    high_nals = _annexb_nals(high)
+    baseline_prefix = b"".join(
+        b"\x00\x00\x00\x01" + nal for nal in baseline_nals if nal[0] & 0x1F in {7, 8}
+    )
+    high_prefix = b"".join(
+        b"\x00\x00\x00\x01" + nal for nal in high_nals if nal[0] & 0x1F in {7, 8}
+    )
+    bare_high = b"".join(
+        b"\x00\x00\x00\x01" + nal for nal in high_nals if nal[0] & 0x1F not in {7, 8}
+    )
+    assert baseline_prefix != high_prefix
+
+    hub = LiveStreamHub(resolve, queue_size=2)
+    viewer = hub.subscribe("rtsp:camera")
+    initial = asyncio.create_task(_next(viewer))
+    await asyncio.sleep(0)
+    backend.emit(EncodedVideoPacket("h264", baseline, 0, 0, True, 1, 90_000))
+    assert (await initial).startswith(baseline_prefix)
+
+    for pts in (1, 2):
+        backend.emit(
+            EncodedVideoPacket(
+                "h264",
+                b"\x00\x00\x00\x01\x41\x9a\x22",
+                pts,
+                pts,
+                False,
+                1,
+                90_000,
+            )
+        )
+    backend.emit(EncodedVideoPacket("h264", high, 3, 3, True, 1, 90_000))
+    await asyncio.sleep(0)
+    assert hub.state("rtsp:camera").dropped_packets == 3
+
+    recovered = asyncio.create_task(_next(viewer))
+    await asyncio.sleep(0)
+    backend.emit(EncodedVideoPacket("h264", bare_high, 4, 4, True, 1, 90_000))
+    recovered_chunk = await recovered
+    assert recovered_chunk.startswith(high_prefix)
+    assert not recovered_chunk.startswith(baseline_prefix)
+    decoder = av.CodecContext.create("h264", "r")
+    assert decoder.decode(av.Packet(recovered_chunk))
+    await viewer.aclose()
+
+
+@pytest.mark.asyncio
+async def test_malformed_h264_config_does_not_replace_cached_config() -> None:
+    backend = _PacketBackend()
+
+    async def resolve(_camera_id: str) -> LiveStreamSource:
+        return _source(backend, source_type="rtsp")
+
+    baseline = _libx264_keyframe("baseline", 64)
+    baseline_prefix = b"".join(
+        b"\x00\x00\x00\x01" + nal
+        for nal in _annexb_nals(baseline)
+        if nal[0] & 0x1F in {7, 8}
+    )
+    hub = LiveStreamHub(resolve)
+    viewer = hub.subscribe("rtsp:camera")
+    initial = asyncio.create_task(_next(viewer))
+    await asyncio.sleep(0)
+    backend.emit(EncodedVideoPacket("h264", baseline, 0, 0, True, 1, 90_000))
+    await initial
+
+    backend.emit(
+        EncodedVideoPacket(
+            "h264",
+            b"\x00\x00\x00\x01\x67\x64\x00\x00\x00\x00\x00\x01\x65\x88\x84",
+            1,
+            1,
+            True,
+            1,
+            90_000,
+        )
+    )
+    await asyncio.sleep(0)
+
+    assert hub._feeds["rtsp:camera"].h264_decoder_config == baseline_prefix
     await viewer.aclose()
 
 

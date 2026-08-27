@@ -338,13 +338,15 @@ class LiveStreamHub:
             for subscriber in tuple(feed.subscribers.values()):
                 try:
                     push = getattr(subscriber.normalizer, "push")
-                    for data in push(packet):
+                    output = tuple(push(packet))
+                    decoder_config = getattr(subscriber.normalizer, "decoder_config")()
+                    for data in output:
                         self._enqueue_chunk(
                             feed,
                             subscriber,
                             _OutputChunk(data, packet.is_keyframe),
+                            decoder_config=decoder_config,
                         )
-                    decoder_config = getattr(subscriber.normalizer, "decoder_config")()
                     if decoder_config:
                         feed.h264_decoder_config = decoder_config
                 except Exception:
@@ -426,6 +428,8 @@ class LiveStreamHub:
         feed: _CameraFeed,
         subscriber: _Subscriber,
         chunk: _OutputChunk,
+        *,
+        decoder_config: bytes | None = None,
     ) -> None:
         if subscriber.closed:
             return
@@ -444,7 +448,9 @@ class LiveStreamHub:
                     subscriber.packets.popleft()
                     feed.dropped_packets += 1
                 subscriber.waiting_for_keyframe = True
-                self._rearm_h264_normalizer(feed, subscriber)
+                self._rearm_h264_normalizer(
+                    feed, subscriber, decoder_config=decoder_config
+                )
                 return
             while subscriber.packets and not subscriber.packets[0].is_keyframe:
                 subscriber.packets.popleft()
@@ -630,15 +636,21 @@ class LiveStreamHub:
                     self._stopping.pop(camera_id, None)
 
     @staticmethod
-    def _rearm_h264_normalizer(feed: _CameraFeed, subscriber: _Subscriber) -> None:
+    def _rearm_h264_normalizer(
+        feed: _CameraFeed,
+        subscriber: _Subscriber,
+        *,
+        decoder_config: bytes | None = None,
+    ) -> None:
         from miloco.camera.h264 import H264AnnexBNormalizer
 
         normalizer = H264AnnexBNormalizer()
-        if feed.h264_decoder_config:
+        seed = decoder_config or feed.h264_decoder_config
+        if seed:
             normalizer.push(
                 EncodedVideoPacket(
                     codec="h264",
-                    data=feed.h264_decoder_config,
+                    data=seed,
                     pts=None,
                     dts=None,
                     is_keyframe=False,
