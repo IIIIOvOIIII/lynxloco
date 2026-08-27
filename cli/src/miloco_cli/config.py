@@ -18,9 +18,12 @@ yaml 的值，没有才取 ``settings.py`` 对应 pydantic 字段的默认值。
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import tempfile
+import threading
+from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -198,6 +201,30 @@ def atomic_write(path: Path, data: dict) -> None:
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
+
+
+_CONFIG_THREAD_LOCK = threading.RLock()
+
+
+@contextmanager
+def _shared_config_lock(path: Path):
+    """Serialize writers on the backend-compatible ``<config>.lock`` file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f"{path.name}.lock")
+    with _CONFIG_THREAD_LOCK:
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        locked = False
+        try:
+            os.fchmod(lock_fd, 0o600)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            locked = True
+            yield
+        finally:
+            try:
+                if locked:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
 
 
 def _read_raw() -> dict[str, Any]:
@@ -409,7 +436,7 @@ def set_value(path: str, raw_value: str) -> Any:
 def set_values(pairs: list[tuple[str, str]]) -> dict[str, Any]:
     """批量校验并原子写入多个 (path, raw_value)；返回 ``{path: persisted_value}``。
 
-    并发说明：当前业务场景不存在并发写入（install/CLI/plugin 启动均为串行），暂不加锁。
+    与后端共用 ``<config>.lock``；持独占锁后重读并仅更新指定字段，避免并发写入丢失。
     """
     if not pairs:
         return {}
@@ -421,10 +448,12 @@ def set_values(pairs: list[tuple[str, str]]) -> dict[str, Any]:
                 f"(known: {', '.join(sorted(_SCHEMA_PATHS))})"
             )
         resolved[path] = _coerce(path, raw)
-    raw_file = _read_raw()
-    for path, value in resolved.items():
-        _set_nested(raw_file, path, value)
-    atomic_write(config_file(), raw_file)
+    path_to_config = config_file()
+    with _shared_config_lock(path_to_config):
+        raw_file = _read_raw()
+        for path, value in resolved.items():
+            _set_nested(raw_file, path, value)
+        atomic_write(path_to_config, raw_file)
     return resolved
 
 
