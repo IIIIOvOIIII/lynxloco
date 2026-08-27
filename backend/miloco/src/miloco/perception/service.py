@@ -20,6 +20,7 @@ from miloco.database.on_demand_log_repo import OnDemandLogRepo
 from miloco.database.perception_repo import PerceptionLogRepo
 from miloco.middleware.exceptions import BusinessException
 from miloco.perception.collect.collector import MultimodalCollector
+from miloco.perception.collect.rtsp_camera_source import RtspApplyResult
 from miloco.perception.processor import PipelineProcessor
 from miloco.perception.runner import PerceptionRunner
 from miloco.perception.schema import (
@@ -32,11 +33,13 @@ from miloco.utils.time_utils import ms_to_iso_local, now_ms
 
 
 class _RtspSettingsApplier(Protocol):
-    async def apply_settings(self) -> None: ...
+    async def apply_settings(self) -> RtspApplyResult: ...
 
 
 class _CameraSourceSynchronizer(Protocol):
     async def sync_devices(self, all_devices: dict | None = None) -> None: ...
+
+    async def disconnect_device(self, did: str) -> None: ...
 
 
 logger = logging.getLogger(__name__)
@@ -78,13 +81,34 @@ class PerceptionService:
         async with self._lifecycle_lock:
             await self._engine.stop()
 
-    async def sync_camera_sources(self) -> None:
+    async def sync_camera_sources(self) -> bool:
         """Atomically apply RTSP settings and reconcile the unified adapter."""
         if self._rtsp_camera_source is None or self._camera_adapter is None:
-            return
-        async with self._camera_sources_lock:
-            await self._rtsp_camera_source.apply_settings()
-            await self._camera_adapter.sync_devices()
+            return True
+        async with self._lifecycle_lock:
+            async with self._camera_sources_lock:
+                result = await self._rtsp_camera_source.apply_settings()
+                success = result.success
+                for did in sorted(result.reconcile_dids):
+                    try:
+                        await self._camera_adapter.disconnect_device(did)
+                    except Exception as error:  # noqa: BLE001
+                        logger.error(
+                            "[service] RTSP adapter reconcile failed for %s (%s)",
+                            did,
+                            type(error).__name__,
+                        )
+                        success = False
+                if self._engine.is_running:
+                    try:
+                        await self._camera_adapter.sync_devices()
+                    except Exception as error:  # noqa: BLE001
+                        logger.error(
+                            "[service] camera source sync failed (%s)",
+                            type(error).__name__,
+                        )
+                        success = False
+                return success
 
     async def stop_to_unconfigured(self) -> None:
         """软停引擎回到「未配模型」态(删当前生效模型用),保留 tick 自愈循环。

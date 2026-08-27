@@ -39,12 +39,14 @@ class _RecordingSession:
     instances: list[_RecordingSession] = []
     fail_start_hosts: set[str] = set()
     fail_stop_ids: set[str] = set()
+    fail_stop_once_ids: set[str] = set()
 
     def __init__(self, source: RtspSourceSettings) -> None:
         self.source = source
         self.start_count = 0
         self.stop_count = 0
         self.connected = False
+        self.state_override: CameraSourceState | None = None
         self.video_cb = None
         self.audio_cb = None
         self.instances.append(self)
@@ -59,12 +61,14 @@ class _RecordingSession:
 
     async def stop(self) -> None:
         self.stop_count += 1
-        self.connected = False
+        if self.source.id in self.fail_stop_once_ids and self.stop_count == 1:
+            raise RuntimeError("secret transient stop failure")
         if self.source.id in self.fail_stop_ids:
             raise RuntimeError("secret stop failure")
+        self.connected = False
 
     def state(self) -> CameraSourceState:
-        return CameraSourceState(connected=self.connected)
+        return self.state_override or CameraSourceState(connected=self.connected)
 
 
 @pytest.fixture(autouse=True)
@@ -72,6 +76,7 @@ def _reset_fake_session(monkeypatch: pytest.MonkeyPatch) -> None:
     _RecordingSession.instances = []
     _RecordingSession.fail_start_hosts = set()
     _RecordingSession.fail_stop_ids = set()
+    _RecordingSession.fail_stop_once_ids = set()
     monkeypatch.setattr(
         "miloco.perception.collect.rtsp_camera_source.RtspSession",
         _RecordingSession,
@@ -135,6 +140,26 @@ async def test_connect_ignores_disabled_source_and_registers_enabled_session() -
     assert source.get_state(enabled.id).connected is True
     assert source.get_session(disabled.id) is None
     assert len(_RecordingSession.instances) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_state_returns_the_session_network_state_without_forcing_online() -> (
+    None
+):
+    enabled = _source(1)
+    source = RtspCameraSource(lambda: [enabled])
+    await source.connect_device(enabled.id, _video_cb, _audio_cb)
+    session = source.get_session(enabled.id)
+    assert isinstance(session, _RecordingSession)
+    session.state_override = CameraSourceState(
+        connected=False,
+        video_codec="h265",
+        reconnect_attempt=3,
+        error_code="authentication_failed",
+        error_message="Authentication failed",
+    )
+
+    assert source.get_state(enabled.id) == session.state_override
 
 
 @pytest.mark.asyncio
@@ -253,9 +278,32 @@ async def test_apply_settings_isolates_restart_failures_and_redacts_details(
 
     assert source.get_session(failing.id) is None
     assert source.get_session(healthy.id) is not healthy_original
+    failed_replacement = _RecordingSession.instances[-2]
+    assert failed_replacement.source.uri == "rtsp://private-host/secret-path"
+    assert failed_replacement.stop_count == 1
     assert "private-host" not in caplog.text
     assert "secret-path" not in caplog.text
     assert "secret start failure" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_failed_stop_is_retained_and_retried_by_later_cleanup() -> None:
+    configured = _source(1)
+    source = RtspCameraSource(lambda: [configured])
+    await source.connect_device(configured.id, _video_cb, _audio_cb)
+    session = source.get_session(configured.id)
+    assert isinstance(session, _RecordingSession)
+    _RecordingSession.fail_stop_once_ids = {configured.id}
+
+    await source.disconnect_device(configured.id)
+    assert session.stop_count == 1
+    assert session.connected is True
+    assert configured.id in source._pending_cleanup
+
+    await source.disconnect_device(configured.id)
+    assert session.stop_count == 2
+    assert session.connected is False
+    assert configured.id not in source._pending_cleanup
 
 
 @pytest.mark.asyncio

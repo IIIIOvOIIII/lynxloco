@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from types import SimpleNamespace
-from typing import Literal
+from typing import Literal, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
@@ -196,9 +197,13 @@ class _FrameProducingMiotSource:
 
 
 class _AdapterRtspSession:
+    instances: list[_AdapterRtspSession] = []
+
     def __init__(self, source: RtspSourceSettings) -> None:
         self.source = source
         self.connected = False
+        self.stop_count = 0
+        self.instances.append(self)
 
     async def start(self, video_cb, audio_cb) -> None:
         if "broken" in self.source.uri:
@@ -214,10 +219,16 @@ class _AdapterRtspSession:
         )
 
     async def stop(self) -> None:
+        self.stop_count += 1
         self.connected = False
 
     def state(self) -> CameraSourceState:
         return CameraSourceState(connected=self.connected)
+
+
+@pytest.fixture(autouse=True)
+def _reset_adapter_rtsp_sessions() -> None:
+    _AdapterRtspSession.instances = []
 
 
 @pytest.mark.asyncio
@@ -276,12 +287,13 @@ async def test_sync_camera_sources_serializes_apply_then_adapter_sync() -> None:
     max_in_flight = 0
 
     class _Source:
-        async def apply_settings(self) -> None:
+        async def apply_settings(self):
             nonlocal in_flight, max_in_flight
             in_flight += 1
             max_in_flight = max(max_in_flight, in_flight)
             events.append("apply")
-            await __import__("asyncio").sleep(0)
+            await asyncio.sleep(0)
+            return SimpleNamespace(success=True, reconcile_dids=frozenset())
 
     class _Adapter:
         async def sync_devices(self, all_devices: dict | None = None) -> None:
@@ -289,7 +301,10 @@ async def test_sync_camera_sources_serializes_apply_then_adapter_sync() -> None:
             nonlocal in_flight
             events.append("sync")
             in_flight -= 1
-            await __import__("asyncio").sleep(0)
+            await asyncio.sleep(0)
+
+        async def disconnect_device(self, did: str) -> None:
+            raise AssertionError(f"unexpected disconnect: {did}")
 
     source = _Source()
     adapter = _Adapter()
@@ -302,13 +317,290 @@ async def test_sync_camera_sources_serializes_apply_then_adapter_sync() -> None:
         camera_adapter=adapter,  # type: ignore[arg-type]
     )
 
-    await __import__("asyncio").gather(
+    await asyncio.gather(
         service.sync_camera_sources(),
         service.sync_camera_sources(),
     )
 
     assert events == ["apply", "sync", "apply", "sync"]
     assert max_in_flight == 1
+
+
+@pytest.mark.asyncio
+async def test_restart_failure_has_no_phantom_and_later_sync_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "miloco.perception.collect.rtsp_camera_source.RtspSession",
+        _AdapterRtspSession,
+    )
+    camera_id = "rtsp:00000000-0000-0000-0000-000000000011"
+    settings = [
+        RtspSourceSettings(
+            id=camera_id,
+            name="front door",
+            uri="rtsp://healthy.example/stream",
+            enabled=True,
+        )
+    ]
+    rtsp = RtspCameraSource(lambda: settings)
+    adapter = CameraDeviceAdapter(sources=[rtsp])
+    runner = MagicMock()
+    runner.is_running = True
+    service = PerceptionService(
+        collector=MagicMock(),
+        pipeline=MagicMock(),
+        perception_runner=runner,
+        log_repo=MagicMock(),
+        rtsp_camera_source=rtsp,
+        camera_adapter=adapter,
+    )
+    await adapter.sync_devices()
+    original = rtsp.get_session(camera_id)
+
+    settings = [settings[0].model_copy(update={"uri": "rtsp://broken.example/new"})]
+    applied = await service.sync_camera_sources()
+
+    assert applied is False
+    assert rtsp.get_state(camera_id).connected is False
+    assert rtsp.get_session(camera_id) is None
+    assert adapter.get_connected_devices() == {}
+    failed_replacement = next(
+        session
+        for session in _AdapterRtspSession.instances
+        if session.source.uri == "rtsp://broken.example/new"
+    )
+    assert failed_replacement.connected is False
+    assert failed_replacement.stop_count == 1
+    assert original is not failed_replacement
+
+    settings = [
+        settings[0].model_copy(update={"uri": "rtsp://recovered.example/stream"})
+    ]
+    assert await service.sync_camera_sources() is True
+    assert set(adapter.get_connected_devices()) == {camera_id}
+    assert rtsp.get_state(camera_id).connected is True
+
+
+@pytest.mark.asyncio
+async def test_real_source_adapter_apply_diff_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "miloco.perception.collect.rtsp_camera_source.RtspSession",
+        _AdapterRtspSession,
+    )
+    camera_id = "rtsp:00000000-0000-0000-0000-000000000021"
+    configured = RtspSourceSettings(
+        id=camera_id,
+        name="office camera",
+        room_name="office",
+        uri="rtsp://healthy.example/stream",
+        enabled=False,
+    )
+    settings = [configured]
+    rtsp = RtspCameraSource(lambda: settings)
+    adapter = CameraDeviceAdapter(sources=[rtsp])
+    runner = MagicMock()
+    runner.is_running = True
+    service = PerceptionService(
+        collector=MagicMock(),
+        pipeline=MagicMock(),
+        perception_runner=runner,
+        log_repo=MagicMock(),
+        rtsp_camera_source=rtsp,
+        camera_adapter=adapter,
+    )
+
+    assert await service.sync_camera_sources() is True
+    assert adapter.get_connected_devices() == {}
+
+    settings = [configured.model_copy(update={"enabled": True})]
+    assert await service.sync_camera_sources() is True
+    first_session = rtsp.get_session(camera_id)
+    assert first_session is not None
+    assert set(adapter.get_connected_devices()) == {camera_id}
+
+    settings = [settings[0].model_copy(update={"name": "renamed", "room_name": "hall"})]
+    assert await service.sync_camera_sources() is True
+    assert rtsp.get_session(camera_id) is first_session
+    assert adapter.get_connected_devices()[camera_id].name == "renamed"
+    assert adapter.get_connected_devices()[camera_id].room_name == "hall"
+
+    settings = [
+        settings[0].model_copy(update={"uri": "rtsp://replacement.example/stream"})
+    ]
+    assert await service.sync_camera_sources() is True
+    replacement = rtsp.get_session(camera_id)
+    assert replacement is not first_session
+    assert isinstance(first_session, _AdapterRtspSession)
+    assert isinstance(replacement, _AdapterRtspSession)
+    assert first_session.stop_count == 1
+    assert replacement.stop_count == 0
+    assert len(_AdapterRtspSession.instances) == 2
+
+    settings = [settings[0].model_copy(update={"enabled": False})]
+    assert await service.sync_camera_sources() is True
+    assert adapter.get_connected_devices() == {}
+
+    added_id = "rtsp:00000000-0000-0000-0000-000000000022"
+    settings = [
+        RtspSourceSettings(
+            id=added_id,
+            name="added",
+            uri="rtsp://added.example/stream",
+            enabled=True,
+        )
+    ]
+    assert await service.sync_camera_sources() is True
+    assert set(adapter.get_connected_devices()) == {added_id}
+
+    settings = []
+    assert await service.sync_camera_sources() is True
+    assert adapter.get_connected_devices() == {}
+
+
+@pytest.mark.asyncio
+async def test_paused_engine_applies_settings_without_connecting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "miloco.perception.collect.rtsp_camera_source.RtspSession",
+        _AdapterRtspSession,
+    )
+    settings = [
+        RtspSourceSettings(
+            id="rtsp:00000000-0000-0000-0000-000000000031",
+            name="paused camera",
+            uri="rtsp://paused.example/stream",
+            enabled=True,
+        )
+    ]
+    rtsp = RtspCameraSource(lambda: settings)
+    adapter = CameraDeviceAdapter(sources=[rtsp])
+    runner = MagicMock()
+    runner.is_running = False
+    service = PerceptionService(
+        collector=MagicMock(),
+        pipeline=MagicMock(),
+        perception_runner=runner,
+        log_repo=MagicMock(),
+        rtsp_camera_source=rtsp,
+        camera_adapter=adapter,
+    )
+
+    assert await service.sync_camera_sources() is True
+
+    assert adapter.get_connected_devices() == {}
+    assert rtsp.get_session(settings[0].id) is None
+    assert _AdapterRtspSession.instances == []
+
+
+@pytest.mark.asyncio
+async def test_stopped_engine_does_not_connect_new_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "miloco.perception.collect.rtsp_camera_source.RtspSession",
+        _AdapterRtspSession,
+    )
+    first_id = "rtsp:00000000-0000-0000-0000-000000000041"
+    settings = [
+        RtspSourceSettings(
+            id=first_id,
+            name="running camera",
+            uri="rtsp://running.example/stream",
+            enabled=True,
+        )
+    ]
+    rtsp = RtspCameraSource(lambda: settings)
+    adapter = CameraDeviceAdapter(sources=[rtsp])
+    runner = MagicMock()
+    runner.is_running = True
+    service = PerceptionService(
+        collector=MagicMock(),
+        pipeline=MagicMock(),
+        perception_runner=runner,
+        log_repo=MagicMock(),
+        rtsp_camera_source=rtsp,
+        camera_adapter=adapter,
+    )
+    assert await service.sync_camera_sources() is True
+    assert set(adapter.get_connected_devices()) == {first_id}
+
+    await adapter.shutdown()
+    runner.is_running = False
+    second_id = "rtsp:00000000-0000-0000-0000-000000000042"
+    settings = [
+        RtspSourceSettings(
+            id=second_id,
+            name="new while stopped",
+            uri="rtsp://stopped.example/stream",
+            enabled=True,
+        )
+    ]
+
+    assert await service.sync_camera_sources() is True
+    assert adapter.get_connected_devices() == {}
+    assert rtsp.get_session(second_id) is None
+    assert len(_AdapterRtspSession.instances) == 1
+
+
+@pytest.mark.asyncio
+async def test_stop_race_cannot_reconnect_after_shutdown() -> None:
+    events: list[str] = []
+    sync_entered = asyncio.Event()
+    release_sync = asyncio.Event()
+
+    class _Source:
+        async def apply_settings(self):
+            return SimpleNamespace(success=True, reconcile_dids=frozenset())
+
+    class _Adapter:
+        async def sync_devices(self, all_devices: dict | None = None) -> None:
+            del all_devices
+            sync_entered.set()
+            await release_sync.wait()
+            events.append("sync")
+
+        async def disconnect_device(self, did: str) -> None:
+            raise AssertionError(f"unexpected disconnect: {did}")
+
+        async def shutdown(self) -> None:
+            events.append("shutdown")
+
+    class _Runner:
+        def __init__(self, adapter: _Adapter) -> None:
+            self.is_running = True
+            self._adapter = adapter
+
+        async def stop(self) -> None:
+            self.is_running = False
+            await self._adapter.shutdown()
+
+    adapter = _Adapter()
+    runner = _Runner(adapter)
+    from miloco.perception.runner import PerceptionRunner
+
+    service = PerceptionService(
+        collector=MagicMock(),
+        pipeline=MagicMock(),
+        perception_runner=cast(PerceptionRunner, runner),
+        log_repo=MagicMock(),
+        rtsp_camera_source=_Source(),  # type: ignore[arg-type]
+        camera_adapter=adapter,  # type: ignore[arg-type]
+    )
+
+    sync_task = asyncio.create_task(service.sync_camera_sources())
+    await sync_entered.wait()
+    stop_task = asyncio.create_task(service.stop_engine())
+    await asyncio.sleep(0)
+    assert events == []
+
+    release_sync.set()
+    await asyncio.gather(sync_task, stop_task)
+
+    assert events == ["sync", "shutdown"]
 
 
 @pytest.mark.asyncio
