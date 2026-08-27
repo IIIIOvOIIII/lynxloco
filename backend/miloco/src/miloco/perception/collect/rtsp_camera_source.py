@@ -165,7 +165,8 @@ class RtspCameraSource:
 
     def retain_pending_connection(self, did: str) -> bool:
         """Keep adapter buffers while a registered session connects/reconnects."""
-        return did in self._sessions
+        entry = self._sessions.get(did)
+        return entry is not None and entry.session.is_active() is True
 
     def get_state(self, did: str) -> CameraSourceState:
         entry = self._sessions.get(did) or self._pending_cleanup.get(did)

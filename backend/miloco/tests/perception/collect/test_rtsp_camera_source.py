@@ -46,6 +46,7 @@ class _RecordingSession:
         self.start_count = 0
         self.stop_count = 0
         self.connected = False
+        self.active = False
         self.state_override: CameraSourceState | None = None
         self.video_cb = None
         self.audio_cb = None
@@ -57,6 +58,7 @@ class _RecordingSession:
         self.audio_cb = audio_cb
         if any(host in self.source.uri for host in self.fail_start_hosts):
             raise RuntimeError("secret start failure")
+        self.active = True
         self.connected = True
 
     async def stop(self) -> None:
@@ -65,10 +67,14 @@ class _RecordingSession:
             raise RuntimeError("secret transient stop failure")
         if self.source.id in self.fail_stop_ids:
             raise RuntimeError("secret stop failure")
+        self.active = False
         self.connected = False
 
     def state(self) -> CameraSourceState:
         return self.state_override or CameraSourceState(connected=self.connected)
+
+    def is_active(self) -> bool:
+        return self.active
 
 
 @pytest.fixture(autouse=True)
@@ -165,6 +171,20 @@ async def test_get_state_returns_the_session_network_state_without_forcing_onlin
     current = [enabled.model_copy(update={"enabled": False})]
     source._settings_loader = lambda: current
     await source.apply_settings()
+    assert source.retain_pending_connection(enabled.id) is False
+
+
+@pytest.mark.asyncio
+async def test_terminal_session_is_not_a_retainable_pending_registration() -> None:
+    enabled = _source(1)
+    source = RtspCameraSource(lambda: [enabled])
+    await source.connect_device(enabled.id, _video_cb, _audio_cb)
+    session = source.get_session(enabled.id)
+    assert isinstance(session, _RecordingSession)
+    session.connected = False
+    session.active = False
+
+    assert source.get_state(enabled.id).connected is False
     assert source.retain_pending_connection(enabled.id) is False
 
 

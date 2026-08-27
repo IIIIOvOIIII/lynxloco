@@ -138,6 +138,11 @@ class RtspSession:
             return self._state
         return replace(self._state, dropped_frames=dropped_frames)
 
+    def is_active(self) -> bool:
+        """Return whether the background producer task is still alive."""
+        task = self._task
+        return task is not None and not task.done()
+
     def add_packet_listener(self, listener: PacketListener) -> Callable[[], None]:
         if listener not in self._listeners:
             self._listeners = (*self._listeners, listener)

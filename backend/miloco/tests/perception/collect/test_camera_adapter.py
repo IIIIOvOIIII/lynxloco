@@ -202,12 +202,14 @@ class _AdapterRtspSession:
     def __init__(self, source: RtspSourceSettings) -> None:
         self.source = source
         self.connected = False
+        self.active = False
         self.stop_count = 0
         self.instances.append(self)
 
     async def start(self, video_cb, audio_cb) -> None:
         if "broken" in self.source.uri:
             raise RuntimeError("operator-secret private-path")
+        self.active = True
         self.connected = True
         await video_cb(
             self.source.id,
@@ -220,10 +222,14 @@ class _AdapterRtspSession:
 
     async def stop(self) -> None:
         self.stop_count += 1
+        self.active = False
         self.connected = False
 
     def state(self) -> CameraSourceState:
         return CameraSourceState(connected=self.connected)
+
+    def is_active(self) -> bool:
+        return self.active
 
 
 @pytest.fixture(autouse=True)

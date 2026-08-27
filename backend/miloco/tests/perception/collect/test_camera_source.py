@@ -109,6 +109,47 @@ class _SynchronousFailedSource(_RecordingSource):
         return _State(connected=False)
 
 
+class _PendingDecisionSource(_RecordingSource):
+    def __init__(
+        self,
+        devices: dict[str, PerceptionDevice],
+        *,
+        decision: str = "active",
+        connected: bool = False,
+    ) -> None:
+        super().__init__("rtsp", devices)
+        self.decision = decision
+        self.network_connected = connected
+        self.registered: set[str] = set()
+        self.connect_attempts = 0
+        self.capability_calls = 0
+
+    async def connect_device(self, did: str, video_cb, audio_cb) -> None:
+        self.connect_attempts += 1
+        self.registered.add(did)
+
+    async def disconnect_device(self, did: str) -> None:
+        self.registered.discard(did)
+        await super().disconnect_device(did)
+
+    def get_state(self, did: str) -> _State:
+        return _State(connected=self.network_connected)
+
+    def retain_pending_connection(self, did: str) -> object:
+        self.capability_calls += 1
+        if self.decision == "raise":
+            raise RuntimeError("operator-secret capability failure")
+        if self.decision == "text":
+            return "yes"
+        if self.decision == "coroutine":
+
+            async def _invalid_async_decision() -> bool:
+                return True
+
+            return _invalid_async_decision()
+        return did in self.registered and self.decision == "active"
+
+
 def test_camera_source_state_has_safe_disconnected_defaults() -> None:
     assert CameraSourceState(connected=False) == CameraSourceState(
         connected=False,
@@ -219,6 +260,91 @@ async def test_synchronous_false_source_still_clears_precreated_buffer() -> None
 
     assert adapter.get_connected_devices() == {}
     assert adapter.collect(did, drain=False) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "decision",
+    ["raise", "text", "coroutine"],
+)
+async def test_invalid_pending_capability_fails_closed_without_leaking_registration(
+    decision: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    did = f"rtsp:invalid-{decision}"
+    source = _PendingDecisionSource({did: _device(did)}, decision=decision)
+    adapter = CameraDeviceAdapter(sources=[source])  # type: ignore[arg-type]
+
+    with caplog.at_level(
+        logging.WARNING, logger="miloco.perception.collect.camera_adapter"
+    ):
+        await adapter.sync_devices()
+
+    assert adapter.get_connected_devices() == {}
+    assert adapter.collect(did, drain=False) is None
+    assert source.registered == set()
+    assert source.disconnected == [did]
+    assert "operator-secret" not in caplog.text
+    assert "capability failure" not in caplog.text
+    assert "Failed to connect device" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_connected_source_does_not_evaluate_broken_pending_capability() -> None:
+    did = "rtsp:connected"
+    source = _PendingDecisionSource(
+        {did: _device(did)}, decision="raise", connected=True
+    )
+    adapter = CameraDeviceAdapter(sources=[source])  # type: ignore[arg-type]
+
+    await adapter.sync_devices()
+
+    assert set(adapter.get_connected_devices()) == {did}
+    assert source.capability_calls == 0
+    assert source.registered == {did}
+    assert source.disconnected == []
+
+
+@pytest.mark.asyncio
+async def test_terminal_pending_registration_is_pruned_without_same_sync_restart() -> (
+    None
+):
+    did = "rtsp:terminal"
+    source = _PendingDecisionSource({did: _device(did)})
+    adapter = CameraDeviceAdapter(sources=[source])  # type: ignore[arg-type]
+    await adapter.sync_devices()
+    assert source.connect_attempts == 1
+
+    source.decision = "terminal"
+    await adapter.sync_devices()
+
+    assert adapter.get_connected_devices() == {}
+    assert source.registered == set()
+    assert source.disconnected == [did]
+    assert source.connect_attempts == 1
+
+    source.decision = "active"
+    await adapter.sync_devices()
+
+    assert set(adapter.get_connected_devices()) == {did}
+    assert source.registered == {did}
+    assert source.connect_attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_active_disconnected_registration_survives_periodic_reconciliation() -> (
+    None
+):
+    did = "rtsp:reconnecting"
+    source = _PendingDecisionSource({did: _device(did)})
+    adapter = CameraDeviceAdapter(sources=[source])  # type: ignore[arg-type]
+
+    await adapter.sync_devices()
+    await adapter.sync_devices()
+
+    assert set(adapter.get_connected_devices()) == {did}
+    assert source.connect_attempts == 1
+    assert source.disconnected == []
 
 
 @pytest.mark.asyncio

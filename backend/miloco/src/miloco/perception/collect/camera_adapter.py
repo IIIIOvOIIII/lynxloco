@@ -19,6 +19,7 @@ physical identities remain inside their source driver.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 from dataclasses import dataclass, field
@@ -215,37 +216,48 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
                     success = False
             if connect_enabled:
                 await self._sync_devices_unlocked()
+            else:
+                pruned = await self._prune_inactive_pending_devices()
+                self._remove_pruned_devices(pruned)
             return success
 
     async def _sync_devices_unlocked(self, all_devices: dict | None = None) -> None:
-        if all_devices is None:
-            for camera_source in self._sources:
-                refresh_if_needed = getattr(camera_source, "refresh_if_needed", None)
-                if refresh_if_needed is None:
-                    continue
-                try:
-                    if self._legacy_miot_constructor:
-                        expected = await self.discover_devices(
-                            online_only=True, require_lan=False
-                        )
-                        connected_count = len(self._devices)
-                    else:
-                        expected = await camera_source.discover_devices(
-                            online_only=True, require_lan=False
-                        )
-                        connected_count = sum(
-                            owner is camera_source
-                            for did, owner in self._did_sources.items()
-                            if did in self._devices
-                        )
-                    await refresh_if_needed(
-                        expected_count=len(expected),
-                        connected_count=connected_count,
-                        now_ms=_monotonic_ms(),
+        pruned = await self._prune_inactive_pending_devices()
+        try:
+            if all_devices is None:
+                for camera_source in self._sources:
+                    refresh_if_needed = getattr(
+                        camera_source, "refresh_if_needed", None
                     )
-                except Exception as error:  # noqa: BLE001
-                    logger.warning("On-demand camera manager refresh failed: %s", error)
-        await super().sync_devices(all_devices)
+                    if refresh_if_needed is None:
+                        continue
+                    try:
+                        if self._legacy_miot_constructor:
+                            expected = await self.discover_devices(
+                                online_only=True, require_lan=False
+                            )
+                            connected_count = len(self._devices)
+                        else:
+                            expected = await camera_source.discover_devices(
+                                online_only=True, require_lan=False
+                            )
+                            connected_count = sum(
+                                owner is camera_source
+                                for did, owner in self._did_sources.items()
+                                if did in self._devices
+                            )
+                        await refresh_if_needed(
+                            expected_count=len(expected),
+                            connected_count=connected_count,
+                            now_ms=_monotonic_ms(),
+                        )
+                    except Exception as error:  # noqa: BLE001
+                        logger.warning(
+                            "On-demand camera manager refresh failed: %s", error
+                        )
+            await super().sync_devices(all_devices)
+        finally:
+            self._remove_pruned_devices(pruned)
 
     async def connect_device(
         self, did: str, source: PerceptionDevice | None = None
@@ -294,11 +306,89 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
             state.sync_buffer.clear()
             raise
         source_state = camera_source.get_state(did)
-        retain_pending = getattr(camera_source, "retain_pending_connection", None)
-        pending_registered = retain_pending(did) if callable(retain_pending) else False
+        pending_registered = False
+        if not source_state.connected:
+            _, pending_registered = self._pending_registration_decision(
+                camera_source, did
+            )
         if not source_state.connected and not pending_registered:
             self._devices.pop(did, None)
             state.sync_buffer.clear()
+            await self._disconnect_source_registration(camera_source, did)
+
+    def _pending_registration_decision(
+        self,
+        camera_source: CameraSourceDriver,
+        did: str,
+    ) -> tuple[bool, bool]:
+        try:
+            retain_pending = getattr(camera_source, "retain_pending_connection", None)
+            if not callable(retain_pending):
+                return False, False
+            result = retain_pending(did)
+        except Exception as error:  # noqa: BLE001
+            logger.warning(
+                "Pending camera registration check failed for %s %s (%s)",
+                camera_source.source_type,
+                did,
+                type(error).__name__,
+            )
+            return True, False
+
+        if inspect.iscoroutine(result):
+            result.close()
+        if result is True:
+            return True, True
+        if result is not False:
+            logger.warning(
+                "Pending camera registration check returned invalid type for %s %s (%s)",
+                camera_source.source_type,
+                did,
+                type(result).__name__,
+            )
+        return True, False
+
+    async def _prune_inactive_pending_devices(
+        self,
+    ) -> dict[str, _CameraDeviceState]:
+        pruned: dict[str, _CameraDeviceState] = {}
+        for did, state in list(self._devices.items()):
+            camera_source = self._did_sources.get(did)
+            if camera_source is None:
+                continue
+            source_state = camera_source.get_state(did)
+            if source_state.connected:
+                continue
+            has_capability, retained = self._pending_registration_decision(
+                camera_source, did
+            )
+            if not has_capability or retained:
+                continue
+            await self._disconnect_source_registration(camera_source, did)
+            state.sync_buffer.clear()
+            pruned[did] = state
+        return pruned
+
+    def _remove_pruned_devices(self, pruned: dict[str, _CameraDeviceState]) -> None:
+        for did, state in pruned.items():
+            if self._devices.get(did) is state:
+                self._devices.pop(did, None)
+                state.sync_buffer.clear()
+
+    @staticmethod
+    async def _disconnect_source_registration(
+        camera_source: CameraSourceDriver,
+        did: str,
+    ) -> None:
+        try:
+            await camera_source.disconnect_device(did)
+        except Exception as error:  # noqa: BLE001
+            logger.error(
+                "Failed to clear camera registration for %s %s (%s)",
+                camera_source.source_type,
+                did,
+                type(error).__name__,
+            )
 
     async def disconnect_device(self, did: str) -> None:
         state = self._devices.pop(did, None)

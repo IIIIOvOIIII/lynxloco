@@ -42,6 +42,29 @@ def _source(**overrides: object) -> RtspSourceSettings:
     return RtspSourceSettings.model_validate(values)
 
 
+@pytest.mark.asyncio
+async def test_session_activity_tracks_background_producer_lifetime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_module = _rtsp_session()
+    release = asyncio.Event()
+
+    async def blocked_main(_self: object) -> None:
+        await release.wait()
+
+    monkeypatch.setattr(session_module.RtspSession, "_main", blocked_main)
+    session = session_module.RtspSession(_source())
+
+    assert session.is_active() is False
+    await session.start(_unused_video_cb, _unused_audio_cb)
+    assert session.is_active() is True
+
+    release.set()
+    await asyncio.sleep(0)
+    assert session.is_active() is False
+    await session.stop()
+
+
 class _VideoFrame:
     def __init__(
         self,
