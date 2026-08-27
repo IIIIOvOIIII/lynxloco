@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import click
 import pytest
 from click.testing import CliRunner
 
@@ -59,8 +61,26 @@ def _common_upsert_args() -> list[str]:
     ]
 
 
+def _edit_replace_args(
+    *, username: str = USERNAME, transport: str = "tcp", audio: str = "--audio"
+) -> list[str]:
+    return [
+        "--name",
+        "Living Room",
+        "--room",
+        "Living Room",
+        "--uri",
+        URI,
+        "--username",
+        username,
+        "--transport",
+        transport,
+        audio,
+    ]
+
+
 def _assert_secret_absent(result) -> None:
-    combined = result.output + repr(result.exception)
+    combined = result.output + (result.stderr or "") + repr(result.exception)
     assert SECRET not in combined
 
 
@@ -70,7 +90,7 @@ def test_camera_list_maps_get_and_prints_json(runner: CliRunner) -> None:
         result = runner.invoke(cli, ["camera", "list"])
 
     assert result.exit_code == 0, result.output
-    api_get.assert_called_once_with("/api/cameras")
+    api_get.assert_called_once_with("/api/cameras", safe_errors=True)
     assert json.loads(result.output) == response
 
 
@@ -103,6 +123,8 @@ def test_rtsp_test_reads_password_from_stdin_and_maps_post(runner: CliRunner) ->
             "transport": "tcp",
             "audio_enabled": True,
         },
+        safe_errors=True,
+        sensitive_values=(SECRET, USERNAME, URI),
     )
     assert json.loads(result.output) == SUCCESS
     _assert_secret_absent(result)
@@ -117,7 +139,12 @@ def test_rtsp_add_maps_full_body_without_echoing_password(runner: CliRunner) -> 
         )
 
     assert result.exit_code == 0, result.output
-    api_post.assert_called_once_with("/api/cameras/rtsp", _upsert_body(password=SECRET))
+    api_post.assert_called_once_with(
+        "/api/cameras/rtsp",
+        _upsert_body(password=SECRET),
+        safe_errors=True,
+        sensitive_values=(SECRET, USERNAME, URI),
+    )
     assert json.loads(result.output) == SUCCESS
     _assert_secret_absent(result)
 
@@ -128,14 +155,64 @@ def test_rtsp_edit_uses_put_and_blank_password_preserves_stored_value(
     with patch("miloco_cli.client.api_put", return_value=SUCCESS) as api_put:
         result = runner.invoke(
             cli,
-            ["camera", "rtsp", "edit", SOURCE_ID, *_common_upsert_args()],
+            ["camera", "rtsp", "edit", SOURCE_ID, *_edit_replace_args()],
         )
 
     assert result.exit_code == 0, result.output
     api_put.assert_called_once_with(
-        f"/api/cameras/rtsp/{SOURCE_ID}", _upsert_body(password="")
+        f"/api/cameras/rtsp/{SOURCE_ID}",
+        _upsert_body(password=""),
+        safe_errors=True,
+        sensitive_values=(USERNAME, URI),
     )
     assert json.loads(result.output) == SUCCESS
+
+
+@pytest.mark.parametrize(
+    "omitted",
+    ["--name", "--room", "--uri", "--username", "--transport", "--audio"],
+)
+def test_rtsp_edit_requires_every_replace_field_without_sending_request(
+    runner: CliRunner, omitted: str
+) -> None:
+    args = _edit_replace_args()
+    index = args.index(omitted)
+    del args[index : index + (1 if omitted == "--audio" else 2)]
+    with patch("miloco_cli.client.api_put") as api_put:
+        result = runner.invoke(cli, ["camera", "rtsp", "edit", SOURCE_ID, *args])
+
+    assert result.exit_code == 1
+    api_put.assert_not_called()
+
+
+def test_rtsp_edit_can_explicitly_clear_username_and_choose_media_fields(
+    runner: CliRunner,
+) -> None:
+    expected = {
+        **_upsert_body(password=""),
+        "username": "",
+        "transport": "udp",
+        "audio_enabled": False,
+    }
+    with patch("miloco_cli.client.api_put", return_value=SUCCESS) as api_put:
+        result = runner.invoke(
+            cli,
+            [
+                "camera",
+                "rtsp",
+                "edit",
+                SOURCE_ID,
+                *_edit_replace_args(username="", transport="udp", audio="--no-audio"),
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    api_put.assert_called_once_with(
+        f"/api/cameras/rtsp/{SOURCE_ID}",
+        expected,
+        safe_errors=True,
+        sensitive_values=(URI,),
+    )
 
 
 @pytest.mark.parametrize(
@@ -152,7 +229,7 @@ def test_camera_state_commands_map_post(
         result = runner.invoke(cli, ["camera", command, SOURCE_ID])
 
     assert result.exit_code == 0, result.output
-    api_post.assert_called_once_with(path)
+    api_post.assert_called_once_with(path, safe_errors=True)
     assert json.loads(result.output) == SUCCESS
 
 
@@ -170,7 +247,7 @@ def test_camera_delete_with_yes_maps_delete(runner: CliRunner) -> None:
         result = runner.invoke(cli, ["camera", "delete", SOURCE_ID, "--yes"])
 
     assert result.exit_code == 0, result.output
-    api_delete.assert_called_once_with(f"/api/cameras/{SOURCE_ID}")
+    api_delete.assert_called_once_with(f"/api/cameras/{SOURCE_ID}", safe_errors=True)
     assert json.loads(result.output) == SUCCESS
 
 
@@ -206,7 +283,7 @@ def test_plaintext_password_option_is_not_accepted_or_echoed(
             ],
         )
 
-    assert result.exit_code != 0
+    assert result.exit_code == 1
     api_post.assert_not_called()
     _assert_secret_absent(result)
 
@@ -238,6 +315,62 @@ def test_camera_output_redacts_sensitive_fields_even_if_backend_echoes_them(
     _assert_secret_absent(result)
 
 
+def test_camera_output_redaction_does_not_corrupt_normal_short_value_substrings(
+    runner: CliRunner,
+) -> None:
+    short_uri = "rtsp://c/live"
+    response = {
+        "code": 0,
+        "data": [
+            {
+                "id": "rtsp:00000000-0000-0000-0000-000000000010",
+                "name": "Camera 0",
+                "room_name": "Hall",
+                "video_codec": "h264",
+                "nested": {
+                    "password": "0",
+                    "username": "a",
+                    "uri": short_uri,
+                    "error_code": "camera_ok",
+                },
+            }
+        ],
+    }
+    with patch("miloco_cli.client.api_post", return_value=response):
+        result = runner.invoke(
+            cli,
+            [
+                "camera",
+                "rtsp",
+                "add",
+                "--name",
+                "Camera 0",
+                "--room",
+                "Hall",
+                "--uri",
+                short_uri,
+                "--username",
+                "a",
+                "--password-stdin",
+                "--pretty",
+            ],
+            input="0\n",
+        )
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)["data"][0]
+    assert data["id"] == "rtsp:00000000-0000-0000-0000-000000000010"
+    assert data["name"] == "Camera 0"
+    assert data["room_name"] == "Hall"
+    assert data["video_codec"] == "h264"
+    assert data["nested"] == {
+        "password": "[REDACTED]",
+        "username": "[REDACTED]",
+        "uri": "[REDACTED]",
+        "error_code": "camera_ok",
+    }
+
+
 @pytest.mark.parametrize("exit_code", [2, 3])
 def test_camera_preserves_network_and_backend_exit_codes(
     runner: CliRunner, exit_code: int
@@ -246,6 +379,13 @@ def test_camera_preserves_network_and_backend_exit_codes(
         result = runner.invoke(cli, ["camera", "list"])
 
     assert result.exit_code == exit_code
+
+
+def test_camera_abort_preserves_validation_exit_code(runner: CliRunner) -> None:
+    with patch("miloco_cli.client.api_get", side_effect=click.Abort()):
+        result = runner.invoke(cli, ["camera", "list"])
+
+    assert result.exit_code == 1
 
 
 def test_unexpected_api_exception_is_safe_and_exits_as_business_failure(
@@ -291,38 +431,117 @@ def test_backend_stable_error_is_displayed_without_request_material(
         )
 
     assert result.exit_code == 3
-    assert "authentication_failed" in result.output
-    assert "RTSP authentication failed" in result.output
+    assert json.loads(result.output) == {
+        "error": {
+            "code": "authentication_failed",
+            "message": "RTSP authentication failed",
+        }
+    }
     assert SECRET not in result.output
     assert URI not in result.output
     assert USERNAME not in result.output
     _assert_secret_absent(result)
 
 
+@pytest.mark.parametrize("invalid_json", [False, True])
+def test_backend_unsafe_or_invalid_error_is_generic_without_leaking_request(
+    runner: CliRunner, invalid_json: bool
+) -> None:
+    userinfo_uri = f"rtsp://{USERNAME}:{SECRET}@camera.local/live"
+    response = MagicMock()
+    response.is_success = False
+    response.status_code = 502
+    response.text = f"proxy echoed {SECRET} {USERNAME} {userinfo_uri}"
+    if invalid_json:
+        response.json.side_effect = ValueError(response.text)
+    else:
+        response.json.return_value = {
+            "detail": {
+                "code": "proxy_error",
+                "message": response.text,
+                "request": {"password": SECRET},
+            }
+        }
+    client = MagicMock()
+    client.__enter__.return_value = client
+    client.__exit__.return_value = False
+    client.post.return_value = response
+    with patch("miloco_cli.client._get_client", return_value=client):
+        result = runner.invoke(
+            cli,
+            ["camera", "rtsp", "add", *_common_upsert_args(), "--password-stdin"],
+            input=f"{SECRET}\n",
+        )
+
+    assert result.exit_code == 3
+    assert json.loads(result.output) == {
+        "error": {
+            "code": "camera_request_failed",
+            "message": "Camera request failed",
+        }
+    }
+    assert USERNAME not in result.output
+    assert userinfo_uri not in result.output
+    _assert_secret_absent(result)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["camera", "rtsp", "add", *_common_upsert_args(), "--transport", "sctp"],
+        ["camera", "rtsp", "add", *_common_upsert_args(), "--password", SECRET],
+        ["camera", "rtsp", "add", *_common_upsert_args(), "--transport"],
+        ["camera", "enable"],
+        ["camera", "unknown-command"],
+    ],
+)
+def test_all_camera_usage_errors_exit_one(runner: CliRunner, args: list[str]) -> None:
+    result = runner.invoke(cli, args)
+
+    assert result.exit_code == 1
+    _assert_secret_absent(result)
+
+
+def test_password_stdin_rejects_tty_without_reading(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import miloco_cli.commands.camera as camera_module
+
+    stdin = MagicMock()
+    stdin.isatty.return_value = True
+    monkeypatch.setattr(camera_module, "sys", SimpleNamespace(stdin=stdin))
+    with patch("miloco_cli.client.api_post") as api_post:
+        result = runner.invoke(
+            cli,
+            ["camera", "rtsp", "add", *_common_upsert_args(), "--password-stdin"],
+        )
+
+    assert result.exit_code == 1
+    assert "pipe" in result.output.lower() or "redirect" in result.output.lower()
+    stdin.readline.assert_not_called()
+    api_post.assert_not_called()
+
+
+@pytest.mark.parametrize("style", ["separate", "equals"])
 def test_debug_invocation_redacts_sensitive_camera_arguments(
-    isolated_config: Path, monkeypatch: pytest.MonkeyPatch
+    isolated_config: Path, monkeypatch: pytest.MonkeyPatch, style: str
 ) -> None:
     from miloco_cli import config as config_module
     from miloco_cli import main as main_module
 
     monkeypatch.setattr(config_module, "load_config", lambda: {"debug": True})
     monkeypatch.setattr(config_module, "miloco_home", lambda: isolated_config)
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "miloco-cli",
-            "camera",
-            "rtsp",
-            "add",
-            "--uri",
-            URI,
-            "--username",
-            USERNAME,
-            "--password",
-            SECRET,
-        ],
-    )
+    argv = [
+        "miloco-cli",
+        "camera",
+        "rtsp",
+        "add",
+    ]
+    if style == "separate":
+        argv.extend(["--uri", URI, "--username", USERNAME, "--password", SECRET])
+    else:
+        argv.extend([f"--uri={URI}", f"--username={USERNAME}", f"--password={SECRET}"])
+    monkeypatch.setattr(sys, "argv", argv)
 
     main_module._debug_log_invocation()
 

@@ -6,7 +6,7 @@ import json
 import re
 import sys
 from collections.abc import Callable
-from typing import Any, NoReturn
+from typing import Any, NoReturn, TypeVar
 
 import click
 
@@ -16,6 +16,39 @@ _API_PREFIX = "/api/cameras"
 _REDACTED = "[REDACTED]"
 _SENSITIVE_KEYS = frozenset({"password", "username", "uri"})
 _RTSP_URI = re.compile(r"rtsps?://[^\s\"']+", re.IGNORECASE)
+_T = TypeVar("_T")
+
+
+class _CameraUsageError(click.UsageError):
+    exit_code = 1
+
+
+def _as_camera_usage_error(error: click.UsageError) -> _CameraUsageError:
+    return _CameraUsageError(error.message, error.ctx)
+
+
+class _CameraCommand(click.Command):
+    def make_context(self, *args, **kwargs):
+        try:
+            return super().make_context(*args, **kwargs)
+        except click.UsageError as error:
+            raise _as_camera_usage_error(error) from None
+
+
+class _CameraGroup(click.Group):
+    command_class = _CameraCommand
+
+    def make_context(self, *args, **kwargs):
+        try:
+            return super().make_context(*args, **kwargs)
+        except click.UsageError as error:
+            raise _as_camera_usage_error(error) from None
+
+    def resolve_command(self, ctx, args):
+        try:
+            return super().resolve_command(ctx, args)
+        except click.UsageError as error:
+            raise _as_camera_usage_error(error) from None
 
 
 def _exit_with_error(message: str, code: int) -> NoReturn:
@@ -29,9 +62,23 @@ def _require(value: str | None, option: str) -> str:
     return value
 
 
+def _require_present(value: _T | None, option: str) -> _T:
+    if value is None:
+        _exit_with_error(f"{option} must be explicitly provided", 1)
+    return value
+
+
 def _read_password(password_stdin: bool) -> str:
     if not password_stdin:
         return ""
+    try:
+        interactive = sys.stdin.isatty()
+    except (AttributeError, OSError):
+        interactive = False
+    if interactive:
+        _exit_with_error(
+            "--password-stdin requires a pipe or redirected non-TTY input", 1
+        )
     try:
         line = sys.stdin.readline()
     except (EOFError, OSError):
@@ -42,25 +89,22 @@ def _read_password(password_stdin: bool) -> str:
     return password
 
 
-def _redact_output(value: Any, sensitive_values: tuple[str, ...] = ()) -> Any:
+def _redact_output(value: Any) -> Any:
     if isinstance(value, dict):
         return {
             key: (
                 _REDACTED
                 if str(key).lower() in _SENSITIVE_KEYS
-                else _redact_output(item, sensitive_values)
+                else _redact_output(item)
             )
             for key, item in value.items()
         }
     if isinstance(value, list):
-        return [_redact_output(item, sensitive_values) for item in value]
+        return [_redact_output(item) for item in value]
     if isinstance(value, tuple):
-        return tuple(_redact_output(item, sensitive_values) for item in value)
+        return tuple(_redact_output(item) for item in value)
     if isinstance(value, str):
         redacted = _RTSP_URI.sub(_REDACTED, value)
-        for sensitive in sensitive_values:
-            if sensitive:
-                redacted = redacted.replace(sensitive, _REDACTED)
         return redacted
     return value
 
@@ -69,15 +113,26 @@ def _request_and_print(
     request: Callable[[], Any],
     *,
     pretty: bool,
-    sensitive_values: tuple[str, ...] = (),
 ) -> None:
     try:
         data = request()
-    except (SystemExit, click.exceptions.Exit):
+    except (SystemExit, click.exceptions.Exit, click.Abort):
         raise
     except Exception:  # noqa: BLE001 - discard input-bearing dependency errors
-        _exit_with_error("camera_request_failed: Camera request failed", 3)
-    print_result(_redact_output(data, sensitive_values), pretty)
+        click.echo(
+            json.dumps(
+                {
+                    "error": {
+                        "code": "camera_request_failed",
+                        "message": "Camera request failed",
+                    }
+                },
+                ensure_ascii=False,
+            ),
+            err=True,
+        )
+        raise click.exceptions.Exit(3) from None
+    print_result(_redact_output(data), pretty)
 
 
 def _upsert_body(
@@ -101,7 +156,7 @@ def _upsert_body(
     }
 
 
-def _management_options(command):
+def _add_options(command):
     command = click.option("--pretty", is_flag=True)(command)
     command = click.option(
         "--audio/--no-audio", "audio_enabled", default=True, show_default=True
@@ -120,7 +175,21 @@ def _management_options(command):
     return command
 
 
-@click.group("camera")
+def _edit_options(command):
+    command = click.option("--pretty", is_flag=True)(command)
+    command = click.option("--audio/--no-audio", "audio_enabled", default=None)(command)
+    command = click.option(
+        "--transport", type=click.Choice(["tcp", "udp"]), default=None
+    )(command)
+    command = click.option("--password-stdin", is_flag=True)(command)
+    command = click.option("--username", default=None)(command)
+    command = click.option("--uri")(command)
+    command = click.option("--room")(command)
+    command = click.option("--name")(command)
+    return command
+
+
+@click.group("camera", cls=_CameraGroup)
 def camera_group() -> None:
     """List and manage camera sources."""
 
@@ -131,10 +200,10 @@ def camera_list(pretty: bool) -> None:
     """List cameras from all configured sources."""
     from miloco_cli.client import api_get
 
-    _request_and_print(lambda: api_get(_API_PREFIX), pretty=pretty)
+    _request_and_print(lambda: api_get(_API_PREFIX, safe_errors=True), pretty=pretty)
 
 
-@click.group("rtsp")
+@click.group("rtsp", cls=_CameraGroup)
 def rtsp_group() -> None:
     """Test, add, and edit RTSP camera sources."""
 
@@ -174,14 +243,20 @@ def rtsp_test(
         audio_enabled=audio_enabled,
     )
     _request_and_print(
-        lambda: api_post(f"{_API_PREFIX}/rtsp/test", body),
+        lambda: api_post(
+            f"{_API_PREFIX}/rtsp/test",
+            body,
+            safe_errors=True,
+            sensitive_values=tuple(
+                value for value in (password, username, validated_uri) if value
+            ),
+        ),
         pretty=pretty,
-        sensitive_values=(password, username, validated_uri),
     )
 
 
 @rtsp_group.command("add")
-@_management_options
+@_add_options
 def rtsp_add(
     name: str | None,
     room: str | None,
@@ -209,24 +284,30 @@ def rtsp_add(
         audio_enabled=audio_enabled,
     )
     _request_and_print(
-        lambda: api_post(f"{_API_PREFIX}/rtsp", body),
+        lambda: api_post(
+            f"{_API_PREFIX}/rtsp",
+            body,
+            safe_errors=True,
+            sensitive_values=tuple(
+                value for value in (password, username, validated_uri) if value
+            ),
+        ),
         pretty=pretty,
-        sensitive_values=(password, username, validated_uri),
     )
 
 
 @rtsp_group.command("edit")
 @click.argument("camera_id", required=False)
-@_management_options
+@_edit_options
 def rtsp_edit(
     camera_id: str | None,
     name: str | None,
     room: str | None,
     uri: str | None,
-    username: str,
+    username: str | None,
     password_stdin: bool,
-    transport: str,
-    audio_enabled: bool,
+    transport: str | None,
+    audio_enabled: bool | None,
     pretty: bool,
 ) -> None:
     """Replace an RTSP source definition while preserving a blank password."""
@@ -234,22 +315,33 @@ def rtsp_edit(
 
     validated_id = _require(camera_id, "camera id")
     validated_name = _require(name, "--name")
-    validated_room = _require(room, "--room")
+    validated_room = _require_present(room, "--room")
     validated_uri = _require(uri, "--uri")
+    validated_username = _require_present(username, "--username")
+    validated_transport = _require_present(transport, "--transport")
+    validated_audio = _require_present(audio_enabled, "--audio/--no-audio")
     password = _read_password(password_stdin)
     body = _upsert_body(
         name=validated_name,
         room=validated_room,
         uri=validated_uri,
-        username=username,
+        username=validated_username,
         password=password,
-        transport=transport,
-        audio_enabled=audio_enabled,
+        transport=validated_transport,
+        audio_enabled=validated_audio,
     )
     _request_and_print(
-        lambda: api_put(f"{_API_PREFIX}/rtsp/{validated_id}", body),
+        lambda: api_put(
+            f"{_API_PREFIX}/rtsp/{validated_id}",
+            body,
+            safe_errors=True,
+            sensitive_values=tuple(
+                value
+                for value in (password, validated_username, validated_uri)
+                if value
+            ),
+        ),
         pretty=pretty,
-        sensitive_values=(password, username, validated_uri),
     )
 
 
@@ -261,7 +353,8 @@ def _state_command(action: str, camera_id: str | None, pretty: bool) -> None:
 
     validated_id = _require(camera_id, "camera id")
     _request_and_print(
-        lambda: api_post(f"{_API_PREFIX}/{validated_id}/{action}"), pretty=pretty
+        lambda: api_post(f"{_API_PREFIX}/{validated_id}/{action}", safe_errors=True),
+        pretty=pretty,
     )
 
 
@@ -293,5 +386,6 @@ def camera_delete(camera_id: str | None, yes: bool, pretty: bool) -> None:
     if not yes:
         _exit_with_error("--yes is required to delete a camera", 1)
     _request_and_print(
-        lambda: api_delete(f"{_API_PREFIX}/{validated_id}"), pretty=pretty
+        lambda: api_delete(f"{_API_PREFIX}/{validated_id}", safe_errors=True),
+        pretty=pretty,
     )

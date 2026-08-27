@@ -124,6 +124,116 @@ def test_api_get_business_error_exits_3():
     assert exc.value.code == 3
 
 
+def test_safe_error_mode_emits_only_stable_code_and_message(capsys):
+    resp = _make_response(
+        {
+            "detail": {
+                "code": "authentication_failed",
+                "message": "RTSP authentication failed",
+            }
+        },
+        status_code=409,
+    )
+    patcher, _ = _patch_client(resp)
+    with patcher, pytest.raises(SystemExit) as exc:
+        api_post(
+            "/api/cameras/rtsp",
+            {"password": "synthetic-camera-secret"},
+            safe_errors=True,
+            sensitive_values=("synthetic-camera-secret",),
+        )
+
+    assert exc.value.code == 3
+    assert json.loads(capsys.readouterr().err) == {
+        "error": {
+            "code": "authentication_failed",
+            "message": "RTSP authentication failed",
+        }
+    }
+
+
+def test_safe_error_mode_replaces_unsafe_schema_with_generic_error(capsys):
+    secret = "synthetic-camera-secret"
+    username = "camera-user"
+    userinfo_uri = f"rtsp://{username}:{secret}@camera.local/live"
+    resp = _make_response(
+        {
+            "detail": {
+                "code": "proxy_error",
+                "message": f"echo {secret} {username} {userinfo_uri}",
+                "request": {"password": secret},
+            }
+        },
+        status_code=502,
+    )
+    patcher, _ = _patch_client(resp)
+    with patcher, pytest.raises(SystemExit) as exc:
+        api_post(
+            "/api/cameras/rtsp",
+            {"password": secret},
+            safe_errors=True,
+            sensitive_values=(secret, username, "rtsp://camera.local/live"),
+        )
+
+    assert exc.value.code == 3
+    captured = capsys.readouterr()
+    assert json.loads(captured.err) == {
+        "error": {
+            "code": "camera_request_failed",
+            "message": "Camera request failed",
+        }
+    }
+    assert secret not in captured.err
+    assert username not in captured.err
+    assert userinfo_uri not in captured.err
+
+
+def test_safe_error_mode_invalid_json_never_prints_response_text(capsys):
+    secret = "synthetic-camera-secret"
+    resp = _make_response({}, status_code=502)
+    resp.json.side_effect = ValueError(f"invalid response containing {secret}")
+    resp.text = f"proxy response containing {secret}"
+    patcher, _ = _patch_client(resp)
+    with patcher, pytest.raises(SystemExit) as exc:
+        api_get(
+            "/api/cameras",
+            safe_errors=True,
+            sensitive_values=(secret,),
+        )
+
+    assert exc.value.code == 3
+    captured = capsys.readouterr()
+    assert json.loads(captured.err) == {
+        "error": {
+            "code": "camera_request_failed",
+            "message": "Camera request failed",
+        }
+    }
+    assert secret not in captured.err
+
+
+def test_safe_error_mode_nonzero_success_envelope_is_generic(capsys):
+    secret = "synthetic-camera-secret"
+    resp = _make_response({"code": 9, "message": f"echo {secret}"})
+    patcher, _ = _patch_client(resp)
+    with patcher, pytest.raises(SystemExit) as exc:
+        api_get(
+            "/api/cameras",
+            safe_errors=True,
+            sensitive_values=(secret,),
+        )
+
+    assert exc.value.code == 3
+    captured = capsys.readouterr()
+    assert json.loads(captured.err) == {
+        "error": {
+            "code": "camera_request_failed",
+            "message": "Camera request failed",
+        }
+    }
+    assert secret not in captured.err
+
+
 # ─── api_post / api_put / api_patch ──────────────────────────────────────────
 
 

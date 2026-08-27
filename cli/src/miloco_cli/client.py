@@ -6,8 +6,9 @@
 """
 
 import json
+import re
 import sys
-from typing import NoReturn
+from typing import NoReturn, cast
 
 import httpx
 
@@ -29,11 +30,61 @@ def _get_client(cfg: dict) -> httpx.Client:
     )
 
 
-def _handle_response(resp: httpx.Response) -> dict | list:
+_STABLE_ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_RTSP_URI = re.compile(r"rtsps?://", re.IGNORECASE)
+
+
+def _safe_business_error(
+    data: object | None,
+    *,
+    sensitive_values: tuple[str, ...],
+) -> NoReturn:
+    """Print only the camera API's approved stable error envelope."""
+    detail = data.get("detail") if isinstance(data, dict) else None
+    code = detail.get("code") if isinstance(detail, dict) else None
+    message = detail.get("message") if isinstance(detail, dict) else None
+    is_stable = (
+        isinstance(data, dict)
+        and set(data) == {"detail"}
+        and isinstance(detail, dict)
+        and set(detail) == {"code", "message"}
+        and isinstance(code, str)
+        and bool(_STABLE_ERROR_CODE.fullmatch(code))
+        and isinstance(message, str)
+        and bool(message)
+        and len(message) <= 200
+        and not any(ord(character) < 32 for character in message)
+    )
+    if is_stable:
+        serialized = json.dumps(detail, ensure_ascii=False)
+        is_stable = not _RTSP_URI.search(serialized) and not any(
+            sensitive and sensitive in serialized for sensitive in sensitive_values
+        )
+
+    error: object = (
+        {"code": code, "message": message}
+        if is_stable
+        else {
+            "code": "camera_request_failed",
+            "message": "Camera request failed",
+        }
+    )
+    print(json.dumps({"error": error}, ensure_ascii=False), file=sys.stderr)
+    sys.exit(3)
+
+
+def _handle_response(
+    resp: httpx.Response,
+    *,
+    safe_errors: bool = False,
+    sensitive_values: tuple[str, ...] = (),
+) -> dict | list:
     """统一处理响应，业务错误 sys.exit(3)。"""
     try:
         data = resp.json()
     except Exception:
+        if safe_errors:
+            _safe_business_error(None, sensitive_values=sensitive_values)
         print(
             json.dumps(
                 {
@@ -47,12 +98,16 @@ def _handle_response(resp: httpx.Response) -> dict | list:
 
     # FastAPI 4xx/5xx 返回的错误体（如 422 {"detail": [...]}）无 code 字段
     if not resp.is_success:
+        if safe_errors:
+            _safe_business_error(data, sensitive_values=sensitive_values)
         print(json.dumps({"error": data}, ensure_ascii=False), file=sys.stderr)
         sys.exit(3)
 
     # observability 系列 endpoint（/api/actions、/api/traces 等）直接返回裸 list,
     # 无 NormalResponse 信封;2xx 已判过,list 恒为成功,原样透传。
     if isinstance(data, dict) and data.get("code", 0) != 0:
+        if safe_errors:
+            _safe_business_error(data, sensitive_values=sensitive_values)
         print(json.dumps(data, ensure_ascii=False), file=sys.stderr)
         sys.exit(3)
 
@@ -75,23 +130,42 @@ def api_get(
     params: dict | list[tuple[str, str | int | float | None]] | None = None,
     *,
     timeout: float | None = None,
+    safe_errors: bool = False,
+    sensitive_values: tuple[str, ...] = (),
 ) -> dict | list:
     cfg = load_config()
     try:
         with _get_client(cfg) as client:
             kw = {"timeout": timeout} if timeout is not None else {}
             resp = client.get(path, params=params, **kw)
-            return _handle_response(resp)
+            return _handle_response(
+                resp,
+                safe_errors=safe_errors,
+                sensitive_values=sensitive_values,
+            )
     except httpx.RequestError:
         _connect_error(cfg["server"]["url"])
 
 
-def api_post(path: str, body: dict | None = None) -> dict:
+def api_post(
+    path: str,
+    body: dict | None = None,
+    *,
+    safe_errors: bool = False,
+    sensitive_values: tuple[str, ...] = (),
+) -> dict:
     cfg = load_config()
     try:
         with _get_client(cfg) as client:
             resp = client.post(path, json=body or {})
-            return _handle_response(resp)
+            return cast(
+                dict,
+                _handle_response(
+                    resp,
+                    safe_errors=safe_errors,
+                    sensitive_values=sensitive_values,
+                ),
+            )
     except httpx.RequestError:
         _connect_error(cfg["server"]["url"])
 
@@ -100,6 +174,9 @@ def api_post_multipart(
     path: str,
     files: list[tuple[str, tuple[str, bytes, str]]],
     data: dict | None = None,
+    *,
+    safe_errors: bool = False,
+    sensitive_values: tuple[str, ...] = (),
 ) -> dict:
     """POST multipart/form-data（上传文件 + 表单字段）。
 
@@ -111,36 +188,82 @@ def api_post_multipart(
     try:
         with _get_client(cfg) as client:
             resp = client.post(path, files=files, data=data or {})
-            return _handle_response(resp)
+            return cast(
+                dict,
+                _handle_response(
+                    resp,
+                    safe_errors=safe_errors,
+                    sensitive_values=sensitive_values,
+                ),
+            )
     except httpx.RequestError:
         _connect_error(cfg["server"]["url"])
 
 
-def api_put(path: str, body: dict | None = None) -> dict:
+def api_put(
+    path: str,
+    body: dict | None = None,
+    *,
+    safe_errors: bool = False,
+    sensitive_values: tuple[str, ...] = (),
+) -> dict:
     cfg = load_config()
     try:
         with _get_client(cfg) as client:
             resp = client.put(path, json=body or {})
-            return _handle_response(resp)
+            return cast(
+                dict,
+                _handle_response(
+                    resp,
+                    safe_errors=safe_errors,
+                    sensitive_values=sensitive_values,
+                ),
+            )
     except httpx.RequestError:
         _connect_error(cfg["server"]["url"])
 
 
-def api_patch(path: str, body: dict | None = None) -> dict:
+def api_patch(
+    path: str,
+    body: dict | None = None,
+    *,
+    safe_errors: bool = False,
+    sensitive_values: tuple[str, ...] = (),
+) -> dict:
     cfg = load_config()
     try:
         with _get_client(cfg) as client:
             resp = client.patch(path, json=body or {})
-            return _handle_response(resp)
+            return cast(
+                dict,
+                _handle_response(
+                    resp,
+                    safe_errors=safe_errors,
+                    sensitive_values=sensitive_values,
+                ),
+            )
     except httpx.RequestError:
         _connect_error(cfg["server"]["url"])
 
 
-def api_delete(path: str, params: dict | None = None) -> dict:
+def api_delete(
+    path: str,
+    params: dict | None = None,
+    *,
+    safe_errors: bool = False,
+    sensitive_values: tuple[str, ...] = (),
+) -> dict:
     cfg = load_config()
     try:
         with _get_client(cfg) as client:
             resp = client.delete(path, params=params)
-            return _handle_response(resp)
+            return cast(
+                dict,
+                _handle_response(
+                    resp,
+                    safe_errors=safe_errors,
+                    sensitive_values=sensitive_values,
+                ),
+            )
     except httpx.RequestError:
         _connect_error(cfg["server"]["url"])
