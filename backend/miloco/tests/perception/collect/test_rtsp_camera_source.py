@@ -160,6 +160,12 @@ async def test_get_state_returns_the_session_network_state_without_forcing_onlin
     )
 
     assert source.get_state(enabled.id) == session.state_override
+    assert source.retain_pending_connection(enabled.id) is True
+
+    current = [enabled.model_copy(update={"enabled": False})]
+    source._settings_loader = lambda: current
+    await source.apply_settings()
+    assert source.retain_pending_connection(enabled.id) is False
 
 
 @pytest.mark.asyncio

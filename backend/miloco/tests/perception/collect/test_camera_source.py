@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass
 from typing import Literal
 
+import numpy as np
 import pytest
 from miloco.perception.collect.camera_adapter import CameraDeviceAdapter
 from miloco.perception.collect.camera_source import CameraSourceState
@@ -70,6 +71,42 @@ class _FailingShutdownSource(_RecordingSource):
     async def shutdown(self) -> None:
         self.shutdown_count += 1
         raise RuntimeError("sensitive shutdown details")
+
+
+class _AsyncPendingSource(_RecordingSource):
+    def __init__(self, devices: dict[str, PerceptionDevice]) -> None:
+        super().__init__("rtsp", devices)
+        self._registered: set[str] = set()
+        self._video_callbacks: dict[str, object] = {}
+
+    async def connect_device(self, did: str, video_cb, audio_cb) -> None:
+        self._registered.add(did)
+        self._video_callbacks[did] = video_cb
+
+    def get_state(self, did: str) -> _State:
+        return _State(connected=False)
+
+    def retain_pending_connection(self, did: str) -> bool:
+        return did in self._registered
+
+    async def emit_video(self, did: str) -> None:
+        callback = self._video_callbacks[did]
+        await callback(  # type: ignore[operator]
+            did,
+            np.ones((2, 2, 3), dtype=np.uint8),
+            100,
+            0,
+            1_000,
+            1_001,
+        )
+
+
+class _SynchronousFailedSource(_RecordingSource):
+    async def connect_device(self, did: str, video_cb, audio_cb) -> None:
+        return None
+
+    def get_state(self, did: str) -> _State:
+        return _State(connected=False)
 
 
 def test_camera_source_state_has_safe_disconnected_defaults() -> None:
@@ -152,6 +189,36 @@ async def test_failed_connect_removes_state_and_next_sync_retries() -> None:
 
     assert set(adapter.get_connected_devices()) == {"flaky"}
     assert source.connect_attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_registered_async_source_retains_buffer_until_late_callback() -> None:
+    did = "rtsp:pending"
+    source = _AsyncPendingSource({did: _device(did)})
+    adapter = CameraDeviceAdapter(sources=[source])  # type: ignore[arg-type]
+
+    await adapter.sync_devices()
+
+    assert set(adapter.get_connected_devices()) == {did}
+    assert source.get_state(did).connected is False
+
+    await source.emit_video(did)
+    collected = adapter.collect(did, drain=False)
+    assert collected is not None
+    assert collected.meta.did == did
+    assert len(collected.video) == 1
+
+
+@pytest.mark.asyncio
+async def test_synchronous_false_source_still_clears_precreated_buffer() -> None:
+    did = "miot-failed"
+    source = _SynchronousFailedSource("miot", {did: _device(did)})
+    adapter = CameraDeviceAdapter(sources=[source])  # type: ignore[arg-type]
+
+    await adapter.sync_devices()
+
+    assert adapter.get_connected_devices() == {}
+    assert adapter.collect(did, drain=False) is None
 
 
 @pytest.mark.asyncio

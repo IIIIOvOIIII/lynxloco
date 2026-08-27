@@ -52,3 +52,11 @@ class CameraSourceDriver(Protocol):
     def get_state(self, did: str) -> CameraSourceState: ...
 
     async def shutdown(self) -> None: ...
+
+
+class PendingConnectionCameraSource(Protocol):
+    """Optional capability for transports registered before network readiness."""
+
+    def retain_pending_connection(self, did: str) -> bool:
+        """Return whether the adapter buffer must outlive a false network state."""
+        ...

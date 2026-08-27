@@ -293,7 +293,10 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
             self._devices.pop(did, None)
             state.sync_buffer.clear()
             raise
-        if not camera_source.get_state(did).connected:
+        source_state = camera_source.get_state(did)
+        retain_pending = getattr(camera_source, "retain_pending_connection", None)
+        pending_registered = retain_pending(did) if callable(retain_pending) else False
+        if not source_state.connected and not pending_registered:
             self._devices.pop(did, None)
             state.sync_buffer.clear()
 
