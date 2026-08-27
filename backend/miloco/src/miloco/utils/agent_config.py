@@ -10,9 +10,10 @@ can update it independently —
 - Backend: ``ensure_backend_token()`` persists ``server.token``; other
            backend-side writes go through :func:`update_shared_config`.
 
-All writers deep-merge into the same file via an atomic ``tmpfile +
-os.replace``, so concurrent writes don't produce partial JSON. Whichever
-writer publishes a field first wins, and the others pick it up on next read.
+Backend writers using this module deep-merge through one process lock plus a
+shared Unix lock file and publish via atomic ``tmpfile + os.replace``. The lock
+does not turn uncooperative manual edits or legacy CLI/plugin writers into a
+cross-process compare-and-swap protocol; those remain outside this guarantee.
 
 Backend token bootstrap priority (see :func:`ensure_backend_token`):
   ``MILOCO_SERVER__TOKEN`` env / ``settings.server.token`` (already loaded)
@@ -23,11 +24,15 @@ Backend token bootstrap priority (see :func:`ensure_backend_token`):
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
 import tempfile
+import threading
 import uuid
+from collections.abc import Callable
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +41,8 @@ from miloco.utils.common import deep_merge
 from miloco.utils.paths import config_file
 
 logger = logging.getLogger(__name__)
+
+_CONFIG_THREAD_LOCK = threading.RLock()
 
 
 def _user_config_path() -> Path:
@@ -68,6 +75,34 @@ def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
+
+
+@contextmanager
+def _shared_config_lock(path: Path):
+    """Serialize cooperating backend writers in this process and across processes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f"{path.name}.lock")
+    with _CONFIG_THREAD_LOCK:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+
+def _mutate_shared_config(
+    mutation: Callable[[dict[str, Any]], dict[str, Any]],
+) -> dict[str, Any]:
+    path = _user_config_path()
+    with _shared_config_lock(path):
+        existing = _read_config_dict(path)
+        merged = mutation(existing)
+        _atomic_write_json(path, merged)
+        reset_settings()
+        return merged
 
 
 def ensure_backend_token() -> str:
@@ -104,13 +139,23 @@ def ensure_backend_token() -> str:
 def update_shared_config(**updates: Any) -> dict[str, Any]:
     """Deep-merge ``updates`` into ``$MILOCO_HOME/config.json`` and persist.
 
-    Concurrency note: The current deployment has no concurrent writers —
-    bootstrap and CLI writes are serialised by install.sh / user workflow.
-    If that assumption changes, add file-level locking here.
+    Cooperating backend writers share a process lock and a Unix flock. The file
+    is re-read only after both locks are held, so updates to disjoint fields are
+    not lost.
     """
-    path = _user_config_path()
-    existing = _read_config_dict(path)
-    merged = deep_merge(existing, updates)
-    _atomic_write_json(path, merged)
-    reset_settings()
-    return merged
+    return _mutate_shared_config(lambda existing: deep_merge(existing, updates))
+
+
+def mutate_rtsp_sources(
+    mutation: Callable[[list[dict[str, Any]]], list[dict[str, Any]]],
+) -> dict[str, Any]:
+    """Mutate the current on-disk RTSP list under the shared writer lock."""
+
+    def apply(existing: dict[str, Any]) -> dict[str, Any]:
+        camera = existing.get("camera")
+        raw_sources = camera.get("rtsp_sources") if isinstance(camera, dict) else []
+        current = list(raw_sources) if isinstance(raw_sources, list) else []
+        updated = mutation(current)
+        return deep_merge(existing, {"camera": {"rtsp_sources": updated}})
+
+    return _mutate_shared_config(apply)

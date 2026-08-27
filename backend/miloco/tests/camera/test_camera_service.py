@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import Callable
 from types import SimpleNamespace
 
@@ -63,6 +64,7 @@ class _ConfigStore:
         self.write_count = 0
         self.fail_write = False
         self.events: list[str] = []
+        self._lock = threading.Lock()
 
     def load(self):
         return SimpleNamespace(camera=SimpleNamespace(rtsp_sources=list(self.sources)))
@@ -75,6 +77,19 @@ class _ConfigStore:
         raw_sources = updates["camera"]["rtsp_sources"]
         self.sources = [RtspSourceSettings.model_validate(item) for item in raw_sources]
         return updates
+
+    def mutate(self, mutation):
+        with self._lock:
+            self.events.append("persist")
+            self.write_count += 1
+            if self.fail_write:
+                raise OSError("disk private detail")
+            current = [source.model_dump() for source in self.sources]
+            raw_sources = mutation(current)
+            self.sources = [
+                RtspSourceSettings.model_validate(item) for item in raw_sources
+            ]
+            return {"camera": {"rtsp_sources": raw_sources}}
 
 
 class _Perception:
@@ -135,7 +150,25 @@ def _service(
         miot or _Miot(),
         perception or _Perception(),
         settings_loader=store.load,
-        config_writer=store.write,
+        sources_mutator=store.mutate,
+        probe=probe or successful_probe,
+    )
+
+
+def _transactional_service(
+    store: _ConfigStore,
+    perception: _Perception | None = None,
+    *,
+    probe: Callable | None = None,
+) -> CameraService:
+    async def successful_probe(_source: RtspSourceSettings) -> RtspProbeResult:
+        return _probe_result()
+
+    return CameraService(
+        _Miot(),
+        perception or _Perception(),
+        settings_loader=store.load,
+        sources_mutator=store.mutate,
         probe=probe or successful_probe,
     )
 
@@ -261,18 +294,18 @@ async def test_enable_probes_then_persists_then_hot_applies() -> None:
         events.append("probe")
         return _probe_result()
 
-    original_write = store.write
+    original_mutate = store.mutate
 
-    def write(**updates):
+    def mutate(mutation):
         events.append("persist")
-        return original_write(**updates)
+        return original_mutate(mutation)
 
     async def sync() -> bool:
         events.append("sync")
         perception.sync_count += 1
         return True
 
-    store.write = write
+    store.mutate = mutate
     perception.sync_camera_sources = sync
 
     enabled = await _service(store, perception, probe=probe).enable(SOURCE_ID)
@@ -314,9 +347,15 @@ async def test_persist_failure_never_hot_applies() -> None:
 
 
 @pytest.mark.asyncio
-async def test_enable_hot_apply_failure_compensates_disabled_and_cleans_up() -> None:
+@pytest.mark.parametrize(
+    "initial_result",
+    [False, RuntimeError("initial apply private detail")],
+)
+async def test_enable_hot_apply_failure_compensates_disabled_and_cleans_up(
+    initial_result: bool | BaseException,
+) -> None:
     store = _ConfigStore([_source()])
-    perception = _Perception(sync_results=[False, True])
+    perception = _Perception(sync_results=[initial_result, True])
 
     with pytest.raises(CameraConflictError) as caught:
         await _service(store, perception).enable(SOURCE_ID)
@@ -385,3 +424,209 @@ async def test_concurrent_enables_do_not_lose_another_source_update() -> None:
         SOURCE_ID,
         SECOND_SOURCE_ID,
     }
+
+
+@pytest.mark.asyncio
+async def test_probe_cancellation_propagates_without_mutation() -> None:
+    store = _ConfigStore([_source()])
+    perception = _Perception()
+    probe_started = asyncio.Event()
+
+    async def blocking_probe(_source: RtspSourceSettings) -> RtspProbeResult:
+        probe_started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    task = asyncio.create_task(
+        _transactional_service(store, perception, probe=blocking_probe).enable(
+            SOURCE_ID
+        )
+    )
+    await probe_started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert store.write_count == 0
+    assert store.sources[0].enabled is False
+    assert perception.sync_count == 0
+
+
+class _BlockingRuntimePerception(_Perception):
+    def __init__(self, store: _ConfigStore, results: list[bool]) -> None:
+        super().__init__()
+        self._store = store
+        self._results = list(results)
+        self.first_sync_started = asyncio.Event()
+        self.release_first_sync = asyncio.Event()
+        self.runtime_enabled = False
+
+    async def sync_camera_sources(self) -> bool:
+        self.sync_count += 1
+        if self.sync_count == 1:
+            self.first_sync_started.set()
+            await self.release_first_sync.wait()
+        result = self._results.pop(0)
+        if result:
+            self.runtime_enabled = self._store.sources[0].enabled
+        return result
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_successful_enable_waits_for_stable_enabled_state() -> None:
+    store = _ConfigStore([_source()])
+    perception = _BlockingRuntimePerception(store, [True])
+    task = asyncio.create_task(
+        _transactional_service(store, perception).enable(SOURCE_ID)
+    )
+    await perception.first_sync_started.wait()
+
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    perception.release_first_sync.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert store.sources[0].enabled is True
+    assert perception.runtime_enabled is True
+    assert perception.sync_count == 1
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_failed_enable_waits_for_compensation_cleanup() -> None:
+    store = _ConfigStore([_source()])
+    perception = _BlockingRuntimePerception(store, [False, True])
+    task = asyncio.create_task(
+        _transactional_service(store, perception).enable(SOURCE_ID)
+    )
+    await perception.first_sync_started.wait()
+
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    perception.release_first_sync.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert store.sources[0].enabled is False
+    assert perception.runtime_enabled is False
+    assert perception.sync_count == 2
+    assert store.write_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cleanup_result",
+    [False, RuntimeError("cleanup private detail")],
+)
+async def test_cleanup_failure_returns_stable_code_and_keeps_disabled(
+    cleanup_result: bool | BaseException,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = _ConfigStore([_source()])
+    perception = _Perception(sync_results=[False, cleanup_result])
+
+    with pytest.raises(CameraConflictError) as caught:
+        await _transactional_service(store, perception).enable(SOURCE_ID)
+
+    assert caught.value.code == "cleanup_failed"
+    assert caught.value.safe_message == "Camera rollback cleanup could not be applied"
+    assert store.sources[0].enabled is False
+    assert perception.sync_count == 2
+    assert "cleanup private detail" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_two_service_instances_create_without_lost_update() -> None:
+    store = _ConfigStore()
+    first = _transactional_service(store)
+    second = _transactional_service(store)
+
+    await asyncio.gather(
+        first.create_rtsp(_upsert(name="First", uri="rtsp://first.local/live")),
+        second.create_rtsp(_upsert(name="Second", uri="rtsp://second.local/live")),
+    )
+
+    assert {source.name for source in store.sources} == {"First", "Second"}
+
+
+@pytest.mark.asyncio
+async def test_two_service_instances_edit_different_sources_without_lost_update() -> (
+    None
+):
+    store = _ConfigStore([_source(), _source(SECOND_SOURCE_ID, name="Bedroom")])
+    first = _transactional_service(store)
+    second = _transactional_service(store)
+
+    await asyncio.gather(
+        first.edit_rtsp(SOURCE_ID, _upsert(name="First Updated")),
+        second.edit_rtsp(
+            SECOND_SOURCE_ID,
+            _upsert(name="Second Updated", uri="rtsp://second.local/live"),
+        ),
+    )
+
+    assert {source.id: source.name for source in store.sources} == {
+        SOURCE_ID: "First Updated",
+        SECOND_SOURCE_ID: "Second Updated",
+    }
+
+
+@pytest.mark.asyncio
+async def test_post_write_reload_validation_is_stable_and_redacted(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret = "reload-secret"
+    store = _ConfigStore([_source(password=secret)])
+    original_load = store.load
+    load_count = 0
+
+    def invalid_after_write():
+        nonlocal load_count
+        load_count += 1
+        if load_count >= 1:
+            raise ValueError(
+                f"invalid rtsp://synthetic-user:{secret}@camera.local/live"
+            )
+        return original_load()
+
+    service = CameraService(
+        _Miot(),
+        _Perception(),
+        settings_loader=invalid_after_write,
+        sources_mutator=store.mutate,
+    )
+
+    with pytest.raises(CameraConflictError) as caught:
+        await service.disable(SOURCE_ID)
+
+    assert caught.value.code == "persistence_failed"
+    assert secret not in caplog.text
+    assert "synthetic-user" not in caplog.text
+    assert "rtsp://" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_list_reload_validation_is_stable_and_redacted(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret = "list-reload-secret"
+
+    def invalid_load():
+        raise ValueError(f"invalid rtsp://synthetic-user:{secret}@camera.local/live")
+
+    service = CameraService(
+        _Miot(),
+        _Perception(),
+        settings_loader=invalid_load,
+        sources_mutator=lambda mutation: {},
+    )
+
+    with pytest.raises(CameraConflictError) as caught:
+        await service.list_cameras()
+
+    assert caught.value.code == "persistence_failed"
+    assert secret not in caplog.text
+    assert "synthetic-user" not in caplog.text
+    assert "rtsp://" not in caplog.text

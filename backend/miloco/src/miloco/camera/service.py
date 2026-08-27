@@ -13,7 +13,7 @@ from miloco.config import get_settings
 from miloco.config.settings import MilocoSettings, RtspSourceSettings
 from miloco.perception.collect.camera_source import CameraSourceState
 from miloco.perception.collect.rtsp_probe import RtspProbeResult, probe_rtsp_source
-from miloco.utils.agent_config import update_shared_config
+from miloco.utils.agent_config import mutate_rtsp_sources
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +45,8 @@ class CameraConflictError(CameraServiceError):
 
 
 SettingsLoader = Callable[[], MilocoSettings | Any]
-ConfigWriter = Callable[..., dict[str, Any]]
+SourcesMutation = Callable[[list[dict[str, Any]]], list[dict[str, Any]]]
+SourcesMutator = Callable[[SourcesMutation], dict[str, Any]]
 Probe = Callable[[RtspSourceSettings], Awaitable[RtspProbeResult]]
 
 
@@ -58,20 +59,21 @@ class CameraService:
         perception_service: _CameraSourceSynchronizer,
         *,
         settings_loader: SettingsLoader = get_settings,
-        config_writer: ConfigWriter = update_shared_config,
+        sources_mutator: SourcesMutator = mutate_rtsp_sources,
         probe: Probe = probe_rtsp_source,
     ) -> None:
         self._miot_service = miot_service
         self._perception_service = perception_service
         self._settings_loader = settings_loader
-        self._config_writer = config_writer
+        self._sources_mutator = sources_mutator
         self._probe = probe
         self._write_lock = asyncio.Lock()
 
     async def list_cameras(self) -> list[CameraSummary]:
         miot_rows = await self._miot_service.list_cameras_with_state()
         summaries = [self._miot_summary(row) for row in miot_rows]
-        summaries.extend(self._rtsp_summary(source) for source in self._sources())
+        sources = await asyncio.to_thread(self._load_sources_safely)
+        summaries.extend(self._rtsp_summary(source) for source in sources)
         return summaries
 
     async def test_rtsp(self, body: RtspSourceUpsert) -> RtspProbeResult:
@@ -82,75 +84,75 @@ class CameraService:
 
     async def create_rtsp(self, body: RtspSourceUpsert) -> CameraSummary:
         async with self._write_lock:
-            sources = self._sources()
             source = self._source_from_upsert(
                 f"rtsp:{uuid.uuid4()}", body, enabled=False, password=body.password
             )
-            sources.append(source)
-            await self._persist_and_sync(sources)
-            return self._rtsp_summary(self._find(source.id))
+            sources = await self._await_shielded_transaction(
+                self._mutate_and_sync(lambda current: [*current, source.model_dump()])
+            )
+            return self._rtsp_summary(self._locate(sources, source.id)[1])
 
     async def edit_rtsp(self, camera_id: str, body: RtspSourceUpsert) -> CameraSummary:
         async with self._write_lock:
-            sources = self._sources()
-            index, current = self._locate(sources, camera_id)
-            password = body.password if body.password else current.password
-            sources[index] = self._source_from_upsert(
-                current.id,
-                body,
-                enabled=current.enabled,
-                password=password,
+
+            def edit(raw_sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+                sources = self._validate_sources(raw_sources)
+                index, current = self._locate(sources, camera_id)
+                password = body.password if body.password else current.password
+                sources[index] = self._source_from_upsert(
+                    current.id,
+                    body,
+                    enabled=current.enabled,
+                    password=password,
+                )
+                return [source.model_dump() for source in sources]
+
+            sources = await self._await_shielded_transaction(
+                self._mutate_and_sync(edit)
             )
-            await self._persist_and_sync(sources)
-            return self._rtsp_summary(self._find(camera_id))
+            return self._rtsp_summary(self._locate(sources, camera_id)[1])
 
     async def enable(self, camera_id: str) -> CameraSummary:
         async with self._write_lock:
-            sources = self._sources()
-            index, current = self._locate(sources, camera_id)
+            sources = await asyncio.to_thread(self._load_sources_safely)
+            _index, current = self._locate(sources, camera_id)
             await self._probe(current)
-            sources[index] = current.model_copy(update={"enabled": True})
-            self._persist(sources)
-            if not await self._sync_safely():
-                compensated = self._sources()
-                compensated_index, persisted = self._locate(compensated, camera_id)
-                compensated[compensated_index] = persisted.model_copy(
-                    update={"enabled": False}
-                )
-                try:
-                    self._persist(compensated)
-                except CameraConflictError as error:
-                    raise CameraConflictError(
-                        "compensation_failed",
-                        "Camera update could not be rolled back",
-                    ) from error
-                await self._sync_safely()
-                raise CameraConflictError(
-                    "hot_apply_failed", "Camera update could not be applied"
-                )
-            return self._rtsp_summary(self._find(camera_id))
+            enabled = await self._await_shielded_transaction(
+                self._enable_transaction(camera_id)
+            )
+            return self._rtsp_summary(enabled)
 
     async def disable(self, camera_id: str) -> CameraSummary:
         async with self._write_lock:
-            sources = self._sources()
-            index, current = self._locate(sources, camera_id)
-            sources[index] = current.model_copy(update={"enabled": False})
-            await self._persist_and_sync(sources)
-            return self._rtsp_summary(self._find(camera_id))
+            sources = await self._await_shielded_transaction(
+                self._mutate_and_sync(self._set_enabled(camera_id, False))
+            )
+            return self._rtsp_summary(self._locate(sources, camera_id)[1])
 
     async def delete(self, camera_id: str) -> None:
         async with self._write_lock:
-            sources = self._sources()
-            index, _current = self._locate(sources, camera_id)
-            del sources[index]
-            await self._persist_and_sync(sources)
+
+            def delete(raw_sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+                sources = self._validate_sources(raw_sources)
+                index, _current = self._locate(sources, camera_id)
+                del sources[index]
+                return [source.model_dump() for source in sources]
+
+            await self._await_shielded_transaction(self._mutate_and_sync(delete))
 
     def _sources(self) -> list[RtspSourceSettings]:
         return list(self._settings_loader().camera.rtsp_sources)
 
-    def _find(self, camera_id: str) -> RtspSourceSettings:
-        _index, source = self._locate(self._sources(), camera_id)
-        return source
+    def _load_sources_safely(self) -> list[RtspSourceSettings]:
+        try:
+            return self._sources()
+        except CameraServiceError:
+            raise
+        except Exception as error:  # noqa: BLE001
+            self._log_persistence_failure(error)
+            raise CameraConflictError(
+                "persistence_failed", "Camera configuration could not be loaded"
+            ) from None
 
     @staticmethod
     def _locate(
@@ -181,28 +183,94 @@ class CameraService:
             enabled=enabled,
         )
 
-    def _persist(self, sources: list[RtspSourceSettings]) -> None:
-        payload = [source.model_dump() for source in sources]
+    @staticmethod
+    def _validate_sources(
+        raw_sources: list[dict[str, Any]],
+    ) -> list[RtspSourceSettings]:
+        return [RtspSourceSettings.model_validate(source) for source in raw_sources]
+
+    async def _mutate_sources(
+        self, mutation: SourcesMutation
+    ) -> list[RtspSourceSettings]:
+        def mutate_and_reload() -> list[RtspSourceSettings]:
+            self._sources_mutator(mutation)
+            return self._sources()
+
         try:
-            self._config_writer(camera={"rtsp_sources": payload})
+            return await asyncio.to_thread(mutate_and_reload)
+        except CameraServiceError:
+            raise
         except Exception as error:  # noqa: BLE001
-            logger.error(
-                "Camera configuration persistence failed (%s)",
-                type(error).__name__,
-            )
+            self._log_persistence_failure(error)
             raise CameraConflictError(
                 "persistence_failed", "Camera configuration could not be saved"
             ) from None
-        # update_shared_config resets the settings singleton; read it immediately so
-        # validation or an unexpected writer contract fails before runtime apply.
-        self._sources()
 
-    async def _persist_and_sync(self, sources: list[RtspSourceSettings]) -> None:
-        self._persist(sources)
+    async def _mutate_and_sync(
+        self, mutation: SourcesMutation
+    ) -> list[RtspSourceSettings]:
+        sources = await self._mutate_sources(mutation)
         if not await self._sync_safely():
             raise CameraConflictError(
                 "hot_apply_failed", "Camera update could not be applied"
             )
+        return sources
+
+    async def _enable_transaction(self, camera_id: str) -> RtspSourceSettings:
+        enabled_sources = await self._mutate_sources(self._set_enabled(camera_id, True))
+        enabled = self._locate(enabled_sources, camera_id)[1]
+        if await self._sync_safely():
+            return enabled
+
+        try:
+            await self._mutate_sources(self._set_enabled(camera_id, False))
+        except CameraConflictError as error:
+            raise CameraConflictError(
+                "compensation_failed", "Camera update could not be rolled back"
+            ) from error
+        if not await self._sync_safely():
+            raise CameraConflictError(
+                "cleanup_failed", "Camera rollback cleanup could not be applied"
+            )
+        raise CameraConflictError(
+            "hot_apply_failed", "Camera update could not be applied"
+        )
+
+    def _set_enabled(self, camera_id: str, enabled: bool) -> SourcesMutation:
+        def mutate(raw_sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            sources = self._validate_sources(raw_sources)
+            index, current = self._locate(sources, camera_id)
+            sources[index] = current.model_copy(update={"enabled": enabled})
+            return [source.model_dump() for source in sources]
+
+        return mutate
+
+    @staticmethod
+    async def _await_shielded_transaction(transaction):
+        task = asyncio.create_task(transaction)
+        cancellation: asyncio.CancelledError | None = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as error:
+                cancellation = error
+            except Exception:
+                break
+        try:
+            result = task.result()
+        except Exception:
+            if cancellation is not None:
+                raise cancellation
+            raise
+        if cancellation is not None:
+            raise cancellation
+        return result
+
+    @staticmethod
+    def _log_persistence_failure(error: BaseException) -> None:
+        logger.error(
+            "Camera configuration persistence failed (%s)", type(error).__name__
+        )
 
     async def _sync_safely(self) -> bool:
         try:

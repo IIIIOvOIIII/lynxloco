@@ -1,11 +1,20 @@
 from __future__ import annotations
 
 import logging
+import warnings
 from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI, Request
-from fastapi.testclient import TestClient
+from starlette.exceptions import StarletteDeprecationWarning
+
+with warnings.catch_warnings():
+    warnings.filterwarnings(
+        "ignore",
+        message="Using `httpx` with `starlette.testclient` is deprecated.*",
+        category=StarletteDeprecationWarning,
+    )
+    from fastapi.testclient import TestClient
 from miloco.camera.router import _get_camera_service, router
 from miloco.camera.schema import CameraSummary
 from miloco.camera.service import CameraConflictError, CameraNotFoundError
@@ -239,3 +248,48 @@ def test_client_supplied_id_is_ignored(client: TestClient, service: _Service) ->
     submitted = service.calls[-1][1]
     assert not hasattr(submitted, "id")
     assert not hasattr(submitted, "enabled")
+
+
+def test_persistence_failure_response_and_logs_are_redacted(
+    client: TestClient, service: _Service, caplog: pytest.LogCaptureFixture
+) -> None:
+    secret = "router-persistence-secret"
+    service.error = CameraConflictError(
+        "persistence_failed", "Camera configuration could not be saved"
+    )
+    caplog.set_level(logging.WARNING)
+
+    response = client.post(
+        f"/api/cameras/{SOURCE_ID}/disable",
+        headers=_auth(),
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "code": "persistence_failed",
+            "message": "Camera configuration could not be saved",
+        }
+    }
+    combined = response.text + caplog.text
+    assert secret not in combined
+    assert "synthetic-user" not in combined
+    assert "rtsp://" not in combined
+
+
+def test_list_persistence_failure_is_a_stable_conflict(
+    client: TestClient, service: _Service
+) -> None:
+    service.error = CameraConflictError(
+        "persistence_failed", "Camera configuration could not be loaded"
+    )
+
+    response = client.get("/api/cameras", headers=_auth())
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "code": "persistence_failed",
+            "message": "Camera configuration could not be loaded",
+        }
+    }

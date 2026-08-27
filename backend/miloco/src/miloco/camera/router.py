@@ -60,7 +60,10 @@ def _raise_management_error(error: CameraServiceError | RtspSourceError) -> None
 
 @router.get("")
 async def list_cameras(service: CameraServiceDependency) -> NormalResponse:
-    cameras = await service.list_cameras()
+    try:
+        cameras = await service.list_cameras()
+    except CameraServiceError as error:
+        _raise_management_error(error)
     return NormalResponse(
         code=0,
         message="Cameras retrieved successfully",
