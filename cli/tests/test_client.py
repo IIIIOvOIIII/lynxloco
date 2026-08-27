@@ -152,6 +152,40 @@ def test_safe_error_mode_emits_only_stable_code_and_message(capsys):
     }
 
 
+def test_safe_error_mode_checks_raw_quoted_and_escaped_credentials(capsys):
+    password = 'quote"secret\\tail'
+    username = 'user"name\\tail'
+    resp = _make_response(
+        {
+            "detail": {
+                "code": "authentication_failed",
+                "message": f"echoed {password} for {username}",
+            }
+        },
+        status_code=409,
+    )
+    patcher, _ = _patch_client(resp)
+    with patcher, pytest.raises(SystemExit) as exc:
+        api_post(
+            "/api/cameras/rtsp",
+            {"password": password, "username": username},
+            safe_errors=True,
+            sensitive_values=(password, username),
+        )
+
+    assert exc.value.code == 3
+    captured = capsys.readouterr()
+    payload = json.loads(captured.err)
+    assert payload == {
+        "error": {
+            "code": "camera_request_failed",
+            "message": "Camera request failed",
+        }
+    }
+    assert password not in repr(payload)
+    assert username not in repr(payload)
+
+
 def test_safe_error_mode_replaces_unsafe_schema_with_generic_error(capsys):
     secret = "synthetic-camera-secret"
     username = "camera-user"

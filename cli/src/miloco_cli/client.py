@@ -8,7 +8,7 @@
 import json
 import re
 import sys
-from typing import NoReturn, cast
+from typing import Any, NoReturn, cast
 
 import httpx
 
@@ -32,6 +32,24 @@ def _get_client(cfg: dict) -> httpx.Client:
 
 _STABLE_ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _RTSP_URI = re.compile(r"rtsps?://", re.IGNORECASE)
+_REDACTED = "[REDACTED]"
+
+
+def redact_sensitive_scalar(
+    value: Any, sensitive_values: tuple[str, ...]
+) -> tuple[Any, bool]:
+    """Redact exact credential scalars and long credential substrings."""
+    secrets = tuple(secret for secret in sensitive_values if secret)
+    if any(value == secret for secret in secrets):
+        return _REDACTED, True
+    if not isinstance(value, str):
+        return value, False
+
+    redacted = value
+    for secret in secrets:
+        if len(secret) >= 4:
+            redacted = redacted.replace(secret, _REDACTED)
+    return redacted, redacted != value
 
 
 def _safe_business_error(
@@ -43,6 +61,12 @@ def _safe_business_error(
     detail = data.get("detail") if isinstance(data, dict) else None
     code = detail.get("code") if isinstance(detail, dict) else None
     message = detail.get("message") if isinstance(detail, dict) else None
+    _redacted_code, code_contains_sensitive = redact_sensitive_scalar(
+        code, sensitive_values
+    )
+    _redacted_message, message_contains_sensitive = redact_sensitive_scalar(
+        message, sensitive_values
+    )
     is_stable = (
         isinstance(data, dict)
         and set(data) == {"detail"}
@@ -54,12 +78,11 @@ def _safe_business_error(
         and bool(message)
         and len(message) <= 200
         and not any(ord(character) < 32 for character in message)
+        and not code_contains_sensitive
+        and not message_contains_sensitive
+        and not _RTSP_URI.search(code)
+        and not _RTSP_URI.search(message)
     )
-    if is_stable:
-        serialized = json.dumps(detail, ensure_ascii=False)
-        is_stable = not _RTSP_URI.search(serialized) and not any(
-            sensitive and sensitive in serialized for sensitive in sensitive_values
-        )
 
     error: object = (
         {"code": code, "message": message}

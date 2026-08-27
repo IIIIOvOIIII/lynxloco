@@ -315,6 +315,57 @@ def test_camera_output_redacts_sensitive_fields_even_if_backend_echoes_them(
     _assert_secret_absent(result)
 
 
+def test_camera_success_redacts_long_quoted_credentials_in_non_sensitive_fields(
+    runner: CliRunner,
+) -> None:
+    password = 'quote"secret\\tail'
+    username = 'user"name\\tail'
+    response = {
+        "code": 0,
+        "message": f"created with {password} for {username}",
+        "data": {
+            "id": SOURCE_ID,
+            "name": "Camera retained",
+            "nested": [
+                {"password_echo": password},
+                {"username_echo": f"owner={username}"},
+            ],
+        },
+    }
+    with patch("miloco_cli.client.api_post", return_value=response):
+        result = runner.invoke(
+            cli,
+            [
+                "camera",
+                "rtsp",
+                "add",
+                "--name",
+                "Camera retained",
+                "--room",
+                "Hall",
+                "--uri",
+                URI,
+                "--username",
+                username,
+                "--password-stdin",
+                "--pretty",
+            ],
+            input=f"{password}\n",
+        )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["data"]["id"] == SOURCE_ID
+    assert payload["data"]["name"] == "Camera retained"
+    assert payload["message"] == "created with [REDACTED] for [REDACTED]"
+    assert payload["data"]["nested"] == [
+        {"password_echo": "[REDACTED]"},
+        {"username_echo": "owner=[REDACTED]"},
+    ]
+    assert password not in repr(payload)
+    assert username not in repr(payload)
+
+
 def test_camera_output_redaction_does_not_corrupt_normal_short_value_substrings(
     runner: CliRunner,
 ) -> None:
@@ -331,6 +382,9 @@ def test_camera_output_redaction_does_not_corrupt_normal_short_value_substrings(
                     "password": "0",
                     "username": "a",
                     "uri": short_uri,
+                    "password_echo": "0",
+                    "username_echo": "a",
+                    "message": "Camera 0 assigned a channel",
                     "error_code": "camera_ok",
                 },
             }
@@ -367,6 +421,9 @@ def test_camera_output_redaction_does_not_corrupt_normal_short_value_substrings(
         "password": "[REDACTED]",
         "username": "[REDACTED]",
         "uri": "[REDACTED]",
+        "password_echo": "[REDACTED]",
+        "username_echo": "[REDACTED]",
+        "message": "Camera 0 assigned a channel",
         "error_code": "camera_ok",
     }
 

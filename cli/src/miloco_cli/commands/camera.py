@@ -10,6 +10,7 @@ from typing import Any, NoReturn, TypeVar
 
 import click
 
+from miloco_cli.client import redact_sensitive_scalar
 from miloco_cli.output import print_result
 
 _API_PREFIX = "/api/cameras"
@@ -89,30 +90,31 @@ def _read_password(password_stdin: bool) -> str:
     return password
 
 
-def _redact_output(value: Any) -> Any:
+def _redact_output(value: Any, sensitive_values: tuple[str, ...] = ()) -> Any:
     if isinstance(value, dict):
         return {
             key: (
                 _REDACTED
                 if str(key).lower() in _SENSITIVE_KEYS
-                else _redact_output(item)
+                else _redact_output(item, sensitive_values)
             )
             for key, item in value.items()
         }
     if isinstance(value, list):
-        return [_redact_output(item) for item in value]
+        return [_redact_output(item, sensitive_values) for item in value]
     if isinstance(value, tuple):
-        return tuple(_redact_output(item) for item in value)
-    if isinstance(value, str):
-        redacted = _RTSP_URI.sub(_REDACTED, value)
-        return redacted
-    return value
+        return tuple(_redact_output(item, sensitive_values) for item in value)
+    redacted, _changed = redact_sensitive_scalar(value, sensitive_values)
+    if isinstance(redacted, str):
+        return _RTSP_URI.sub(_REDACTED, redacted)
+    return redacted
 
 
 def _request_and_print(
     request: Callable[[], Any],
     *,
     pretty: bool,
+    sensitive_values: tuple[str, ...] = (),
 ) -> None:
     try:
         data = request()
@@ -132,7 +134,11 @@ def _request_and_print(
             err=True,
         )
         raise click.exceptions.Exit(3) from None
-    print_result(_redact_output(data), pretty)
+    print_result(_redact_output(data, sensitive_values), pretty)
+
+
+def _sensitive_values(*values: str) -> tuple[str, ...]:
+    return tuple(value for value in values if value)
 
 
 def _upsert_body(
@@ -233,6 +239,7 @@ def rtsp_test(
 
     validated_uri = _require(uri, "--uri")
     password = _read_password(password_stdin)
+    sensitive_values = _sensitive_values(password, username, validated_uri)
     body = _upsert_body(
         name="",
         room="",
@@ -247,11 +254,10 @@ def rtsp_test(
             f"{_API_PREFIX}/rtsp/test",
             body,
             safe_errors=True,
-            sensitive_values=tuple(
-                value for value in (password, username, validated_uri) if value
-            ),
+            sensitive_values=sensitive_values,
         ),
         pretty=pretty,
+        sensitive_values=sensitive_values,
     )
 
 
@@ -274,6 +280,7 @@ def rtsp_add(
     validated_room = _require(room, "--room")
     validated_uri = _require(uri, "--uri")
     password = _read_password(password_stdin)
+    sensitive_values = _sensitive_values(password, username, validated_uri)
     body = _upsert_body(
         name=validated_name,
         room=validated_room,
@@ -288,11 +295,10 @@ def rtsp_add(
             f"{_API_PREFIX}/rtsp",
             body,
             safe_errors=True,
-            sensitive_values=tuple(
-                value for value in (password, username, validated_uri) if value
-            ),
+            sensitive_values=sensitive_values,
         ),
         pretty=pretty,
+        sensitive_values=sensitive_values,
     )
 
 
@@ -321,6 +327,7 @@ def rtsp_edit(
     validated_transport = _require_present(transport, "--transport")
     validated_audio = _require_present(audio_enabled, "--audio/--no-audio")
     password = _read_password(password_stdin)
+    sensitive_values = _sensitive_values(password, validated_username, validated_uri)
     body = _upsert_body(
         name=validated_name,
         room=validated_room,
@@ -335,13 +342,10 @@ def rtsp_edit(
             f"{_API_PREFIX}/rtsp/{validated_id}",
             body,
             safe_errors=True,
-            sensitive_values=tuple(
-                value
-                for value in (password, validated_username, validated_uri)
-                if value
-            ),
+            sensitive_values=sensitive_values,
         ),
         pretty=pretty,
+        sensitive_values=sensitive_values,
     )
 
 
