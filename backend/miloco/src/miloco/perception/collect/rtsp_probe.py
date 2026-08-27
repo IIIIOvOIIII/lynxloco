@@ -8,6 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal, cast
 from urllib.parse import quote, urlsplit, urlunsplit
+from weakref import WeakKeyDictionary
 
 import av
 
@@ -23,6 +24,11 @@ class RtspProbeResult:
     time_base: str
     audio_codec: str | None
     audio_sample_rate: int | None
+
+
+_ACTIVE_PROBES: WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[str, asyncio.Task[RtspProbeResult]]
+] = WeakKeyDictionary()
 
 
 class RtspSourceError(RuntimeError):
@@ -46,12 +52,14 @@ def _validate_uri(uri: str) -> None:
     try:
         parts = urlsplit(uri)
         host = parts.hostname
+        port = parts.port
     except ValueError:
         raise _error("invalid_uri", "RTSP URI is invalid", recoverable=False) from None
 
     if (
         parts.scheme not in {"rtsp", "rtsps"}
         or host is None
+        or (port is not None and not 1 <= port <= 65535)
         or parts.username is not None
         or parts.password is not None
         or parts.fragment
@@ -72,7 +80,11 @@ def _authenticated_url(source: RtspSourceSettings) -> str:
     )
 
 
-def _classify_failure(failure: BaseException) -> RtspSourceError:
+def _classify_failure(
+    failure: BaseException, *, phase: Literal["open", "media"] = "open"
+) -> RtspSourceError:
+    if isinstance(failure, RtspSourceError):
+        return failure
     if isinstance(
         failure,
         (av.error.HTTPUnauthorizedError, av.error.HTTPForbiddenError, PermissionError),
@@ -97,6 +109,19 @@ def _classify_failure(failure: BaseException) -> RtspSourceError:
         )
     if isinstance(failure, (av.error.ConnectionResetError, ConnectionResetError)):
         return _error("connection_reset", "RTSP connection was reset", recoverable=True)
+    if phase == "media" and isinstance(
+        failure,
+        (
+            av.error.DecoderNotFoundError,
+            av.error.InvalidDataError,
+            av.error.NotImplementedError,
+        ),
+    ):
+        return _error(
+            "unsupported_video_codec",
+            "RTSP video codec could not be decoded",
+            recoverable=False,
+        )
     if isinstance(
         failure,
         (
@@ -110,8 +135,6 @@ def _classify_failure(failure: BaseException) -> RtspSourceError:
         ),
     ):
         return _error("connection_failed", "RTSP connection failed", recoverable=True)
-    if isinstance(failure, RtspSourceError):
-        return failure
     return _error("connection_failed", "RTSP connection failed", recoverable=True)
 
 
@@ -148,6 +171,15 @@ def _open_container(
 
 
 def _probe_sync(
+    source: RtspSourceSettings,
+    timeout_sec: float,
+    open_input: Callable[..., av.container.InputContainer],
+) -> RtspProbeResult:
+    with av.logging.Capture(local=True):
+        return _probe_sync_captured(source, timeout_sec, open_input)
+
+
+def _probe_sync_captured(
     source: RtspSourceSettings,
     timeout_sec: float,
     open_input: Callable[..., av.container.InputContainer],
@@ -214,7 +246,7 @@ def _probe_sync(
                 caught = close_failure
 
     if caught is not None:
-        classified = _classify_failure(caught)
+        classified = _classify_failure(caught, phase="media")
         caught = None
         raise classified
     assert result is not None
@@ -229,9 +261,36 @@ async def probe_rtsp_source(
 ) -> RtspProbeResult:
     """Validate an RTSP source within one caller-visible total timeout."""
     _validate_uri(source.uri)
+    loop = asyncio.get_running_loop()
+    source_id = source.id
+    loop_probes = _ACTIVE_PROBES.setdefault(loop, {})
+    active = loop_probes.get(source_id)
+    if active is not None and not active.done():
+        raise _error(
+            "probe_in_progress",
+            "RTSP source probe is already running",
+            recoverable=True,
+        )
+    if active is not None:
+        loop_probes.pop(source_id, None)
+
+    worker = asyncio.create_task(
+        asyncio.to_thread(_probe_sync, source, timeout_sec, open_input)
+    )
+    loop_probes[source_id] = worker
+
+    def _finish(done: asyncio.Task[RtspProbeResult]) -> None:
+        try:
+            done.exception()
+        except asyncio.CancelledError:
+            pass
+        if loop_probes.get(source_id) is done:
+            loop_probes.pop(source_id, None)
+
+    worker.add_done_callback(_finish)
     try:
         return await asyncio.wait_for(
-            asyncio.to_thread(_probe_sync, source, timeout_sec, open_input),
+            asyncio.shield(worker),
             timeout=timeout_sec,
         )
     except asyncio.TimeoutError:
