@@ -8,6 +8,11 @@ from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
+import numpy as np
+from numpy.typing import NDArray
+
+from miloco.camera.transcoder import SharedH264Transcoder
+
 
 @dataclass(frozen=True)
 class EncodedVideoPacket:
@@ -44,6 +49,24 @@ class SourceLifecycle(Protocol):
     ) -> Callable[[], None]: ...
 
 
+class DecodedVideoSource(Protocol):
+    def add_video_frame_listener(
+        self,
+        listener: Callable[[NDArray[np.uint8], int | None], None],
+    ) -> Callable[[], None]: ...
+
+
+class H264Transcoder(Protocol):
+    def attach(self) -> AsyncGenerator[bytes, None]: ...
+
+    async def push_frame(self, frame: NDArray[np.uint8], pts: int | None) -> None: ...
+
+    async def stop(self) -> None: ...
+
+
+TranscoderFactory = Callable[[Callable[[str], None]], H264Transcoder]
+
+
 @dataclass(frozen=True)
 class LiveStreamSource:
     """An already-owned source backend resolved without connection material."""
@@ -60,10 +83,17 @@ LiveStreamResolver = Callable[[str], Awaitable[LiveStreamSource]]
 
 @dataclass
 class _Subscriber:
-    packets: deque[EncodedVideoPacket]
+    packets: deque[_OutputChunk]
     ready: asyncio.Event
     closed: bool = False
     waiting_for_keyframe: bool = True
+    normalizer: object | None = None
+
+
+@dataclass(frozen=True)
+class _OutputChunk:
+    data: bytes
+    is_keyframe: bool
 
 
 @dataclass
@@ -72,13 +102,25 @@ class _CameraFeed:
     subscribers: dict[int, _Subscriber]
     packet_detach: Callable[[], None] = lambda: None
     lifecycle_detach: Callable[[], None] = lambda: None
+    frame_detach: Callable[[], None] = lambda: None
+    mode: Literal["passthrough", "transcoding", "error"] = "passthrough"
+    transcoder: H264Transcoder | None = None
+    transcode_stream: AsyncGenerator[bytes, None] | None = None
+    transcode_task: asyncio.Task[None] | None = None
+    h264_decoder_config: bytes = b""
     dropped_packets: int = 0
 
 
 class LiveStreamHub:
     """Fan out one existing encoded source to isolated bounded viewers."""
 
-    def __init__(self, resolver: LiveStreamResolver, *, queue_size: int = 8) -> None:
+    def __init__(
+        self,
+        resolver: LiveStreamResolver,
+        *,
+        queue_size: int = 8,
+        transcoder_factory: TranscoderFactory | None = None,
+    ) -> None:
         if queue_size < 1:
             raise ValueError("queue_size must be positive")
         self._resolver = resolver
@@ -87,6 +129,9 @@ class LiveStreamHub:
         self._states: dict[str, LiveStreamState] = {}
         self._lock = asyncio.Lock()
         self._next_subscriber_id = 0
+        self._transcoder_factory = transcoder_factory or (
+            lambda on_error: SharedH264Transcoder(on_error=on_error)
+        )
 
     async def subscribe(self, camera_id: str) -> AsyncGenerator[bytes, None]:
         subscriber_id, subscriber = await self._attach(camera_id)
@@ -107,7 +152,6 @@ class LiveStreamHub:
             if feed is None:
                 self._states[camera_id] = self._idle_state()
                 return
-            self._detach_source(feed)
             for subscriber in feed.subscribers.values():
                 subscriber.closed = True
                 subscriber.packets.clear()
@@ -115,6 +159,7 @@ class LiveStreamHub:
             self._states[camera_id] = self._idle_state(
                 dropped_packets=feed.dropped_packets
             )
+        await self._shutdown_feed(feed)
 
     def state(self, camera_id: str) -> LiveStreamState:
         feed = self._feeds.get(camera_id)
@@ -126,9 +171,11 @@ class LiveStreamHub:
         )
         return LiveStreamState(
             viewer_count=len(feed.subscribers),
-            mode="passthrough",
+            mode=feed.mode,
             input_codec=feed.source.input_codec,
-            output_codec=feed.source.input_codec,
+            output_codec=(
+                "h264" if feed.mode == "transcoding" else feed.source.input_codec
+            ),
             queue_depth=queue_depth,
             dropped_packets=feed.dropped_packets,
             error_code=None,
@@ -158,6 +205,11 @@ class LiveStreamHub:
                 def receive(packet: EncodedVideoPacket) -> None:
                     loop.call_soon_threadsafe(self._publish, camera_id, feed, packet)
 
+                def receive_frame(frame: NDArray[np.uint8], pts: int | None) -> None:
+                    loop.call_soon_threadsafe(
+                        self._schedule_frame, camera_id, feed, frame, pts
+                    )
+
                 def source_closed(error_code: str | None) -> None:
                     loop.call_soon_threadsafe(
                         self._source_closed, camera_id, feed, error_code
@@ -165,6 +217,13 @@ class LiveStreamHub:
 
                 try:
                     feed.packet_detach = listener_adder(receive)
+                    frame_adder = getattr(
+                        source.backend, "add_video_frame_listener", None
+                    )
+                    if source.source_type == "rtsp":
+                        if not callable(frame_adder):
+                            raise RuntimeError("Decoded video fan-out is unavailable")
+                        feed.frame_detach = frame_adder(receive_frame)
                     close_adder = getattr(source.backend, "add_close_listener", None)
                     if callable(close_adder):
                         feed.lifecycle_detach = close_adder(source_closed)
@@ -183,13 +242,34 @@ class LiveStreamHub:
                     )
                     raise
 
+                if source.source_type == "rtsp" and source.input_codec == "hevc":
+                    await self._activate_transcoder(camera_id, feed)
+
             subscriber_id = self._next_subscriber_id
             self._next_subscriber_id += 1
-            subscriber = _Subscriber(deque(), asyncio.Event())
+            normalizer: object | None = None
+            if feed.source.source_type == "rtsp" and feed.source.input_codec == "h264":
+                from miloco.camera.h264 import H264AnnexBNormalizer
+
+                normalizer = H264AnnexBNormalizer()
+                if feed.h264_decoder_config:
+                    normalizer.push(
+                        EncodedVideoPacket(
+                            codec="h264",
+                            data=feed.h264_decoder_config,
+                            pts=None,
+                            dts=None,
+                            is_keyframe=False,
+                            time_base_num=1,
+                            time_base_den=1,
+                        )
+                    )
+            subscriber = _Subscriber(deque(), asyncio.Event(), normalizer=normalizer)
             feed.subscribers[subscriber_id] = subscriber
             return subscriber_id, subscriber
 
     async def _detach(self, camera_id: str, subscriber_id: int) -> None:
+        stopped_feed: _CameraFeed | None = None
         async with self._lock:
             feed = self._feeds.get(camera_id)
             if feed is None:
@@ -202,10 +282,12 @@ class LiveStreamHub:
             if feed.subscribers:
                 return
             self._feeds.pop(camera_id, None)
-            self._detach_source(feed)
+            stopped_feed = feed
             self._states[camera_id] = self._idle_state(
                 dropped_packets=feed.dropped_packets
             )
+        if stopped_feed is not None:
+            await self._shutdown_feed(stopped_feed)
 
     def _publish(
         self,
@@ -216,9 +298,53 @@ class LiveStreamHub:
         feed = self._feeds.get(camera_id)
         if feed is not source_feed or not isinstance(packet, EncodedVideoPacket):
             return
+        if feed.source.source_type == "rtsp":
+            if feed.mode == "transcoding":
+                return
+            if packet.codec != "h264":
+                asyncio.create_task(self._activate_transcoder(camera_id, feed))
+                return
+            compatibility_checked = False
+            compatible = True
+            for subscriber in tuple(feed.subscribers.values()):
+                normalizer = subscriber.normalizer
+                try:
+                    inspect = getattr(normalizer, "inspect")
+                    compatibility = inspect(packet)
+                    compatibility_checked = True
+                    if not compatibility.passthrough:
+                        compatible = False
+                        break
+                except Exception:
+                    compatible = False
+                    break
+            if not compatibility_checked or not compatible:
+                asyncio.create_task(self._activate_transcoder(camera_id, feed))
+                return
+            for subscriber in tuple(feed.subscribers.values()):
+                try:
+                    push = getattr(subscriber.normalizer, "push")
+                    for data in push(packet):
+                        self._enqueue_chunk(
+                            feed,
+                            subscriber,
+                            _OutputChunk(data, packet.is_keyframe),
+                        )
+                    decoder_config = getattr(subscriber.normalizer, "decoder_config")()
+                    if decoder_config:
+                        feed.h264_decoder_config = decoder_config
+                except Exception:
+                    subscriber.closed = True
+                    subscriber.packets.clear()
+                    subscriber.ready.set()
+            return
         for subscriber in tuple(feed.subscribers.values()):
             try:
-                self._enqueue(feed, subscriber, packet)
+                self._enqueue_chunk(
+                    feed,
+                    subscriber,
+                    _OutputChunk(packet.data, packet.is_keyframe),
+                )
             except Exception:
                 # A corrupt subscriber must not interrupt any other viewer.
                 subscriber.closed = True
@@ -236,6 +362,7 @@ class LiveStreamHub:
             return
         self._feeds.pop(camera_id, None)
         self._detach_source(feed)
+        asyncio.create_task(self._stop_transcoder(feed))
         for subscriber in feed.subscribers.values():
             subscriber.closed = True
             subscriber.packets.clear()
@@ -262,27 +389,28 @@ class LiveStreamHub:
             feed.lifecycle_detach,
             lambda: None,
         )
-        for detach in (packet_detach, lifecycle_detach):
+        frame_detach, feed.frame_detach = feed.frame_detach, lambda: None
+        for detach in (packet_detach, lifecycle_detach, frame_detach):
             try:
                 detach()
             except Exception:
                 pass
 
-    def _enqueue(
+    def _enqueue_chunk(
         self,
         feed: _CameraFeed,
         subscriber: _Subscriber,
-        packet: EncodedVideoPacket,
+        chunk: _OutputChunk,
     ) -> None:
         if subscriber.closed:
             return
         if subscriber.waiting_for_keyframe:
-            if not packet.is_keyframe:
+            if not chunk.is_keyframe:
                 feed.dropped_packets += 1
                 return
             subscriber.waiting_for_keyframe = False
 
-        subscriber.packets.append(packet)
+        subscriber.packets.append(chunk)
         if len(subscriber.packets) > self._queue_size:
             subscriber.packets.popleft()
             feed.dropped_packets += 1
@@ -293,6 +421,148 @@ class LiveStreamHub:
                 subscriber.waiting_for_keyframe = True
         if subscriber.packets:
             subscriber.ready.set()
+
+    async def _activate_transcoder(
+        self, camera_id: str, source_feed: _CameraFeed
+    ) -> None:
+        feed = self._feeds.get(camera_id)
+        if feed is not source_feed or feed.mode == "error":
+            return
+        if feed.transcoder is not None:
+            feed.mode = "transcoding"
+            return
+        loop = asyncio.get_running_loop()
+
+        def on_error(error_code: str) -> None:
+            safe_code = (
+                error_code if error_code == "transcode_failed" else "transcode_failed"
+            )
+            loop.call_soon_threadsafe(
+                self._transcoder_failed, camera_id, feed, safe_code
+            )
+
+        transcoder = self._transcoder_factory(on_error)
+        feed.transcoder = transcoder
+        feed.mode = "transcoding"
+        stream = transcoder.attach()
+        feed.transcode_stream = stream
+        feed.transcode_task = asyncio.create_task(
+            self._consume_transcoder(camera_id, feed, transcoder, stream)
+        )
+
+    def _schedule_frame(
+        self,
+        camera_id: str,
+        source_feed: _CameraFeed,
+        frame: NDArray[np.uint8],
+        pts: int | None,
+    ) -> None:
+        feed = self._feeds.get(camera_id)
+        if feed is not source_feed or feed.mode != "transcoding":
+            return
+        transcoder = feed.transcoder
+        if transcoder is not None:
+            asyncio.create_task(
+                self._push_transcode_frame(camera_id, feed, transcoder, frame, pts)
+            )
+
+    async def _push_transcode_frame(
+        self,
+        camera_id: str,
+        source_feed: _CameraFeed,
+        transcoder: H264Transcoder,
+        frame: NDArray[np.uint8],
+        pts: int | None,
+    ) -> None:
+        if (
+            self._feeds.get(camera_id) is not source_feed
+            or source_feed.transcoder is not transcoder
+        ):
+            return
+        try:
+            await transcoder.push_frame(frame, pts)
+        except Exception:
+            self._transcoder_failed(camera_id, source_feed, "transcode_failed")
+
+    async def _consume_transcoder(
+        self,
+        camera_id: str,
+        source_feed: _CameraFeed,
+        transcoder: H264Transcoder,
+        stream: AsyncGenerator[bytes, None],
+    ) -> None:
+        try:
+            async for data in stream:
+                if (
+                    self._feeds.get(camera_id) is not source_feed
+                    or source_feed.transcoder is not transcoder
+                ):
+                    return
+                keyframe = self._annexb_contains_idr(data)
+                for subscriber in tuple(source_feed.subscribers.values()):
+                    self._enqueue_chunk(
+                        source_feed, subscriber, _OutputChunk(data, keyframe)
+                    )
+        except Exception:
+            self._transcoder_failed(camera_id, source_feed, "transcode_failed")
+
+    def _transcoder_failed(
+        self,
+        camera_id: str,
+        source_feed: _CameraFeed,
+        error_code: str,
+    ) -> None:
+        feed = self._feeds.get(camera_id)
+        if feed is not source_feed:
+            return
+        self._feeds.pop(camera_id, None)
+        feed.mode = "error"
+        self._detach_source(feed)
+        for subscriber in feed.subscribers.values():
+            subscriber.closed = True
+            subscriber.packets.clear()
+            subscriber.ready.set()
+        self._states[camera_id] = LiveStreamState(
+            viewer_count=0,
+            mode="error",
+            input_codec=feed.source.input_codec,
+            output_codec=None,
+            queue_depth=0,
+            dropped_packets=feed.dropped_packets,
+            error_code=(
+                error_code if error_code == "transcode_failed" else "transcode_failed"
+            ),
+        )
+        asyncio.create_task(self._stop_transcoder(feed))
+
+    async def _shutdown_feed(self, feed: _CameraFeed) -> None:
+        self._detach_source(feed)
+        await self._stop_transcoder(feed)
+
+    async def _stop_transcoder(self, feed: _CameraFeed) -> None:
+        transcoder, feed.transcoder = feed.transcoder, None
+        task, feed.transcode_task = feed.transcode_task, None
+        stream, feed.transcode_stream = feed.transcode_stream, None
+        if transcoder is not None:
+            try:
+                await transcoder.stop()
+            except Exception:
+                pass
+        current = asyncio.current_task()
+        if task is not None and task is not current:
+            await asyncio.gather(task, return_exceptions=True)
+        if stream is not None and task is None:
+            try:
+                await stream.aclose()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _annexb_contains_idr(data: bytes) -> bool:
+        normalized = data.replace(b"\x00\x00\x01", b"\x00\x00\x00\x01")
+        return any(
+            nal and nal[0] & 0x1F == 5 for nal in normalized.split(b"\x00\x00\x00\x01")
+        )
 
     @staticmethod
     def _idle_state(*, dropped_packets: int = 0) -> LiveStreamState:

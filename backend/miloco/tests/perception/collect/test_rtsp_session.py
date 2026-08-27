@@ -1186,6 +1186,49 @@ async def test_packet_snapshot_and_decode_share_one_open_session(
 
 
 @pytest.mark.asyncio
+async def test_decoded_frame_listener_reuses_perception_decode_and_is_isolated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_module = _rtsp_session()
+    packet = _Packet(_stream("video", "hevc"), [_VideoFrame(17)])
+    container = _YieldThenBlockContainer(packet)
+    opener = _SequenceOpener(container)
+    monkeypatch.setattr(session_module.av, "open", opener)
+    session = session_module.RtspSession(_source())
+    perception: list[int] = []
+    live: list[tuple[int, int | None]] = []
+    done = asyncio.Event()
+
+    def broken_listener(_frame: np.ndarray, _pts: int | None) -> None:
+        raise RuntimeError("private frame material")
+
+    def live_listener(frame: np.ndarray, pts: int | None) -> None:
+        live.append((int(frame[0, 0, 0]), pts))
+        done.set()
+
+    broken_detach = session.add_video_frame_listener(broken_listener)
+    live_detach = session.add_video_frame_listener(live_listener)
+
+    async def video_cb(
+        _did: str,
+        frame: np.ndarray,
+        *_args: object,
+    ) -> None:
+        perception.append(int(frame[0, 0, 0]))
+
+    await session.start(video_cb, _unused_audio_cb)
+    await asyncio.wait_for(done.wait(), timeout=1.0)
+
+    assert perception == [17]
+    assert live == [(17, 17)]
+    assert opener.calls == 1
+    assert packet.decode_calls == 1
+    broken_detach()
+    live_detach()
+    await session.stop()
+
+
+@pytest.mark.asyncio
 async def test_close_listener_reports_manual_and_terminal_shutdown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

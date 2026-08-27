@@ -53,6 +53,12 @@ class CloseListener(Protocol):
     def __call__(self, error_code: str | None) -> None: ...
 
 
+class VideoFrameListener(Protocol):
+    """A consumer of the same decoded BGR frame used by perception."""
+
+    def __call__(self, frame: NDArray[np.uint8], pts: int | None) -> None: ...
+
+
 @dataclass(frozen=True)
 class _DecodedEvent:
     kind: Literal["video", "audio"]
@@ -83,6 +89,7 @@ class RtspSession:
         self._video_cb: VideoFrameCallback | None = None
         self._audio_cb: AudioFrameCallback | None = None
         self._listeners: tuple[PacketListener, ...] = ()
+        self._video_frame_listeners: tuple[VideoFrameListener, ...] = ()
         self._close_listeners: tuple[CloseListener, ...] = ()
         self._close_listener_lock = threading.Lock()
         self._ingress_lock = threading.Lock()
@@ -209,6 +216,27 @@ class RtspSession:
 
         if already_closed:
             notify_once(error_code)
+        return unsubscribe
+
+    def add_video_frame_listener(
+        self, listener: VideoFrameListener
+    ) -> Callable[[], None]:
+        """Attach to decoded perception frames without opening another source."""
+        if listener not in self._video_frame_listeners:
+            self._video_frame_listeners = (*self._video_frame_listeners, listener)
+        removed = False
+
+        def unsubscribe() -> None:
+            nonlocal removed
+            if removed:
+                return
+            removed = True
+            self._video_frame_listeners = tuple(
+                registered
+                for registered in self._video_frame_listeners
+                if registered is not listener
+            )
+
         return unsubscribe
 
     async def _main(self) -> None:
@@ -614,17 +642,29 @@ class RtspSession:
                         return
                     break
                 self._mark_frame(event)
-                try:
-                    if event.kind == "video" and self._video_cb is not None:
-                        await self._video_cb(
-                            self._source.id,
-                            cast(NDArray[np.uint8], event.frame),
-                            event.stream_ts,
-                            0,
-                            event.recv_unix_ms,
-                            event.decoded_unix_ms,
-                        )
-                    elif event.kind == "audio" and self._audio_cb is not None:
+                if event.kind == "video":
+                    try:
+                        if self._video_cb is not None:
+                            await self._video_cb(
+                                self._source.id,
+                                cast(NDArray[np.uint8], event.frame),
+                                event.stream_ts,
+                                0,
+                                event.recv_unix_ms,
+                                event.decoded_unix_ms,
+                            )
+                    except Exception:
+                        pass
+                    for listener in self._video_frame_listeners:
+                        try:
+                            listener(
+                                cast(NDArray[np.uint8], event.frame),
+                                event.stream_ts,
+                            )
+                        except Exception:
+                            pass
+                elif event.kind == "audio" and self._audio_cb is not None:
+                    try:
                         await self._audio_cb(
                             self._source.id,
                             cast(NDArray[np.int16], event.frame),
@@ -633,8 +673,8 @@ class RtspSession:
                             event.recv_unix_ms,
                             event.decoded_unix_ms,
                         )
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
 
     async def _consume_packet_ingress(self) -> None:
         assert self._packet_ready is not None
