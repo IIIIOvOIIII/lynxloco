@@ -20,3 +20,10 @@
 - Expected result: 仓库只包含已批准的设计与进度文档变更，工作区干净，不向无授权上游写入。
 - Result: Achieved。设计与进度文档已提交；未修改实现代码，未推送到小米上游。
 - Next step: 等待用户审阅正式设计文档；用户明确批准文档后，调用 writing-plans 创建三个独立批次的详细实施计划。
+
+## 2026-08-28 00:32 SGT
+
+- Current work: 用户已书面批准设计；使用 writing-plans 将工作拆成 RTSP 感知基础、RTSP 实时预览、OpenAI Responses Omni 三份可独立实施和回滚的计划，并执行跨计划自检。
+- Expected result: 每份计划具备准确文件路径、接口契约、TDD 步骤、逐任务验证命令、提交边界和最终验收门禁；不修改业务代码。
+- Result: Achieved。三份计划共 1,031 行、196 个可勾选步骤；未发现 TODO/TBD/FIXME/未决路径，占位符扫描与 `git diff --check` 通过。计划固定了 MIoT DID 兼容、单 RTSP 会话复用、H.265 按观看者转码、Responses 12 图硬上限、空 Key/Bearer 鉴权、协议禁止自动回退及真实 E2E `not_measured` 边界。
+- Next step: 本地提交设计状态、三份实施计划与本进度记录；随后由用户选择在当前会话按 subagent-driven-development 执行，或在单独会话按 executing-plans 分批执行。
