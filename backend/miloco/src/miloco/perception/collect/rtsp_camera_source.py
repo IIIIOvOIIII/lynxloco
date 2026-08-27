@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -51,6 +52,7 @@ class RtspCameraSource:
         self._settings_loader = settings_loader
         self._sessions: dict[str, _SessionEntry] = {}
         self._pending_cleanup: dict[str, _SessionEntry] = {}
+        self._terminal_tombstones: dict[str, str] = {}
         self._lifecycle_lock = asyncio.Lock()
 
     def _load_settings(self) -> dict[str, RtspSourceSettings]:
@@ -65,7 +67,7 @@ class RtspCameraSource:
         return {
             setting.id: self._as_device(setting)
             for setting in self._settings_loader()
-            if setting.enabled
+            if setting.enabled and not self._is_terminally_suppressed(setting)
         }
 
     async def connect_device(
@@ -82,6 +84,10 @@ class RtspCameraSource:
             setting = self._load_settings().get(did)
             if setting is None or not setting.enabled:
                 return
+            fingerprint = self._connection_fingerprint(setting)
+            if self._terminal_tombstones.get(did) == fingerprint:
+                return
+            self._terminal_tombstones.pop(did, None)
 
             session: RtspSession | None = None
             try:
@@ -107,6 +113,7 @@ class RtspCameraSource:
         """Apply settings to active sessions without rebuilding unchanged sources."""
         async with self._lifecycle_lock:
             settings = self._load_settings()
+            self._reconcile_terminal_tombstones(settings)
             success = True
             reconcile_dids = set(self._pending_cleanup)
 
@@ -166,7 +173,29 @@ class RtspCameraSource:
     def retain_pending_connection(self, did: str) -> bool:
         """Keep adapter buffers while a registered session connects/reconnects."""
         entry = self._sessions.get(did)
-        return entry is not None and entry.session.is_active() is True
+        if entry is None:
+            return False
+        if entry.session.is_active() is True:
+            return True
+        if entry.session.is_terminal() is True:
+            self._terminal_tombstones[did] = self._connection_fingerprint(entry.setting)
+        return False
+
+    async def request_retry(self, did: str) -> bool:
+        """Clear terminal suppression before one explicit adapter retry."""
+        async with self._lifecycle_lock:
+            setting = self._load_settings().get(did)
+            if setting is None or not setting.enabled:
+                self._terminal_tombstones.pop(did, None)
+                return False
+            if did in self._pending_cleanup and not await self._retry_pending(did):
+                return False
+            entry = self._sessions.get(did)
+            if entry is not None and not entry.session.is_active():
+                if not await self._stop_active(did):
+                    return False
+            self._terminal_tombstones.pop(did, None)
+            return True
 
     def get_state(self, did: str) -> CameraSourceState:
         entry = self._sessions.get(did) or self._pending_cleanup.get(did)
@@ -179,6 +208,23 @@ class RtspCameraSource:
         if setting is None or not setting.enabled:
             return None
         return self._as_device(setting)
+
+    def _reconcile_terminal_tombstones(
+        self, settings: dict[str, RtspSourceSettings]
+    ) -> None:
+        for did, fingerprint in list(self._terminal_tombstones.items()):
+            setting = settings.get(did)
+            if (
+                setting is None
+                or not setting.enabled
+                or self._connection_fingerprint(setting) != fingerprint
+            ):
+                self._terminal_tombstones.pop(did, None)
+
+    def _is_terminally_suppressed(self, setting: RtspSourceSettings) -> bool:
+        return self._terminal_tombstones.get(
+            setting.id
+        ) == self._connection_fingerprint(setting)
 
     async def shutdown(self) -> None:
         async with self._lifecycle_lock:
@@ -236,6 +282,16 @@ class RtspCameraSource:
         return any(
             getattr(old, field) != getattr(new, field) for field in _CONNECTION_FIELDS
         )
+
+    @staticmethod
+    def _connection_fingerprint(setting: RtspSourceSettings) -> str:
+        digest = hashlib.sha256()
+        for field in _CONNECTION_FIELDS:
+            digest.update(field.encode())
+            digest.update(b"\0")
+            digest.update(str(getattr(setting, field)).encode())
+            digest.update(b"\0")
+        return digest.hexdigest()
 
     @staticmethod
     def _as_device(setting: RtspSourceSettings) -> PerceptionDevice:

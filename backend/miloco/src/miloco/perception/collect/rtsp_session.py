@@ -64,6 +64,7 @@ class RtspSession:
         self._source = source
         self._queue_size = queue_size
         self._state = CameraSourceState(connected=False)
+        self._terminal = False
         self._task: asyncio.Task[None] | None = None
         self._lifecycle_lock = asyncio.Lock()
         self._stop_async: asyncio.Event | None = None
@@ -106,6 +107,7 @@ class RtspSession:
             self._packet_ready = asyncio.Event()
             self._stop_async = asyncio.Event()
             self._stop_thread.clear()
+            self._terminal = False
             self._producer_done = False
             self._clear_ingress()
             self._listener_executor = ThreadPoolExecutor(
@@ -142,6 +144,10 @@ class RtspSession:
         """Return whether the background producer task is still alive."""
         task = self._task
         return task is not None and not task.done()
+
+    def is_terminal(self) -> bool:
+        """Return whether the producer stopped on a non-recoverable failure."""
+        return self._terminal
 
     def add_packet_listener(self, listener: PacketListener) -> Callable[[], None]:
         if listener not in self._listeners:
@@ -190,6 +196,7 @@ class RtspSession:
         try:
             _validate_uri(self._source.uri)
         except RtspSourceError as error:
+            self._terminal = not error.recoverable
             self._record_error(error, reconnect_attempt=0)
             return
 
@@ -233,6 +240,7 @@ class RtspSession:
             if saw_frame:
                 attempt = 0
             if not error.recoverable:
+                self._terminal = True
                 self._record_error(error, reconnect_attempt=attempt)
                 return
 

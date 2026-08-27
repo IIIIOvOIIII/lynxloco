@@ -215,6 +215,7 @@ class _AdapterRtspSession:
         self.source = source
         self.connected = False
         self.active = False
+        self.terminal = False
         self.stop_count = 0
         self.instances.append(self)
 
@@ -242,6 +243,9 @@ class _AdapterRtspSession:
 
     def is_active(self) -> bool:
         return self.active
+
+    def is_terminal(self) -> bool:
+        return self.terminal
 
 
 @pytest.fixture(autouse=True)
@@ -352,6 +356,9 @@ async def test_sync_camera_sources_serializes_apply_then_adapter_sync() -> None:
             await asyncio.sleep(0)
             return SimpleNamespace(success=True, reconcile_dids=frozenset())
 
+        async def request_retry(self, did: str) -> bool:
+            return True
+
     class _Adapter:
         async def reconcile_and_sync(
             self, disconnect_dids: frozenset[str], *, connect_enabled: bool
@@ -440,6 +447,101 @@ async def test_restart_failure_has_no_phantom_and_later_sync_recovers(
     assert await service.sync_camera_sources() is True
     assert set(adapter.get_connected_devices()) == {camera_id}
     assert rtsp.get_state(camera_id).connected is True
+
+
+@pytest.mark.asyncio
+async def test_terminal_rtsp_stays_suppressed_until_connection_config_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "miloco.perception.collect.rtsp_camera_source.RtspSession",
+        _AdapterRtspSession,
+    )
+    camera_id = "rtsp:00000000-0000-0000-0000-000000000012"
+    configured = RtspSourceSettings(
+        id=camera_id,
+        name="terminal camera",
+        uri="rtsp://private-host.example/secret-path",
+        username="private-user",
+        password="private-password",
+        enabled=True,
+    )
+    settings = [configured]
+    rtsp = RtspCameraSource(lambda: settings)
+    adapter = CameraDeviceAdapter(sources=[rtsp])
+    await adapter.sync_devices()
+    terminal = rtsp.get_session(camera_id)
+    assert isinstance(terminal, _AdapterRtspSession)
+    terminal.connected = False
+    terminal.active = False
+    terminal.terminal = True
+
+    await adapter.sync_devices()
+    await adapter.sync_devices()
+    await adapter.sync_devices()
+
+    assert adapter.get_connected_devices() == {}
+    assert rtsp.get_session(camera_id) is None
+    assert len(_AdapterRtspSession.instances) == 1
+    assert "private-password" not in repr(rtsp._terminal_tombstones)
+    assert "private-user" not in repr(rtsp._terminal_tombstones)
+    assert "secret-path" not in repr(rtsp._terminal_tombstones)
+
+    settings = [configured.model_copy(update={"name": "metadata only"})]
+    await rtsp.apply_settings()
+    await adapter.sync_devices()
+    assert len(_AdapterRtspSession.instances) == 1
+
+    settings = [
+        settings[0].model_copy(update={"uri": "rtsp://recovered.example/stream"})
+    ]
+    await rtsp.apply_settings()
+    await adapter.sync_devices()
+
+    assert len(_AdapterRtspSession.instances) == 2
+    assert set(adapter.get_connected_devices()) == {camera_id}
+
+
+@pytest.mark.asyncio
+async def test_explicit_retry_restarts_terminal_rtsp_without_config_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "miloco.perception.collect.rtsp_camera_source.RtspSession",
+        _AdapterRtspSession,
+    )
+    camera_id = "rtsp:00000000-0000-0000-0000-000000000013"
+    settings = [
+        RtspSourceSettings(
+            id=camera_id,
+            name="manual retry camera",
+            uri="rtsp://retry.example/stream",
+            enabled=True,
+        )
+    ]
+    rtsp = RtspCameraSource(lambda: settings)
+    adapter = CameraDeviceAdapter(sources=[rtsp])
+    runner = MagicMock()
+    runner.is_running = True
+    service = PerceptionService(
+        collector=MagicMock(),
+        pipeline=MagicMock(),
+        perception_runner=runner,
+        log_repo=MagicMock(),
+        rtsp_camera_source=rtsp,
+        camera_adapter=adapter,
+    )
+    await adapter.sync_devices()
+    terminal = rtsp.get_session(camera_id)
+    assert isinstance(terminal, _AdapterRtspSession)
+    terminal.connected = False
+    terminal.active = False
+    terminal.terminal = True
+
+    assert await service.retry_camera_source(camera_id) is True
+
+    assert len(_AdapterRtspSession.instances) == 2
+    assert set(adapter.get_connected_devices()) == {camera_id}
 
 
 @pytest.mark.asyncio
@@ -615,6 +717,9 @@ async def test_stop_race_cannot_reconnect_after_shutdown() -> None:
     class _Source:
         async def apply_settings(self):
             return SimpleNamespace(success=True, reconcile_dids=frozenset())
+
+        async def request_retry(self, did: str) -> bool:
+            return True
 
     class _Adapter:
         async def reconcile_and_sync(

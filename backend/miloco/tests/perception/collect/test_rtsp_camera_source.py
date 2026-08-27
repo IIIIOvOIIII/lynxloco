@@ -47,6 +47,7 @@ class _RecordingSession:
         self.stop_count = 0
         self.connected = False
         self.active = False
+        self.terminal = False
         self.state_override: CameraSourceState | None = None
         self.video_cb = None
         self.audio_cb = None
@@ -75,6 +76,9 @@ class _RecordingSession:
 
     def is_active(self) -> bool:
         return self.active
+
+    def is_terminal(self) -> bool:
+        return self.terminal
 
 
 @pytest.fixture(autouse=True)
@@ -183,9 +187,37 @@ async def test_terminal_session_is_not_a_retainable_pending_registration() -> No
     assert isinstance(session, _RecordingSession)
     session.connected = False
     session.active = False
+    session.terminal = True
 
     assert source.get_state(enabled.id).connected is False
     assert source.retain_pending_connection(enabled.id) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("removed", [False, True])
+async def test_disable_or_delete_clears_terminal_retry_suppression(
+    removed: bool,
+) -> None:
+    configured = _source(1)
+    current = [configured]
+    source = RtspCameraSource(lambda: current)
+    await source.connect_device(configured.id, _video_cb, _audio_cb)
+    terminal = source.get_session(configured.id)
+    assert isinstance(terminal, _RecordingSession)
+    terminal.connected = False
+    terminal.active = False
+    terminal.terminal = True
+    assert source.retain_pending_connection(configured.id) is False
+    await source.disconnect_device(configured.id)
+
+    current = [] if removed else [configured.model_copy(update={"enabled": False})]
+    await source.apply_settings()
+    current = [configured]
+    await source.apply_settings()
+    await source.connect_device(configured.id, _video_cb, _audio_cb)
+
+    assert source.get_session(configured.id) is not None
+    assert len(_RecordingSession.instances) == 2
 
 
 @pytest.mark.asyncio

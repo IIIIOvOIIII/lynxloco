@@ -101,6 +101,8 @@ class _Perception:
     ) -> None:
         self.sync_results = list(sync_results or [True])
         self.sync_count = 0
+        self.retry_count = 0
+        self.retry_ids: list[str] = []
         self.events: list[str] = []
         state_map = states or {}
         self._rtsp_camera_source = SimpleNamespace(
@@ -114,6 +116,12 @@ class _Perception:
         if isinstance(result, BaseException):
             raise result
         return result
+
+    async def retry_camera_source(self, camera_id: str) -> bool:
+        self.events.append("retry")
+        self.retry_count += 1
+        self.retry_ids.append(camera_id)
+        return True
 
 
 class _Miot:
@@ -327,6 +335,26 @@ async def test_enable_probes_then_persists_then_hot_applies(
     assert events == ["probe", "persist", "sync"]
     assert enabled.enabled is True
     assert store.sources[0].enabled is True
+
+
+@pytest.mark.asyncio
+async def test_enable_already_enabled_probes_then_explicitly_retries_without_write() -> (
+    None
+):
+    store = _ConfigStore([_source(enabled=True)])
+    perception = _Perception()
+
+    async def probe(_source: RtspSourceSettings) -> RtspProbeResult:
+        perception.events.append("probe")
+        return _probe_result()
+
+    enabled = await _service(store, perception, probe=probe).enable(SOURCE_ID)
+
+    assert perception.events == ["probe", "retry"]
+    assert enabled.enabled is True
+    assert store.write_count == 0
+    assert perception.sync_count == 0
+    assert perception.retry_ids == [SOURCE_ID]
 
 
 @pytest.mark.asyncio

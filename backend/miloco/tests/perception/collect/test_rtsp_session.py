@@ -339,6 +339,7 @@ async def test_stop_cancels_backoff_without_waiting_for_delay(
 
     await session.start(_unused_video_cb, _unused_audio_cb)
     await _wait_until(lambda: session.state().reconnect_attempt == 1)
+    assert session.is_terminal() is False
     await asyncio.wait_for(session.stop(), timeout=0.2)
 
     assert session.state().connected is False
@@ -537,6 +538,7 @@ async def test_terminal_source_error_stops_without_reconnect_and_redacts_state(
     state = session.state()
     assert opener.calls == 1
     assert state.connected is False
+    assert session.is_terminal() is True
     assert state.error_message == "RTSP resource was not found"
     assert "private" not in repr(state)
     assert "secret" not in repr(state)

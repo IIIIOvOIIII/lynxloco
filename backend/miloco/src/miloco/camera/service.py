@@ -25,6 +25,8 @@ class _MiotCameraLister(Protocol):
 class _CameraSourceSynchronizer(Protocol):
     async def sync_camera_sources(self) -> bool: ...
 
+    async def retry_camera_source(self, camera_id: str) -> bool: ...
+
 
 class CameraServiceError(RuntimeError):
     """Stable, credential-free management failure."""
@@ -117,6 +119,15 @@ class CameraService:
             sources = await asyncio.to_thread(self._load_sources_safely)
             _index, current = self._locate(sources, camera_id)
             await self._probe(current)
+            if current.enabled:
+                retried = await self._await_shielded_transaction(
+                    self._retry_safely(camera_id)
+                )
+                if not retried:
+                    raise CameraConflictError(
+                        "hot_apply_failed", "Camera update could not be applied"
+                    )
+                return self._rtsp_summary(current)
             enabled = await self._await_shielded_transaction(
                 self._enable_transaction(camera_id)
             )
@@ -277,6 +288,13 @@ class CameraService:
             return await self._perception_service.sync_camera_sources()
         except Exception as error:  # noqa: BLE001
             logger.error("Camera hot apply failed (%s)", type(error).__name__)
+            return False
+
+    async def _retry_safely(self, camera_id: str) -> bool:
+        try:
+            return await self._perception_service.retry_camera_source(camera_id)
+        except Exception as error:  # noqa: BLE001
+            logger.error("Camera retry failed (%s)", type(error).__name__)
             return False
 
     def _rtsp_state(self, camera_id: str) -> CameraSourceState:

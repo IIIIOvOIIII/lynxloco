@@ -35,6 +35,8 @@ from miloco.utils.time_utils import ms_to_iso_local, now_ms
 class _RtspSettingsApplier(Protocol):
     async def apply_settings(self) -> RtspApplyResult: ...
 
+    async def request_retry(self, did: str) -> bool: ...
+
 
 class _CameraSourceSynchronizer(Protocol):
     async def reconcile_and_sync(
@@ -105,6 +107,26 @@ class PerceptionService:
                     )
                     success = False
                 return success
+
+    async def retry_camera_source(self, did: str) -> bool:
+        """Clear one terminal tombstone and perform one explicit reconnect."""
+        if self._rtsp_camera_source is None or self._camera_adapter is None:
+            return True
+        async with self._lifecycle_lock:
+            async with self._camera_sources_lock:
+                if not await self._rtsp_camera_source.request_retry(did):
+                    return False
+                try:
+                    return await self._camera_adapter.reconcile_and_sync(
+                        frozenset({did}),
+                        connect_enabled=self._engine.is_running,
+                    )
+                except Exception as error:  # noqa: BLE001
+                    logger.error(
+                        "[service] camera source retry failed (%s)",
+                        type(error).__name__,
+                    )
+                    return False
 
     async def stop_to_unconfigured(self) -> None:
         """软停引擎回到「未配模型」态(删当前生效模型用),保留 tick 自愈循环。
