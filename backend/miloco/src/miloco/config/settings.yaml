@@ -63,6 +63,7 @@ notify:
 camera:
   frame_interval: 1000   # 帧采集间隔（毫秒）
   max_cache_images: 6    # 最大缓存图像数量
+  rtsp_sources: []       # 手工配置的 RTSP 摄像机来源
 
 # 规则引擎相关配置
 rule:

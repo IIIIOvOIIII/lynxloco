@@ -18,6 +18,7 @@ import logging
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, ClassVar, Literal
+from urllib.parse import urlsplit
 
 import yaml
 from pydantic import BaseModel, Field, computed_field, field_validator, model_validator
@@ -270,11 +271,61 @@ class SchedulerSettings(BaseModel):
     )
 
 
+class RtspSourceSettings(BaseModel):
+    """手工配置的 RTSP 摄像机来源。"""
+
+    id: str
+    name: str
+    room_name: str = ""
+    uri: str
+    username: str = ""
+    password: str = ""
+    transport: Literal["tcp", "udp"] = "tcp"
+    audio_enabled: bool = True
+    enabled: bool = False
+
+    @field_validator("id")
+    @classmethod
+    def _validate_id(cls, value: str) -> str:
+        if not value.startswith("rtsp:"):
+            raise ValueError("RTSP source id must start with 'rtsp:'")
+        return value
+
+    @field_validator("uri")
+    @classmethod
+    def _validate_uri(cls, value: str) -> str:
+        if any(ord(character) < 32 or ord(character) == 127 for character in value):
+            raise ValueError("RTSP URI must not contain control characters")
+
+        try:
+            parts = urlsplit(value)
+        except ValueError as exc:
+            raise ValueError("RTSP URI is invalid") from exc
+
+        if parts.scheme not in {"rtsp", "rtsps"}:
+            raise ValueError("RTSP URI scheme must be rtsp or rtsps")
+        if parts.username is not None or parts.password is not None:
+            raise ValueError("RTSP URI must not include userinfo")
+        if parts.hostname is None:
+            raise ValueError("RTSP URI must include a host")
+        if "#" in value:
+            raise ValueError("RTSP URI must not include a fragment")
+        return value
+
+
 class CameraSettings(BaseModel):
     """摄像头采集参数。"""
 
     frame_interval: int = Field(default=1000, description="帧采集间隔（毫秒）")
     max_cache_images: int = Field(default=6, description="最大缓存图像数量")
+    rtsp_sources: list[RtspSourceSettings] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_unique_rtsp_source_ids(self) -> CameraSettings:
+        source_ids = [source.id for source in self.rtsp_sources]
+        if len(source_ids) != len(set(source_ids)):
+            raise ValueError("RTSP source ids must be unique")
+        return self
 
 
 class RuleSettings(BaseModel):

@@ -56,17 +56,18 @@ def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
     """Write JSON atomically via tmpfile + ``os.replace``."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    os.fchmod(fd, 0o600)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-            f.write("\n")
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(tmp, path)
-    except BaseException:
-        try:
+        os.chmod(path, 0o600)
+    finally:
+        if os.path.exists(tmp):
             os.unlink(tmp)
-        except OSError:
-            pass
-        raise
 
 
 def ensure_backend_token() -> str:
