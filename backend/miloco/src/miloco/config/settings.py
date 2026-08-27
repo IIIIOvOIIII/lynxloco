@@ -19,9 +19,17 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 from urllib.parse import urlsplit
+from uuid import UUID
 
 import yaml
-from pydantic import BaseModel, Field, computed_field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -274,7 +282,9 @@ class SchedulerSettings(BaseModel):
 class RtspSourceSettings(BaseModel):
     """手工配置的 RTSP 摄像机来源。"""
 
-    id: str
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    id: str = Field(frozen=True)
     name: str
     room_name: str = ""
     uri: str
@@ -287,8 +297,16 @@ class RtspSourceSettings(BaseModel):
     @field_validator("id")
     @classmethod
     def _validate_id(cls, value: str) -> str:
-        if not value.startswith("rtsp:"):
-            raise ValueError("RTSP source id must start with 'rtsp:'")
+        prefix = "rtsp:"
+        if not value.startswith(prefix):
+            raise ValueError("RTSP source id must use the 'rtsp:<uuid>' format")
+        suffix = value.removeprefix(prefix)
+        try:
+            parsed_uuid = UUID(suffix)
+        except ValueError as exc:
+            raise ValueError("RTSP source id must use the 'rtsp:<uuid>' format") from exc
+        if str(parsed_uuid) != suffix:
+            raise ValueError("RTSP source id must use the 'rtsp:<uuid>' format")
         return value
 
     @field_validator("uri")

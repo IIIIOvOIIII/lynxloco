@@ -9,10 +9,12 @@ import pytest
 from miloco.config.settings import CameraSettings, RtspSourceSettings
 from pydantic import ValidationError
 
+_SOURCE_ID = "rtsp:00000000-0000-0000-0000-000000000001"
+
 
 def _source(**overrides: object) -> RtspSourceSettings:
     data: dict[str, object] = {
-        "id": "rtsp:living-room",
+        "id": _SOURCE_ID,
         "name": "Living room",
         "uri": "rtsp://camera.local:554/stream1",
     }
@@ -47,9 +49,37 @@ def test_rtsp_source_rejects_unsafe_or_incomplete_uris(uri: str) -> None:
         _source(uri=uri)
 
 
-def test_rtsp_source_requires_rtsp_prefixed_id() -> None:
+@pytest.mark.parametrize(
+    "source_id",
+    [
+        "living-room",
+        "rtsp:",
+        "rtsp:living-room",
+        "rtsp:00000000-0000-0000-0000-00000000000z",
+    ],
+)
+def test_rtsp_source_requires_an_rtsp_prefixed_uuid_id(source_id: str) -> None:
     with pytest.raises(ValidationError):
-        _source(id="living-room")
+        _source(id=source_id)
+
+
+def test_rtsp_source_id_is_immutable_after_creation() -> None:
+    source = _source()
+
+    with pytest.raises(ValidationError):
+        source.id = "rtsp:00000000-0000-0000-0000-000000000002"
+
+
+def test_rtsp_source_validation_error_hides_userinfo_uri() -> None:
+    uri = "rtsp://private-user:private-password@camera.local/stream1"
+
+    with pytest.raises(ValidationError) as exc_info:
+        _source(uri=uri)
+
+    for rendered_error in (str(exc_info.value), repr(exc_info.value)):
+        assert uri not in rendered_error
+        assert "private-user" not in rendered_error
+        assert "private-password" not in rendered_error
 
 
 def test_camera_rejects_duplicate_rtsp_source_ids() -> None:
