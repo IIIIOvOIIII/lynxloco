@@ -5,12 +5,14 @@ Perception module — multimodal smart home perception engine.
 import asyncio
 import logging
 
+from miloco.config import get_settings
 from miloco.database.on_demand_log_repo import OnDemandLogRepo
 from miloco.database.perception_repo import PerceptionLogRepo
 from miloco.perception.client import PerceptionEngineProxy
 from miloco.perception.collect.camera_adapter import CameraDeviceAdapter
 from miloco.perception.collect.collector import MultimodalCollector
 from miloco.perception.collect.miot_camera_source import MiotCameraSource
+from miloco.perception.collect.rtsp_camera_source import RtspCameraSource
 from miloco.perception.processor import PipelineProcessor
 
 logger = logging.getLogger(__name__)
@@ -39,8 +41,9 @@ async def init_perception_module(miot_proxy, kv_repo):
 
     # 3. 初始化相机适配器
     miot_source = MiotCameraSource(miot_proxy)
+    rtsp_source = RtspCameraSource(lambda: get_settings().camera.rtsp_sources)
     camera_adapter = CameraDeviceAdapter(
-        sources=[miot_source],
+        sources=[miot_source, rtsp_source],
         on_window_ready=mark_window_ready,
     )
 
@@ -69,6 +72,8 @@ async def init_perception_module(miot_proxy, kv_repo):
         perception_runner=perception_runner,
         log_repo=perception_log_repo,
         on_demand_log_repo=on_demand_log_repo,
+        rtsp_camera_source=rtsp_source,
+        camera_adapter=camera_adapter,
     )
 
     # 7.1 把 omni 熔断器的状态变化桥接到 SSE(通过 PipelineProcessor._publish),

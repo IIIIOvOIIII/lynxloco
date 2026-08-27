@@ -9,9 +9,12 @@ from the realtime stream buffers via collector.collect_batch(),
 ensuring a unified data path.
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
 import shutil
+from typing import Protocol
 
 from miloco.database.on_demand_log_repo import OnDemandLogRepo
 from miloco.database.perception_repo import PerceptionLogRepo
@@ -27,6 +30,15 @@ from miloco.perception.schema import (
 from miloco.perception.types import PerceptionDevice
 from miloco.utils.time_utils import ms_to_iso_local, now_ms
 
+
+class _RtspSettingsApplier(Protocol):
+    async def apply_settings(self) -> None: ...
+
+
+class _CameraSourceSynchronizer(Protocol):
+    async def sync_devices(self, all_devices: dict | None = None) -> None: ...
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -40,16 +52,21 @@ class PerceptionService:
         perception_runner: PerceptionRunner,
         log_repo: PerceptionLogRepo,
         on_demand_log_repo: OnDemandLogRepo | None = None,
+        rtsp_camera_source: _RtspSettingsApplier | None = None,
+        camera_adapter: _CameraSourceSynchronizer | None = None,
     ):
         self._collector = collector
         self._pipeline = pipeline
         self._engine = perception_runner
         self._log_repo = log_repo
         self._od_log_repo = on_demand_log_repo or OnDemandLogRepo()
+        self._rtsp_camera_source = rtsp_camera_source
+        self._camera_adapter = camera_adapter
         # 串行化引擎生命周期操作(start/stop/重建/降级)。这些操作都含多个 await
         # 让出点且改 runner._is_running,不加锁会在「应用设置重启」与用户手动
         # 启停/删模型交错时出现 executor 未重挂、孤儿 task 等状态错乱。
         self._lifecycle_lock = asyncio.Lock()
+        self._camera_sources_lock = asyncio.Lock()
 
     # ---- Realtime engine lifecycle ----
 
@@ -60,6 +77,14 @@ class PerceptionService:
     async def stop_engine(self) -> None:
         async with self._lifecycle_lock:
             await self._engine.stop()
+
+    async def sync_camera_sources(self) -> None:
+        """Atomically apply RTSP settings and reconcile the unified adapter."""
+        if self._rtsp_camera_source is None or self._camera_adapter is None:
+            return
+        async with self._camera_sources_lock:
+            await self._rtsp_camera_source.apply_settings()
+            await self._camera_adapter.sync_devices()
 
     async def stop_to_unconfigured(self) -> None:
         """软停引擎回到「未配模型」态(删当前生效模型用),保留 tick 自愈循环。
@@ -91,7 +116,11 @@ class PerceptionService:
                     await self._engine.start()
                 return True
             except Exception as e:  # noqa: BLE001
-                logger.error("[service] 感知参数变更后重启失败(config 已写盘) | %s", e, exc_info=True)
+                logger.error(
+                    "[service] 感知参数变更后重启失败(config 已写盘) | %s",
+                    e,
+                    exc_info=True,
+                )
                 return False
 
     async def apply_omni_fps_live(self, omni_fps: int) -> bool:
@@ -109,7 +138,9 @@ class PerceptionService:
                 await self._pipeline.apply_omni_fps(omni_fps)
                 return True
             except Exception as e:  # noqa: BLE001
-                logger.error("[service] omni_fps 热更失败(config 已写盘) | %s", e, exc_info=True)
+                logger.error(
+                    "[service] omni_fps 热更失败(config 已写盘) | %s", e, exc_info=True
+                )
                 return False
 
     def engine_status(self) -> PerceptionEngineStatus:
@@ -182,9 +213,7 @@ class PerceptionService:
         valid_dids: list[str] = []
         for did in request.sources:
             if did not in active_sources:
-                logger.warning(
-                    "[service](device=%s) 未激活感知(skipped)", did
-                )
+                logger.warning("[service](device=%s) 未激活感知(skipped)", did)
                 continue
             valid_dids.append(did)
 
@@ -198,7 +227,9 @@ class PerceptionService:
         t_start = now_ms()
 
         # Single batch inference call — collector assembles batch, processor infers
-        pipeline_result = await self._pipeline.process_on_demand(valid_dids, request.query)
+        pipeline_result = await self._pipeline.process_on_demand(
+            valid_dids, request.query
+        )
 
         if not pipeline_result:
             raise BusinessException(
@@ -232,7 +263,9 @@ class PerceptionService:
 
             settings = get_settings()
             snapshot_root = get_snapshot_root()
-            if check_disk_space(snapshot_root, settings.perception.snapshot_min_free_disk_mb):
+            if check_disk_space(
+                snapshot_root, settings.perception.snapshot_min_free_disk_mb
+            ):
                 clip_dids = save_event_artifacts(log_id, artifacts)
                 clip_kinds = {
                     did: artifacts.clips[did][1]
