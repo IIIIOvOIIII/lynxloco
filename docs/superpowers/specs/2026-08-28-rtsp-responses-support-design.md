@@ -1,6 +1,6 @@
 # RTSP 摄像机与 OpenAI Responses 本地 Omni 支持设计
 
-- 状态：已获用户批准，详细实施计划已编写
+- 状态：已批准；RTSP 感知基础已实施，仓库级既有 type/format 与 macOS node-monitor 基线未清零；RTSP 实时预览与 Responses 尚未实施
 - 日期：2026-08-28
 - 基线提交：`e900529`
 - 仓库：`XiaoMi/xiaomi-miloco`
@@ -562,3 +562,13 @@ CLI 输出不得打印密码或完整带敏 URI。
 - 接受真实本地 VLM E2E 在未选定实际服务前为 `not_measured`。
 - 实施过程中先写失败测试，再改生产代码。
 - 不进行生产部署；如未来涉及生产环境，另行走 CO/PAM 与项目部署流程。
+
+## 18. RTSP 感知基础实施结果
+
+截至 2026-08-28，批次 1 的 RTSP 感知基础功能已实施：安全配置与 owner-only 原子写入、MIoT 来源抽取且 DID 保持不变、RTSP 探测、单源单会话解码、有界队列、错误分类与重连、统一 `CameraDeviceAdapter`/`MultimodalCollector` 接入、热更新管理 API 和凭据安全 CLI 均已有自动化契约覆盖。
+
+确定性 H.264（含音频）与 H.265（无音频）PyAV fixture 已通过真实 `RtspSession -> RtspCameraSource -> CameraDeviceAdapter -> MultimodalCollector -> DeviceData` 集成路径；H.264 音频被归一化为 16 kHz、mono、`int16` PCM。相关 RTSP/摄像机聚焦测试为 142 passed，CLI 为 629 passed；本地 CI 脚本的 6 项门禁通过，其中 backend 仅按脚本既有规则排除 3 项 macOS `node_monitor`/`smaps` 平台失败。
+
+仓库级既有门禁仍未清零，因此本状态不等于整个仓库质量基线全绿：当前 changed-path `ty` 只剩 `perception/service.py` 两条本计划未改动的既有诊断；一次只读全库 `ty` 检查报告 946 条诊断；只读 `ruff check .` 通过，但最终 `ruff format --check .` 显示 303 个既有文件需要格式化。不得为关闭本批次而扩大范围修复这些存量债务。
+
+未提供 `MILOCO_RTSP_TEST_URL`，真实 RTSP 网络 E2E、真实解码启动时间与断线重连行为均为 `not_measured`；CPU 与可持续 fps 也为 `not_measured`。本批次没有部署到实验室主机，也没有接触生产环境。RTSP 浏览器实时预览/H.265 按观看者转码属于批次 2，当前明确尚未实施；OpenAI Responses Omni 属于批次 3，当前也尚未实施。
