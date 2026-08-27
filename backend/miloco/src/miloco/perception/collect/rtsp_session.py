@@ -10,12 +10,13 @@ from collections import deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
-from typing import Literal, Protocol, cast
+from typing import Literal, Protocol, SupportsBytes, cast
 
 import av
 import numpy as np
 from numpy.typing import NDArray
 
+from miloco.camera.stream import EncodedVideoPacket
 from miloco.config.settings import RtspSourceSettings
 from miloco.perception.collect.camera_source import (
     AudioFrameCallback,
@@ -43,7 +44,7 @@ def reconnect_delay(attempt: int, *, jitter: float) -> float:
 class PacketListener(Protocol):
     """A dormant hook for consumers of packets from this same demux session."""
 
-    def __call__(self, packet: object) -> None: ...
+    def __call__(self, packet: EncodedVideoPacket) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -78,7 +79,7 @@ class RtspSession:
         self._listeners: tuple[PacketListener, ...] = ()
         self._ingress_lock = threading.Lock()
         self._media_ingress: deque[_DecodedEvent] = deque()
-        self._packet_ingress: deque[object] = deque()
+        self._packet_ingress: deque[EncodedVideoPacket] = deque()
         self._media_drain_scheduled = False
         self._packet_drain_scheduled = False
         self._dropped_frames = 0
@@ -378,10 +379,12 @@ class RtspSession:
         for packet in container.demux():
             if self._stop_thread.is_set():
                 break
-            if self._listeners:
-                self._enqueue_packet_from_thread(packet, loop)
 
             stream_type = getattr(packet.stream, "type", None)
+            if self._listeners and stream_type == "video":
+                self._enqueue_packet_from_thread(
+                    self._snapshot_video_packet(packet), loop
+                )
             if stream_type == "audio" and not self._source.audio_enabled:
                 continue
             if stream_type not in {"video", "audio"}:
@@ -503,7 +506,7 @@ class RtspSession:
             loop.call_soon_threadsafe(self._wake_media_consumer)
 
     def _enqueue_packet_from_thread(
-        self, packet: object, loop: asyncio.AbstractEventLoop
+        self, packet: EncodedVideoPacket, loop: asyncio.AbstractEventLoop
     ) -> None:
         if self._stop_thread.is_set():
             return
@@ -603,7 +606,7 @@ class RtspSession:
 
     async def _run_packet_listeners(
         self,
-        packet: object,
+        packet: EncodedVideoPacket,
         listeners: tuple[PacketListener, ...],
     ) -> None:
         executor = self._listener_executor
@@ -631,7 +634,7 @@ class RtspSession:
 
     @staticmethod
     def _notify_packet_listeners_sync(
-        packet: object,
+        packet: EncodedVideoPacket,
         listeners: tuple[PacketListener, ...],
     ) -> None:
         for listener in listeners:
@@ -639,6 +642,38 @@ class RtspSession:
                 listener(packet)
             except Exception:
                 pass
+
+    @staticmethod
+    def _snapshot_video_packet(packet: object) -> EncodedVideoPacket:
+        stream = getattr(packet, "stream", None)
+        context = getattr(stream, "codec_context", None)
+        codec_name = str(getattr(context, "name", "")).lower()
+        if codec_name == "h265":
+            codec_name = "hevc"
+        if codec_name not in {"h264", "hevc"}:
+            raise RtspSourceError(
+                "unsupported_video_codec",
+                "RTSP video codec could not be decoded",
+                recoverable=False,
+            )
+        time_base = getattr(packet, "time_base", None) or getattr(
+            stream, "time_base", None
+        )
+        numerator = int(getattr(time_base, "numerator", 1))
+        denominator = int(getattr(time_base, "denominator", 1))
+        if denominator == 0:
+            numerator, denominator = 1, 1
+        extradata = getattr(context, "extradata", None)
+        return EncodedVideoPacket(
+            codec=cast(Literal["h264", "hevc"], codec_name),
+            data=bytes(cast(SupportsBytes, packet)),
+            pts=getattr(packet, "pts", None),
+            dts=getattr(packet, "dts", None),
+            is_keyframe=bool(getattr(packet, "is_keyframe", False)),
+            time_base_num=numerator,
+            time_base_den=denominator,
+            extradata=bytes(extradata) if extradata else b"",
+        )
 
     def _shutdown_listener_executor(self) -> None:
         executor = self._listener_executor

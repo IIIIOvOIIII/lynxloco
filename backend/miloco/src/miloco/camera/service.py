@@ -9,6 +9,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
 
 from miloco.camera.schema import CameraSummary, RtspSourceUpsert
+from miloco.camera.stream import LiveStreamSource
 from miloco.config import get_settings
 from miloco.config.settings import MilocoSettings, RtspSourceSettings
 from miloco.perception.collect.camera_source import CameraSourceState
@@ -77,6 +78,51 @@ class CameraService:
         sources = await asyncio.to_thread(self._load_sources_safely)
         summaries.extend(self._rtsp_summary(source) for source in sources)
         return summaries
+
+    async def resolve_live_stream(self, camera_id: str) -> LiveStreamSource:
+        """Resolve an existing runtime backend without creating a connection."""
+        if camera_id.startswith("rtsp:"):
+            sources = await asyncio.to_thread(self._load_sources_safely)
+            _index, source = self._locate(sources, camera_id)
+            if not source.enabled:
+                raise CameraConflictError("camera_disabled", "Camera is disabled")
+            registry = getattr(self._perception_service, "_rtsp_camera_source", None)
+            if registry is None:
+                raise CameraConflictError(
+                    "camera_unavailable", "Camera stream is unavailable"
+                )
+            session = registry.get_session(camera_id)
+            if session is None:
+                raise CameraConflictError(
+                    "camera_unavailable", "Camera stream is unavailable"
+                )
+            state = registry.get_state(camera_id)
+            return LiveStreamSource(
+                camera_id=camera_id,
+                source_type="rtsp",
+                backend=session,
+                channel=0,
+                input_codec=state.video_codec,
+            )
+
+        rows = await self._miot_service.list_cameras_with_state()
+        for row in rows:
+            did = str(row.get("did") or "")
+            channel = int(row.get("channel") or 0)
+            channel_count = int(row.get("channel_count") or 1)
+            resolved_id = f"{did}:ch{channel}" if channel_count > 1 else did
+            if resolved_id != camera_id:
+                continue
+            if not bool(row.get("in_use", False)):
+                raise CameraConflictError("camera_disabled", "Camera is disabled")
+            return LiveStreamSource(
+                camera_id=did,
+                source_type="miot",
+                backend=self._miot_service,
+                channel=channel,
+                input_codec=None,
+            )
+        raise CameraNotFoundError()
 
     async def test_rtsp(self, body: RtspSourceUpsert) -> RtspProbeResult:
         source = self._source_from_upsert(

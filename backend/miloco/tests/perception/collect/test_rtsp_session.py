@@ -15,6 +15,7 @@ from typing import Any
 import av
 import numpy as np
 import pytest
+from miloco.camera.stream import EncodedVideoPacket
 from miloco.config.settings import RtspSourceSettings
 from miloco.perception.collect.rtsp_probe import RtspSourceError
 
@@ -114,14 +115,31 @@ def _stream(kind: str, codec: str) -> object:
 
 
 class _Packet:
-    def __init__(self, stream: object, frames: list[object]) -> None:
+    def __init__(
+        self,
+        stream: object,
+        frames: list[object],
+        *,
+        data: bytes | bytearray = b"encoded-video",
+        pts: int | None = 90,
+        dts: int | None = 80,
+        is_keyframe: bool = True,
+    ) -> None:
         self.stream = stream
         self._frames = frames
         self.decode_calls = 0
+        self._data = data
+        self.pts = pts
+        self.dts = dts
+        self.is_keyframe = is_keyframe
+        self.time_base = Fraction(1, 90_000)
 
     def decode(self) -> list[object]:
         self.decode_calls += 1
         return self._frames
+
+    def __bytes__(self) -> bytes:
+        return bytes(self._data)
 
 
 class _Container:
@@ -1095,10 +1113,10 @@ async def test_packet_listener_is_dormant_unsubscribable_and_failure_isolated(
     monkeypatch.setattr(session_module.av, "open", opener)
     monkeypatch.setattr(session_module, "reconnect_delay", lambda *_a, **_kw: 0.0)
     session = session_module.RtspSession(_source())
-    seen: list[object] = []
+    seen: list[EncodedVideoPacket] = []
     video_done = asyncio.Event()
 
-    def broken_listener(received: object) -> None:
+    def broken_listener(received: EncodedVideoPacket) -> None:
         seen.append(received)
         raise RuntimeError("listener private detail")
 
@@ -1116,9 +1134,55 @@ async def test_packet_listener_is_dormant_unsubscribable_and_failure_isolated(
     await _wait_until(lambda: session.state().error_code == "authentication_failed")
     active_unsubscribe()
 
-    assert seen == [packet]
+    assert len(seen) == 1
+    snapshot = seen[0]
+    assert snapshot.codec == "h264"
+    assert snapshot.data == b"encoded-video"
+    assert snapshot.pts == 90
+    assert snapshot.dts == 80
+    assert snapshot.is_keyframe is True
+    assert (snapshot.time_base_num, snapshot.time_base_den) == (1, 90_000)
     assert opener.calls == 2
     await session.stop()
+
+
+@pytest.mark.asyncio
+async def test_packet_snapshot_and_decode_share_one_open_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_module = _rtsp_session()
+    encoded = bytearray(b"immutable-packet")
+    packet = _Packet(
+        _stream("video", "h264"),
+        [_VideoFrame(9)],
+        data=encoded,
+        pts=180,
+        dts=170,
+    )
+    container = _YieldThenBlockContainer(packet)
+    opener = _SequenceOpener(container)
+    monkeypatch.setattr(session_module.av, "open", opener)
+    monkeypatch.setattr(session_module, "reconnect_delay", lambda *_a, **_kw: 0.0)
+    session = session_module.RtspSession(_source())
+    snapshots: list[EncodedVideoPacket] = []
+    video_done = asyncio.Event()
+
+    session.add_packet_listener(snapshots.append)
+
+    async def video_cb(*_args: object) -> None:
+        video_done.set()
+
+    await session.start(video_cb, _unused_audio_cb)
+    await asyncio.wait_for(video_done.wait(), timeout=1.0)
+    await _wait_until(lambda: len(snapshots) == 1)
+    assert container.blocked.wait(timeout=0.5)
+    encoded[:] = b"mutated-after-demux"
+
+    assert opener.calls == 1
+    assert packet.decode_calls == 1
+    assert snapshots[0].data == b"immutable-packet"
+    await session.stop()
+    assert opener.calls == 1
 
 
 async def _unused_video_cb(*_args: object) -> None:
