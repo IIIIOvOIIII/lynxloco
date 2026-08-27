@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import ceil, log2
 
 from miloco.camera.stream import EncodedVideoPacket
 
@@ -13,6 +14,9 @@ _MAX_NAL_BYTES = 4 * 1024 * 1024
 _MAX_NALS = 256
 _BROWSER_SAFE_PROFILES = frozenset({66, 77, 100})
 _BROWSER_SAFE_LEVELS = frozenset({10, 11, 12, 13, 20, 21, 22, 30, 31, 32, 40})
+_HIGH_PROFILE_SYNTAX = frozenset(
+    {44, 83, 86, 100, 110, 118, 122, 128, 134, 135, 138, 139, 244}
+)
 
 
 @dataclass(frozen=True)
@@ -37,12 +41,25 @@ class _MalformedH264(ValueError):
     pass
 
 
+class _UnsupportedH264Configuration(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class _SpsSyntax:
+    sps_id: int
+    profile: int
+    profile_compatibility: int
+    level: int
+    chroma_format_idc: int
+
+
 class _BitReader:
     def __init__(self, data: bytes) -> None:
         self._data = data
         self._position = 0
 
-    def _read_bit(self) -> int:
+    def read_bit(self) -> int:
         if self._position >= len(self._data) * 8:
             raise _MalformedH264
         byte = self._data[self._position // 8]
@@ -50,16 +67,53 @@ class _BitReader:
         self._position += 1
         return bit
 
-    def read_ue(self) -> int:
+    def read_bits(self, count: int) -> int:
+        if count < 0 or count > 32:
+            raise _MalformedH264
+        value = 0
+        for _ in range(count):
+            value = (value << 1) | self.read_bit()
+        return value
+
+    def read_ue(self, maximum: int = (1 << 31) - 1) -> int:
         leading_zeros = 0
-        while self._read_bit() == 0:
+        while self.read_bit() == 0:
             leading_zeros += 1
             if leading_zeros > 31:
                 raise _MalformedH264
         suffix = 0
         for _ in range(leading_zeros):
-            suffix = (suffix << 1) | self._read_bit()
-        return (1 << leading_zeros) - 1 + suffix
+            suffix = (suffix << 1) | self.read_bit()
+        value = (1 << leading_zeros) - 1 + suffix
+        if value > maximum:
+            raise _MalformedH264
+        return value
+
+    def read_se(self, maximum_absolute: int = (1 << 30) - 1) -> int:
+        code_num = self.read_ue(maximum_absolute * 2)
+        value = (code_num + 1) // 2 if code_num & 1 else -(code_num // 2)
+        if abs(value) > maximum_absolute:
+            raise _MalformedH264
+        return value
+
+    def more_rbsp_data(self) -> bool:
+        remaining = len(self._data) * 8 - self._position
+        if remaining <= 0:
+            return False
+        bits = [
+            (self._data[position // 8] >> (7 - position % 8)) & 1
+            for position in range(self._position, len(self._data) * 8)
+        ]
+        return not (bits[0] == 1 and all(bit == 0 for bit in bits[1:]))
+
+    def consume_rbsp_trailing_bits(self) -> None:
+        if self.read_bit() != 1:
+            raise _MalformedH264
+        while self._position % 8:
+            if self.read_bit() != 0:
+                raise _MalformedH264
+        if self._position != len(self._data) * 8:
+            raise _MalformedH264
 
 
 def _rbsp(ebsp: bytes) -> bytes:
@@ -83,7 +137,71 @@ def _rbsp(ebsp: bytes) -> bytes:
     return bytes(result)
 
 
-def _parse_sps(nal: bytes) -> tuple[int, int, int, int]:
+def _parse_scaling_list(reader: _BitReader, size: int) -> None:
+    last_scale = 8
+    next_scale = 8
+    for _ in range(size):
+        if next_scale != 0:
+            next_scale = (last_scale + reader.read_se(255) + 256) % 256
+        last_scale = last_scale if next_scale == 0 else next_scale
+
+
+def _parse_hrd(reader: _BitReader) -> None:
+    cpb_count = reader.read_ue(31) + 1
+    reader.read_bits(4)
+    reader.read_bits(4)
+    for _ in range(cpb_count):
+        reader.read_ue()
+        reader.read_ue()
+        reader.read_bit()
+    reader.read_bits(5)
+    reader.read_bits(5)
+    reader.read_bits(5)
+    reader.read_bits(5)
+
+
+def _parse_vui(reader: _BitReader) -> None:
+    if reader.read_bit():
+        aspect_ratio_idc = reader.read_bits(8)
+        if aspect_ratio_idc == 255:
+            reader.read_bits(16)
+            reader.read_bits(16)
+    if reader.read_bit():
+        reader.read_bit()
+    if reader.read_bit():
+        reader.read_bits(3)
+        reader.read_bit()
+        if reader.read_bit():
+            reader.read_bits(8)
+            reader.read_bits(8)
+            reader.read_bits(8)
+    if reader.read_bit():
+        reader.read_ue()
+        reader.read_ue()
+    if reader.read_bit():
+        reader.read_bits(32)
+        reader.read_bits(32)
+        reader.read_bit()
+    nal_hrd = bool(reader.read_bit())
+    if nal_hrd:
+        _parse_hrd(reader)
+    vcl_hrd = bool(reader.read_bit())
+    if vcl_hrd:
+        _parse_hrd(reader)
+    if nal_hrd or vcl_hrd:
+        reader.read_bit()
+    reader.read_bit()
+    if reader.read_bit():
+        reader.read_bit()
+        reader.read_ue()
+        reader.read_ue()
+        reader.read_ue()
+        reader.read_ue()
+        reader.read_ue()
+        reader.read_ue()
+
+
+def _parse_sps(nal: bytes) -> _SpsSyntax:
     if len(nal) < 5 or nal[0] & 0x1F != 7:
         raise _MalformedH264
     rbsp = _rbsp(nal[1:])
@@ -92,20 +210,106 @@ def _parse_sps(nal: bytes) -> tuple[int, int, int, int]:
     profile, profile_compatibility, level = rbsp[:3]
     if profile_compatibility & 0x03:
         raise _MalformedH264
-    sps_id = _BitReader(rbsp[3:]).read_ue()
-    if sps_id > 31:
-        raise _MalformedH264
-    return sps_id, profile, profile_compatibility, level
+    reader = _BitReader(rbsp[3:])
+    sps_id = reader.read_ue(31)
+    chroma_format_idc = 1
+    if profile in _HIGH_PROFILE_SYNTAX:
+        chroma_format_idc = reader.read_ue(3)
+        if chroma_format_idc == 3:
+            reader.read_bit()
+        reader.read_ue(6)
+        reader.read_ue(6)
+        reader.read_bit()
+        if reader.read_bit():
+            scaling_list_count = 8 if chroma_format_idc != 3 else 12
+            for index in range(scaling_list_count):
+                if reader.read_bit():
+                    _parse_scaling_list(reader, 16 if index < 6 else 64)
+
+    reader.read_ue(12)
+    pic_order_count_type = reader.read_ue(2)
+    if pic_order_count_type == 0:
+        reader.read_ue(12)
+    elif pic_order_count_type == 1:
+        reader.read_bit()
+        reader.read_se()
+        reader.read_se()
+        cycle_count = reader.read_ue(255)
+        for _ in range(cycle_count):
+            reader.read_se()
+    reader.read_ue(65535)
+    reader.read_bit()
+    reader.read_ue(65535)
+    reader.read_ue(65535)
+    frame_mbs_only = bool(reader.read_bit())
+    if not frame_mbs_only:
+        reader.read_bit()
+    reader.read_bit()
+    if reader.read_bit():
+        reader.read_ue(65535)
+        reader.read_ue(65535)
+        reader.read_ue(65535)
+        reader.read_ue(65535)
+    if reader.read_bit():
+        _parse_vui(reader)
+    reader.consume_rbsp_trailing_bits()
+    return _SpsSyntax(
+        sps_id,
+        profile,
+        profile_compatibility,
+        level,
+        chroma_format_idc,
+    )
 
 
-def _parse_pps(nal: bytes) -> tuple[int, int]:
+def _parse_pps(nal: bytes, chroma_format_idc: int) -> tuple[int, int]:
     if len(nal) < 2 or nal[0] & 0x1F != 8:
         raise _MalformedH264
     reader = _BitReader(_rbsp(nal[1:]))
-    pps_id = reader.read_ue()
-    sps_id = reader.read_ue()
-    if pps_id > 255 or sps_id > 31:
-        raise _MalformedH264
+    pps_id = reader.read_ue(255)
+    sps_id = reader.read_ue(31)
+    reader.read_bit()
+    reader.read_bit()
+    slice_group_count = reader.read_ue(7) + 1
+    if slice_group_count > 1:
+        map_type = reader.read_ue(6)
+        if map_type == 0:
+            for _ in range(slice_group_count):
+                reader.read_ue(65535)
+        elif map_type == 2:
+            for _ in range(slice_group_count - 1):
+                reader.read_ue(65535)
+                reader.read_ue(65535)
+        elif map_type in {3, 4, 5}:
+            reader.read_bit()
+            reader.read_ue(65535)
+        elif map_type == 6:
+            map_units = reader.read_ue(65535) + 1
+            bits_per_id = ceil(log2(slice_group_count))
+            for _ in range(map_units):
+                if reader.read_bits(bits_per_id) >= slice_group_count:
+                    raise _MalformedH264
+        else:
+            raise _MalformedH264
+    reader.read_ue(31)
+    reader.read_ue(31)
+    reader.read_bit()
+    reader.read_bits(2)
+    reader.read_se(51)
+    reader.read_se(51)
+    reader.read_se(51)
+    reader.read_bit()
+    reader.read_bit()
+    reader.read_bit()
+    if reader.more_rbsp_data():
+        transform_8x8_mode = bool(reader.read_bit())
+        if reader.read_bit():
+            extra_lists = (2 if chroma_format_idc != 3 else 6) * transform_8x8_mode
+            for index in range(6 + extra_lists):
+                if reader.read_bit():
+                    _parse_scaling_list(reader, 16 if index < 6 else 64)
+        reader.read_se(51)
+    reader.consume_rbsp_trailing_bits()
     return pps_id, sps_id
 
 
@@ -230,49 +434,23 @@ def _build_configuration(
     length_size: int, sps: tuple[bytes, ...], pps: tuple[bytes, ...]
 ) -> _AvcConfiguration:
     if (
-        not sps
-        or not pps
-        or len(sps) > 31
-        or len(pps) > 31
+        len(sps) != 1
+        or len(pps) != 1
         or sum(map(len, sps + pps)) > _MAX_EXTRADATA_BYTES
     ):
+        raise _UnsupportedH264Configuration
+
+    syntax = _parse_sps(sps[0])
+    _, referenced_sps_id = _parse_pps(pps[0], syntax.chroma_format_idc)
+    if referenced_sps_id != syntax.sps_id:
         raise _MalformedH264
-
-    sps_by_id: dict[int, bytes] = {}
-    common_format: tuple[int, int, int] | None = None
-    for nal in sps:
-        sps_id, profile, profile_compatibility, level = _parse_sps(nal)
-        stream_format = (profile, profile_compatibility, level)
-        if common_format is None:
-            common_format = stream_format
-        elif stream_format != common_format:
-            raise _MalformedH264
-        prior = sps_by_id.get(sps_id)
-        if prior is not None and prior != nal:
-            raise _MalformedH264
-        sps_by_id[sps_id] = nal
-
-    pps_by_id: dict[int, tuple[int, bytes]] = {}
-    for nal in pps:
-        pps_id, referenced_sps_id = _parse_pps(nal)
-        if referenced_sps_id not in sps_by_id:
-            raise _MalformedH264
-        prior = pps_by_id.get(pps_id)
-        current = (referenced_sps_id, nal)
-        if prior is not None and prior != current:
-            raise _MalformedH264
-        pps_by_id[pps_id] = current
-
-    if common_format is None:
-        raise _MalformedH264
-    profile, profile_compatibility, level = common_format
     return _AvcConfiguration(
         length_size,
         sps,
         pps,
-        profile,
-        profile_compatibility,
-        level,
+        syntax.profile,
+        syntax.profile_compatibility,
+        syntax.level,
     )
 
 
@@ -363,6 +541,12 @@ class H264AnnexBNormalizer:
                     nals,
                     None,
                 )
+        except _UnsupportedH264Configuration:
+            return (
+                H264Compatibility(False, None, None, "configuration_unsupported"),
+                None,
+                None,
+            )
         except _MalformedH264:
             return (
                 H264Compatibility(False, None, None, "malformed_h264"),

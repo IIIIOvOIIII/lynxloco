@@ -12,6 +12,8 @@ FIXTURES = Path(__file__).parents[1] / "fixtures" / "rtsp"
 START_CODE = b"\x00\x00\x00\x01"
 SPS = bytes.fromhex("6742c01eda11ec0440000003004000000523c58ba8")
 PPS = bytes.fromhex("68ce0fc8")
+HIGH_SPS = bytes.fromhex("6764000aacd9447a10000003001000000303c0f1225960")
+HIGH_PPS = bytes.fromhex("68ebe3cb22c0")
 P_SLICE = bytes.fromhex("419a22")
 AVCC = bytes.fromhex("0142c01effe10015") + SPS + bytes.fromhex("010004") + PPS
 
@@ -229,7 +231,7 @@ def test_declared_oversized_nal_and_excessive_nal_count_are_rejected() -> None:
         _packet(oversized_decoder_config, keyframe=True),
     ):
         normalizer = H264AnnexBNormalizer()
-        assert normalizer.inspect(packet).reason == "malformed_h264"
+        assert normalizer.inspect(packet).passthrough is False
         assert normalizer.push(packet) == []
 
 
@@ -326,13 +328,77 @@ def test_all_sps_must_have_one_supported_non_conflicting_format() -> None:
 
     assert H264AnnexBNormalizer().inspect(
         _packet(packet, keyframe=True, extradata=unsupported)
-    ) == H264Compatibility(False, 0x6E, 0x1E, "profile_unsupported")
+    ) == H264Compatibility(False, None, None, "configuration_unsupported")
     assert (
         H264AnnexBNormalizer()
         .inspect(_packet(packet, keyframe=True, extradata=conflicting))
         .reason
-        == "malformed_h264"
+        == "configuration_unsupported"
     )
+
+
+def test_truncated_or_trailing_parameter_set_syntax_is_rejected() -> None:
+    packet = (FIXTURES / "h264_avcc_packets.bin").read_bytes()
+    malformed_records = [
+        *(
+            _avcc_with_parameter_sets(
+                (SPS[:end],),
+                (PPS,),
+                profile=0x42,
+                profile_compatibility=0xC0,
+                level=0x1E,
+            )
+            for end in range(1, len(SPS))
+        ),
+        *(
+            _avcc_with_parameter_sets(
+                (SPS,),
+                (PPS[:end],),
+                profile=0x42,
+                profile_compatibility=0xC0,
+                level=0x1E,
+            )
+            for end in range(1, len(PPS))
+        ),
+        _avcc_extradata(sps=SPS + b"\x00"),
+        _avcc_extradata(pps=PPS + b"\x00"),
+    ]
+
+    for extradata in malformed_records:
+        assert (
+            H264AnnexBNormalizer()
+            .inspect(_packet(packet, keyframe=True, extradata=extradata))
+            .passthrough
+            is False
+        )
+
+
+def test_high_profile_required_syntax_is_consumed_to_rbsp_trailing_bits() -> None:
+    extradata = _avcc_extradata(
+        sps=HIGH_SPS,
+        pps=HIGH_PPS,
+        profile=100,
+        profile_compatibility=0,
+        level=10,
+    )
+
+    assert H264AnnexBNormalizer().inspect(
+        _packet(START_CODE + P_SLICE, extradata=extradata)
+    ) == H264Compatibility(True, 100, 10, "compatible")
+
+
+def test_multiple_real_parameter_sets_are_ambiguous_for_jmuxer_v1() -> None:
+    ambiguous = _avcc_with_parameter_sets(
+        (SPS, HIGH_SPS),
+        (PPS, HIGH_PPS),
+        profile=0x42,
+        profile_compatibility=0xC0,
+        level=0x1E,
+    )
+
+    assert H264AnnexBNormalizer().inspect(
+        _packet(REAL_AVCC_PACKET, keyframe=True, extradata=ambiguous)
+    ) == H264Compatibility(False, None, None, "configuration_unsupported")
 
 
 def test_bad_packet_resets_viewer_until_a_new_idr() -> None:
@@ -367,9 +433,13 @@ def test_unsupported_configuration_resets_viewer_until_a_new_idr() -> None:
 def test_decoder_configuration_change_waits_for_idr_and_injects_new_config() -> None:
     normalizer = H264AnnexBNormalizer()
     idr = (FIXTURES / "h264_avcc_packets.bin").read_bytes()
-    new_sps = bytearray(SPS)
-    new_sps[-1] ^= 0x01
-    new_extradata = _avcc_extradata(sps=bytes(new_sps))
+    new_extradata = _avcc_extradata(
+        sps=HIGH_SPS,
+        pps=HIGH_PPS,
+        profile=100,
+        profile_compatibility=0,
+        level=10,
+    )
 
     assert normalizer.push(_packet(idr, keyframe=True, extradata=AVCC))
     assert (
@@ -383,7 +453,7 @@ def test_decoder_configuration_change_waits_for_idr_and_injects_new_config() -> 
     )
     recovered = normalizer.push(_packet(idr, keyframe=True))
     assert recovered and recovered[0].startswith(
-        START_CODE + bytes(new_sps) + START_CODE + PPS
+        START_CODE + HIGH_SPS + START_CODE + HIGH_PPS
     )
 
 
@@ -407,8 +477,14 @@ def test_real_annexb_fixture_decodes_at_least_one_frame_with_public_pyav() -> No
     [
         (b"", H264Compatibility(False, None, None, "configuration_missing")),
         (
-            _avcc_extradata(profile=0x6E),
-            H264Compatibility(False, 0x6E, 0x1E, "profile_unsupported"),
+            _avcc_extradata(
+                sps=bytes((0x67, 0x6E)) + HIGH_SPS[2:],
+                pps=HIGH_PPS,
+                profile=0x6E,
+                profile_compatibility=0,
+                level=10,
+            ),
+            H264Compatibility(False, 0x6E, 10, "profile_unsupported"),
         ),
         (
             _avcc_extradata(level=0x29),
