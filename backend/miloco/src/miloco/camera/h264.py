@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isqrt
 
 from miloco.camera.stream import EncodedVideoPacket
 
@@ -17,17 +18,17 @@ _HIGH_PROFILE_SYNTAX = frozenset(
     {44, 83, 86, 100, 110, 118, 122, 128, 134, 135, 138, 139, 244}
 )
 _LEVEL_LIMITS = {
-    10: (99, 396),
-    11: (396, 900),
-    12: (396, 2376),
-    13: (396, 2376),
-    20: (396, 2376),
-    21: (792, 4752),
-    22: (1620, 8100),
-    30: (1620, 8100),
-    31: (3600, 18000),
-    32: (5120, 20480),
-    40: (8192, 32768),
+    10: (1485, 99, 396),
+    11: (3000, 396, 900),
+    12: (6000, 396, 2376),
+    13: (11880, 396, 2376),
+    20: (11880, 396, 2376),
+    21: (19800, 792, 4752),
+    22: (20250, 1620, 8100),
+    30: (40500, 1620, 8100),
+    31: (108000, 3600, 18000),
+    32: (216000, 5120, 20480),
+    40: (245760, 8192, 32768),
 }
 
 
@@ -70,6 +71,8 @@ class _SpsSyntax:
 class _VuiSyntax:
     max_num_reorder_frames: int | None = None
     max_dec_frame_buffering: int | None = None
+    fixed_num_units_in_tick: int | None = None
+    fixed_time_scale: int | None = None
 
 
 class _BitReader:
@@ -174,10 +177,16 @@ def _parse_vui(reader: _BitReader) -> _VuiSyntax:
     if reader.read_bit():
         reader.read_ue(5)
         reader.read_ue(5)
+    fixed_num_units_in_tick: int | None = None
+    fixed_time_scale: int | None = None
     if reader.read_bit():
-        if reader.read_bits(32) == 0 or reader.read_bits(32) == 0:
+        num_units_in_tick = reader.read_bits(32)
+        time_scale = reader.read_bits(32)
+        if num_units_in_tick == 0 or time_scale == 0:
             raise _MalformedH264
-        reader.read_bit()
+        if reader.read_bit():
+            fixed_num_units_in_tick = num_units_in_tick
+            fixed_time_scale = time_scale
     nal_hrd = bool(reader.read_bit())
     if nal_hrd:
         raise _UnsupportedH264Configuration
@@ -197,7 +206,12 @@ def _parse_vui(reader: _BitReader) -> _VuiSyntax:
         max_dec_frame_buffering = reader.read_ue(16)
         if max_num_reorder_frames > max_dec_frame_buffering:
             raise _MalformedH264
-    return _VuiSyntax(max_num_reorder_frames, max_dec_frame_buffering)
+    return _VuiSyntax(
+        max_num_reorder_frames,
+        max_dec_frame_buffering,
+        fixed_num_units_in_tick,
+        fixed_time_scale,
+    )
 
 
 def _parse_sps(nal: bytes) -> _SpsSyntax:
@@ -281,10 +295,22 @@ def _parse_sps(nal: bytes) -> _SpsSyntax:
 
     limits = _LEVEL_LIMITS.get(level)
     if limits is not None:
-        max_fs, max_dpb_mbs = limits
+        max_mbps, max_fs, max_dpb_mbs = limits
         if level == 11 and profile in {66, 77, 88} and profile_compatibility & 0x10:
-            max_fs, max_dpb_mbs = 99, 396
-        if pic_size_in_mbs > max_fs:
+            max_mbps, max_fs, max_dpb_mbs = 1485, 99, 396
+        max_dimension_in_mbs = isqrt(max_fs * 8)
+        if (
+            pic_size_in_mbs > max_fs
+            or pic_width_in_mbs > max_dimension_in_mbs
+            or frame_height_in_mbs > max_dimension_in_mbs
+        ):
+            raise _UnsupportedH264Configuration
+        if (
+            vui.fixed_num_units_in_tick is not None
+            and vui.fixed_time_scale is not None
+            and pic_size_in_mbs * vui.fixed_time_scale
+            > max_mbps * 2 * vui.fixed_num_units_in_tick
+        ):
             raise _UnsupportedH264Configuration
         max_dpb_frames = min(max_dpb_mbs // pic_size_in_mbs, 16)
         if num_ref_frames > max_dpb_frames:

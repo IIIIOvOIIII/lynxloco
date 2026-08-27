@@ -567,6 +567,38 @@ def test_level_maxfs_and_dpb_boundaries_are_enforced() -> None:
     assert compatibility(exceeds_vui_dpb).passthrough is False
 
 
+def test_level_single_dimension_and_fixed_rate_mbps_limits_are_enforced() -> None:
+    too_wide = _review_sps(width_mbs=99, height_map_units=1)
+    sixty_fps = _review_sps(
+        width_mbs=11,
+        height_map_units=9,
+        timing=(1, 120),
+    )
+    exactly_max_mbps = _review_sps(
+        width_mbs=11,
+        height_map_units=9,
+        timing=(1, 30),
+    )
+
+    def compatible(sps: bytes) -> bool:
+        extradata = _avcc_extradata(
+            sps=sps,
+            pps=_review_pps(),
+            profile=66,
+            profile_compatibility=0,
+            level=10,
+        )
+        return (
+            H264AnnexBNormalizer()
+            .inspect(_packet(START_CODE + P_SLICE, extradata=extradata))
+            .passthrough
+        )
+
+    assert compatible(too_wide) is False
+    assert compatible(sixty_fps) is False
+    assert compatible(exactly_max_mbps) is True
+
+
 @pytest.mark.parametrize(
     ("sps", "pps", "profile", "compatibility", "level"),
     [
