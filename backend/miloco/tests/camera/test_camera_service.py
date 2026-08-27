@@ -285,7 +285,9 @@ async def test_test_source_does_not_write_or_hot_apply() -> None:
 
 
 @pytest.mark.asyncio
-async def test_enable_probes_then_persists_then_hot_applies() -> None:
+async def test_enable_probes_then_persists_then_hot_applies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     store = _ConfigStore([_source()])
     perception = _Perception()
     events: list[str] = []
@@ -305,8 +307,8 @@ async def test_enable_probes_then_persists_then_hot_applies() -> None:
         perception.sync_count += 1
         return True
 
-    store.mutate = mutate
-    perception.sync_camera_sources = sync
+    monkeypatch.setattr(store, "mutate", mutate)
+    monkeypatch.setattr(perception, "sync_camera_sources", sync)
 
     enabled = await _service(store, perception, probe=probe).enable(SOURCE_ID)
 
