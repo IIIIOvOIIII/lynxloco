@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator, Callable
+from pathlib import Path
 from typing import Literal
 
+import av
 import numpy as np
 import pytest
 from miloco.camera.service import CameraConflictError, CameraService
@@ -121,6 +123,28 @@ def _source(
 
 async def _next(stream) -> bytes:
     return await asyncio.wait_for(anext(stream), timeout=0.5)
+
+
+def _annexb_nals(data: bytes) -> list[bytes]:
+    starts: list[tuple[int, int]] = []
+    index = 0
+    while index <= len(data) - 3:
+        if data[index : index + 4] == b"\x00\x00\x00\x01":
+            starts.append((index, 4))
+            index += 4
+        elif data[index : index + 3] == b"\x00\x00\x01":
+            starts.append((index, 3))
+            index += 3
+        else:
+            index += 1
+    return [
+        data[
+            start + size : starts[position + 1][0]
+            if position + 1 < len(starts)
+            else None
+        ]
+        for position, (start, size) in enumerate(starts)
+    ]
 
 
 @pytest.mark.asyncio
@@ -356,13 +380,21 @@ async def test_broken_subscriber_cleanup_does_not_affect_other_viewers() -> None
 
 
 class _FakeTranscoder:
-    def __init__(self, *, fail: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail: bool = False,
+        stop_entered: asyncio.Event | None = None,
+        stop_release: asyncio.Event | None = None,
+    ) -> None:
         self.queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=2)
         self.pushes = 0
         self.stop_count = 0
         self.viewer_count = 0
         self.fail = fail
         self.on_error: Callable[[str], None] | None = None
+        self.stop_entered = stop_entered
+        self.stop_release = stop_release
 
     def attach(self) -> AsyncGenerator[bytes, None]:
         async def stream() -> AsyncGenerator[bytes, None]:
@@ -387,9 +419,152 @@ class _FakeTranscoder:
 
     async def stop(self) -> None:
         self.stop_count += 1
+        if self.stop_entered is not None:
+            self.stop_entered.set()
+        if self.stop_release is not None:
+            await self.stop_release.wait()
         while not self.queue.empty():
             self.queue.get_nowait()
         await self.queue.put(None)
+
+
+@pytest.mark.asyncio
+async def test_new_viewer_waits_for_previous_transcoder_shutdown() -> None:
+    first_backend = _PacketBackend()
+    second_backend = _PacketBackend()
+    backends = iter((first_backend, second_backend))
+    resolve_count = 0
+    stop_entered = asyncio.Event()
+    stop_release = asyncio.Event()
+    created: list[_FakeTranscoder] = []
+
+    async def resolve(_camera_id: str) -> LiveStreamSource:
+        nonlocal resolve_count
+        resolve_count += 1
+        return _source(next(backends), codec="hevc", source_type="rtsp")
+
+    def factory(on_error: Callable[[str], None]) -> _FakeTranscoder:
+        transcoder = _FakeTranscoder(
+            stop_entered=stop_entered if not created else None,
+            stop_release=stop_release if not created else None,
+        )
+        transcoder.on_error = on_error
+        created.append(transcoder)
+        return transcoder
+
+    hub = LiveStreamHub(resolve, transcoder_factory=factory)
+    first = hub.subscribe("rtsp:camera")
+    first_pending = asyncio.create_task(_next(first))
+    await asyncio.sleep(0)
+    first_backend.emit_frame(1)
+    assert await first_pending == b"encoded:\x01"
+
+    closing = asyncio.create_task(first.aclose())
+    await asyncio.wait_for(stop_entered.wait(), 1)
+    replacement = hub.subscribe("rtsp:camera")
+    replacement_pending = asyncio.create_task(_next(replacement))
+    await asyncio.sleep(0)
+
+    assert len(created) == 1
+    assert resolve_count == 1
+    assert not replacement_pending.done()
+
+    stop_release.set()
+    await asyncio.wait_for(closing, 1)
+    for _ in range(20):
+        if len(created) == 2:
+            break
+        await asyncio.sleep(0)
+    assert len(created) == 2
+    assert resolve_count == 2
+    second_backend.emit_frame(2)
+    assert await replacement_pending == b"encoded:\x02"
+    await replacement.aclose()
+
+
+@pytest.mark.asyncio
+async def test_one_camera_shutdown_does_not_block_another_camera() -> None:
+    first_backend = _PacketBackend()
+    other_backend = _PacketBackend()
+    stop_entered = asyncio.Event()
+    stop_release = asyncio.Event()
+    created: list[_FakeTranscoder] = []
+
+    async def resolve(camera_id: str) -> LiveStreamSource:
+        backend = first_backend if camera_id == "rtsp:first" else other_backend
+        return _source(backend, codec="hevc", source_type="rtsp")
+
+    def factory(on_error: Callable[[str], None]) -> _FakeTranscoder:
+        transcoder = _FakeTranscoder(
+            stop_entered=stop_entered if not created else None,
+            stop_release=stop_release if not created else None,
+        )
+        transcoder.on_error = on_error
+        created.append(transcoder)
+        return transcoder
+
+    hub = LiveStreamHub(resolve, transcoder_factory=factory)
+    first = hub.subscribe("rtsp:first")
+    first_pending = asyncio.create_task(_next(first))
+    await asyncio.sleep(0)
+    first_backend.emit_frame(1)
+    await first_pending
+    closing = asyncio.create_task(first.aclose())
+    await asyncio.wait_for(stop_entered.wait(), 1)
+
+    other = hub.subscribe("rtsp:other")
+    other_pending = asyncio.create_task(_next(other))
+    await asyncio.sleep(0)
+    other_backend.emit_frame(2)
+    assert await other_pending == b"encoded:\x02"
+    assert len(created) == 2
+
+    stop_release.set()
+    await asyncio.wait_for(closing, 1)
+    await other.aclose()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_waiter_and_close_camera_share_one_shutdown() -> None:
+    backend = _PacketBackend()
+    stop_entered = asyncio.Event()
+    stop_release = asyncio.Event()
+    created: list[_FakeTranscoder] = []
+
+    async def resolve(_camera_id: str) -> LiveStreamSource:
+        return _source(backend, codec="hevc", source_type="rtsp")
+
+    def factory(on_error: Callable[[str], None]) -> _FakeTranscoder:
+        transcoder = _FakeTranscoder(
+            stop_entered=stop_entered,
+            stop_release=stop_release,
+        )
+        transcoder.on_error = on_error
+        created.append(transcoder)
+        return transcoder
+
+    hub = LiveStreamHub(resolve, transcoder_factory=factory)
+    viewer = hub.subscribe("rtsp:camera")
+    initial = asyncio.create_task(_next(viewer))
+    await asyncio.sleep(0)
+    backend.emit_frame(1)
+    await initial
+    closing = asyncio.create_task(viewer.aclose())
+    await asyncio.wait_for(stop_entered.wait(), 1)
+
+    waiter = hub.subscribe("rtsp:camera")
+    waiter_pending = asyncio.create_task(_next(waiter))
+    closing_camera = asyncio.create_task(hub.close_camera("rtsp:camera"))
+    await asyncio.sleep(0)
+    waiter_pending.cancel()
+    await asyncio.gather(waiter_pending, return_exceptions=True)
+    stop_release.set()
+
+    await asyncio.wait_for(closing, 1)
+    await asyncio.wait_for(closing_camera, 1)
+    assert len(created) == 1
+    assert created[0].stop_count == 1
+    assert hub.state("rtsp:camera").mode == "idle"
 
 
 @pytest.mark.asyncio
@@ -521,6 +696,65 @@ async def test_late_h264_viewer_waits_for_next_idr_without_forcing_transcode() -
     assert created == 0
     await first.aclose()
     await late.aclose()
+
+
+@pytest.mark.asyncio
+async def test_h264_overflow_rearms_decoder_config_before_next_idr() -> None:
+    backend = _PacketBackend()
+
+    async def resolve(_camera_id: str) -> LiveStreamSource:
+        return _source(backend, source_type="rtsp")
+
+    fixture = (
+        Path(__file__).parents[1] / "fixtures" / "rtsp" / "h264_annexb_packets.bin"
+    ).read_bytes()
+    nals = _annexb_nals(fixture)
+    idr = next(nal for nal in nals if nal[0] & 0x1F == 5)
+    decoder_config = b"".join(
+        b"\x00\x00\x00\x01" + nal for nal in nals if nal[0] & 0x1F in {7, 8}
+    )
+
+    hub = LiveStreamHub(resolve, queue_size=2)
+    viewer = hub.subscribe("rtsp:camera")
+    initial = asyncio.create_task(_next(viewer))
+    await asyncio.sleep(0)
+    backend.emit(EncodedVideoPacket("h264", fixture, 0, 0, True, 1, 90_000))
+    assert (await initial).startswith(decoder_config)
+
+    for pts in (1, 2, 3):
+        backend.emit(
+            EncodedVideoPacket(
+                "h264",
+                b"\x00\x00\x00\x01\x41\x9a\x22",
+                pts,
+                pts,
+                False,
+                1,
+                90_000,
+            )
+        )
+    await asyncio.sleep(0)
+    assert hub.state("rtsp:camera").dropped_packets == 3
+
+    recovered = asyncio.create_task(_next(viewer))
+    await asyncio.sleep(0)
+    backend.emit(
+        EncodedVideoPacket(
+            "h264",
+            b"\x00\x00\x00\x01" + idr,
+            4,
+            4,
+            True,
+            1,
+            90_000,
+        )
+    )
+    recovered_chunk = await recovered
+    assert recovered_chunk.startswith(decoder_config)
+    decoder = av.CodecContext.create("h264", "r")
+    assert decoder.decode(av.Packet(recovered_chunk))
+    assert hub.state("rtsp:camera").dropped_packets == 3
+    await viewer.aclose()
 
 
 @pytest.mark.asyncio

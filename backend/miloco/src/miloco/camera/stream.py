@@ -126,6 +126,7 @@ class LiveStreamHub:
         self._resolver = resolver
         self._queue_size = queue_size
         self._feeds: dict[str, _CameraFeed] = {}
+        self._stopping: dict[str, asyncio.Task[None]] = {}
         self._states: dict[str, LiveStreamState] = {}
         self._lock = asyncio.Lock()
         self._next_subscriber_id = 0
@@ -147,19 +148,23 @@ class LiveStreamHub:
             await self._detach(camera_id, subscriber_id)
 
     async def close_camera(self, camera_id: str) -> None:
-        async with self._lock:
-            feed = self._feeds.pop(camera_id, None)
-            if feed is None:
-                self._states[camera_id] = self._idle_state()
-                return
-            for subscriber in feed.subscribers.values():
-                subscriber.closed = True
-                subscriber.packets.clear()
-                subscriber.ready.set()
-            self._states[camera_id] = self._idle_state(
-                dropped_packets=feed.dropped_packets
-            )
-        await self._shutdown_feed(feed)
+        while True:
+            async with self._lock:
+                stopping = self._stopping.get(camera_id)
+                if stopping is None:
+                    feed = self._feeds.pop(camera_id, None)
+                    if feed is None:
+                        self._states[camera_id] = self._idle_state()
+                        return
+                    for subscriber in feed.subscribers.values():
+                        subscriber.closed = True
+                        subscriber.packets.clear()
+                        subscriber.ready.set()
+                    self._states[camera_id] = self._idle_state(
+                        dropped_packets=feed.dropped_packets
+                    )
+                    stopping = self._start_shutdown_locked(camera_id, feed)
+            await asyncio.shield(stopping)
 
     def state(self, camera_id: str) -> LiveStreamState:
         feed = self._feeds.get(camera_id)
@@ -182,7 +187,14 @@ class LiveStreamHub:
         )
 
     async def _attach(self, camera_id: str) -> tuple[int, _Subscriber]:
-        async with self._lock:
+        while True:
+            await self._wait_for_shutdown(camera_id)
+            await self._lock.acquire()
+            if camera_id in self._stopping:
+                self._lock.release()
+                continue
+            break
+        try:
             feed = self._feeds.get(camera_id)
             if feed is None:
                 source = await self._resolver(camera_id)
@@ -267,9 +279,11 @@ class LiveStreamHub:
             subscriber = _Subscriber(deque(), asyncio.Event(), normalizer=normalizer)
             feed.subscribers[subscriber_id] = subscriber
             return subscriber_id, subscriber
+        finally:
+            self._lock.release()
 
     async def _detach(self, camera_id: str, subscriber_id: int) -> None:
-        stopped_feed: _CameraFeed | None = None
+        stopping: asyncio.Task[None] | None = None
         async with self._lock:
             feed = self._feeds.get(camera_id)
             if feed is None:
@@ -282,12 +296,12 @@ class LiveStreamHub:
             if feed.subscribers:
                 return
             self._feeds.pop(camera_id, None)
-            stopped_feed = feed
             self._states[camera_id] = self._idle_state(
                 dropped_packets=feed.dropped_packets
             )
-        if stopped_feed is not None:
-            await self._shutdown_feed(stopped_feed)
+            stopping = self._start_shutdown_locked(camera_id, feed)
+        if stopping is not None:
+            await asyncio.shield(stopping)
 
     def _publish(
         self,
@@ -357,30 +371,41 @@ class LiveStreamHub:
         source_feed: _CameraFeed,
         error_code: str | None,
     ) -> None:
-        feed = self._feeds.get(camera_id)
-        if feed is not source_feed:
-            return
-        self._feeds.pop(camera_id, None)
-        self._detach_source(feed)
-        asyncio.create_task(self._stop_transcoder(feed))
-        for subscriber in feed.subscribers.values():
-            subscriber.closed = True
-            subscriber.packets.clear()
-            subscriber.ready.set()
-        if error_code is None:
-            self._states[camera_id] = self._idle_state(
-                dropped_packets=feed.dropped_packets
-            )
-        else:
-            self._states[camera_id] = LiveStreamState(
-                viewer_count=0,
-                mode="error",
-                input_codec=feed.source.input_codec,
-                output_codec=None,
-                queue_depth=0,
-                dropped_packets=feed.dropped_packets,
-                error_code=error_code,
-            )
+        asyncio.create_task(
+            self._handle_source_closed(camera_id, source_feed, error_code)
+        )
+
+    async def _handle_source_closed(
+        self,
+        camera_id: str,
+        source_feed: _CameraFeed,
+        error_code: str | None,
+    ) -> None:
+        async with self._lock:
+            feed = self._feeds.get(camera_id)
+            if feed is not source_feed:
+                return
+            self._feeds.pop(camera_id, None)
+            for subscriber in feed.subscribers.values():
+                subscriber.closed = True
+                subscriber.packets.clear()
+                subscriber.ready.set()
+            if error_code is None:
+                self._states[camera_id] = self._idle_state(
+                    dropped_packets=feed.dropped_packets
+                )
+            else:
+                self._states[camera_id] = LiveStreamState(
+                    viewer_count=0,
+                    mode="error",
+                    input_codec=feed.source.input_codec,
+                    output_codec=None,
+                    queue_depth=0,
+                    dropped_packets=feed.dropped_packets,
+                    error_code=error_code,
+                )
+            stopping = self._start_shutdown_locked(camera_id, feed)
+        await asyncio.shield(stopping)
 
     @staticmethod
     def _detach_source(feed: _CameraFeed) -> None:
@@ -414,6 +439,13 @@ class LiveStreamHub:
         if len(subscriber.packets) > self._queue_size:
             subscriber.packets.popleft()
             feed.dropped_packets += 1
+            if subscriber.normalizer is not None and feed.mode == "passthrough":
+                while subscriber.packets:
+                    subscriber.packets.popleft()
+                    feed.dropped_packets += 1
+                subscriber.waiting_for_keyframe = True
+                self._rearm_h264_normalizer(feed, subscriber)
+                return
             while subscriber.packets and not subscriber.packets[0].is_keyframe:
                 subscriber.packets.popleft()
                 feed.dropped_packets += 1
@@ -512,28 +544,41 @@ class LiveStreamHub:
         source_feed: _CameraFeed,
         error_code: str,
     ) -> None:
-        feed = self._feeds.get(camera_id)
-        if feed is not source_feed:
-            return
-        self._feeds.pop(camera_id, None)
-        feed.mode = "error"
-        self._detach_source(feed)
-        for subscriber in feed.subscribers.values():
-            subscriber.closed = True
-            subscriber.packets.clear()
-            subscriber.ready.set()
-        self._states[camera_id] = LiveStreamState(
-            viewer_count=0,
-            mode="error",
-            input_codec=feed.source.input_codec,
-            output_codec=None,
-            queue_depth=0,
-            dropped_packets=feed.dropped_packets,
-            error_code=(
-                error_code if error_code == "transcode_failed" else "transcode_failed"
-            ),
+        asyncio.create_task(
+            self._handle_transcoder_failed(camera_id, source_feed, error_code)
         )
-        asyncio.create_task(self._stop_transcoder(feed))
+
+    async def _handle_transcoder_failed(
+        self,
+        camera_id: str,
+        source_feed: _CameraFeed,
+        error_code: str,
+    ) -> None:
+        async with self._lock:
+            feed = self._feeds.get(camera_id)
+            if feed is not source_feed:
+                return
+            self._feeds.pop(camera_id, None)
+            feed.mode = "error"
+            for subscriber in feed.subscribers.values():
+                subscriber.closed = True
+                subscriber.packets.clear()
+                subscriber.ready.set()
+            self._states[camera_id] = LiveStreamState(
+                viewer_count=0,
+                mode="error",
+                input_codec=feed.source.input_codec,
+                output_codec=None,
+                queue_depth=0,
+                dropped_packets=feed.dropped_packets,
+                error_code=(
+                    error_code
+                    if error_code == "transcode_failed"
+                    else "transcode_failed"
+                ),
+            )
+            stopping = self._start_shutdown_locked(camera_id, feed)
+        await asyncio.shield(stopping)
 
     async def _shutdown_feed(self, feed: _CameraFeed) -> None:
         self._detach_source(feed)
@@ -556,6 +601,52 @@ class LiveStreamHub:
                 await stream.aclose()
             except Exception:
                 pass
+
+    async def _wait_for_shutdown(self, camera_id: str) -> None:
+        while True:
+            async with self._lock:
+                stopping = self._stopping.get(camera_id)
+            if stopping is None:
+                return
+            await asyncio.shield(stopping)
+
+    def _start_shutdown_locked(
+        self, camera_id: str, feed: _CameraFeed
+    ) -> asyncio.Task[None]:
+        stopping = self._stopping.get(camera_id)
+        if stopping is not None:
+            return stopping
+        stopping = asyncio.create_task(self._shutdown_registered(camera_id, feed))
+        self._stopping[camera_id] = stopping
+        return stopping
+
+    async def _shutdown_registered(self, camera_id: str, feed: _CameraFeed) -> None:
+        current = asyncio.current_task()
+        try:
+            await self._shutdown_feed(feed)
+        finally:
+            async with self._lock:
+                if self._stopping.get(camera_id) is current:
+                    self._stopping.pop(camera_id, None)
+
+    @staticmethod
+    def _rearm_h264_normalizer(feed: _CameraFeed, subscriber: _Subscriber) -> None:
+        from miloco.camera.h264 import H264AnnexBNormalizer
+
+        normalizer = H264AnnexBNormalizer()
+        if feed.h264_decoder_config:
+            normalizer.push(
+                EncodedVideoPacket(
+                    codec="h264",
+                    data=feed.h264_decoder_config,
+                    pts=None,
+                    dts=None,
+                    is_keyframe=False,
+                    time_base_num=1,
+                    time_base_den=1,
+                )
+            )
+        subscriber.normalizer = normalizer
 
     @staticmethod
     def _annexb_contains_idr(data: bytes) -> bool:
