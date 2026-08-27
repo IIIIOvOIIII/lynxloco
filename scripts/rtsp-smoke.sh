@@ -111,6 +111,7 @@ print("{}\t{}\t{}".format(
 IFS=$'\t' read -r VIDEO_CODEC WIDTH HEIGHT <<<"$probe_summary"
 
 START_NS="$(python3 -c 'import time; print(time.monotonic_ns())')"
+ENABLE_BASELINE_MS="$(python3 -c 'import time; print(time.time_ns() // 1_000_000)')"
 miloco-cli camera enable "$CAMERA_ID" >/dev/null
 
 deadline=$((SECONDS + SMOKE_TIMEOUT_SEC))
@@ -122,22 +123,26 @@ import sys
 
 rows = json.load(sys.stdin).get("data", [])
 camera_id = sys.argv[1]
+enable_baseline_ms = int(sys.argv[2])
 raise SystemExit(0 if any(
     row.get("id") == camera_id
     and row.get("enabled") is True
     and row.get("connected") is True
     and bool(row.get("video_codec"))
+    and isinstance(row.get("last_frame_unix_ms"), int)
+    and not isinstance(row.get("last_frame_unix_ms"), bool)
+    and row["last_frame_unix_ms"] >= enable_baseline_ms
     for row in rows
 ) else 1)
-' "$CAMERA_ID"; then
+' "$CAMERA_ID" "$ENABLE_BASELINE_MS"; then
         END_NS="$(python3 -c 'import time; print(time.monotonic_ns())')"
         STARTUP_MS=$(((END_NS - START_NS) / 1000000))
-        printf 'codec=%s dimensions=%sx%s probe_frame=passed source_ready_ms=%s reconnect=not_measured\n' \
+        printf 'codec=%s dimensions=%sx%s decoded_frame_startup_ms=%s reconnect=not_measured\n' \
             "$VIDEO_CODEC" "$WIDTH" "$HEIGHT" "$STARTUP_MS"
         exit 0
     fi
     sleep 1
 done
 
-echo "Temporary RTSP source did not reach session-ready state before timeout" >&2
+echo "Temporary RTSP source did not decode a post-enable frame before timeout" >&2
 exit 4
