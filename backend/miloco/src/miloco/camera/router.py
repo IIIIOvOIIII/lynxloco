@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
+import hmac
 import logging
 from dataclasses import asdict
 from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from fastapi.websockets import WebSocketDisconnect
 from pydantic import ValidationError
 
@@ -17,12 +20,7 @@ from miloco.camera.schema import RtspSourceUpsert
 from miloco.camera.service import CameraNotFoundError, CameraService, CameraServiceError
 from miloco.camera.stream import LiveStreamHub
 from miloco.config import get_settings
-from miloco.middleware import (
-    verify_token,
-    verify_token_query_fallback,
-    verify_websocket_token,
-)
-from miloco.middleware.exceptions import AuthenticationException
+from miloco.middleware import verify_token
 from miloco.perception.collect.rtsp_probe import RtspSourceError
 from miloco.schema.common_schema import NormalResponse
 
@@ -38,13 +36,14 @@ WS_CAMERA_DISABLED = 4403
 WS_CAMERA_UNAVAILABLE = 1013
 WS_STREAM_FAILED = 1011
 
-_SAFE_STREAM_REASONS = {
-    "camera_not_found",
-    "camera_disabled",
-    "camera_unavailable",
-    "stream_unavailable",
-    "transcode_failed",
-    "stream_failed",
+WS_CAMERA_PROTOCOL = "miloco.camera.v1"
+WS_AUTH_PROTOCOL_PREFIX = "miloco.auth."
+
+_RUNTIME_CLOSES = {
+    "camera_unavailable": (WS_CAMERA_UNAVAILABLE, "camera_unavailable"),
+    "stream_unavailable": (WS_CAMERA_UNAVAILABLE, "stream_unavailable"),
+    "transcode_failed": (WS_STREAM_FAILED, "transcode_failed"),
+    "stream_failed": (WS_STREAM_FAILED, "stream_failed"),
 }
 
 
@@ -182,24 +181,62 @@ def _stream_close_for_error(error: CameraServiceError) -> tuple[int, str]:
     return WS_CAMERA_UNAVAILABLE, "camera_unavailable"
 
 
-def _safe_stream_reason(error_code: str | None) -> str:
-    if error_code in _SAFE_STREAM_REASONS:
-        return error_code
-    return "stream_failed"
+def _runtime_stream_close(error_code: str | None) -> tuple[int, str]:
+    return _RUNTIME_CLOSES.get(error_code, (WS_STREAM_FAILED, "stream_failed"))
+
+
+def _bearer_token(websocket: WebSocket) -> str | None:
+    authorization = websocket.headers.get("Authorization")
+    if authorization and authorization.startswith("Bearer "):
+        return authorization.removeprefix("Bearer ")
+    return None
+
+
+def _protocol_token(websocket: WebSocket) -> tuple[str | None, bool]:
+    protocols = {
+        protocol.strip()
+        for protocol in websocket.headers.get("Sec-WebSocket-Protocol", "").split(",")
+        if protocol.strip()
+    }
+    if WS_CAMERA_PROTOCOL not in protocols:
+        return None, False
+    credentials = [
+        protocol.removeprefix(WS_AUTH_PROTOCOL_PREFIX)
+        for protocol in protocols
+        if protocol.startswith(WS_AUTH_PROTOCOL_PREFIX)
+    ]
+    if len(credentials) != 1 or not credentials[0]:
+        return None, True
+    credential = credentials[0]
+    try:
+        padding = "=" * (-len(credential) % 4)
+        decoded = base64.b64decode(
+            credential + padding, altchars=b"-_", validate=True
+        ).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError):
+        return None, True
+    return decoded, True
+
+
+def _verify_generic_websocket(websocket: WebSocket) -> str | None:
+    expected = get_settings().server.token
+    if not expected:
+        return None
+    header_token = _bearer_token(websocket)
+    protocol_token, offered_camera_protocol = _protocol_token(websocket)
+    supplied = header_token or protocol_token
+    if supplied is None or not hmac.compare_digest(
+        supplied.encode("utf-8"), expected.encode("utf-8")
+    ):
+        raise PermissionError
+    return WS_CAMERA_PROTOCOL if offered_camera_protocol else None
 
 
 @router.get(
     "/{camera_id}/watch",
-    dependencies=[Depends(verify_token_query_fallback)],
     summary="Unified live camera view",
 )
-async def camera_watch_page(
-    camera_id: str, service: CameraServiceDependency
-) -> HTMLResponse:
-    try:
-        await service.resolve_live_stream(camera_id)
-    except CameraServiceError as error:
-        _raise_management_error(error)
+async def camera_watch_page(camera_id: str) -> HTMLResponse:
     static_dir: Path = get_settings().directories.static_dir
     template = (static_dir / "watch.html").read_text(encoding="utf-8")
     return HTMLResponse(template, headers={"Cache-Control": "no-store"})
@@ -223,10 +260,11 @@ async def camera_stream_websocket(
     hub: LiveStreamHubDependency,
 ) -> None:
     try:
-        verify_websocket_token(websocket)
-    except AuthenticationException:
-        await websocket.close(code=1008, reason="unauthorized")
+        accepted_protocol = _verify_generic_websocket(websocket)
+    except PermissionError:
+        await websocket.send_denial_response(Response(status_code=403))
         return
+    await websocket.accept(subprotocol=accepted_protocol)
     try:
         await service.resolve_live_stream(camera_id)
     except CameraServiceError as error:
@@ -239,10 +277,7 @@ async def camera_stream_websocket(
     receiver: asyncio.Task[None] | None = None
     close_code = 1000
     close_reason = ""
-    accepted = False
     try:
-        await websocket.accept()
-        accepted = True
 
         async def send_chunks() -> None:
             async for chunk in stream:
@@ -257,16 +292,16 @@ async def camera_stream_websocket(
             sender.result()
             state = hub.state(camera_id)
             if state.error_code is not None:
-                close_code = WS_STREAM_FAILED
-                close_reason = _safe_stream_reason(state.error_code)
+                close_code, close_reason = _runtime_stream_close(state.error_code)
     except WebSocketDisconnect:
         pass
     except asyncio.CancelledError:
         raise
     except Exception as error:  # noqa: BLE001
         logger.warning("Camera live stream failed (%s)", type(error).__name__)
-        close_code = WS_STREAM_FAILED
-        close_reason = _safe_stream_reason(hub.state(camera_id).error_code)
+        close_code, close_reason = _runtime_stream_close(
+            hub.state(camera_id).error_code
+        )
     finally:
         for task in (sender, receiver):
             if task is not None and not task.done():
@@ -280,8 +315,7 @@ async def camera_stream_websocket(
             await stream.aclose()
         except Exception:  # noqa: BLE001
             logger.warning("Camera live stream detach failed")
-        if accepted:
-            try:
-                await websocket.close(code=close_code, reason=close_reason)
-            except Exception:  # noqa: BLE001
-                pass
+        try:
+            await websocket.close(code=close_code, reason=close_reason)
+        except Exception:  # noqa: BLE001
+            pass

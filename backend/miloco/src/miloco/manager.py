@@ -58,6 +58,8 @@ class _MiotListenerWebSocket:
 class _MiotLiveStreamBackend:
     """Expose one legacy MIoT live subscription as a hub packet source."""
 
+    _SHUTDOWN_TIMEOUT_SECONDS = 0.1
+
     def __init__(self, legacy_manager: Any, camera_id: str, channel: int) -> None:
         self._legacy_manager = legacy_manager
         self._camera_id = camera_id
@@ -67,28 +69,38 @@ class _MiotLiveStreamBackend:
         self._next_listener_id = 0
         self._connection_id: str | None = None
         self._start_task: asyncio.Task[None] | None = None
+        self._start_tasks: set[asyncio.Task[None]] = set()
         self._close_task: asyncio.Task[None] | None = None
+        self._generation = 0
+        self._closed = False
         self._websocket = _MiotListenerWebSocket(self)
 
     def add_packet_listener(
         self, listener: Callable[[EncodedVideoPacket], None]
     ) -> Callable[[], None]:
+        if self._closed:
+            raise RuntimeError("MIoT live stream backend is closed")
+        was_empty = not self._listeners
         listener_id = self._next_listener_id
         self._next_listener_id += 1
         self._listeners[listener_id] = listener
-        should_start = self._start_task is None or (
-            self._start_task.done()
-            and (
-                self._connection_id is None
-                or (self._close_task is not None and not self._close_task.done())
-            )
+        if was_empty:
+            self._generation += 1
+        close_task = self._close_task
+        close_pending = close_task is not None and not close_task.done()
+        should_start = self._connection_id is None and (
+            close_pending or self._start_task is None or self._start_task.done()
         )
         if should_start:
-            self._start_task = asyncio.create_task(self._start())
+            self._create_start(
+                generation=self._generation,
+                preceding_close=close_task if close_pending else None,
+            )
 
         def detach() -> None:
             self._listeners.pop(listener_id, None)
             if not self._listeners:
+                self._generation += 1
                 self._schedule_close()
 
         return detach
@@ -124,26 +136,48 @@ class _MiotLiveStreamBackend:
             except Exception:  # noqa: BLE001
                 logger.warning("MIoT live stream listener failed")
 
-    async def _start(self) -> None:
+    def _create_start(
+        self,
+        *,
+        generation: int,
+        preceding_close: asyncio.Task[None] | None = None,
+    ) -> None:
+        task = asyncio.create_task(
+            self._start(generation=generation, preceding_close=preceding_close)
+        )
+        self._start_task = task
+        self._start_tasks.add(task)
+        task.add_done_callback(self._start_tasks.discard)
+
+    async def _start(
+        self,
+        *,
+        generation: int,
+        preceding_close: asyncio.Task[None] | None,
+    ) -> None:
         try:
-            close_task = self._close_task
-            if close_task is not None and not close_task.done():
-                await asyncio.gather(close_task, return_exceptions=True)
+            if preceding_close is not None and not preceding_close.done():
+                await asyncio.gather(preceding_close, return_exceptions=True)
+            if self._closed or not self._listeners or generation != self._generation:
+                return
             self._websocket.reopen()
-            self._connection_id = await self._legacy_manager.new_connection(
+            connection_id = await self._legacy_manager.new_connection(
                 websocket=self._websocket,
                 user_name="unified-camera-view",
                 token_hash="internal",
                 camera_id=self._camera_id,
                 channel=self._channel,
             )
-            if not self._listeners:
-                await self._close_connection(start_task=self._start_task)
+            if self._closed or not self._listeners or generation != self._generation:
+                await self._close_connection_id(connection_id)
+                return
+            self._connection_id = connection_id
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
             logger.warning("MIoT live stream subscription failed")
-            self._notify_closed("camera_unavailable")
+            if generation == self._generation and self._listeners:
+                self._notify_closed("camera_unavailable")
 
     def _schedule_close(self) -> None:
         if self._close_task is None or self._close_task.done():
@@ -160,6 +194,9 @@ class _MiotLiveStreamBackend:
         connection_id, self._connection_id = self._connection_id, None
         if connection_id is None:
             return
+        await self._close_connection_id(connection_id)
+
+    async def _close_connection_id(self, connection_id: str) -> None:
         try:
             await self._legacy_manager.close_connection(
                 user_name="unified-camera-view",
@@ -179,11 +216,40 @@ class _MiotLiveStreamBackend:
                 pass
 
     async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._generation += 1
         self._listeners.clear()
-        await self._close_connection(start_task=self._start_task)
+        self._close_listeners.clear()
+        start_tasks = tuple(self._start_tasks)
+        for task in start_tasks:
+            task.cancel()
+        if start_tasks:
+            _done, pending = await asyncio.wait(
+                start_tasks, timeout=self._SHUTDOWN_TIMEOUT_SECONDS
+            )
+            if pending:
+                logger.warning("MIoT live stream start did not cancel before shutdown")
         close_task = self._close_task
-        if close_task is not None and close_task is not asyncio.current_task():
-            await asyncio.gather(close_task, return_exceptions=True)
+        if close_task is not None and not close_task.done():
+            close_task.cancel()
+            _done, pending = await asyncio.wait(
+                {close_task}, timeout=self._SHUTDOWN_TIMEOUT_SECONDS
+            )
+            if pending:
+                logger.warning("MIoT live stream detach did not cancel before shutdown")
+        connection_id, self._connection_id = self._connection_id, None
+        if connection_id is not None:
+            detach_task = asyncio.create_task(self._close_connection_id(connection_id))
+            _done, pending = await asyncio.wait(
+                {detach_task}, timeout=self._SHUTDOWN_TIMEOUT_SECONDS
+            )
+            if pending:
+                detach_task.cancel()
+                logger.warning("MIoT live stream detach timed out during shutdown")
+        self._start_task = None
+        self._close_task = None
         await self._websocket.close()
 
 

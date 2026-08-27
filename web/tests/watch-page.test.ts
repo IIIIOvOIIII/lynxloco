@@ -11,6 +11,20 @@ describe("bundled camera viewer", () => {
   it("builds the generic stream URL from an encoded camera id", () => {
     expect(page).toContain("/api/cameras/${encodeURIComponent(camId)}/stream");
     expect(page).not.toContain("/api/cameras/${camId}/stream");
+    expect(page).not.toContain("?token=${encodeURIComponent(token)}");
+  });
+
+  it("carries browser websocket auth in a non-secret echoed subprotocol", () => {
+    expect(page).toContain('const CAMERA_PROTOCOL = "miloco.camera.v1"');
+    expect(page).toContain('`miloco.auth.${base64UrlToken(token)}`');
+    expect(page).toContain("new WebSocket(url, [CAMERA_PROTOCOL, authProtocol(token)])");
+  });
+
+  it("uses an ephemeral URL fragment and clears it before network access", () => {
+    expect(page).toContain('new URLSearchParams(location.hash.slice(1))');
+    expect(page).toContain("history.replaceState(null, \"\", location.pathname + location.search)");
+    expect(page).not.toContain('params.get("token")');
+    expect(page).not.toContain('localStorage.getItem("miloco_token")');
   });
 
   it("contains no legacy MIoT stream path", () => {

@@ -68,6 +68,11 @@
 <script type="module">
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
+const fragmentParams = new URLSearchParams(location.hash.slice(1));
+const FRAGMENT_TOKEN = fragmentParams.get("token") || "";
+if (location.hash) {
+  history.replaceState(null, "", location.pathname + location.search);
+}
 if (params.get("embedded") === "1") document.body.classList.add("embedded");
 
 // 语言:读主应用同源写入的 localStorage key,只识别显式 "en",其余一律中文。
@@ -86,7 +91,7 @@ const I18N = {
     foundCams: (n) => `已找到 ${n} 个可观看的摄像头`,
     noCams: "当前没有可观看的摄像头",
     pickCamFirst: "请先选择摄像头",
-    missingToken: "缺少 token：请从 Miloco 家庭面板打开，或在开发环境带 ?token=… query",
+    missingToken: "缺少 token：请从 Miloco 家庭面板打开，或使用临时安全链接",
     connecting: "连接中…",
     connectingCam: "正在连接摄像头…",
     disconnected: (code) => `已断开 (${code})`,
@@ -124,7 +129,7 @@ const I18N = {
     foundCams: (n) => `Found ${n} viewable camera(s)`,
     noCams: "No viewable cameras right now",
     pickCamFirst: "Please pick a camera first",
-    missingToken: "Missing token: open this page from Miloco, or pass ?token=… during development",
+    missingToken: "Missing token: open this page from Miloco, or use an ephemeral secure link",
     connecting: "Connecting…",
     connectingCam: "Connecting to camera…",
     disconnected: (code) => `Disconnected (${code})`,
@@ -161,8 +166,8 @@ $("loading").textContent = t("loading");
 $("state").textContent = t("ready");
 
 // The compatibility watch handler may substitute this placeholder. The generic
-// camera watch route serves the asset unchanged and resolves auth from the URL
-// or existing local browser state; it never writes a token into returned HTML.
+// camera watch route serves the asset unchanged. Its optional fragment token
+// is removed from the address bar before any network request is made.
 const INJECTED_TOKEN = "__MILOCO_TOKEN__";
 // **不能**用 `!== "__MILOCO_TOKEN__"` 这种严格相等比较 — backend 是全文 replace,
 // 比较右侧的 "__MILOCO_TOKEN__" 字符串字面量也会被替换成真 token,导致条件
@@ -170,14 +175,24 @@ const INJECTED_TOKEN = "__MILOCO_TOKEN__";
 // **不含完整占位** `__MILOCO_TOKEN__`,replace 不动它,继续工作。
 const TOKEN_INJECTED = INJECTED_TOKEN && !INJECTED_TOKEN.startsWith("__MILOCO_");
 
-// Token resolution priority: injected by backend > URL param > localStorage(只读)。
-// 故意不写 localStorage:query token 走临时态,刷新或换页就丢。早期版本会把 query
-// token setItem 持久化方便 dev,但住户/群聊转发 watch URL 时会让接收方浏览器一直
-// 用旧 token,token rotate 后看不出 401 来源。生产期 backend 注入路径(TOKEN_INJECTED)
-// 优先,这条 fallback 仅给手动 dev 链接 / 老链接兜底用。
+// Token resolution priority: the legacy handler's in-memory injection, then
+// the one-shot URL fragment. Never read credentials from query/localStorage.
 function resolveToken() {
   if (TOKEN_INJECTED) return INJECTED_TOKEN;
-  return params.get("token") || localStorage.getItem("miloco_token") || "";
+  return FRAGMENT_TOKEN;
+}
+
+const CAMERA_PROTOCOL = "miloco.camera.v1";
+
+function base64UrlToken(token) {
+  const bytes = new TextEncoder().encode(token);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+
+function authProtocol(token) {
+  return `miloco.auth.${base64UrlToken(token)}`;
 }
 
 function cameraIdFromPath() {
@@ -448,11 +463,10 @@ function connect() {
   localStorage.setItem("miloco_camera_id", camId);
 
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  const url = `${proto}://${location.host}/api/cameras/${encodeURIComponent(camId)}/stream`
-            + `?token=${encodeURIComponent(token)}`;
+  const url = `${proto}://${location.host}/api/cameras/${encodeURIComponent(camId)}/stream`;
 
   setState(t("connecting"));
-  ws = new WebSocket(url);
+  ws = new WebSocket(url, [CAMERA_PROTOCOL, authProtocol(token)]);
   ws.binaryType = "arraybuffer";
   // 本次连接的 socket 引用 + 专属 AbortController。listener 都挂在 thisWs 上并带
   // signal,支持的浏览器上 tearDown abort 后一次性解绑。身份守卫 `thisWs !== ws` 不是

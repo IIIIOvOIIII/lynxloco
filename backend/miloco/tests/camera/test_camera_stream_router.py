@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
+import logging
+import socket
 import struct
 import warnings
 from collections.abc import AsyncGenerator
@@ -8,9 +12,12 @@ from types import SimpleNamespace
 from typing import Any, Literal, cast
 
 import pytest
+import uvicorn
 from fastapi import FastAPI, Request
 from starlette.exceptions import StarletteDeprecationWarning
 from starlette.websockets import WebSocketDisconnect
+from websockets.asyncio.client import connect
+from websockets.exceptions import ConnectionClosedError, InvalidStatus
 
 with warnings.catch_warnings():
     warnings.filterwarnings(
@@ -30,6 +37,13 @@ from miloco.camera.router import (
 from miloco.camera.service import CameraConflictError, CameraNotFoundError
 from miloco.camera.stream import LiveStreamSource, LiveStreamState
 from miloco.middleware.exception_handler import handle_exception
+
+_FIXED_PROTOCOL = "miloco.camera.v1"
+
+
+def _auth_protocol(token: str) -> str:
+    encoded = base64.urlsafe_b64encode(token.encode()).decode().rstrip("=")
+    return f"miloco.auth.{encoded}"
 
 
 class _Service:
@@ -100,11 +114,12 @@ def client(service: _Service, hub: _Hub, monkeypatch: pytest.MonkeyPatch) -> Tes
     monkeypatch.setattr(
         "miloco.camera.router.get_settings",
         lambda: SimpleNamespace(
+            server=SimpleNamespace(token="service-token"),
             directories=SimpleNamespace(
                 static_dir=(
                     __import__("pathlib").Path(__file__).parents[4] / "web" / "public"
                 )
-            )
+            ),
         ),
     )
     app = FastAPI()
@@ -126,8 +141,10 @@ def test_authenticated_rtsp_upgrade_sends_binary_annexb_and_detaches(
     client: TestClient, hub: _Hub
 ) -> None:
     with client.websocket_connect(
-        "/api/cameras/rtsp%3Acamera/stream?token=service-token"
+        "/api/cameras/rtsp%3Acamera/stream",
+        subprotocols=[_FIXED_PROTOCOL, _auth_protocol("service-token")],
     ) as websocket:
+        assert websocket.accepted_subprotocol == _FIXED_PROTOCOL
         assert websocket.receive_bytes() == b"\x00\x00\x00\x01\x65"
 
     assert hub.closed.is_set()
@@ -140,13 +157,118 @@ def test_unauthenticated_upgrade_is_rejected(client: TestClient) -> None:
             pass
 
 
+def test_generic_upgrade_rejects_legacy_query_token(client: TestClient) -> None:
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect(
+            "/api/cameras/rtsp%3Acamera/stream?token=service-token"
+        ):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_uvicorn_handshake_contract_and_access_logs_never_expose_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    special_token = "sp ace/+?汉字-secret"
+    rejected_token = f"{special_token}-wrong"
+    monkeypatch.setattr(
+        "miloco.camera.router.get_settings",
+        lambda: SimpleNamespace(
+            server=SimpleNamespace(token=special_token),
+            directories=SimpleNamespace(
+                static_dir=(
+                    __import__("pathlib").Path(__file__).parents[4] / "web" / "public"
+                )
+            ),
+        ),
+    )
+    service = _Service()
+    hub = _Hub()
+    app = FastAPI()
+    app.include_router(router, prefix="/api")
+    app.dependency_overrides[_get_camera_service] = lambda: service
+    app.dependency_overrides[_get_live_stream_hub] = lambda: hub
+
+    access_log = io.StringIO()
+    access_handler = logging.StreamHandler(access_log)
+    access_logger = logging.getLogger("uvicorn.access")
+    access_logger.addHandler(access_handler)
+    previous_level = access_logger.level
+    access_logger.setLevel(logging.INFO)
+
+    server_socket = socket.socket()
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_socket.bind(("127.0.0.1", 0))
+    server_socket.listen(128)
+    server_socket.setblocking(False)
+    port = server_socket.getsockname()[1]
+    server = uvicorn.Server(
+        uvicorn.Config(app, log_config=None, access_log=True, lifespan="off")
+    )
+    server_task = asyncio.create_task(server.serve(sockets=[server_socket]))
+    try:
+        for _ in range(100):
+            if server.started:
+                break
+            await asyncio.sleep(0.01)
+        assert server.started
+        url = f"ws://127.0.0.1:{port}/api/cameras/rtsp%3Acamera/stream"
+
+        with pytest.raises(InvalidStatus) as unauthenticated:
+            async with connect(url):
+                pass
+        assert unauthenticated.value.response.status_code == 403
+
+        with pytest.raises(InvalidStatus) as rejected:
+            async with connect(
+                url,
+                subprotocols=[_FIXED_PROTOCOL, _auth_protocol(rejected_token)],
+            ):
+                pass
+        assert rejected.value.response.status_code == 403
+
+        async with connect(
+            url,
+            subprotocols=[_FIXED_PROTOCOL, _auth_protocol(special_token)],
+        ) as websocket:
+            assert websocket.subprotocol == _FIXED_PROTOCOL
+            assert await websocket.recv() == b"\x00\x00\x00\x01\x65"
+
+        service.error = CameraNotFoundError()
+        async with connect(
+            url,
+            subprotocols=[_FIXED_PROTOCOL, _auth_protocol(special_token)],
+        ) as websocket:
+            with pytest.raises(ConnectionClosedError) as missing:
+                await websocket.recv()
+        assert missing.value.rcvd is not None
+        assert missing.value.rcvd.code == 4404
+        assert missing.value.rcvd.reason == "camera_not_found"
+    finally:
+        server.should_exit = True
+        await asyncio.wait_for(server_task, timeout=2)
+        server_socket.close()
+        access_logger.removeHandler(access_handler)
+        access_logger.setLevel(previous_level)
+
+    rendered_log = access_log.getvalue()
+    for secret in (
+        special_token,
+        rejected_token,
+        _auth_protocol(special_token),
+        _auth_protocol(rejected_token),
+    ):
+        assert secret not in rendered_log
+
+
 @pytest.mark.parametrize("camera_id", ["miot-camera", "miot-camera:ch1"])
 def test_miot_camera_ids_route_through_the_unified_stream(
     client: TestClient, service: _Service, hub: _Hub, camera_id: str
 ) -> None:
     service.source_type = "miot"
     with client.websocket_connect(
-        f"/api/cameras/{camera_id}/stream?token=service-token"
+        f"/api/cameras/{camera_id}/stream",
+        headers={"Authorization": "Bearer service-token"},
     ) as websocket:
         assert websocket.receive_bytes().startswith(b"\x00\x00\x00\x01")
 
@@ -180,9 +302,10 @@ def test_resolution_failures_close_with_stable_safe_codes(
 
     with pytest.raises(WebSocketDisconnect) as raised:
         with client.websocket_connect(
-            "/api/cameras/rtsp%3Acamera/stream?token=service-token"
-        ):
-            pass
+            "/api/cameras/rtsp%3Acamera/stream",
+            headers={"Authorization": "Bearer service-token"},
+        ) as websocket:
+            websocket.receive_bytes()
 
     assert raised.value.code == code
     assert raised.value.reason == reason
@@ -190,19 +313,68 @@ def test_resolution_failures_close_with_stable_safe_codes(
     assert "rtsp://" not in raised.value.reason
 
 
-def test_live_failure_closes_safely_and_detaches(client: TestClient, hub: _Hub) -> None:
+@pytest.mark.parametrize(
+    ("error_code", "expected_code", "expected_reason"),
+    [
+        ("camera_unavailable", 1013, "camera_unavailable"),
+        ("transcode_failed", 1011, "transcode_failed"),
+        ("rtsp://private/unknown", 1011, "stream_failed"),
+    ],
+)
+def test_live_failure_closes_safely_and_detaches(
+    client: TestClient,
+    hub: _Hub,
+    error_code: str,
+    expected_code: int,
+    expected_reason: str,
+) -> None:
     hub.error = RuntimeError("rtsp://user:password@camera/live")
-    hub.error_code = "transcode_failed"
+    hub.error_code = error_code
 
     with pytest.raises(WebSocketDisconnect) as raised:
         with client.websocket_connect(
-            "/api/cameras/rtsp%3Acamera/stream?token=service-token"
+            "/api/cameras/rtsp%3Acamera/stream",
+            headers={"Authorization": "Bearer service-token"},
         ) as websocket:
             websocket.receive_bytes()
 
-    assert raised.value.code == 1011
-    assert raised.value.reason == "transcode_failed"
+    assert raised.value.code == expected_code
+    assert raised.value.reason == expected_reason
+    assert "private" not in raised.value.reason
+    assert "password" not in raised.value.reason
     assert hub.closed.is_set()
+
+
+@pytest.mark.parametrize(
+    ("error_code", "expected_code", "expected_reason"),
+    [
+        ("camera_unavailable", 1013, "camera_unavailable"),
+        ("stream_unavailable", 1013, "stream_unavailable"),
+        ("transcode_failed", 1011, "transcode_failed"),
+        ("stream_failed", 1011, "stream_failed"),
+        ("rtsp://private/unknown", 1011, "stream_failed"),
+    ],
+)
+def test_normal_stream_end_maps_runtime_state_to_safe_close(
+    client: TestClient,
+    hub: _Hub,
+    error_code: str,
+    expected_code: int,
+    expected_reason: str,
+) -> None:
+    hub.error_code = error_code
+
+    with pytest.raises(WebSocketDisconnect) as raised:
+        with client.websocket_connect(
+            "/api/cameras/rtsp%3Acamera/stream",
+            headers={"Authorization": "Bearer service-token"},
+        ) as websocket:
+            assert websocket.receive_bytes().startswith(b"\x00\x00\x00\x01")
+            websocket.receive_bytes()
+
+    assert raised.value.code == expected_code
+    assert raised.value.reason == expected_reason
+    assert "private" not in raised.value.reason
 
 
 @pytest.mark.asyncio
@@ -210,19 +382,19 @@ async def test_abrupt_client_disconnect_closes_the_stream_iterator(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "miloco.middleware.auth_middleware.get_settings",
+        "miloco.camera.router.get_settings",
         lambda: SimpleNamespace(server=SimpleNamespace(token="service-token")),
     )
 
     class _DisconnectingWebSocket:
-        headers: dict[str, str] = {}
-        query_params = {"token": "service-token"}
+        headers = {"Authorization": "Bearer service-token"}
+        query_params: dict[str, str] = {}
 
         def __init__(self) -> None:
             self.accepted = False
             self.closed: list[tuple[int, str]] = []
 
-        async def accept(self) -> None:
+        async def accept(self, *, subprotocol: str | None = None) -> None:
             self.accepted = True
 
         async def receive(self) -> dict[str, str]:
@@ -260,42 +432,33 @@ async def test_disconnect_watcher_does_not_swallow_unexpected_receive_errors() -
         await _watch_for_disconnect(cast(Any, _BrokenWebSocket()))
 
 
-def test_watch_page_requires_auth_resolves_camera_and_never_injects_token(
+def test_watch_page_is_public_static_asset_and_never_injects_token(
     client: TestClient, service: _Service
 ) -> None:
-    unauthorized = client.get("/api/cameras/rtsp%3Acamera/watch")
-    assert unauthorized.status_code == 401
-
-    response = client.get("/api/cameras/rtsp%3Acamera/watch?token=service-token")
+    response = client.get("/api/cameras/rtsp%3Acamera/watch")
 
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store"
-    assert service.resolved[-1] == "rtsp:camera"
+    assert service.resolved == []
     assert "service-token" not in response.text
 
 
 @pytest.mark.parametrize(
-    ("error", "status", "code"),
+    "error",
     [
-        (CameraNotFoundError(), 404, "camera_not_found"),
-        (
-            CameraConflictError("camera_disabled", "Camera is disabled"),
-            409,
-            "camera_disabled",
-        ),
+        CameraNotFoundError(),
+        CameraConflictError("camera_disabled", "Camera is disabled"),
     ],
 )
-def test_watch_page_uses_existing_safe_http_error_contract(
+def test_watch_page_does_not_resolve_or_disclose_camera_state(
     client: TestClient,
     service: _Service,
     error: BaseException,
-    status: int,
-    code: str,
 ) -> None:
     service.error = error
-    response = client.get("/api/cameras/rtsp%3Acamera/watch?token=service-token")
-    assert response.status_code == status
-    assert response.json()["detail"]["code"] == code
+    response = client.get("/api/cameras/rtsp%3Acamera/watch")
+    assert response.status_code == 200
+    assert service.resolved == []
 
 
 @pytest.mark.asyncio
@@ -418,6 +581,153 @@ async def test_miot_backend_restart_does_not_deadlock_pending_detach() -> None:
     second_detach()
 
     await asyncio.wait_for(backend.aclose(), timeout=0.2)
+
+
+@pytest.mark.asyncio
+async def test_miot_backend_reattaches_while_first_start_is_pending() -> None:
+    from miloco.manager import _MiotLiveStreamBackend
+
+    class _LegacyManager:
+        def __init__(self) -> None:
+            self.starts = 0
+            self.closes: list[str] = []
+            self.first_started = asyncio.Event()
+            self.release_first = asyncio.Event()
+            self.second_started = asyncio.Event()
+
+        async def new_connection(self, **_kwargs) -> str:
+            self.starts += 1
+            if self.starts == 1:
+                self.first_started.set()
+                await self.release_first.wait()
+            else:
+                self.second_started.set()
+            return f"connection-{self.starts}"
+
+        async def close_connection(self, *, cid: str, **_kwargs) -> None:
+            self.closes.append(cid)
+
+    legacy = _LegacyManager()
+    backend = _MiotLiveStreamBackend(legacy, "miot-camera", 0)
+    first_detach = backend.add_packet_listener(lambda _packet: None)
+    await asyncio.wait_for(legacy.first_started.wait(), timeout=0.2)
+
+    first_detach()
+    second_detach = backend.add_packet_listener(lambda _packet: None)
+    legacy.release_first.set()
+
+    await asyncio.wait_for(legacy.second_started.wait(), timeout=0.2)
+    assert backend._connection_id == "connection-2"
+    assert legacy.closes == ["connection-1"]
+
+    second_detach()
+    await asyncio.wait_for(backend.aclose(), timeout=0.2)
+
+
+@pytest.mark.asyncio
+async def test_miot_backend_keeps_pending_start_when_second_listener_attaches() -> None:
+    from miloco.manager import _MiotLiveStreamBackend
+
+    class _LegacyManager:
+        def __init__(self) -> None:
+            self.starts = 0
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def new_connection(self, **_kwargs) -> str:
+            self.starts += 1
+            self.started.set()
+            await self.release.wait()
+            return "connection-id"
+
+        async def close_connection(self, **_kwargs) -> None:
+            return
+
+    legacy = _LegacyManager()
+    backend = _MiotLiveStreamBackend(legacy, "miot-camera", 0)
+    first_detach = backend.add_packet_listener(lambda _packet: None)
+    await asyncio.wait_for(legacy.started.wait(), timeout=0.2)
+    second_detach = backend.add_packet_listener(lambda _packet: None)
+    legacy.release.set()
+    await asyncio.sleep(0)
+
+    assert legacy.starts == 1
+    assert backend._connection_id == "connection-id"
+
+    first_detach()
+    second_detach()
+    await asyncio.wait_for(backend.aclose(), timeout=0.2)
+
+
+@pytest.mark.asyncio
+async def test_miot_backend_reattaches_while_active_connection_is_closing() -> None:
+    from miloco.manager import _MiotLiveStreamBackend
+
+    class _LegacyManager:
+        def __init__(self) -> None:
+            self.starts = 0
+            self.first_close_started = asyncio.Event()
+            self.release_first_close = asyncio.Event()
+            self.second_started = asyncio.Event()
+
+        async def new_connection(self, **_kwargs) -> str:
+            self.starts += 1
+            if self.starts == 2:
+                self.second_started.set()
+            return f"connection-{self.starts}"
+
+        async def close_connection(self, *, cid: str, **_kwargs) -> None:
+            if cid == "connection-1":
+                self.first_close_started.set()
+                await self.release_first_close.wait()
+
+    legacy = _LegacyManager()
+    backend = _MiotLiveStreamBackend(legacy, "miot-camera", 0)
+    first_detach = backend.add_packet_listener(lambda _packet: None)
+    await asyncio.sleep(0)
+    assert backend._connection_id == "connection-1"
+
+    first_detach()
+    await asyncio.wait_for(legacy.first_close_started.wait(), timeout=0.2)
+    second_detach = backend.add_packet_listener(lambda _packet: None)
+    legacy.release_first_close.set()
+
+    await asyncio.wait_for(legacy.second_started.wait(), timeout=0.2)
+    assert backend._connection_id == "connection-2"
+
+    second_detach()
+    await asyncio.wait_for(backend.aclose(), timeout=0.2)
+
+
+@pytest.mark.asyncio
+async def test_miot_backend_shutdown_cancels_hanging_start_and_is_bounded() -> None:
+    from miloco.manager import _MiotLiveStreamBackend
+
+    class _LegacyManager:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.cancelled = asyncio.Event()
+
+        async def new_connection(self, **_kwargs) -> str:
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.cancelled.set()
+
+        async def close_connection(self, **_kwargs) -> None:
+            raise AssertionError("a pending start has no connection to close")
+
+    legacy = _LegacyManager()
+    backend = _MiotLiveStreamBackend(legacy, "miot-camera", 0)
+    backend.add_packet_listener(lambda _packet: None)
+    await asyncio.wait_for(legacy.started.wait(), timeout=0.2)
+
+    await asyncio.wait_for(backend.aclose(), timeout=0.2)
+
+    assert legacy.cancelled.is_set()
+    assert backend._connection_id is None
+    assert backend._listeners == {}
 
 
 @pytest.mark.asyncio
