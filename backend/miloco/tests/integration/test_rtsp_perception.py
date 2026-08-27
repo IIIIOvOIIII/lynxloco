@@ -34,12 +34,13 @@ async def _wait_for_device_data(
     collector: MultimodalCollector,
     camera_id: str,
     *,
+    expect_audio: bool,
     timeout: float = 2.0,
 ) -> DeviceData:
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
         data = collector.collect(camera_id, drain=False)
-        if data is not None and data.video:
+        if data is not None and data.video and (not expect_audio or data.audio):
             return data
         await asyncio.sleep(0.01)
     raise AssertionError(f"No decoded DeviceData for {camera_id}")
@@ -90,7 +91,11 @@ async def test_fixture_media_reaches_device_data_through_rtsp_perception_pipelin
 
     try:
         await collector.sync_all_devices()
-        data = await _wait_for_device_data(collector, camera_id)
+        data = await _wait_for_device_data(
+            collector,
+            camera_id,
+            expect_audio=expect_audio,
+        )
         state = source.get_state(camera_id)
 
         assert data.meta.did == camera_id

@@ -39,7 +39,7 @@
 
 - Current work: 完成 RTSP 感知基础批次的真实媒体集成测试、实验室 smoke 工具、全量回归与实施边界收口；未运行真实 RTSP 网络测试，未开始实时预览或 Responses 批次。
 - Expected result: H.264/H.265 fixture 必须经 `RtspSession -> RtspCameraSource -> CameraDeviceAdapter -> MultimodalCollector` 进入 `DeviceData`，可选音频成为 16 kHz mono `int16` PCM；所有凭据保持去敏，仓库既有门禁缺口和未测量项必须显式记录。
-- Result: Achieved with baseline limitations。初始集成 RED 暴露异步 session 尚未 connected 即被 adapter 删除的真实生命周期缺口，修复并独立审查后为 2 passed；RTSP/摄像机聚焦套件最终 142 passed、CLI 629 passed、`local-ci --tests` 6 项通过（backend 仅保留脚本已知的 3 项 macOS node-monitor/smaps 排除）。无 URL smoke 以 exit 2 fail closed，未产生配置写入且不回显合成凭据。changed-path `ty` 清理后仅余 `perception/service.py:310` 与 `:325` 两条本计划未改动的既有诊断；一次只读全库检查为 946 diagnostics，较早 HEAD 的全库 `task check` 曾为 1025，数量变化来自期间提交和检查范围/版本状态，不作为本批次功能回归。只读 Ruff lint 通过，最终 format baseline 仍有 303 个文件未格式化；3 项 macOS node-monitor、真实 RTSP 网络、启动延迟、断线重连、CPU 和 fps 均明确为 `not_measured` 或既有平台基线。
+- Result: Achieved with baseline limitations。初始集成 RED 暴露异步 session 尚未 connected 即被 adapter 删除的真实生命周期缺口，修复并独立审查后为 2 passed；后续复审又修正 H.264 视频先到、音频稍后到时测试过早返回的调度竞态。RTSP/摄像机聚焦套件最终 148 passed、CLI 629 passed、`local-ci --tests` 6 项通过（backend 仅保留脚本已知的 3 项 macOS node-monitor/smaps 排除）。无 URL smoke 以 exit 2 fail closed，未产生配置写入且不回显合成凭据。changed-path `ty` 清理后仅余 `perception/service.py:310` 与 `:325` 两条本计划未改动的既有诊断；一次只读全库检查为 946 diagnostics，较早 HEAD 的全库 `task check` 曾为 1025，数量变化来自期间提交和检查范围/版本状态，不作为本批次功能回归。只读 Ruff lint 通过，最终 format baseline 仍有 303 个文件未格式化；3 项 macOS node-monitor、真实 RTSP 网络、启动延迟、断线重连、CPU 和 fps 均明确为 `not_measured` 或既有平台基线。
 - Next step: 提交 Task 8 授权文件并执行独立任务审查；随后对 RTSP 感知基础整个提交批次做总审查。批次 2 实时预览、批次 3 Responses、`ai-lab01/02.esxi` 部署与实验室验收继续保持独立后续阶段。
 
 ## 2026-08-28 04:45 SGT — 范围事件
