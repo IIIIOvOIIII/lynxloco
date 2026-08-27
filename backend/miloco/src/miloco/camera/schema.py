@@ -19,6 +19,7 @@ class CameraSummary(BaseModel):
     connected: bool
     video_codec: str | None
     audio_codec: str | None
+    last_frame_unix_ms: int | None = None
     has_password: bool = False
     error_code: str | None = None
     error_message: str | None = None

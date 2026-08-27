@@ -152,6 +152,8 @@ def test_all_management_endpoints_are_authenticated_and_routed(
     assert response.status_code == 200
     assert response.json()["code"] == 0
     assert service.calls[-1][0] == call_name
+    if call_name == "list":
+        assert response.json()["data"][0]["last_frame_unix_ms"] is None
     serialized = response.text
     assert "stored-secret" not in serialized
     assert "camera-user" not in serialized

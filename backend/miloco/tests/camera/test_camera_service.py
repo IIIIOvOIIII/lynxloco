@@ -182,6 +182,7 @@ async def test_list_aggregates_miot_and_redacted_rtsp_state() -> None:
                 connected=True,
                 video_codec="h264",
                 audio_codec="aac",
+                last_frame_unix_ms=1_787_851_234_567,
                 error_code=None,
                 error_message=None,
             )
@@ -214,12 +215,23 @@ async def test_list_aggregates_miot_and_redacted_rtsp_state() -> None:
         "connected": True,
         "video_codec": "h264",
         "audio_codec": "aac",
+        "last_frame_unix_ms": 1_787_851_234_567,
         "has_password": True,
         "error_code": None,
         "error_message": None,
     }
     assert "stored-secret" not in repr(summaries)
     assert "camera-user" not in repr(summaries)
+
+
+@pytest.mark.asyncio
+async def test_list_reports_null_frame_time_until_rtsp_source_decodes_a_frame() -> None:
+    summaries = await _service(
+        _ConfigStore([_source(enabled=True)]),
+        _Perception(states={SOURCE_ID: CameraSourceState(connected=True)}),
+    ).list_cameras()
+
+    assert summaries[0].last_frame_unix_ms is None
 
 
 @pytest.mark.asyncio

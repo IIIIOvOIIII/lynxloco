@@ -304,6 +304,7 @@ class CameraService:
             connected=state.connected,
             video_codec=state.video_codec,
             audio_codec=state.audio_codec,
+            last_frame_unix_ms=state.last_frame_unix_ms,
             has_password=bool(source.password),
             error_code=state.error_code,
             error_message=state.error_message,
