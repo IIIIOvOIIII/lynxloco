@@ -71,6 +71,10 @@ try:
         finally:
             if os.path.exists(tmp):
                 os.unlink(tmp)
+    if os.stat(path).st_mode & 0o777 != 0o600:
+        if request.get("test_fail_chmod"):
+            raise OSError("test chmod failure")
+        os.chmod(path, 0o600)
     sys.stdout.write(json.dumps({"raw": raw}, ensure_ascii=False))
 finally:
     fcntl.flock(lock_fd, fcntl.LOCK_UN)
@@ -86,7 +90,10 @@ function testHookValue(name: string): number | boolean | undefined {
     );
     return Number.isSafeInteger(value) && value > 0 ? value : undefined;
   }
-  return process.env.MILOCO_SHARED_CONFIG_TEST_FAIL_AFTER_TEMP === "1" || undefined;
+  if (name === "test_fail_after_temp") {
+    return process.env.MILOCO_SHARED_CONFIG_TEST_FAIL_AFTER_TEMP === "1" || undefined;
+  }
+  return process.env.MILOCO_SHARED_CONFIG_TEST_FAIL_CHMOD === "1" || undefined;
 }
 
 function pythonCommand(): string {
@@ -106,6 +113,7 @@ export function transactSharedConfig(
     },
     test_hold_temp_ms: testHookValue("test_hold_temp_ms"),
     test_fail_after_temp: testHookValue("test_fail_after_temp"),
+    test_fail_chmod: testHookValue("test_fail_chmod"),
   });
   const result = spawnSync(pythonCommand(), ["-c", PYTHON_TRANSACTION], {
     encoding: "utf8",

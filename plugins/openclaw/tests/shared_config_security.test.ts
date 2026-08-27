@@ -10,6 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 const PYTHON = process.env.MILOCO_PYTHON_BIN || "python3";
@@ -86,6 +87,20 @@ function waitForExit(child: ReturnType<typeof spawn>): Promise<string> {
   });
 }
 
+async function makeApi(): Promise<OpenClawPluginApi> {
+  const { kPluginId } = await import("../src/config.js");
+  return {
+    runtime: {
+      config: {
+        current: () => ({
+          plugins: { entries: { [kPluginId]: { config: {} } } },
+        }),
+      },
+    },
+    config: {},
+  } as unknown as OpenClawPluginApi;
+}
+
 describe("shared config security transaction", () => {
   let originalHome: string | undefined;
   let originalPython: string | undefined;
@@ -106,6 +121,7 @@ describe("shared config security transaction", () => {
     process.umask(originalUmask);
     delete process.env.MILOCO_SHARED_CONFIG_TEST_HOLD_TEMP_MS;
     delete process.env.MILOCO_SHARED_CONFIG_TEST_FAIL_AFTER_TEMP;
+    delete process.env.MILOCO_SHARED_CONFIG_TEST_FAIL_CHMOD;
     if (originalHome === undefined) delete process.env.MILOCO_HOME;
     else process.env.MILOCO_HOME = originalHome;
     if (originalPython === undefined) delete process.env.MILOCO_PYTHON_BIN;
@@ -175,5 +191,70 @@ describe("shared config security transaction", () => {
     );
 
     expect(readFileSync(configPath, "utf8")).toBe(original);
+  });
+
+  it("loadSharedConfig repairs canonical world-readable config permissions without content IO", async () => {
+    const { loadSharedConfig } = await import("../src/miloco/config.js");
+    const api = await makeApi();
+    loadSharedConfig(api);
+    chmodSync(configPath, 0o644);
+    const content = readFileSync(configPath, "utf8");
+    const mtime = statSync(configPath).mtimeMs;
+
+    loadSharedConfig(api);
+
+    expect(readFileSync(configPath, "utf8")).toBe(content);
+    expect(statSync(configPath).mtimeMs).toBe(mtime);
+    expect(statSync(configPath).mode & 0o777).toBe(0o600);
+  });
+
+  it("updateSharedConfig repairs canonical world-readable config permissions without content IO", async () => {
+    const { updateSharedConfig } = await import("../src/miloco/config.js");
+    const partial = { agent: { webhook_url: "http://plugin.local/webhook" } };
+    updateSharedConfig(partial);
+    chmodSync(configPath, 0o644);
+    const content = readFileSync(configPath, "utf8");
+    const mtime = statSync(configPath).mtimeMs;
+
+    updateSharedConfig(partial);
+
+    expect(readFileSync(configPath, "utf8")).toBe(content);
+    expect(statSync(configPath).mtimeMs).toBe(mtime);
+    expect(statSync(configPath).mode & 0o777).toBe(0o600);
+  });
+
+  it("keeps canonical owner-only config mtime unchanged for an equivalent update", async () => {
+    const { updateSharedConfig } = await import("../src/miloco/config.js");
+    const partial = { agent: { webhook_url: "http://plugin.local/webhook" } };
+    updateSharedConfig(partial);
+    const content = readFileSync(configPath, "utf8");
+    const mtime = statSync(configPath).mtimeMs;
+
+    updateSharedConfig(partial);
+
+    expect(readFileSync(configPath, "utf8")).toBe(content);
+    expect(statSync(configPath).mtimeMs).toBe(mtime);
+    expect(statSync(configPath).mode & 0o777).toBe(0o600);
+  });
+
+  it("fails closed without exposing config content when permission repair fails", async () => {
+    const { updateSharedConfig } = await import("../src/miloco/config.js");
+    const partial = { agent: { webhook_url: "http://plugin.local/webhook" } };
+    updateSharedConfig(partial);
+    chmodSync(configPath, 0o644);
+    const content = readFileSync(configPath, "utf8");
+    process.env.MILOCO_SHARED_CONFIG_TEST_FAIL_CHMOD = "1";
+
+    let failure: unknown;
+    try {
+      updateSharedConfig(partial);
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(String(failure)).toBe("Error: Miloco shared config transaction failed");
+    expect(String(failure)).not.toContain(content);
+    expect(readFileSync(configPath, "utf8")).toBe(content);
+    expect(statSync(configPath).mode & 0o777).toBe(0o644);
   });
 });
