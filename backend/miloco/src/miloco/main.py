@@ -434,6 +434,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
     watchdog.enter_shutdown()
 
+    await _shutdown_camera_live_streams()
+
     cleanup_task.cancel()
     try:
         await cleanup_task
@@ -501,6 +503,14 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     event_log.shutdown()
 
     logger.info("Application has been shut down")
+
+
+async def _shutdown_camera_live_streams() -> None:
+    """Release live-view subscribers without blocking the remaining shutdown."""
+    try:
+        await get_manager().shutdown_live_streams()
+    except Exception as error:  # noqa: BLE001
+        logger.error("Failed to stop camera live streams: %s", error)
 
 
 _settings = get_settings()

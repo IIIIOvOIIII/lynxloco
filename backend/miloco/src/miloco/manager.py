@@ -5,10 +5,18 @@
 Service manager module
 """
 
+import asyncio
 import logging
+import struct
 import uuid
+from collections.abc import Callable
+from dataclasses import replace
+from typing import Any
+
+from starlette.websockets import WebSocketState
 
 from miloco.camera.service import CameraService
+from miloco.camera.stream import EncodedVideoPacket, LiveStreamHub, LiveStreamSource
 from miloco.config import get_settings
 from miloco.database.kv_repo import KVRepo, SystemConfigKeys
 from miloco.database.person_repo import PersonRepo
@@ -24,6 +32,159 @@ from miloco.rule.terminate_evaluator import TerminateEvaluator
 from miloco.task.service import TaskService
 
 logger = logging.getLogger(__name__)
+
+
+class _MiotListenerWebSocket:
+    """Adapt the legacy MIoT fan-out wire format to packet callbacks."""
+
+    def __init__(self, owner: "_MiotLiveStreamBackend") -> None:
+        self._owner = owner
+        self.client_state = WebSocketState.CONNECTED
+
+    async def send_text(self, _message: str) -> None:
+        # The unified endpoint has a fixed binary-only H.264 contract.
+        return
+
+    async def send_bytes(self, payload: bytes) -> None:
+        self._owner.publish_legacy_payload(payload)
+
+    async def close(self) -> None:
+        self.client_state = WebSocketState.DISCONNECTED
+
+    def reopen(self) -> None:
+        self.client_state = WebSocketState.CONNECTED
+
+
+class _MiotLiveStreamBackend:
+    """Expose one legacy MIoT live subscription as a hub packet source."""
+
+    def __init__(self, legacy_manager: Any, camera_id: str, channel: int) -> None:
+        self._legacy_manager = legacy_manager
+        self._camera_id = camera_id
+        self._channel = channel
+        self._listeners: dict[int, Callable[[EncodedVideoPacket], None]] = {}
+        self._close_listeners: dict[int, Callable[[str | None], None]] = {}
+        self._next_listener_id = 0
+        self._connection_id: str | None = None
+        self._start_task: asyncio.Task[None] | None = None
+        self._close_task: asyncio.Task[None] | None = None
+        self._websocket = _MiotListenerWebSocket(self)
+
+    def add_packet_listener(
+        self, listener: Callable[[EncodedVideoPacket], None]
+    ) -> Callable[[], None]:
+        listener_id = self._next_listener_id
+        self._next_listener_id += 1
+        self._listeners[listener_id] = listener
+        should_start = self._start_task is None or (
+            self._start_task.done()
+            and (
+                self._connection_id is None
+                or (self._close_task is not None and not self._close_task.done())
+            )
+        )
+        if should_start:
+            self._start_task = asyncio.create_task(self._start())
+
+        def detach() -> None:
+            self._listeners.pop(listener_id, None)
+            if not self._listeners:
+                self._schedule_close()
+
+        return detach
+
+    def add_close_listener(
+        self, listener: Callable[[str | None], None]
+    ) -> Callable[[], None]:
+        listener_id = self._next_listener_id
+        self._next_listener_id += 1
+        self._close_listeners[listener_id] = listener
+
+        def detach() -> None:
+            self._close_listeners.pop(listener_id, None)
+
+        return detach
+
+    def publish_legacy_payload(self, payload: bytes) -> None:
+        if len(payload) < 16:
+            return
+        frame_type, timestamp = struct.unpack(">B7xQ", payload[:16])
+        packet = EncodedVideoPacket(
+            codec="h264",
+            data=bytes(payload[16:]),
+            pts=timestamp,
+            dts=timestamp,
+            is_keyframe=frame_type == 1,
+            time_base_num=1,
+            time_base_den=1000,
+        )
+        for listener in tuple(self._listeners.values()):
+            try:
+                listener(packet)
+            except Exception:  # noqa: BLE001
+                logger.warning("MIoT live stream listener failed")
+
+    async def _start(self) -> None:
+        try:
+            close_task = self._close_task
+            if close_task is not None and not close_task.done():
+                await asyncio.gather(close_task, return_exceptions=True)
+            self._websocket.reopen()
+            self._connection_id = await self._legacy_manager.new_connection(
+                websocket=self._websocket,
+                user_name="unified-camera-view",
+                token_hash="internal",
+                camera_id=self._camera_id,
+                channel=self._channel,
+            )
+            if not self._listeners:
+                await self._close_connection(start_task=self._start_task)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.warning("MIoT live stream subscription failed")
+            self._notify_closed("camera_unavailable")
+
+    def _schedule_close(self) -> None:
+        if self._close_task is None or self._close_task.done():
+            start_task = self._start_task
+            self._close_task = asyncio.create_task(
+                self._close_connection(start_task=start_task)
+            )
+
+    async def _close_connection(
+        self, *, start_task: asyncio.Task[None] | None = None
+    ) -> None:
+        if start_task is not None and start_task is not asyncio.current_task():
+            await asyncio.gather(start_task, return_exceptions=True)
+        connection_id, self._connection_id = self._connection_id, None
+        if connection_id is None:
+            return
+        try:
+            await self._legacy_manager.close_connection(
+                user_name="unified-camera-view",
+                token_hash="internal",
+                camera_id=self._camera_id,
+                channel=self._channel,
+                cid=connection_id,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("MIoT live stream detach failed")
+
+    def _notify_closed(self, error_code: str | None) -> None:
+        for listener in tuple(self._close_listeners.values()):
+            try:
+                listener(error_code)
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def aclose(self) -> None:
+        self._listeners.clear()
+        await self._close_connection(start_task=self._start_task)
+        close_task = self._close_task
+        if close_task is not None and close_task is not asyncio.current_task():
+            await asyncio.gather(close_task, return_exceptions=True)
+        await self._websocket.close()
 
 
 class Manager:
@@ -108,6 +269,7 @@ class Manager:
             self._miot_service,
             self._perception_service,
         )
+        self._initialize_live_stream_hub()
 
         self._task_service = TaskService(rule_service=self._rule_service)
 
@@ -145,6 +307,47 @@ class Manager:
     @property
     def camera_service(self) -> CameraService:
         return self._camera_service
+
+    def _initialize_live_stream_hub(self) -> None:
+        if getattr(self, "_live_stream_hub", None) is not None:
+            return
+        self._miot_live_backends: dict[tuple[str, int], _MiotLiveStreamBackend] = {}
+        self._live_stream_camera_ids: set[str] = set()
+        self._live_stream_hub = LiveStreamHub(self._resolve_live_stream)
+
+    async def _resolve_live_stream(self, camera_id: str) -> LiveStreamSource:
+        source = await self._camera_service.resolve_live_stream(camera_id)
+        self._live_stream_camera_ids.add(camera_id)
+        if source.source_type != "miot":
+            return source
+        key = (source.camera_id, source.channel)
+        backend = self._miot_live_backends.get(key)
+        if backend is None:
+            from miloco.miot.ws import miot_video_stream_manager
+
+            backend = _MiotLiveStreamBackend(
+                miot_video_stream_manager, source.camera_id, source.channel
+            )
+            self._miot_live_backends[key] = backend
+        return replace(source, backend=backend, input_codec="h264")
+
+    @property
+    def live_stream_hub(self) -> LiveStreamHub:
+        return self._live_stream_hub
+
+    async def shutdown_live_streams(self) -> None:
+        hub = getattr(self, "_live_stream_hub", None)
+        if hub is None:
+            return
+        camera_ids = set(getattr(self, "_live_stream_camera_ids", ()))
+        camera_ids.update(getattr(hub, "_feeds", ()))
+        for camera_id in camera_ids:
+            await hub.close_camera(camera_id)
+        backends = tuple(getattr(self, "_miot_live_backends", {}).values())
+        await asyncio.gather(
+            *(backend.aclose() for backend in backends), return_exceptions=True
+        )
+        self._live_stream_camera_ids.clear()
 
     @property
     def task_service(self) -> TaskService:
