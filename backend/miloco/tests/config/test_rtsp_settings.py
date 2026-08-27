@@ -19,7 +19,7 @@ def _source(**overrides: object) -> RtspSourceSettings:
         "uri": "rtsp://camera.local:554/stream1",
     }
     data.update(overrides)
-    return RtspSourceSettings(**data)
+    return RtspSourceSettings.model_validate(data)
 
 
 @pytest.mark.parametrize(
@@ -29,7 +29,9 @@ def test_rtsp_source_accepts_rtsp_and_rtsps_uris(uri: str) -> None:
     assert _source(uri=uri).uri == uri
 
 
-@pytest.mark.parametrize("uri", ["http://camera.local/stream1", "https://camera.local/stream1"])
+@pytest.mark.parametrize(
+    "uri", ["http://camera.local/stream1", "https://camera.local/stream1"]
+)
 def test_rtsp_source_rejects_unsupported_uri_schemes(uri: str) -> None:
     with pytest.raises(ValidationError):
         _source(uri=uri)
