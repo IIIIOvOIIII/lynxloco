@@ -37,9 +37,12 @@ class _RtspSettingsApplier(Protocol):
 
 
 class _CameraSourceSynchronizer(Protocol):
-    async def sync_devices(self, all_devices: dict | None = None) -> None: ...
-
-    async def disconnect_device(self, did: str) -> None: ...
+    async def reconcile_and_sync(
+        self,
+        disconnect_dids: frozenset[str],
+        *,
+        connect_enabled: bool,
+    ) -> bool: ...
 
 
 logger = logging.getLogger(__name__)
@@ -89,25 +92,18 @@ class PerceptionService:
             async with self._camera_sources_lock:
                 result = await self._rtsp_camera_source.apply_settings()
                 success = result.success
-                for did in sorted(result.reconcile_dids):
-                    try:
-                        await self._camera_adapter.disconnect_device(did)
-                    except Exception as error:  # noqa: BLE001
-                        logger.error(
-                            "[service] RTSP adapter reconcile failed for %s (%s)",
-                            did,
-                            type(error).__name__,
-                        )
-                        success = False
-                if self._engine.is_running:
-                    try:
-                        await self._camera_adapter.sync_devices()
-                    except Exception as error:  # noqa: BLE001
-                        logger.error(
-                            "[service] camera source sync failed (%s)",
-                            type(error).__name__,
-                        )
-                        success = False
+                try:
+                    reconciled = await self._camera_adapter.reconcile_and_sync(
+                        result.reconcile_dids,
+                        connect_enabled=self._engine.is_running,
+                    )
+                    success = success and reconciled
+                except Exception as error:  # noqa: BLE001
+                    logger.error(
+                        "[service] camera source sync failed (%s)",
+                        type(error).__name__,
+                    )
+                    success = False
                 return success
 
     async def stop_to_unconfigured(self) -> None:

@@ -18,6 +18,7 @@ physical identities remain inside their source driver.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
@@ -65,6 +66,7 @@ def _unix_ms() -> int:
 
 _CAMERA_TRACKS = ["decoded_video", "decoded_audio"]
 
+
 @dataclass
 class _CameraDeviceState:
     """Per-channel stream state — one entry per camera lens.
@@ -107,6 +109,7 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
             raise ValueError("At least one camera source is required")
 
         self._sources = list(sources)
+        self._sync_lock = asyncio.Lock()
         self._miot_proxy = miot_proxy
         self._on_window_ready = on_window_ready
         self._devices: dict[str, _CameraDeviceState] = {}
@@ -188,6 +191,33 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
         相机（要救），但排除云端就离线的相机（救不活，避免它让判据永真致 refresh
         空转）。scope 内相机要么已连、要么云端离线时不触发，零额外开销。
         """
+        async with self._sync_lock:
+            await self._sync_devices_unlocked(all_devices)
+
+    async def reconcile_and_sync(
+        self,
+        disconnect_dids: frozenset[str],
+        *,
+        connect_enabled: bool,
+    ) -> bool:
+        """Reconcile hot-apply removals under the same lock as periodic sync."""
+        async with self._sync_lock:
+            success = True
+            for did in sorted(disconnect_dids):
+                try:
+                    await self.disconnect_device(did)
+                except Exception as error:  # noqa: BLE001
+                    logger.error(
+                        "Failed to reconcile camera %s (%s)",
+                        did,
+                        type(error).__name__,
+                    )
+                    success = False
+            if connect_enabled:
+                await self._sync_devices_unlocked()
+            return success
+
+    async def _sync_devices_unlocked(self, all_devices: dict | None = None) -> None:
         if all_devices is None:
             for camera_source in self._sources:
                 refresh_if_needed = getattr(camera_source, "refresh_if_needed", None)
@@ -214,9 +244,7 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
                         now_ms=_monotonic_ms(),
                     )
                 except Exception as error:  # noqa: BLE001
-                    logger.warning(
-                        "On-demand camera manager refresh failed: %s", error
-                    )
+                    logger.warning("On-demand camera manager refresh failed: %s", error)
         await super().sync_devices(all_devices)
 
     async def connect_device(
@@ -333,7 +361,9 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
                 return None
             return self._build_device_data(state, tracks)
 
-    def peek_latest_frame(self, did: str, *, window_ms: int = 2000) -> "NDArray[np.uint8] | None":
+    def peek_latest_frame(
+        self, did: str, *, window_ms: int = 2000
+    ) -> "NDArray[np.uint8] | None":
         """非破坏性取该相机最近一帧解码图(numpy BGR);无缓存返 None。
 
         供 tier_c 闲时定期清的 live 检测用——gate 关停时正常 pipeline 不取帧,
