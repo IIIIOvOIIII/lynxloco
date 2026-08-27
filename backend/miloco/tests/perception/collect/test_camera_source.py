@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
 import pytest
 from miloco.perception.collect.camera_adapter import CameraDeviceAdapter
-from miloco.perception.collect.camera_source import CameraSourceState
+from miloco.perception.collect.camera_source import (
+    AudioFrameCallback,
+    CameraSourceState,
+    VideoFrameCallback,
+)
 from miloco.perception.types import PerceptionDevice
 
 
@@ -18,11 +21,6 @@ def _device(did: str) -> PerceptionDevice:
         device_type="camera",
         room_name="test-room",
     )
-
-
-@dataclass
-class _State:
-    connected: bool
 
 
 class _RecordingSource:
@@ -42,14 +40,21 @@ class _RecordingSource:
     ) -> dict[str, PerceptionDevice]:
         return self._devices
 
-    async def connect_device(self, did: str, video_cb, audio_cb) -> None:
+    async def connect_device(
+        self,
+        did: str,
+        video_cb: VideoFrameCallback,
+        audio_cb: AudioFrameCallback,
+    ) -> None:
         self.connected.append(did)
 
     async def disconnect_device(self, did: str) -> None:
         self.disconnected.append(did)
 
-    def get_state(self, did: str) -> _State:
-        return _State(connected=did in self.connected and did not in self.disconnected)
+    def get_state(self, did: str) -> CameraSourceState:
+        return CameraSourceState(
+            connected=did in self.connected and did not in self.disconnected
+        )
 
     async def shutdown(self) -> None:
         self.shutdown_count += 1
@@ -60,7 +65,12 @@ class _FailOnceConnectSource(_RecordingSource):
         super().__init__("rtsp", devices)
         self.connect_attempts = 0
 
-    async def connect_device(self, did: str, video_cb, audio_cb) -> None:
+    async def connect_device(
+        self,
+        did: str,
+        video_cb: VideoFrameCallback,
+        audio_cb: AudioFrameCallback,
+    ) -> None:
         self.connect_attempts += 1
         if self.connect_attempts == 1:
             raise RuntimeError("temporary connect failure")
@@ -77,21 +87,26 @@ class _AsyncPendingSource(_RecordingSource):
     def __init__(self, devices: dict[str, PerceptionDevice]) -> None:
         super().__init__("rtsp", devices)
         self._registered: set[str] = set()
-        self._video_callbacks: dict[str, object] = {}
+        self._video_callbacks: dict[str, VideoFrameCallback] = {}
 
-    async def connect_device(self, did: str, video_cb, audio_cb) -> None:
+    async def connect_device(
+        self,
+        did: str,
+        video_cb: VideoFrameCallback,
+        audio_cb: AudioFrameCallback,
+    ) -> None:
         self._registered.add(did)
         self._video_callbacks[did] = video_cb
 
-    def get_state(self, did: str) -> _State:
-        return _State(connected=False)
+    def get_state(self, did: str) -> CameraSourceState:
+        return CameraSourceState(connected=False)
 
     def retain_pending_connection(self, did: str) -> bool:
         return did in self._registered
 
     async def emit_video(self, did: str) -> None:
         callback = self._video_callbacks[did]
-        await callback(  # type: ignore[operator]
+        await callback(
             did,
             np.ones((2, 2, 3), dtype=np.uint8),
             100,
@@ -102,11 +117,16 @@ class _AsyncPendingSource(_RecordingSource):
 
 
 class _SynchronousFailedSource(_RecordingSource):
-    async def connect_device(self, did: str, video_cb, audio_cb) -> None:
+    async def connect_device(
+        self,
+        did: str,
+        video_cb: VideoFrameCallback,
+        audio_cb: AudioFrameCallback,
+    ) -> None:
         return None
 
-    def get_state(self, did: str) -> _State:
-        return _State(connected=False)
+    def get_state(self, did: str) -> CameraSourceState:
+        return CameraSourceState(connected=False)
 
 
 class _PendingDecisionSource(_RecordingSource):
@@ -124,7 +144,12 @@ class _PendingDecisionSource(_RecordingSource):
         self.connect_attempts = 0
         self.capability_calls = 0
 
-    async def connect_device(self, did: str, video_cb, audio_cb) -> None:
+    async def connect_device(
+        self,
+        did: str,
+        video_cb: VideoFrameCallback,
+        audio_cb: AudioFrameCallback,
+    ) -> None:
         self.connect_attempts += 1
         self.registered.add(did)
 
@@ -132,8 +157,8 @@ class _PendingDecisionSource(_RecordingSource):
         self.registered.discard(did)
         await super().disconnect_device(did)
 
-    def get_state(self, did: str) -> _State:
-        return _State(connected=self.network_connected)
+    def get_state(self, did: str) -> CameraSourceState:
+        return CameraSourceState(connected=self.network_connected)
 
     def retain_pending_connection(self, did: str) -> object:
         self.capability_calls += 1
@@ -176,7 +201,7 @@ async def test_adapter_merges_sources_and_routes_each_did_to_its_owner() -> None
         },
     )
     rtsp = _RecordingSource("rtsp", {"rtsp-1": _device("rtsp-1")})
-    adapter = CameraDeviceAdapter(sources=[miot, rtsp])  # type: ignore[arg-type]
+    adapter = CameraDeviceAdapter(sources=[miot, rtsp])
 
     discovered = await adapter.discover_devices()
 
@@ -207,7 +232,7 @@ async def test_adapter_merges_sources_and_routes_each_did_to_its_owner() -> None
 async def test_adapter_rejects_duplicate_dids_across_sources() -> None:
     miot = _RecordingSource("miot", {"shared": _device("shared")})
     rtsp = _RecordingSource("rtsp", {"shared": _device("shared")})
-    adapter = CameraDeviceAdapter(sources=[miot, rtsp])  # type: ignore[arg-type]
+    adapter = CameraDeviceAdapter(sources=[miot, rtsp])
 
     with pytest.raises(
         RuntimeError,
@@ -219,7 +244,7 @@ async def test_adapter_rejects_duplicate_dids_across_sources() -> None:
 @pytest.mark.asyncio
 async def test_failed_connect_removes_state_and_next_sync_retries() -> None:
     source = _FailOnceConnectSource({"flaky": _device("flaky")})
-    adapter = CameraDeviceAdapter(sources=[source])  # type: ignore[arg-type]
+    adapter = CameraDeviceAdapter(sources=[source])
 
     await adapter.sync_devices()
 
@@ -236,7 +261,7 @@ async def test_failed_connect_removes_state_and_next_sync_retries() -> None:
 async def test_registered_async_source_retains_buffer_until_late_callback() -> None:
     did = "rtsp:pending"
     source = _AsyncPendingSource({did: _device(did)})
-    adapter = CameraDeviceAdapter(sources=[source])  # type: ignore[arg-type]
+    adapter = CameraDeviceAdapter(sources=[source])
 
     await adapter.sync_devices()
 
@@ -254,7 +279,7 @@ async def test_registered_async_source_retains_buffer_until_late_callback() -> N
 async def test_synchronous_false_source_still_clears_precreated_buffer() -> None:
     did = "miot-failed"
     source = _SynchronousFailedSource("miot", {did: _device(did)})
-    adapter = CameraDeviceAdapter(sources=[source])  # type: ignore[arg-type]
+    adapter = CameraDeviceAdapter(sources=[source])
 
     await adapter.sync_devices()
 
@@ -273,7 +298,7 @@ async def test_invalid_pending_capability_fails_closed_without_leaking_registrat
 ) -> None:
     did = f"rtsp:invalid-{decision}"
     source = _PendingDecisionSource({did: _device(did)}, decision=decision)
-    adapter = CameraDeviceAdapter(sources=[source])  # type: ignore[arg-type]
+    adapter = CameraDeviceAdapter(sources=[source])
 
     with caplog.at_level(
         logging.WARNING, logger="miloco.perception.collect.camera_adapter"
@@ -295,7 +320,7 @@ async def test_connected_source_does_not_evaluate_broken_pending_capability() ->
     source = _PendingDecisionSource(
         {did: _device(did)}, decision="raise", connected=True
     )
-    adapter = CameraDeviceAdapter(sources=[source])  # type: ignore[arg-type]
+    adapter = CameraDeviceAdapter(sources=[source])
 
     await adapter.sync_devices()
 
@@ -311,7 +336,7 @@ async def test_terminal_pending_registration_is_pruned_without_same_sync_restart
 ):
     did = "rtsp:terminal"
     source = _PendingDecisionSource({did: _device(did)})
-    adapter = CameraDeviceAdapter(sources=[source])  # type: ignore[arg-type]
+    adapter = CameraDeviceAdapter(sources=[source])
     await adapter.sync_devices()
     assert source.connect_attempts == 1
 
@@ -337,7 +362,7 @@ async def test_active_disconnected_registration_survives_periodic_reconciliation
 ):
     did = "rtsp:reconnecting"
     source = _PendingDecisionSource({did: _device(did)})
-    adapter = CameraDeviceAdapter(sources=[source])  # type: ignore[arg-type]
+    adapter = CameraDeviceAdapter(sources=[source])
 
     await adapter.sync_devices()
     await adapter.sync_devices()
@@ -353,9 +378,7 @@ async def test_shutdown_logs_source_failure_and_continues(
 ) -> None:
     failing = _FailingShutdownSource("miot", {})
     healthy = _RecordingSource("rtsp", {})
-    adapter = CameraDeviceAdapter(
-        sources=[failing, healthy]  # type: ignore[list-item]
-    )
+    adapter = CameraDeviceAdapter(sources=[failing, healthy])
 
     with caplog.at_level(
         logging.ERROR, logger="miloco.perception.collect.camera_adapter"

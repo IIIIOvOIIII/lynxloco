@@ -11,8 +11,13 @@ import numpy as np
 import pytest
 from miloco.config.settings import RtspSourceSettings
 from miloco.database.kv_repo import ScopeConfigKeys
+from miloco.miot.client import MiotProxy
 from miloco.perception.collect.camera_adapter import CameraDeviceAdapter
-from miloco.perception.collect.camera_source import CameraSourceState
+from miloco.perception.collect.camera_source import (
+    AudioFrameCallback,
+    CameraSourceState,
+    VideoFrameCallback,
+)
 from miloco.perception.collect.miot_camera_source import MiotCameraSource
 from miloco.perception.collect.rtsp_camera_source import RtspCameraSource
 from miloco.perception.service import PerceptionService
@@ -53,8 +58,8 @@ class _RecordingMiotProxy:
         self._cameras = cameras
         self._kv_repo = _FakeKV()
         self._camera_awake_cache: dict = {}
-        self.video_subscriptions: list[tuple[str, int, object]] = []
-        self.audio_subscriptions: list[tuple[str, int, object]] = []
+        self.video_subscriptions: list[tuple[str, int, VideoFrameCallback]] = []
+        self.audio_subscriptions: list[tuple[str, int, AudioFrameCallback]] = []
         self.video_unsubscriptions: list[tuple[str, int, int]] = []
         self.audio_unsubscriptions: list[tuple[str, int, int]] = []
 
@@ -65,13 +70,13 @@ class _RecordingMiotProxy:
         return self._cameras.get(did)
 
     async def start_camera_decode_video_stream(
-        self, did: str, channel: int, callback: object
+        self, did: str, channel: int, callback: VideoFrameCallback
     ) -> int:
         self.video_subscriptions.append((did, channel, callback))
         return 101
 
     async def start_camera_decode_audio_stream(
-        self, did: str, channel: int, callback: object
+        self, did: str, channel: int, callback: AudioFrameCallback
     ) -> int:
         self.audio_subscriptions.append((did, channel, callback))
         return 202
@@ -95,7 +100,7 @@ async def test_miot_discovery_preserves_single_and_multichannel_dids() -> None:
             "single": _camera("single", channel_count=1),
         }
     )
-    adapter = CameraDeviceAdapter(miot_proxy=proxy)  # type: ignore[arg-type]
+    adapter = CameraDeviceAdapter(miot_proxy=cast(MiotProxy, proxy))
 
     devices = await adapter.discover_devices()
 
@@ -110,7 +115,7 @@ async def test_miot_callbacks_collection_unregistration_and_shutdown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     proxy = _RecordingMiotProxy({"dual": _camera("dual", channel_count=2)})
-    adapter = CameraDeviceAdapter(miot_proxy=proxy)  # type: ignore[arg-type]
+    adapter = CameraDeviceAdapter(miot_proxy=cast(MiotProxy, proxy))
     device = (await adapter.discover_devices())["dual:ch1"]
     monkeypatch.setattr(
         "miloco.perception.collect.camera_adapter._monotonic_ms", lambda: 50_000
@@ -133,10 +138,10 @@ async def test_miot_callbacks_collection_unregistration_and_shutdown(
     audio_callback = proxy.audio_subscriptions[0][2]
     video_frame = np.zeros((2, 3, 3), dtype=np.uint8)
     audio_frame = np.array([11, -12], dtype=np.int16)
-    await video_callback(  # type: ignore[operator]
+    await video_callback(
         "dual", video_frame, 9_000, 1, 1_700_000_049_970, 1_700_000_049_990
     )
-    await audio_callback(  # type: ignore[operator]
+    await audio_callback(
         "dual", audio_frame, 9_000, 1, 1_700_000_049_975, 1_700_000_049_990
     )
 
@@ -165,7 +170,9 @@ class _FrameProducingMiotSource:
     def __init__(self) -> None:
         self.connected = False
 
-    async def discover_devices(self, *args, **kwargs):
+    async def discover_devices(
+        self, all_devices: dict | None = None, **filters: object
+    ) -> dict[str, PerceptionDevice]:
         return {
             "miot-stable-did": PerceptionDevice(
                 did="miot-stable-did",
@@ -175,7 +182,12 @@ class _FrameProducingMiotSource:
             )
         }
 
-    async def connect_device(self, did, video_cb, audio_cb) -> None:
+    async def connect_device(
+        self,
+        did: str,
+        video_cb: VideoFrameCallback,
+        audio_cb: AudioFrameCallback,
+    ) -> None:
         self.connected = True
         await video_cb(
             did,
@@ -186,10 +198,10 @@ class _FrameProducingMiotSource:
             1_001,
         )
 
-    async def disconnect_device(self, did) -> None:
+    async def disconnect_device(self, did: str) -> None:
         self.connected = False
 
-    def get_state(self, did) -> CameraSourceState:
+    def get_state(self, did: str) -> CameraSourceState:
         return CameraSourceState(connected=self.connected)
 
     async def shutdown(self) -> None:
@@ -304,7 +316,7 @@ async def test_failing_rtsp_does_not_block_miot_or_another_rtsp_device_data(
     ]
     miot = _FrameProducingMiotSource()
     rtsp = RtspCameraSource(lambda: settings)
-    adapter = CameraDeviceAdapter(sources=[miot, rtsp])  # type: ignore[list-item]
+    adapter = CameraDeviceAdapter(sources=[miot, rtsp])
 
     with caplog.at_level(logging.ERROR):
         await adapter.sync_devices()
