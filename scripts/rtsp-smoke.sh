@@ -36,7 +36,18 @@ cleanup() {
         miloco-cli camera delete "$cleanup_id" --yes >/dev/null 2>&1 || true
     fi
 }
-trap cleanup EXIT INT TERM HUP
+
+handle_signal() {
+    local exit_code="$1"
+    trap - EXIT INT TERM HUP
+    cleanup
+    exit "$exit_code"
+}
+
+trap cleanup EXIT
+trap 'handle_signal 130' INT
+trap 'handle_signal 143' TERM
+trap 'handle_signal 129' HUP
 
 run_with_optional_password() {
     if [[ -n "$RTSP_PASSWORD" ]]; then
@@ -91,7 +102,11 @@ import json
 import sys
 
 data = json.load(sys.stdin)["data"]
-print(f"{data[\"video_codec\"]}\t{int(data[\"width\"])}\t{int(data[\"height\"])}")
+print("{}\t{}\t{}".format(
+    data["video_codec"],
+    int(data["width"]),
+    int(data["height"]),
+))
 ')"
 IFS=$'\t' read -r VIDEO_CODEC WIDTH HEIGHT <<<"$probe_summary"
 
@@ -117,12 +132,12 @@ raise SystemExit(0 if any(
 ' "$CAMERA_ID"; then
         END_NS="$(python3 -c 'import time; print(time.monotonic_ns())')"
         STARTUP_MS=$(((END_NS - START_NS) / 1000000))
-        printf 'codec=%s dimensions=%sx%s startup_ms=%s reconnect=not_measured\n' \
+        printf 'codec=%s dimensions=%sx%s probe_frame=passed source_ready_ms=%s reconnect=not_measured\n' \
             "$VIDEO_CODEC" "$WIDTH" "$HEIGHT" "$STARTUP_MS"
         exit 0
     fi
     sleep 1
 done
 
-echo "Temporary RTSP source did not reach decoded-connected state before timeout" >&2
+echo "Temporary RTSP source did not reach session-ready state before timeout" >&2
 exit 4
