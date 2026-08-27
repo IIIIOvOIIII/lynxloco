@@ -194,6 +194,73 @@ async def test_terminal_session_is_not_a_retainable_pending_registration() -> No
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_code", "safe_message"),
+    [
+        ("authentication_failed", "RTSP authentication failed"),
+        ("resource_not_found", "RTSP resource was not found"),
+        ("no_video_stream", "RTSP source has no video stream"),
+    ],
+)
+async def test_terminal_status_survives_session_cleanup_without_sensitive_text(
+    error_code: str,
+    safe_message: str,
+) -> None:
+    configured = _source(
+        1,
+        uri="rtsp://private-host.example/secret-path",
+        username="private-user",
+        password="private-password",
+    )
+    current = [configured]
+    source = RtspCameraSource(lambda: current)
+    await source.connect_device(configured.id, _video_cb, _audio_cb)
+    terminal = source.get_session(configured.id)
+    assert isinstance(terminal, _RecordingSession)
+    terminal.connected = False
+    terminal.active = False
+    terminal.terminal = True
+    terminal.state_override = CameraSourceState(
+        connected=False,
+        video_codec="h264",
+        width=1920,
+        height=1080,
+        last_frame_unix_ms=1_787_851_234_567,
+        error_code=error_code,
+        error_message="raw failure at rtsp://private-user:private-password@host/secret",
+    )
+
+    assert source.retain_pending_connection(configured.id) is False
+    await source.disconnect_device(configured.id)
+    await source.discover_devices()
+    await source.discover_devices()
+
+    expected = CameraSourceState(
+        connected=False,
+        video_codec="h264",
+        width=1920,
+        height=1080,
+        last_frame_unix_ms=1_787_851_234_567,
+        error_code=error_code,
+        error_message=safe_message,
+    )
+    assert source.get_state(configured.id) == expected
+    tombstone_repr = repr(source._terminal_tombstones)
+    assert "private-password" not in tombstone_repr
+    assert "private-user" not in tombstone_repr
+    assert "secret-path" not in tombstone_repr
+    assert "raw failure" not in tombstone_repr
+
+    current = [configured.model_copy(update={"name": "metadata only"})]
+    await source.apply_settings()
+    assert source.get_state(configured.id) == expected
+
+    current = [current[0].model_copy(update={"uri": "rtsp://recovered.example/stream"})]
+    await source.apply_settings()
+    assert source.get_state(configured.id) == CameraSourceState(connected=False)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("removed", [False, True])
 async def test_disable_or_delete_clears_terminal_retry_suppression(
     removed: bool,
@@ -212,6 +279,7 @@ async def test_disable_or_delete_clears_terminal_retry_suppression(
 
     current = [] if removed else [configured.model_copy(update={"enabled": False})]
     await source.apply_settings()
+    assert source.get_state(configured.id) == CameraSourceState(connected=False)
     current = [configured]
     await source.apply_settings()
     await source.connect_device(configured.id, _video_cb, _audio_cb)

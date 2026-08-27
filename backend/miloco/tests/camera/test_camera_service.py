@@ -13,7 +13,9 @@ from miloco.camera.service import (
     CameraService,
 )
 from miloco.config.settings import RtspSourceSettings
+from miloco.perception.collect.camera_adapter import CameraDeviceAdapter
 from miloco.perception.collect.camera_source import CameraSourceState
+from miloco.perception.collect.rtsp_camera_source import RtspCameraSource
 from miloco.perception.collect.rtsp_probe import RtspProbeResult, RtspSourceError
 
 SOURCE_ID = "rtsp:00000000-0000-0000-0000-000000000001"
@@ -132,6 +134,36 @@ class _Miot:
         return list(self.cameras)
 
 
+class _ApiTerminalSession:
+    def __init__(self, source: RtspSourceSettings) -> None:
+        self.source = source
+        self.active = False
+        self.terminal = False
+        self.state_override = CameraSourceState(connected=False)
+
+    async def start(self, video_cb, audio_cb) -> None:
+        del video_cb, audio_cb
+        self.active = True
+        self.state_override = CameraSourceState(connected=True)
+
+    async def stop(self) -> None:
+        self.active = False
+        self.state_override = CameraSourceState(
+            connected=False,
+            error_code=self.state_override.error_code,
+            error_message=self.state_override.error_message,
+        )
+
+    def state(self) -> CameraSourceState:
+        return self.state_override
+
+    def is_active(self) -> bool:
+        return self.active
+
+    def is_terminal(self) -> bool:
+        return self.terminal
+
+
 def _probe_result() -> RtspProbeResult:
     return RtspProbeResult(
         video_codec="h264",
@@ -240,6 +272,50 @@ async def test_list_reports_null_frame_time_until_rtsp_source_decodes_a_frame() 
     ).list_cameras()
 
     assert summaries[0].last_frame_unix_ms is None
+
+
+@pytest.mark.asyncio
+async def test_list_preserves_safe_terminal_status_after_adapter_prunes_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "miloco.perception.collect.rtsp_camera_source.RtspSession",
+        _ApiTerminalSession,
+    )
+    store = _ConfigStore(
+        [
+            _source(
+                enabled=True,
+                uri="rtsp://private-host.example/secret-path",
+                password="private-password",
+            )
+        ]
+    )
+    source = RtspCameraSource(lambda: store.load().camera.rtsp_sources)
+    adapter = CameraDeviceAdapter(sources=[source])
+    await adapter.sync_devices()
+    session = source.get_session(SOURCE_ID)
+    assert isinstance(session, _ApiTerminalSession)
+    session.active = False
+    session.terminal = True
+    session.state_override = CameraSourceState(
+        connected=False,
+        error_code="resource_not_found",
+        error_message="RTSP resource was not found",
+    )
+
+    await adapter.sync_devices()
+    await adapter.sync_devices()
+    perception = _Perception()
+    perception._rtsp_camera_source = SimpleNamespace(get_state=source.get_state)
+
+    summaries = await _service(store, perception).list_cameras()
+
+    assert summaries[0].connected is False
+    assert summaries[0].error_code == "resource_not_found"
+    assert summaries[0].error_message == "RTSP resource was not found"
+    assert "private-password" not in repr(summaries)
+    assert "secret-path" not in repr(summaries)
 
 
 @pytest.mark.asyncio

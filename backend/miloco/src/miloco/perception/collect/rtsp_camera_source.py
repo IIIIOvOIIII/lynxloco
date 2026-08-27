@@ -28,6 +28,14 @@ _CONNECTION_FIELDS = (
     "audio_enabled",
 )
 
+_SAFE_TERMINAL_MESSAGES = {
+    "invalid_uri": "RTSP URI is invalid",
+    "authentication_failed": "RTSP authentication failed",
+    "resource_not_found": "RTSP resource was not found",
+    "unsupported_video_codec": "RTSP video codec could not be decoded",
+    "no_video_stream": "RTSP source has no video stream",
+}
+
 
 @dataclass(frozen=True)
 class RtspApplyResult:
@@ -43,6 +51,12 @@ class _SessionEntry:
     audio_cb: AudioFrameCallback
 
 
+@dataclass(frozen=True)
+class _TerminalTombstone:
+    fingerprint: str
+    state: CameraSourceState
+
+
 class RtspCameraSource:
     """Own the one live ``RtspSession`` allowed for each enabled RTSP source."""
 
@@ -52,7 +66,7 @@ class RtspCameraSource:
         self._settings_loader = settings_loader
         self._sessions: dict[str, _SessionEntry] = {}
         self._pending_cleanup: dict[str, _SessionEntry] = {}
-        self._terminal_tombstones: dict[str, str] = {}
+        self._terminal_tombstones: dict[str, _TerminalTombstone] = {}
         self._lifecycle_lock = asyncio.Lock()
 
     def _load_settings(self) -> dict[str, RtspSourceSettings]:
@@ -85,7 +99,8 @@ class RtspCameraSource:
             if setting is None or not setting.enabled:
                 return
             fingerprint = self._connection_fingerprint(setting)
-            if self._terminal_tombstones.get(did) == fingerprint:
+            tombstone = self._terminal_tombstones.get(did)
+            if tombstone is not None and tombstone.fingerprint == fingerprint:
                 return
             self._terminal_tombstones.pop(did, None)
 
@@ -178,7 +193,10 @@ class RtspCameraSource:
         if entry.session.is_active() is True:
             return True
         if entry.session.is_terminal() is True:
-            self._terminal_tombstones[did] = self._connection_fingerprint(entry.setting)
+            self._terminal_tombstones[did] = _TerminalTombstone(
+                fingerprint=self._connection_fingerprint(entry.setting),
+                state=self._terminal_state(entry.session.state()),
+            )
         return False
 
     async def request_retry(self, did: str) -> bool:
@@ -199,9 +217,17 @@ class RtspCameraSource:
 
     def get_state(self, did: str) -> CameraSourceState:
         entry = self._sessions.get(did) or self._pending_cleanup.get(did)
-        if entry is None:
-            return CameraSourceState(connected=False)
-        return entry.session.state()
+        if entry is not None:
+            return entry.session.state()
+        setting = self._load_settings().get(did)
+        tombstone = self._terminal_tombstones.get(did)
+        if (
+            setting is not None
+            and tombstone is not None
+            and tombstone.fingerprint == self._connection_fingerprint(setting)
+        ):
+            return tombstone.state
+        return CameraSourceState(connected=False)
 
     def get_cached_device(self, did: str) -> PerceptionDevice | None:
         setting = self._load_settings().get(did)
@@ -212,19 +238,38 @@ class RtspCameraSource:
     def _reconcile_terminal_tombstones(
         self, settings: dict[str, RtspSourceSettings]
     ) -> None:
-        for did, fingerprint in list(self._terminal_tombstones.items()):
+        for did, tombstone in list(self._terminal_tombstones.items()):
             setting = settings.get(did)
             if (
                 setting is None
                 or not setting.enabled
-                or self._connection_fingerprint(setting) != fingerprint
+                or self._connection_fingerprint(setting) != tombstone.fingerprint
             ):
                 self._terminal_tombstones.pop(did, None)
 
     def _is_terminally_suppressed(self, setting: RtspSourceSettings) -> bool:
-        return self._terminal_tombstones.get(
-            setting.id
-        ) == self._connection_fingerprint(setting)
+        tombstone = self._terminal_tombstones.get(setting.id)
+        return (
+            tombstone is not None
+            and tombstone.fingerprint == self._connection_fingerprint(setting)
+        )
+
+    @staticmethod
+    def _terminal_state(state: CameraSourceState) -> CameraSourceState:
+        error_message = _SAFE_TERMINAL_MESSAGES.get(state.error_code or "")
+        return CameraSourceState(
+            connected=False,
+            video_codec=state.video_codec,
+            audio_codec=state.audio_codec,
+            width=state.width,
+            height=state.height,
+            fps=state.fps,
+            last_frame_unix_ms=state.last_frame_unix_ms,
+            reconnect_attempt=state.reconnect_attempt,
+            dropped_frames=state.dropped_frames,
+            error_code=state.error_code if error_message is not None else None,
+            error_message=error_message,
+        )
 
     async def shutdown(self) -> None:
         async with self._lifecycle_lock:

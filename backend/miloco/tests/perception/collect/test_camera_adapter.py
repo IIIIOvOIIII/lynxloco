@@ -216,12 +216,15 @@ class _AdapterRtspSession:
         self.connected = False
         self.active = False
         self.terminal = False
+        self.state_override: CameraSourceState | None = None
+        self.video_cb = None
         self.stop_count = 0
         self.instances.append(self)
 
     async def start(self, video_cb, audio_cb) -> None:
         if "broken" in self.source.uri:
             raise RuntimeError("operator-secret private-path")
+        self.video_cb = video_cb
         self.active = True
         self.connected = True
         await video_cb(
@@ -239,7 +242,7 @@ class _AdapterRtspSession:
         self.connected = False
 
     def state(self) -> CameraSourceState:
-        return CameraSourceState(connected=self.connected)
+        return self.state_override or CameraSourceState(connected=self.connected)
 
     def is_active(self) -> bool:
         return self.active
@@ -475,6 +478,17 @@ async def test_terminal_rtsp_stays_suppressed_until_connection_config_changes(
     terminal.connected = False
     terminal.active = False
     terminal.terminal = True
+    terminal.state_override = CameraSourceState(
+        connected=False,
+        video_codec="h264",
+        width=1920,
+        height=1080,
+        last_frame_unix_ms=1_787_851_234_567,
+        error_code="authentication_failed",
+        error_message="RTSP authentication failed",
+    )
+    late_video_cb = terminal.video_cb
+    assert late_video_cb is not None
 
     await adapter.sync_devices()
     await adapter.sync_devices()
@@ -483,6 +497,7 @@ async def test_terminal_rtsp_stays_suppressed_until_connection_config_changes(
     assert adapter.get_connected_devices() == {}
     assert rtsp.get_session(camera_id) is None
     assert len(_AdapterRtspSession.instances) == 1
+    assert rtsp.get_state(camera_id) == terminal.state_override
     assert "private-password" not in repr(rtsp._terminal_tombstones)
     assert "private-user" not in repr(rtsp._terminal_tombstones)
     assert "secret-path" not in repr(rtsp._terminal_tombstones)
@@ -491,6 +506,18 @@ async def test_terminal_rtsp_stays_suppressed_until_connection_config_changes(
     await rtsp.apply_settings()
     await adapter.sync_devices()
     assert len(_AdapterRtspSession.instances) == 1
+    assert rtsp.get_state(camera_id) == terminal.state_override
+
+    await late_video_cb(
+        camera_id,
+        np.full((2, 2, 3), 9, dtype=np.uint8),
+        900,
+        0,
+        9_000,
+        9_001,
+    )
+    assert adapter.get_connected_devices() == {}
+    assert rtsp.get_state(camera_id) == terminal.state_override
 
     settings = [
         settings[0].model_copy(update={"uri": "rtsp://recovered.example/stream"})
@@ -500,6 +527,7 @@ async def test_terminal_rtsp_stays_suppressed_until_connection_config_changes(
 
     assert len(_AdapterRtspSession.instances) == 2
     assert set(adapter.get_connected_devices()) == {camera_id}
+    assert rtsp.get_state(camera_id).error_code is None
 
 
 @pytest.mark.asyncio
@@ -537,11 +565,19 @@ async def test_explicit_retry_restarts_terminal_rtsp_without_config_change(
     terminal.connected = False
     terminal.active = False
     terminal.terminal = True
+    terminal.state_override = CameraSourceState(
+        connected=False,
+        error_code="authentication_failed",
+        error_message="RTSP authentication failed",
+    )
+    await adapter.sync_devices()
+    assert rtsp.get_state(camera_id).error_code == "authentication_failed"
 
     assert await service.retry_camera_source(camera_id) is True
 
     assert len(_AdapterRtspSession.instances) == 2
     assert set(adapter.get_connected_devices()) == {camera_id}
+    assert rtsp.get_state(camera_id).error_code is None
 
 
 @pytest.mark.asyncio
