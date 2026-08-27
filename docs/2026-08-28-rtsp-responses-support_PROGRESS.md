@@ -27,3 +27,10 @@
 - Expected result: 每份计划具备准确文件路径、接口契约、TDD 步骤、逐任务验证命令、提交边界和最终验收门禁；不修改业务代码。
 - Result: Achieved。三份计划共 1,033 行、196 个可勾选步骤；未发现 TODO/TBD/FIXME/未决路径，占位符扫描与 `git diff --check` 通过。计划固定了 MIoT DID 兼容、单 RTSP 会话复用、H.265 按观看者转码、Responses 12 图硬上限、空 Key/Bearer 鉴权、协议禁止自动回退及真实 E2E `not_measured` 边界。
 - Next step: 本地提交设计状态、三份实施计划与本进度记录；随后由用户选择在当前会话按 subagent-driven-development 执行，或在单独会话按 executing-plans 分批执行。
+
+## 2026-08-28 00:48 SGT
+
+- Current work: 用户选择 subagent-driven-development 并授权完成后部署到 `ai-lab01.esxi` / `ai-lab02.esxi`；已建立隔离 worktree 与 `feature/rtsp-responses-support` 分支，按锁文件安装依赖，完成 RTSP 感知基础计划的执行前一致性扫描。
+- Expected result: 获得可复现的干净功能基线、独立任务账本和明确的跨任务接口裁决，再开始 Task 1 的 TDD 实现。
+- Result: Partial。Hermes 185 passed/2 skipped，其余前端/插件/脚本基线门禁通过；后端在零业务改动基线上出现 3 个已知 macOS node-monitor 分支失败，以及 1 个 ReID 首次冷加载 600ms 阈值失败。聚焦复跑后 ReID 通过；3 个 node-monitor 失败确认是 Darwin 走 psutil fallback、测试却 patch Linux `parse_smaps` 的既有平台问题。已记录精确基线排除，不修改或放宽无关测试。
+- Next step: 提交本次执行启动记录，然后分派 RTSP 感知基础 Task 1；每个任务严格执行 RED→GREEN、实现者自审、独立规格/质量审查和必要修复循环。
