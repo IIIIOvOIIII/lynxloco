@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import ceil, log2
 
 from miloco.camera.stream import EncodedVideoPacket
 
@@ -17,6 +16,19 @@ _BROWSER_SAFE_LEVELS = frozenset({10, 11, 12, 13, 20, 21, 22, 30, 31, 32, 40})
 _HIGH_PROFILE_SYNTAX = frozenset(
     {44, 83, 86, 100, 110, 118, 122, 128, 134, 135, 138, 139, 244}
 )
+_LEVEL_LIMITS = {
+    10: (99, 396),
+    11: (396, 900),
+    12: (396, 2376),
+    13: (396, 2376),
+    20: (396, 2376),
+    21: (792, 4752),
+    22: (1620, 8100),
+    30: (1620, 8100),
+    31: (3600, 18000),
+    32: (5120, 20480),
+    40: (8192, 32768),
+}
 
 
 @dataclass(frozen=True)
@@ -52,6 +64,12 @@ class _SpsSyntax:
     profile_compatibility: int
     level: int
     chroma_format_idc: int
+
+
+@dataclass(frozen=True)
+class _VuiSyntax:
+    max_num_reorder_frames: int | None = None
+    max_dec_frame_buffering: int | None = None
 
 
 class _BitReader:
@@ -137,68 +155,49 @@ def _rbsp(ebsp: bytes) -> bytes:
     return bytes(result)
 
 
-def _parse_scaling_list(reader: _BitReader, size: int) -> None:
-    last_scale = 8
-    next_scale = 8
-    for _ in range(size):
-        if next_scale != 0:
-            next_scale = (last_scale + reader.read_se(255) + 256) % 256
-        last_scale = last_scale if next_scale == 0 else next_scale
-
-
-def _parse_hrd(reader: _BitReader) -> None:
-    cpb_count = reader.read_ue(31) + 1
-    reader.read_bits(4)
-    reader.read_bits(4)
-    for _ in range(cpb_count):
-        reader.read_ue()
-        reader.read_ue()
-        reader.read_bit()
-    reader.read_bits(5)
-    reader.read_bits(5)
-    reader.read_bits(5)
-    reader.read_bits(5)
-
-
-def _parse_vui(reader: _BitReader) -> None:
+def _parse_vui(reader: _BitReader) -> _VuiSyntax:
     if reader.read_bit():
         aspect_ratio_idc = reader.read_bits(8)
         if aspect_ratio_idc == 255:
-            reader.read_bits(16)
-            reader.read_bits(16)
+            if reader.read_bits(16) == 0 or reader.read_bits(16) == 0:
+                raise _MalformedH264
+        elif aspect_ratio_idc not in set(range(1, 17)):
+            raise _MalformedH264
     if reader.read_bit():
         reader.read_bit()
     if reader.read_bit():
-        reader.read_bits(3)
+        if reader.read_bits(3) > 5:
+            raise _MalformedH264
         reader.read_bit()
         if reader.read_bit():
-            reader.read_bits(8)
-            reader.read_bits(8)
-            reader.read_bits(8)
+            raise _UnsupportedH264Configuration
     if reader.read_bit():
-        reader.read_ue()
-        reader.read_ue()
+        reader.read_ue(5)
+        reader.read_ue(5)
     if reader.read_bit():
-        reader.read_bits(32)
-        reader.read_bits(32)
+        if reader.read_bits(32) == 0 or reader.read_bits(32) == 0:
+            raise _MalformedH264
         reader.read_bit()
     nal_hrd = bool(reader.read_bit())
     if nal_hrd:
-        _parse_hrd(reader)
+        raise _UnsupportedH264Configuration
     vcl_hrd = bool(reader.read_bit())
     if vcl_hrd:
-        _parse_hrd(reader)
-    if nal_hrd or vcl_hrd:
-        reader.read_bit()
+        raise _UnsupportedH264Configuration
     reader.read_bit()
+    max_num_reorder_frames: int | None = None
+    max_dec_frame_buffering: int | None = None
     if reader.read_bit():
         reader.read_bit()
-        reader.read_ue()
-        reader.read_ue()
-        reader.read_ue()
-        reader.read_ue()
-        reader.read_ue()
-        reader.read_ue()
+        reader.read_ue(16)
+        reader.read_ue(16)
+        reader.read_ue(16)
+        reader.read_ue(16)
+        max_num_reorder_frames = reader.read_ue(16)
+        max_dec_frame_buffering = reader.read_ue(16)
+        if max_num_reorder_frames > max_dec_frame_buffering:
+            raise _MalformedH264
+    return _VuiSyntax(max_num_reorder_frames, max_dec_frame_buffering)
 
 
 def _parse_sps(nal: bytes) -> _SpsSyntax:
@@ -213,18 +212,20 @@ def _parse_sps(nal: bytes) -> _SpsSyntax:
     reader = _BitReader(rbsp[3:])
     sps_id = reader.read_ue(31)
     chroma_format_idc = 1
+    separate_colour_plane = False
     if profile in _HIGH_PROFILE_SYNTAX:
         chroma_format_idc = reader.read_ue(3)
         if chroma_format_idc == 3:
-            reader.read_bit()
-        reader.read_ue(6)
-        reader.read_ue(6)
-        reader.read_bit()
+            separate_colour_plane = bool(reader.read_bit())
+        if (
+            chroma_format_idc != 1
+            or reader.read_ue(6) != 0
+            or reader.read_ue(6) != 0
+            or reader.read_bit()
+        ):
+            raise _UnsupportedH264Configuration
         if reader.read_bit():
-            scaling_list_count = 8 if chroma_format_idc != 3 else 12
-            for index in range(scaling_list_count):
-                if reader.read_bit():
-                    _parse_scaling_list(reader, 16 if index < 6 else 64)
+            raise _UnsupportedH264Configuration
 
     reader.read_ue(12)
     pic_order_count_type = reader.read_ue(2)
@@ -237,22 +238,63 @@ def _parse_sps(nal: bytes) -> _SpsSyntax:
         cycle_count = reader.read_ue(255)
         for _ in range(cycle_count):
             reader.read_se()
-    reader.read_ue(65535)
+    num_ref_frames = reader.read_ue(65535)
     reader.read_bit()
-    reader.read_ue(65535)
-    reader.read_ue(65535)
+    pic_width_in_mbs = reader.read_ue(65535) + 1
+    pic_height_in_map_units = reader.read_ue(65535) + 1
     frame_mbs_only = bool(reader.read_bit())
     if not frame_mbs_only:
         reader.read_bit()
     reader.read_bit()
+    crop_left = crop_right = crop_top = crop_bottom = 0
     if reader.read_bit():
-        reader.read_ue(65535)
-        reader.read_ue(65535)
-        reader.read_ue(65535)
-        reader.read_ue(65535)
+        crop_left = reader.read_ue(65535)
+        crop_right = reader.read_ue(65535)
+        crop_top = reader.read_ue(65535)
+        crop_bottom = reader.read_ue(65535)
+    vui = _VuiSyntax()
     if reader.read_bit():
-        _parse_vui(reader)
+        vui = _parse_vui(reader)
     reader.consume_rbsp_trailing_bits()
+
+    frame_height_in_mbs = (2 - int(frame_mbs_only)) * pic_height_in_map_units
+    pic_size_in_mbs = pic_width_in_mbs * frame_height_in_mbs
+    coded_width = pic_width_in_mbs * 16
+    coded_height = frame_height_in_mbs * 16
+    chroma_array_type = 0 if separate_colour_plane else chroma_format_idc
+    crop_units = {
+        0: (1, 2 - int(frame_mbs_only)),
+        1: (2, 2 * (2 - int(frame_mbs_only))),
+        2: (2, 2 - int(frame_mbs_only)),
+        3: (1, 2 - int(frame_mbs_only)),
+    }
+    crop_unit_x, crop_unit_y = crop_units[chroma_array_type]
+    display_width = coded_width - crop_unit_x * (crop_left + crop_right)
+    display_height = coded_height - crop_unit_y * (crop_top + crop_bottom)
+    if (
+        display_width <= 0
+        or display_height <= 0
+        or display_width % 2
+        or display_height % 2
+    ):
+        raise _MalformedH264
+
+    limits = _LEVEL_LIMITS.get(level)
+    if limits is not None:
+        max_fs, max_dpb_mbs = limits
+        if level == 11 and profile in {66, 77, 88} and profile_compatibility & 0x10:
+            max_fs, max_dpb_mbs = 99, 396
+        if pic_size_in_mbs > max_fs:
+            raise _UnsupportedH264Configuration
+        max_dpb_frames = min(max_dpb_mbs // pic_size_in_mbs, 16)
+        if num_ref_frames > max_dpb_frames:
+            raise _UnsupportedH264Configuration
+        if vui.max_dec_frame_buffering is not None:
+            if (
+                vui.max_dec_frame_buffering < num_ref_frames
+                or vui.max_dec_frame_buffering > max_dpb_frames
+            ):
+                raise _UnsupportedH264Configuration
     return _SpsSyntax(
         sps_id,
         profile,
@@ -272,43 +314,27 @@ def _parse_pps(nal: bytes, chroma_format_idc: int) -> tuple[int, int]:
     reader.read_bit()
     slice_group_count = reader.read_ue(7) + 1
     if slice_group_count > 1:
-        map_type = reader.read_ue(6)
-        if map_type == 0:
-            for _ in range(slice_group_count):
-                reader.read_ue(65535)
-        elif map_type == 2:
-            for _ in range(slice_group_count - 1):
-                reader.read_ue(65535)
-                reader.read_ue(65535)
-        elif map_type in {3, 4, 5}:
-            reader.read_bit()
-            reader.read_ue(65535)
-        elif map_type == 6:
-            map_units = reader.read_ue(65535) + 1
-            bits_per_id = ceil(log2(slice_group_count))
-            for _ in range(map_units):
-                if reader.read_bits(bits_per_id) >= slice_group_count:
-                    raise _MalformedH264
-        else:
-            raise _MalformedH264
+        raise _UnsupportedH264Configuration
     reader.read_ue(31)
     reader.read_ue(31)
     reader.read_bit()
-    reader.read_bits(2)
-    reader.read_se(51)
-    reader.read_se(51)
-    reader.read_se(51)
+    if reader.read_bits(2) > 2:
+        raise _MalformedH264
+    pic_init_qp_minus26 = reader.read_se(26)
+    pic_init_qs_minus26 = reader.read_se(26)
+    reader.read_se(12)
+    if pic_init_qp_minus26 > 25 or pic_init_qs_minus26 > 25:
+        raise _MalformedH264
     reader.read_bit()
     reader.read_bit()
     reader.read_bit()
     if reader.more_rbsp_data():
-        transform_8x8_mode = bool(reader.read_bit())
+        reader.read_bit()
         if reader.read_bit():
-            extra_lists = (2 if chroma_format_idc != 3 else 6) * transform_8x8_mode
-            for index in range(6 + extra_lists):
-                if reader.read_bit():
-                    _parse_scaling_list(reader, 16 if index < 6 else 64)
-        reader.read_se(51)
+            raise _UnsupportedH264Configuration
+        second_chroma_qp_index_offset = reader.read_se(12)
+        if not -12 <= second_chroma_qp_index_offset <= 12:
+            raise _MalformedH264
     reader.consume_rbsp_trailing_bits()
     return pps_id, sps_id
 

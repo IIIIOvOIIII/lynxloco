@@ -14,6 +14,8 @@ SPS = bytes.fromhex("6742c01eda11ec0440000003004000000523c58ba8")
 PPS = bytes.fromhex("68ce0fc8")
 HIGH_SPS = bytes.fromhex("6764000aacd9447a10000003001000000303c0f1225960")
 HIGH_PPS = bytes.fromhex("68ebe3cb22c0")
+MAIN_SPS = bytes.fromhex("674d400adc47a10000030001000003003c0f122780")
+MAIN_PPS = bytes.fromhex("68ee0f2c80")
 P_SLICE = bytes.fromhex("419a22")
 AVCC = bytes.fromhex("0142c01effe10015") + SPS + bytes.fromhex("010004") + PPS
 
@@ -96,6 +98,107 @@ def _avcc_with_parameter_sets(
             *(len(nal).to_bytes(2, "big") + nal for nal in pps),
         )
     )
+
+
+def _ue_bits(value: int) -> str:
+    code_num = value + 1
+    suffix = f"{code_num:b}"
+    return "0" * (len(suffix) - 1) + suffix
+
+
+def _se_bits(value: int) -> str:
+    code_num = -2 * value if value <= 0 else 2 * value - 1
+    return _ue_bits(code_num)
+
+
+def _rbsp_bytes(bits: str) -> bytes:
+    bits += "1"
+    bits += "0" * (-len(bits) % 8)
+    raw = int(bits, 2).to_bytes(len(bits) // 8, "big")
+    escaped = bytearray()
+    zero_count = 0
+    for byte in raw:
+        if zero_count >= 2 and byte <= 3:
+            escaped.append(3)
+            zero_count = 0
+        escaped.append(byte)
+        zero_count = zero_count + 1 if byte == 0 else 0
+    return bytes(escaped)
+
+
+def _review_sps(
+    *,
+    level: int = 10,
+    width_mbs: int = 1,
+    height_map_units: int = 1,
+    num_ref_frames: int = 0,
+    crop: tuple[int, int, int, int] | None = None,
+    timing: tuple[int, int] | None = None,
+    restriction: tuple[int, int] | None = None,
+) -> bytes:
+    bits = "".join(
+        (
+            _ue_bits(0),  # sps id
+            _ue_bits(0),  # log2_max_frame_num_minus4
+            _ue_bits(0),  # pic_order_cnt_type
+            _ue_bits(0),  # log2_max_pic_order_cnt_lsb_minus4
+            _ue_bits(num_ref_frames),
+            "0",  # gaps_in_frame_num_value_allowed_flag
+            _ue_bits(width_mbs - 1),
+            _ue_bits(height_map_units - 1),
+            "1",  # frame_mbs_only_flag
+            "1",  # direct_8x8_inference_flag
+        )
+    )
+    if crop is None:
+        bits += "0"
+    else:
+        bits += "1" + "".join(_ue_bits(value) for value in crop)
+    if timing is None and restriction is None:
+        bits += "0"
+    else:
+        bits += "1"  # vui_parameters_present_flag
+        bits += "0"  # aspect_ratio_info_present_flag
+        bits += "0"  # overscan_info_present_flag
+        bits += "0"  # video_signal_type_present_flag
+        bits += "0"  # chroma_loc_info_present_flag
+        if timing is None:
+            bits += "0"
+        else:
+            bits += "1" + f"{timing[0]:032b}{timing[1]:032b}" + "1"
+        bits += "00"  # nal/vcl hrd flags
+        bits += "0"  # pic_struct_present_flag
+        if restriction is None:
+            bits += "0"
+        else:
+            reorder, buffering = restriction
+            bits += "1"  # bitstream_restriction_flag
+            bits += "1"  # motion_vectors_over_pic_boundaries_flag
+            bits += _ue_bits(0) * 4
+            bits += _ue_bits(reorder) + _ue_bits(buffering)
+    return bytes((0x67, 0x42, 0, level)) + _rbsp_bytes(bits)
+
+
+def _review_pps(
+    *, weighted_bipred_idc: int = 0, qp: int = 0, qs: int = 0, chroma: int = 0
+) -> bytes:
+    bits = "".join(
+        (
+            _ue_bits(0),  # pps id
+            _ue_bits(0),  # sps id
+            "00",  # entropy_coding_mode/bottom_field_pic_order flags
+            _ue_bits(0),  # num_slice_groups_minus1
+            _ue_bits(0),
+            _ue_bits(0),
+            "0",  # weighted_pred_flag
+            f"{weighted_bipred_idc:02b}",
+            _se_bits(qp),
+            _se_bits(qs),
+            _se_bits(chroma),
+            "100",  # deblocking/constrained/redundant flags
+        )
+    )
+    return b"\x68" + _rbsp_bytes(bits)
 
 
 def _packet(
@@ -399,6 +502,93 @@ def test_multiple_real_parameter_sets_are_ambiguous_for_jmuxer_v1() -> None:
     assert H264AnnexBNormalizer().inspect(
         _packet(REAL_AVCC_PACKET, keyframe=True, extradata=ambiguous)
     ) == H264Compatibility(False, None, None, "configuration_unsupported")
+
+
+@pytest.mark.parametrize(
+    ("sps", "pps"),
+    [
+        (_review_sps(), _review_pps(weighted_bipred_idc=3)),
+        (_review_sps(), _review_pps(qp=26)),
+        (_review_sps(), _review_pps(chroma=13)),
+        (_review_sps(crop=(0, 100, 0, 0)), _review_pps()),
+        (_review_sps(timing=(0, 60)), _review_pps()),
+    ],
+)
+def test_normatively_invalid_review_vectors_fail_closed(sps: bytes, pps: bytes) -> None:
+    extradata = _avcc_extradata(
+        sps=sps,
+        pps=pps,
+        profile=66,
+        profile_compatibility=0,
+        level=10,
+    )
+
+    assert (
+        H264AnnexBNormalizer()
+        .inspect(_packet(START_CODE + P_SLICE, extradata=extradata))
+        .passthrough
+        is False
+    )
+
+
+def test_level_maxfs_and_dpb_boundaries_are_enforced() -> None:
+    valid = _review_sps(
+        width_mbs=11,
+        height_map_units=9,
+        num_ref_frames=4,
+        restriction=(4, 4),
+    )
+    exceeds_max_fs = _review_sps(width_mbs=12, height_map_units=9)
+    exceeds_dpb = _review_sps(width_mbs=11, height_map_units=9, num_ref_frames=5)
+    exceeds_vui_dpb = _review_sps(
+        width_mbs=11,
+        height_map_units=9,
+        num_ref_frames=4,
+        restriction=(4, 5),
+    )
+
+    def compatibility(sps: bytes) -> H264Compatibility:
+        return H264AnnexBNormalizer().inspect(
+            _packet(
+                START_CODE + P_SLICE,
+                extradata=_avcc_extradata(
+                    sps=sps,
+                    pps=_review_pps(),
+                    profile=66,
+                    profile_compatibility=0,
+                    level=10,
+                ),
+            )
+        )
+
+    assert compatibility(valid).passthrough is True
+    assert compatibility(exceeds_max_fs).passthrough is False
+    assert compatibility(exceeds_dpb).passthrough is False
+    assert compatibility(exceeds_vui_dpb).passthrough is False
+
+
+@pytest.mark.parametrize(
+    ("sps", "pps", "profile", "compatibility", "level"),
+    [
+        (SPS, PPS, 66, 0xC0, 30),
+        (MAIN_SPS, MAIN_PPS, 77, 0x40, 10),
+        (HIGH_SPS, HIGH_PPS, 100, 0, 10),
+    ],
+)
+def test_real_baseline_main_and_high_parameter_sets_remain_compatible(
+    sps: bytes, pps: bytes, profile: int, compatibility: int, level: int
+) -> None:
+    extradata = _avcc_extradata(
+        sps=sps,
+        pps=pps,
+        profile=profile,
+        profile_compatibility=compatibility,
+        level=level,
+    )
+
+    assert H264AnnexBNormalizer().inspect(
+        _packet(START_CODE + P_SLICE, extradata=extradata)
+    ) == H264Compatibility(True, profile, level, "compatible")
 
 
 def test_bad_packet_resets_viewer_until_a_new_idr() -> None:
