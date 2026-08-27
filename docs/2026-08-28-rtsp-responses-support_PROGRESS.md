@@ -39,7 +39,7 @@
 
 - Current work: 完成 RTSP 感知基础批次的真实媒体集成测试、实验室 smoke 工具、全量回归与实施边界收口；未运行真实 RTSP 网络测试，未开始实时预览或 Responses 批次。
 - Expected result: H.264/H.265 fixture 必须经 `RtspSession -> RtspCameraSource -> CameraDeviceAdapter -> MultimodalCollector` 进入 `DeviceData`，可选音频成为 16 kHz mono `int16` PCM；所有凭据保持去敏，仓库既有门禁缺口和未测量项必须显式记录。
-- Result: Achieved with baseline limitations。初始集成 RED 暴露异步 session 尚未 connected 即被 adapter 删除的真实生命周期缺口，修复并独立审查后为 2 passed；后续复审又修正 H.264 视频先到、音频稍后到时测试过早返回的调度竞态。RTSP/摄像机聚焦套件最终 148 passed、CLI 629 passed、`local-ci --tests` 6 项通过（backend 仅保留脚本已知的 3 项 macOS node-monitor/smaps 排除）。无 URL smoke 以 exit 2 fail closed，未产生配置写入且不回显合成凭据。changed-path `ty` 清理后仅余 `perception/service.py:310` 与 `:325` 两条本计划未改动的既有诊断；一次只读全库检查为 946 diagnostics，较早 HEAD 的全库 `task check` 曾为 1025，数量变化来自期间提交和检查范围/版本状态，不作为本批次功能回归。只读 Ruff lint 通过，最终 format baseline 仍有 303 个文件未格式化；3 项 macOS node-monitor、真实 RTSP 网络、启动延迟、断线重连、CPU 和 fps 均明确为 `not_measured` 或既有平台基线。
+- Result: Achieved with baseline limitations。初始集成 RED 暴露异步 session 尚未 connected 即被 adapter 删除的真实生命周期缺口，修复并独立审查后为 2 passed；后续复审又修正 H.264 视频先到、音频稍后到时测试过早返回的调度竞态。最终批次审查进一步关闭 terminal 自动重试/状态丢失、CLI 与 OpenClaw 共享配置竞态、旧配置权限过宽、smoke 语法/信号/伪首帧等问题。RTSP/摄像机聚焦套件最终 152 passed、CLI 633 passed、OpenClaw 共享配置安全套件 33 passed，`local-ci --tests` 6 项通过（backend 仅保留脚本已知的 3 项 macOS node-monitor/smaps 排除）。无 URL smoke 以 exit 2 fail closed，未产生配置写入且不回显合成凭据。changed-path `ty` 清理后仅余 `perception/service.py:310` 与 `:325` 两条本计划未改动的既有诊断；一次只读全库检查为 946 diagnostics，较早 HEAD 的全库 `task check` 曾为 1025，数量变化来自期间提交和检查范围/版本状态，不作为本批次功能回归。只读 Ruff lint 通过，最终 format baseline 仍有 303 个文件未格式化；3 项 macOS node-monitor、真实 RTSP 网络、启动延迟、断线重连、CPU 和 fps 均明确为 `not_measured` 或既有平台基线。
 - Next step: 提交 Task 8 授权文件并执行独立任务审查；随后对 RTSP 感知基础整个提交批次做总审查。批次 2 实时预览、批次 3 Responses、`ai-lab01/02.esxi` 部署与实验室验收继续保持独立后续阶段。
 
 ## 2026-08-28 04:45 SGT — 范围事件
@@ -48,3 +48,10 @@
 - Expected result: 任何越出 Task 8 授权路径的修改不得进入提交。
 - Result: Achieved after recovery。计划给出的 `uv run task lint` 实际展开为 `ruff check --fix .; ruff format .`，曾自动格式化 304 个未授权 tracked 文件；执行者立即停止、未 stage/commit 并上报。controller 随后按当时 HEAD 精确反向恢复全部越界 tracked 改动，仅保留 Task 8 自有测试与 smoke 文件；后续只使用 `ruff check .` 和 `ruff format --check .` 两个只读等价检查，未再次运行写入型 lint。
 - Next step: 只 stage 集成测试、smoke 脚本、本进度文档、设计状态和 Task 8 实施报告，提交前复核路径白名单。
+
+## 2026-08-28 05:53 SGT
+
+- Current work: 完成 RTSP 感知基础 Plan 1 的最终有界批次审查，并建立 RTSP 实时预览 Plan 2 的独立执行账本与跨任务接口裁决。
+- Expected result: 所有 Plan 1 Critical/Important finding 关闭；backend、CLI、OpenClaw 三类共享配置写入者统一锁内重读和 0600 权限；终止错误既不周期重试，也持续返回安全可操作状态；随后在不新增 RTSP 输入连接的前提下进入实时预览。
+- Result: Achieved。最终审查在 `0b9a908` 判定 clean：backend RTSP/camera 152 passed、CLI 633 passed、OpenClaw shared-config/security 33 passed。配置、临时文件和锁文件均收敛 0600；OpenClaw/CLI/backend 使用同一 flock 协议；fixture smoke 只接受本次 enable 后的新解码帧。真实摄像机网络、CPU、fps、启动与重连仍按边界为 `not_measured`。
+- Next step: 执行 Plan 2 Task 1，增加不持有凭据、不打开第二条 RTSP 连接的 source-neutral bounded live-stream hub；每任务继续 RED→GREEN、独立审查和有界修复。

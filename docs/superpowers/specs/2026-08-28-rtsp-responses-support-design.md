@@ -567,7 +567,7 @@ CLI 输出不得打印密码或完整带敏 URI。
 
 截至 2026-08-28，批次 1 的 RTSP 感知基础功能已实施：安全配置与 owner-only 原子写入、MIoT 来源抽取且 DID 保持不变、RTSP 探测、单源单会话解码、有界队列、错误分类与重连、统一 `CameraDeviceAdapter`/`MultimodalCollector` 接入、热更新管理 API 和凭据安全 CLI 均已有自动化契约覆盖。
 
-确定性 H.264（含音频）与 H.265（无音频）PyAV fixture 已通过真实 `RtspSession -> RtspCameraSource -> CameraDeviceAdapter -> MultimodalCollector -> DeviceData` 集成路径；H.264 音频被归一化为 16 kHz、mono、`int16` PCM。相关 RTSP/摄像机聚焦测试最终为 148 passed，CLI 为 629 passed；本地 CI 脚本的 6 项门禁通过，其中 backend 仅按脚本既有规则排除 3 项 macOS `node_monitor`/`smaps` 平台失败。
+确定性 H.264（含音频）与 H.265（无音频）PyAV fixture 已通过真实 `RtspSession -> RtspCameraSource -> CameraDeviceAdapter -> MultimodalCollector -> DeviceData` 集成路径；H.264 音频被归一化为 16 kHz、mono、`int16` PCM。相关 RTSP/摄像机聚焦测试最终为 152 passed，CLI 为 633 passed，OpenClaw 共享配置安全套件为 33 passed；本地 CI 脚本的 6 项门禁通过，其中 backend 仅按脚本既有规则排除 3 项 macOS `node_monitor`/`smaps` 平台失败。backend、CLI 和 OpenClaw 三类已知共享配置写入者现使用相同的锁文件协议、锁后重读和 owner-only 原子发布；终止错误会停止周期重试，同时持续暴露白名单化的安全状态，直至连接配置变化或用户显式重试。
 
 仓库级既有门禁仍未清零，因此本状态不等于整个仓库质量基线全绿：当前 changed-path `ty` 只剩 `perception/service.py` 两条本计划未改动的既有诊断；一次只读全库 `ty` 检查报告 946 条诊断；只读 `ruff check .` 通过，但最终 `ruff format --check .` 显示 303 个既有文件需要格式化。不得为关闭本批次而扩大范围修复这些存量债务。
 
