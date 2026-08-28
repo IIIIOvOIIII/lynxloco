@@ -28,6 +28,10 @@ selected host and release before any remote change. `deploy` automatically
 rolls back to the last known-good release when its post-deploy verification
 fails; an operator can also run the explicit `rollback` command.
 
+`./deploy/ai-lab/deploy.sh --help` is an authoritative complete command list:
+it shows exactly the six operations above and does not advertise aliases or
+additional operations.
+
 ## Runtime boundary
 
 Remote release state, including the active and last-known-good revisions, is
