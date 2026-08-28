@@ -132,3 +132,10 @@
 - Expected result: Responses 只产生确定性、可解码、输入不可变的 JPEG 图片序列，最多 6 张全景与 6 张优先 crop、总数不超过 12；普通、batch、stream、fused 与按需查询都必须由同一 live 协议快照选择媒体模式；Chat/Gemini 保持既有 MP4/音频行为。
 - Result: Achieved。初始提交 `7792f8f` 的 16 个新契约和组合回归 212 passed；独立审查发现 `pipeline.py` 的按需查询仍使用默认 `video_audio`。生产入口级 RED 让 Responses/Chat/Gemini 三项精确失败；`5d4515f` 改为 prompt 前只解析一次 live config、显式传 `adapter.media_mode`，并将同一对象交给 `call_omni`。最终相关回归 226 passed，独立精确复审 3 passed，结论 CLEAN。Responses 普通/fused/text-only 均不含 video/audio，fused 不额外注入 gallery/pet 媒体；网络请求仍未实现。
 - Next step: 执行 Responses Task 3，实现标准 `/responses` 非流式 body、空 Key/可选 Bearer、输出与 usage 归一化，并让现有 breaker/trace/parser 无需协议分支。
+
+## 2026-08-28 11:38 SGT
+
+- Current work: 完成 Responses Task 3 的非流式调用、普通/fused 路径统一、日志去敏和凭据隔离独立审查修复。
+- Expected result: `/responses` 只发送标准 text/image body；空 Key 不发 Authorization，非空 Key 发 Bearer，Chat/Gemini 仍强制 Key；所有输出与 usage 在 breaker/trace/parser 前归一化；不支持媒体与畸形响应 fail closed；raw request/response/base64/key 不进普通日志；旧端点 Key 不得跨协议、模型或 Base URL 传播。
+- Result: Achieved。初始 `6705c8d` 的新 Responses 套件 27 passed，整个 Omni 486 passed；独立审查发现旧云 Chat 快照 Key 会在切换到空 Key 本地 Responses 时被错误填回。`f04778e` 以 8 个身份/凭据场景修复：仅有效协议、模型和去尾斜杠 Base URL 全部相同时允许快照 Key 回退，任一变化均精确采用当前 Key（空值有效）。生产级回归确认本地 `/responses` 无 Authorization、捕获请求无旧 secret、breaker 身份 Key 为空；最终 Omni 494 passed，独立复审 CLEAN。SSE 仍未实现。
+- Next step: 执行 Responses Task 4，解析标准 SSE delta/completed/failure 事件并保持现有流式文本片段、usage、breaker 和非流聚合消费者不变。
