@@ -1436,7 +1436,7 @@ def test_published_sha_state_is_new_only_when_every_durable_object_is_absent(
 def _run_existing_sha_transaction_harness(
     tmp_path: Path, *, capability: str, state_pointer: str
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
-    """Exercise transaction receive and build branches while recording forbidden mutations."""
+    """Run the real existing-SHA transaction and orchestration path with boundary observers."""
     sha = "c" * 40
     digest = "d" * 64
     lab_root = tmp_path / "miloco-lab"
@@ -1445,7 +1445,7 @@ def _run_existing_sha_transaction_harness(
     (lab_root / "incoming").mkdir(parents=True)
     if state_pointer != "none":
         state_dir.mkdir(parents=True)
-        (state_dir / state_pointer).write_text(f"{sha}\\n", encoding="utf-8")
+        (state_dir / state_pointer).write_text(f"{sha}\n", encoding="utf-8")
     mutation_log = tmp_path / f"existing-{capability}-{state_pointer}.log"
     harness = tmp_path / f"existing-{capability}-{state_pointer}.sh"
     harness.write_text(
@@ -1457,21 +1457,32 @@ def _run_existing_sha_transaction_harness(
         + "\nrequire_root() { :; }\n"
         + "acquire_transition_lock() { :; }\n"
         + "verify_controller_self() { :; }\n"
-        + "published_sha_state() { printf 'existing\\n'; }\n"
         + "verify_archive_digest() { :; }\n"
         + "validate_archive_members() { :; }\n"
         + "verify_release_tree() { :; }\n"
+        + "require_safe_record() { :; }\n"
         + "chown() { :; }\n"
         + "chmod() { :; }\n"
         + f"read_artifact_record() {{ artifact_archive_digest='{digest}'; artifact_controller_digest='{digest}'; artifact_allowlist_digest='{hashlib.sha256(ALLOWLIST.read_bytes()).hexdigest()}'; }}\n"
-        + f"\nrelease_capability() {{ printf '{capability}\\n'; }}\n"
-        + f"build_and_activate_locked() {{ build_images_and_accept \"$1\" \"$2\" \"$3\" \"{lab_root}/releases/{sha}\"; }}\n"
-        + f"atomic_write() {{ printf 'atomic-write %s\\n' \"$*\" >> '{mutation_log}'; return 99; }}\n"
+        + f"release_filesystem_proof_state() {{ case '{capability}' in capable) marker_runtime_image_id='sha256:{'e' * 64}'; marker_acceptance_image_id='sha256:{'f' * 64}'; return 0 ;; definitively_invalid) return 1 ;; *) return 2 ;; esac; }}\n"
+        + "verify_release() { printf 'verify-release\\n' >> \"$mutation_log\"; }\n"
+        + "install() { printf 'state-directory\\n' >> \"$mutation_log\"; }\n"
+        + f"atomic_write() {{ case \"$1\" in *'/current'|*'/previous') printf 'state-pointer %s\\n' \"$1\" >> '{mutation_log}' ;; *) printf 'atomic-write %s\\n' \"$*\" >> '{mutation_log}'; return 99 ;; esac; }}\n"
+        + "compose_up() { printf 'activation-start\\n' >> \"$mutation_log\"; }\n"
+        + "wait_for_health() { printf 'activation-health\\n' >> \"$mutation_log\"; }\n"
         + f"mark_acceptance_success() {{ printf 'marker-write\\n' >> '{mutation_log}'; }}\n"
         + f"remove_candidate_image_tags() {{ printf 'candidate-tag-removal\\n' >> '{mutation_log}'; }}\n"
         + f"remove_image_tags() {{ printf 'canonical-tag-removal\\n' >> '{mutation_log}'; }}\n"
         + f"invalidate_acceptance() {{ printf 'marker-removal\\n' >> '{mutation_log}'; }}\n"
-        + f"docker_command() {{ case \"$*\" in *' image ls '*|*' image inspect '*) return 99 ;; *) printf 'docker-mutation %s\\n' \"$*\" >> '{mutation_log}'; return 99 ;; esac; }}\n"
+        + "docker_command() {\n"
+        + "  image=\"${*: -1}\"\n"
+        + "  case \"$image\" in\n"
+        + f"    miloco-lab:{sha}) image_id='sha256:{'e' * 64}' ;;\n"
+        + f"    miloco-lab-acceptance:{sha}) image_id='sha256:{'f' * 64}' ;;\n"
+        + "    *) printf 'docker-mutation %s\\n' \"$*\" >> \"$mutation_log\"; return 99 ;;\n"
+        + "  esac\n"
+        + "  case \"$*\" in *' image ls '*|*' image inspect '*) printf '%s\\n' \"$image_id\" ;; *) printf 'docker-mutation %s\\n' \"$*\" >> \"$mutation_log\"; return 99 ;; esac\n"
+        + "}\n"
         + f'transaction_release "ai-lab01.esxi" "{sha}" "{digest}" "{digest}" "{hashlib.sha256(ALLOWLIST.read_bytes()).hexdigest()}"\n',
         encoding="utf-8",
     )
@@ -1491,7 +1502,10 @@ def test_existing_sha_never_rebuilds_or_mutates_when_not_capable(
         tmp_path, capability=capability, state_pointer="none"
     )
     assert result.returncode != 0
-    assert mutation_log == []
+    assert not any(
+        line.startswith(("rm ", "mv ", "atomic-write", "marker-", "candidate-", "canonical-", "docker-mutation", "compose "))
+        for line in mutation_log
+    )
 
 
 @pytest.mark.parametrize("state_pointer", ["current", "previous", "history", "none"])
@@ -1503,7 +1517,11 @@ def test_existing_capable_sha_reuses_without_build_tag_or_marker_mutation(
         tmp_path, capability="capable", state_pointer=state_pointer
     )
     assert result.returncode == 0, result.stderr
-    assert mutation_log == []
+    assert "activation-start" in mutation_log and "activation-health" in mutation_log
+    assert not any(
+        line.startswith(("rm ", "mv ", "atomic-write", "marker-", "candidate-", "canonical-", "docker-mutation", "compose "))
+        for line in mutation_log
+    )
 
 
 @pytest.mark.parametrize(
