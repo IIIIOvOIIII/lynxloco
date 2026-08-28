@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -482,6 +482,23 @@ async def _collect_stream_response(
     }
 
 
+def _responses_image_fields(image: object) -> tuple[str, str]:
+    """Read the typed Task2 image IR, retaining mapping compatibility for callers."""
+    try:
+        media_type = getattr(image, "media_type", None)
+        data = getattr(image, "data", None)
+        if media_type is None and data is None and isinstance(image, Mapping):
+            media_type = image.get("media_type")
+            data = image.get("data")
+    except Exception:
+        raise ValueError("invalid Responses image object") from None
+    if media_type != "image/jpeg":
+        raise ValueError("invalid Responses image media type")
+    if not isinstance(data, str) or not data:
+        raise ValueError("invalid Responses image data")
+    return "image/jpeg", data
+
+
 def _build_messages(payload: dict, adapter: OmniProviderAdapter) -> list[dict]:
     messages: list[dict] = [{"role": "system", "content": payload["system_prompt"]}]
 
@@ -508,11 +525,12 @@ def _build_messages(payload: dict, adapter: OmniProviderAdapter) -> list[dict]:
     # Responses image-sequence payloads use the same internal image_url IR as
     # existing tracker crops. They are converted to input_image by the adapter.
     for image in payload.get("images", []):
+        media_type, data = _responses_image_fields(image)
         content.append(
             {
                 "type": "image_url",
                 "image_url": {
-                    "url": f"data:{image['media_type']};base64,{image['data']}"
+                    "url": f"data:{media_type};base64,{data}"
                 },
             }
         )

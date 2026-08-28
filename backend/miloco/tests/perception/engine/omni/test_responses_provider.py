@@ -12,6 +12,7 @@ from miloco.perception.engine.omni.circuit_breaker import (
     get_omni_circuit_breaker,
     reset_omni_circuit_breaker_for_tests,
 )
+from miloco.perception.engine.omni.prompt_builder import EncodedInputImage
 from miloco.perception.engine.omni.provider import OpenAIResponsesAdapter
 from miloco.perception.snapshot_context import (
     OmniEventArtifacts,
@@ -114,6 +115,11 @@ class _FusedClient:
         return self._response
 
 
+class _ExplodingImageMapping(dict):
+    def get(self, key, default=None):
+        raise RuntimeError("TOP_SECRET_IMAGE_DATA")
+
+
 def _capturing_client(raw: Any, calls: list[dict[str, Any]]):
     class _Client:
         def __init__(self, *args, **kwargs):
@@ -189,6 +195,58 @@ def test_request_contract_is_exact_and_omits_unsupported_fields() -> None:
         "modalities",
     ):
         assert forbidden not in wire
+
+
+def test_build_messages_consumes_typed_responses_image_ir() -> None:
+    payload = {
+        "system_prompt": "system",
+        "user_content": "user",
+        "images": [
+            EncodedInputImage(
+                source="panorama",
+                media_type="image/jpeg",
+                data="TYPED_JPEG_DATA",
+            )
+        ],
+    }
+
+    messages = omni_client._build_messages(payload, OpenAIResponsesAdapter())
+
+    assert messages[-1]["content"] == [
+        {"type": "text", "text": "user"},
+        {
+            "type": "image_url",
+            "image_url": {"url": "data:image/jpeg;base64,TYPED_JPEG_DATA"},
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    "image",
+    [
+        EncodedInputImage(
+            source="panorama",
+            media_type="image/png",  # type: ignore[arg-type]
+            data="TOP_SECRET_IMAGE_DATA",
+        ),
+        {"media_type": "image/jpeg", "data": "", "secret": "TOP_SECRET_IMAGE_DATA"},
+        _ExplodingImageMapping(),
+        object(),
+    ],
+)
+def test_build_messages_rejects_invalid_responses_images_without_echoing(
+    image: object,
+) -> None:
+    payload = {
+        "system_prompt": "system",
+        "user_content": "user",
+        "images": [image],
+    }
+
+    with pytest.raises(ValueError, match="invalid Responses image") as exc:
+        omni_client._build_messages(payload, OpenAIResponsesAdapter())
+
+    assert "TOP_SECRET_IMAGE_DATA" not in str(exc.value)
 
 
 def test_auth_headers_allow_empty_key_and_use_bearer_when_present() -> None:
