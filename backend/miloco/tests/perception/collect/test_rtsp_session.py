@@ -183,13 +183,43 @@ class _BlockingContainer(_Container):
 
     def demux(self) -> list[_Packet]:
         self.entered.set()
-        self.released.wait(timeout=2.0)
+        self.released.wait(timeout=0.1)
         self.exited.set()
         return []
 
     def close(self) -> None:
         super().close()
-        self.released.set()
+
+
+class _OverlapTrackingBlockingContainer(_Container):
+    def __init__(self, *, read_timeout: float = 0.1) -> None:
+        super().__init__([], video_stream=_stream("video", "h264"))
+        self._read_timeout = read_timeout
+        self._inside_demux = False
+        self._lock = threading.Lock()
+        self.entered = threading.Event()
+        self.exited = threading.Event()
+        self.read_return = threading.Event()
+        self.demux_thread: int | None = None
+        self.close_threads: list[int] = []
+        self.close_overlaps: list[bool] = []
+
+    def demux(self) -> list[_Packet]:
+        self.demux_thread = threading.get_ident()
+        with self._lock:
+            self._inside_demux = True
+        self.entered.set()
+        self.read_return.wait(timeout=self._read_timeout)
+        with self._lock:
+            self._inside_demux = False
+        self.exited.set()
+        return []
+
+    def close(self) -> None:
+        with self._lock:
+            self.close_overlaps.append(self._inside_demux)
+        self.close_threads.append(threading.get_ident())
+        super().close()
 
 
 class _YieldThenBlockContainer(_Container):
@@ -203,7 +233,7 @@ class _YieldThenBlockContainer(_Container):
         try:
             yield from packets
             self.blocked.set()
-            self.release.wait(timeout=2.0)
+            self.release.wait(timeout=0.25)
         finally:
             packets.clear()
 
@@ -501,6 +531,8 @@ async def test_eof_reconnects_closes_container_and_success_resets_attempt(
     assert opener.calls == 3
     assert first.closed is True
     assert second.closed is True
+    assert first.close_calls == 1
+    assert second.close_calls == 1
     assert attempts_seen == [0]
     await session.stop()
 
@@ -811,11 +843,34 @@ async def test_stop_is_idempotent_and_closes_active_container(
 
 
 @pytest.mark.asyncio
+async def test_stop_never_closes_container_while_demux_is_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_module = _rtsp_session()
+    container = _OverlapTrackingBlockingContainer(read_timeout=0.1)
+    monkeypatch.setattr(session_module.av, "open", _SequenceOpener(container))
+    session = session_module.RtspSession(_source())
+
+    await session.start(_unused_video_cb, _unused_audio_cb)
+    assert await asyncio.to_thread(container.entered.wait, 0.5)
+    started = stdlib_time.monotonic()
+    await asyncio.wait_for(session.stop(), timeout=0.5)
+
+    assert stdlib_time.monotonic() - started < 0.5
+    assert container.exited.is_set()
+    assert container.close_calls == 1
+    assert container.close_overlaps == [False]
+    assert container.close_threads == [container.demux_thread]
+    assert session._decode_worker is None
+    assert session._task is None
+
+
+@pytest.mark.asyncio
 async def test_external_session_cancellation_closes_and_joins_decode_worker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session_module = _rtsp_session()
-    container = _BlockingContainer()
+    container = _OverlapTrackingBlockingContainer(read_timeout=0.1)
     monkeypatch.setattr(session_module.av, "open", _SequenceOpener(container))
     session = session_module.RtspSession(_source())
 
@@ -829,6 +884,9 @@ async def test_external_session_cancellation_closes_and_joins_decode_worker(
 
     assert container.closed is True
     assert container.exited.is_set()
+    assert container.close_calls == 1
+    assert container.close_overlaps == [False]
+    assert container.close_threads == [container.demux_thread]
     assert session.state().connected is False
     await session.stop()
     assert session._task is None
@@ -858,6 +916,7 @@ async def test_stop_blocks_restart_until_late_open_returns_and_closes(
     await _wait_until(lambda: opener.second_started.is_set())
 
     assert opener.late_container.closed is True
+    assert opener.late_container.close_calls == 1
     assert opener.max_active == 1
     await session.stop()
 
@@ -887,6 +946,7 @@ async def test_cancel_then_stop_blocks_restart_until_open_worker_is_reaped(
     await _wait_until(lambda: opener.second_started.is_set())
 
     assert opener.late_container.closed is True
+    assert opener.late_container.close_calls == 1
     assert opener.max_active == 1
     await session.stop()
 

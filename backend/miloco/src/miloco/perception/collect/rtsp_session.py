@@ -31,7 +31,9 @@ from miloco.perception.collect.rtsp_probe import (
 )
 
 _AUDIO_SAMPLE_RATE = 16_000
-_OPEN_TIMEOUT_SEC = 8.0
+# PyAV applies both values to open and subsequent socket reads. This bounds a
+# stop that is waiting for the demux owner to leave native code to eight seconds.
+_IO_TIMEOUT_SEC = 8.0
 _JITTER_BOUND = 0.2
 
 
@@ -144,7 +146,6 @@ class RtspSession:
             self._stop_thread.set()
             if self._stop_async is not None:
                 self._stop_async.set()
-            await self._close_active_container()
             await asyncio.gather(task, return_exceptions=True)
             if self._task is task:
                 self._task = None
@@ -307,7 +308,6 @@ class RtspSession:
                 self._stop_thread.set()
                 if self._stop_async is not None:
                     self._stop_async.set()
-                await self._close_active_container()
                 raise
             except BaseException as failure:
                 saw_frame = self._connection_had_frame.is_set()
@@ -315,7 +315,6 @@ class RtspSession:
             finally:
                 if container is not None and self._active_container is container:
                     self._active_container = None
-                    await asyncio.to_thread(self._close_container_sync, container)
 
             if self._stop_thread.is_set():
                 return
@@ -393,7 +392,9 @@ class RtspSession:
         try:
             return await asyncio.shield(worker)
         except asyncio.CancelledError:
-            await self._close_active_container()
+            self._stop_thread.set()
+            if self._stop_async is not None:
+                self._stop_async.set()
             try:
                 await asyncio.shield(worker)
             except BaseException:
@@ -418,8 +419,11 @@ class RtspSession:
         container: av.container.InputContainer,
         loop: asyncio.AbstractEventLoop,
     ) -> bool:
-        with av.logging.Capture(local=True):
-            return self._decode_container_captured_sync(container, loop)
+        try:
+            with av.logging.Capture(local=True):
+                return self._decode_container_captured_sync(container, loop)
+        finally:
+            self._close_container_sync(container)
 
     def _decode_container_captured_sync(
         self,
@@ -791,13 +795,6 @@ class RtspSession:
             error_message=error.safe_message,
         )
 
-    async def _close_active_container(self) -> None:
-        container = self._active_container
-        if container is None:
-            return
-        self._active_container = None
-        await asyncio.to_thread(self._close_container_sync, container)
-
     @staticmethod
     def _close_container_sync(container: av.container.InputContainer) -> None:
         with av.logging.Capture(local=True):
@@ -811,4 +808,4 @@ class RtspSession:
         source: RtspSourceSettings,
     ) -> av.container.InputContainer:
         with av.logging.Capture(local=True):
-            return _open_container(source, _OPEN_TIMEOUT_SEC, av.open)
+            return _open_container(source, _IO_TIMEOUT_SEC, av.open)
