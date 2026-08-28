@@ -25,6 +25,23 @@ class TestValidateResources:
         assert result.status == EngineReadiness.NOT_CONFIGURED
         assert "API Key" in result.message
 
+    def test_keyless_provider_is_ready_when_required_models_exist(self, tmp_path):
+        _create_all_models(tmp_path)
+
+        result = validate_resources("", str(tmp_path), auth_required=False)
+
+        assert result.status == EngineReadiness.READY
+        assert result.missing_models == []
+
+    def test_keyless_provider_still_requires_local_models(self, tmp_path):
+        result = validate_resources("", str(tmp_path), auth_required=False)
+
+        assert result.status == EngineReadiness.MODELS_MISSING
+        assert result.missing_models == [
+            "det_4C.onnx",
+            "human_body_reid_v2.onnx",
+        ]
+
     def test_missing_models_dir_none(self):
         result = validate_resources("test-key", None)
         assert result.status == EngineReadiness.MODELS_MISSING

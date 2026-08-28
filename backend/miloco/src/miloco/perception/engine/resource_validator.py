@@ -46,9 +46,11 @@ MODELS: tuple[ModelSpec, ...] = (
 def validate_resources(
     omni_api_key: str,
     models_dir: str | None,
+    *,
+    auth_required: bool = True,
 ) -> ValidationResult:
     """校验感知引擎所需资源，返回校验结果（不抛异常）。"""
-    if not omni_api_key:
+    if auth_required and not omni_api_key:
         return ValidationResult(
             status=EngineReadiness.NOT_CONFIGURED,
             message="Omni API Key 未配置",

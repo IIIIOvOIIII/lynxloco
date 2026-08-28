@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 from jsonschema import Draft202012Validator
 from miloco.config import SETTINGS_SCHEMA, get_settings, reset_settings
-from miloco.config.settings import MilocoSettings
+from miloco.config.settings import MilocoSettings, ModelSettings, OmniModelSettings
 
 
 @pytest.fixture(autouse=True)
@@ -202,6 +202,72 @@ def test_legacy_active_json_profile_keeps_protocol_missing_until_resolution(
     legacy = get_settings().model.omni
     assert legacy.api_protocol is None
     assert resolve_api_protocol(legacy.api_protocol, legacy.model) == "gemini_native"
+
+
+@pytest.mark.parametrize(
+    ("api_protocol", "model", "persisted_key", "expected_key"),
+    [
+        ("openai_responses", "local-vlm", "", ""),
+        (
+            "openai_responses",
+            "local-vlm",
+            "RESPONSES_PERSISTED_KEY",
+            "RESPONSES_PERSISTED_KEY",
+        ),
+        ("openai_chat_completions", "cloud-chat", "", "OLD_CHAT_SENTINEL"),
+        ("gemini_native", "gemini-3-flash", "", "OLD_CHAT_SENTINEL"),
+    ],
+)
+def test_generic_omni_env_key_is_protocol_scoped_during_json_reload(
+    tmp_path: Path,
+    monkeypatch,
+    api_protocol: str,
+    model: str,
+    persisted_key: str,
+    expected_key: str,
+) -> None:
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model": {
+                    "omni": {
+                        "model": model,
+                        "base_url": "http://127.0.0.1:8000/v1",
+                        "api_key": persisted_key,
+                        "api_protocol": api_protocol,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MILOCO_MODEL__OMNI__API_KEY", "OLD_CHAT_SENTINEL")
+    reset_settings()
+
+    settings = get_settings()
+
+    assert settings.model.omni.api_key == expected_key
+    assert settings.perception.engine["omni"]["api_key"] == expected_key
+
+
+def test_generic_omni_env_key_does_not_override_direct_responses_init(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MILOCO_MODEL__OMNI__API_KEY", "OLD_CHAT_SENTINEL")
+
+    settings = MilocoSettings(
+        model=ModelSettings(
+            omni=OmniModelSettings(
+                model="local-vlm",
+                base_url="http://127.0.0.1:8000/v1",
+                api_key="",
+                api_protocol="openai_responses",
+            )
+        )
+    )
+
+    assert settings.model.omni.api_key == ""
+    assert settings.perception.engine["omni"]["api_key"] == ""
 
 
 # SSL 已废弃：backend 永远 HTTP，跨网加密走反代。原 ssl_enabled / ssl_certfile /

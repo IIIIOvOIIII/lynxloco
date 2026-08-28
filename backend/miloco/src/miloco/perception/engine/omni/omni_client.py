@@ -135,8 +135,11 @@ def resolve_omni_api_key(api_key_from_config: str = "") -> str:
 
 
 def resolve_api_key(config: OmniConfig) -> str:
-    """Resolve API key from config or environment variable."""
-    return resolve_omni_api_key(config.api_key)
+    """Resolve the provider key without crossing protocol boundaries."""
+    adapter = get_adapter(config.api_protocol, config.model)
+    if adapter.auth_required:
+        return resolve_omni_api_key(config.api_key)
+    return config.api_key
 
 
 def resolve_live_omni_config(base: OmniConfig) -> OmniConfig:
@@ -149,7 +152,7 @@ def resolve_live_omni_config(base: OmniConfig) -> OmniConfig:
     ``reset_settings()`` 清缓存),即可让新模型在**下一个推理周期**自动生效,无需重启
     进程、不重建引擎。只有调用身份（有效协议、model、规范化 base_url）未变化时，
     当前空 api_key 才退回快照值；切换身份时空 key 是有效选择，不能把旧端点凭据带到新端点。
-    最终调用点 ``resolve_api_key`` 仍会兜底环境变量。
+    最终调用点 ``resolve_api_key`` 仅为需要鉴权的协议兜底通用环境变量。
 
     副作用:调用身份 (resolved protocol, model, base_url, resolved key) 变化时清熔断状态
     到 CLOSED。覆盖所有配置源
@@ -185,7 +188,7 @@ def _maybe_reset_breaker_on_config_change(resolved: OmniConfig) -> None:
         resolve_api_protocol(resolved.api_protocol, resolved.model),
         resolved.model,
         resolved.base_url,
-        resolve_omni_api_key(resolved.api_key),
+        resolve_api_key(resolved),
     )
     prev = getattr(_maybe_reset_breaker_on_config_change, "_last_triple", None)
     if prev is not None and prev != triple:

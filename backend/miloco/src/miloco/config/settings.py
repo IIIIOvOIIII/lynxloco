@@ -15,7 +15,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 from urllib.parse import urlsplit
@@ -670,6 +670,75 @@ class JsonConfigSource(PydanticBaseSettingsSource):
         return data
 
 
+def _source_omni_protocol(data: Mapping[str, Any]) -> tuple[bool, Any]:
+    """Return whether a settings source explicitly selects an Omni protocol."""
+    model = data.get("model")
+    omni = model.get("omni") if isinstance(model, Mapping) else None
+    if isinstance(omni, Mapping) and "api_protocol" in omni:
+        return True, omni["api_protocol"]
+    return False, None
+
+
+class ProtocolScopedEnvSource(PydanticBaseSettingsSource):
+    """Keep the generic Omni env key scoped to key-required protocols.
+
+    ``MILOCO_MODEL__OMNI__API_KEY`` predates provider selection and therefore
+    belongs to the legacy authenticated Chat/Gemini path.  When the effective
+    source stack explicitly selects Responses, remove only that env field so a
+    persisted or init-provided Responses key can still win normally.
+    """
+
+    def __init__(
+        self,
+        settings_cls: type[BaseSettings],
+        *,
+        init_source: PydanticBaseSettingsSource,
+        env_source: PydanticBaseSettingsSource,
+        json_source: PydanticBaseSettingsSource,
+        yaml_source: PydanticBaseSettingsSource,
+    ) -> None:
+        super().__init__(settings_cls)
+        self._init_source = init_source
+        self._env_source = env_source
+        self._json_source = json_source
+        self._yaml_source = yaml_source
+
+    def get_field_value(self, field, field_name):  # type: ignore[override]
+        return None, field_name, False
+
+    def __call__(self) -> dict[str, Any]:  # type: ignore[override]
+        env_data = self._env_source()
+        effective_protocol = None
+        for source in (
+            self._init_source,
+            self._env_source,
+            self._json_source,
+            self._yaml_source,
+        ):
+            found, protocol = _source_omni_protocol(source())
+            if found:
+                effective_protocol = protocol
+                break
+
+        if effective_protocol != "openai_responses":
+            return env_data
+
+        model = env_data.get("model")
+        if not isinstance(model, Mapping):
+            return env_data
+        omni = model.get("omni")
+        if not isinstance(omni, Mapping) or "api_key" not in omni:
+            return env_data
+
+        scoped_env = dict(env_data)
+        scoped_model = {str(key): value for key, value in model.items()}
+        scoped_omni = {str(key): value for key, value in omni.items()}
+        scoped_omni.pop("api_key", None)
+        scoped_model["omni"] = scoped_omni
+        scoped_env["model"] = scoped_model
+        return scoped_env
+
+
 # ─── 顶层 Settings ───────────────────────────────────────────────────────────
 
 
@@ -870,9 +939,16 @@ class MilocoSettings(BaseSettings):
         # 优先级：init（测试覆盖）> env > config.json > settings.yaml > 默认值
         json_source = JsonConfigSource(settings_cls, _user_config_path())
         yaml_source = YamlConfigSource(settings_cls, _SETTINGS_YAML)
+        scoped_env_source = ProtocolScopedEnvSource(
+            settings_cls,
+            init_source=init_settings,
+            env_source=env_settings,
+            json_source=json_source,
+            yaml_source=yaml_source,
+        )
         return (
             init_settings,
-            env_settings,
+            scoped_env_source,
             json_source,
             yaml_source,
         )

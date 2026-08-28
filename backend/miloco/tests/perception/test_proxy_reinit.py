@@ -27,6 +27,7 @@ import pytest
 from miloco.node_monitor import Lifecycle, NodeName
 from miloco.perception.client import PerceptionEngineProxy
 from miloco.perception.engine.resource_validator import (
+    MODELS,
     EngineReadiness,
     ValidationResult,
 )
@@ -89,6 +90,108 @@ def _lifecycle_calls(mon: MagicMock, life: Lifecycle) -> list:
         for c in mon.set_lifecycle.call_args_list
         if c.args[:2] == (NodeName.ENGINE, life)
     ]
+
+
+@contextmanager
+def _real_validation_settings(
+    tmp_path,
+    monkeypatch,
+    *,
+    api_protocol: str,
+    model: str,
+    api_key: str = "",
+):
+    for spec in MODELS:
+        (tmp_path / spec.name).write_bytes(b"model")
+    settings = MagicMock()
+    settings.perception.engine = {
+        "omni": {
+            "model": model,
+            "base_url": "http://127.0.0.1:8000/v1",
+            "api_key": api_key,
+            "api_protocol": api_protocol,
+        },
+        "identity": {"perception_model_dir": str(tmp_path)},
+    }
+    settings.directories.models_dir = tmp_path
+    monitor = MagicMock()
+    monkeypatch.delenv("MILOCO_MODEL__OMNI__API_KEY", raising=False)
+    with (
+        patch("miloco.perception.client.get_settings", return_value=settings),
+        patch("miloco.perception.client.get_monitor", return_value=monitor),
+    ):
+        yield monitor
+
+
+def test_init_engine_allows_explicit_keyless_responses_with_models(
+    tmp_path, monkeypatch
+):
+    proxy = _make_proxy("not_initialized")
+    fake_engine = MagicMock()
+
+    with (
+        patch.object(proxy, "_create_engine", return_value=fake_engine) as create_engine,
+        _real_validation_settings(
+            tmp_path,
+            monkeypatch,
+            api_protocol="openai_responses",
+            model="local-vlm",
+        ),
+    ):
+        proxy._init_engine()
+
+    assert proxy.status == "ready"
+    assert proxy.perception_engine is fake_engine
+    create_engine.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("api_protocol", "model"),
+    [
+        ("openai_chat_completions", "cloud-chat"),
+        ("gemini_native", "gemini-3-flash"),
+    ],
+)
+def test_init_engine_keeps_key_required_protocols_dormant_without_key(
+    tmp_path, monkeypatch, api_protocol: str, model: str
+):
+    proxy = _make_proxy("not_initialized")
+
+    with (
+        patch.object(proxy, "_create_engine") as create_engine,
+        _real_validation_settings(
+            tmp_path,
+            monkeypatch,
+            api_protocol=api_protocol,
+            model=model,
+        ),
+    ):
+        proxy._init_engine()
+
+    assert proxy.status == "no_omni_api_key"
+    assert proxy.perception_engine is None
+    create_engine.assert_not_called()
+
+
+def test_dormant_no_key_proxy_reinitializes_for_keyless_responses(
+    tmp_path, monkeypatch
+):
+    proxy = _make_proxy("no_omni_api_key")
+    fake_engine = MagicMock()
+
+    with (
+        patch.object(proxy, "_create_engine", return_value=fake_engine),
+        _real_validation_settings(
+            tmp_path,
+            monkeypatch,
+            api_protocol="openai_responses",
+            model="local-vlm",
+        ),
+    ):
+        assert proxy.try_reinit() is True
+
+    assert proxy.status == "ready"
+    assert proxy.perception_engine is fake_engine
 
 
 # ── proxy: 三种可恢复态 → ready ────────────────────────────────────────

@@ -258,6 +258,29 @@ def test_auth_headers_allow_empty_key_and_use_bearer_when_present() -> None:
     }
 
 
+def test_runtime_generic_env_key_is_only_for_auth_required_protocols(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MILOCO_MODEL__OMNI__API_KEY", "OLD_CHAT_SENTINEL")
+    responses = _responses_config()
+    chat = OmniConfig(
+        model="cloud-chat",
+        base_url="https://cloud.example/v1",
+        api_key="",
+        api_protocol="openai_chat_completions",
+    )
+    gemini = OmniConfig(
+        model="gemini-3-flash",
+        base_url="https://gemini.example/v1beta",
+        api_key="",
+        api_protocol="gemini_native",
+    )
+
+    assert omni_client.resolve_api_key(responses) == ""
+    assert omni_client.resolve_api_key(chat) == "OLD_CHAT_SENTINEL"
+    assert omni_client.resolve_api_key(gemini) == "OLD_CHAT_SENTINEL"
+
+
 @pytest.mark.parametrize("block_type", ["video_url", "input_audio", "file"])
 def test_unsupported_media_block_fails_locally(block_type: str) -> None:
     messages = _messages()

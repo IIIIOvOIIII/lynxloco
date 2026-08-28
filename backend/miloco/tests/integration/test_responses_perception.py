@@ -15,20 +15,27 @@ from pathlib import Path
 import httpx
 import numpy as np
 import pytest
+from miloco.config import get_settings, reset_settings
 from miloco.perception.engine.config import OmniConfig
+from miloco.perception.engine.omni import omni_client
 from miloco.perception.engine.omni.circuit_breaker import (
     get_omni_circuit_breaker,
     reset_omni_circuit_breaker_for_tests,
 )
+from miloco.perception.engine.omni.omni import _call_omni_messages
 from miloco.perception.engine.omni.omni_client import (
     OmniError,
+    _build_messages,
     call_omni,
     call_omni_stream,
     extract_usage,
+    resolve_api_key,
+    resolve_live_omni_config,
 )
 from miloco.perception.engine.omni.probe import probe_omni
 from miloco.perception.engine.omni.prompt_builder import (
     build_prompt,
+    build_query_prompt,
     build_stream_prompt,
 )
 from miloco.perception.engine.omni.provider import (
@@ -62,9 +69,11 @@ _DATA_URL_PREFIX = "data:image/jpeg;base64,"
 @pytest.fixture(autouse=True)
 def _reset_breaker_and_api_key(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     reset_omni_circuit_breaker_for_tests()
+    reset_settings()
     monkeypatch.delenv("MILOCO_MODEL__OMNI__API_KEY", raising=False)
     yield
     reset_omni_circuit_breaker_for_tests()
+    reset_settings()
 
 
 def _packet() -> IdentityPacket:
@@ -195,6 +204,95 @@ async def test_visual_preflight_tolerates_missing_models_endpoint() -> None:
         ("POST", "/v1/responses"),
     ]
     assert fixture.requests[-1].image_count == 1
+
+
+@pytest.mark.asyncio
+async def test_persisted_keyless_responses_ignores_generic_env_across_all_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sentinel = "OLD_CHAT_SENTINEL"
+    monkeypatch.setenv("MILOCO_HOME", str(tmp_path))
+    monkeypatch.setenv("MILOCO_MODEL__OMNI__API_KEY", sentinel)
+
+    with ResponsesFixtureServer() as fixture:
+        (tmp_path / "config.json").write_text(
+            json.dumps(
+                {
+                    "model": {
+                        "omni": {
+                            "model": "fixture-vlm",
+                            "base_url": fixture.base_url,
+                            "api_key": "",
+                            "api_protocol": "openai_responses",
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        reset_settings()
+        active = get_settings().model.omni
+        resolved = resolve_live_omni_config(
+            OmniConfig(
+                model="old-cloud-chat",
+                base_url="https://old-cloud.example/v1",
+                api_key=sentinel,
+                api_protocol="openai_chat_completions",
+                timeout=2.0,
+            )
+        )
+
+        assert active.api_key == ""
+        assert resolved.api_key == ""
+        assert resolve_api_key(resolved) == ""
+        breaker_identity = getattr(
+            omni_client._maybe_reset_breaker_on_config_change,
+            "_last_triple",
+        )
+        assert breaker_identity[-1] == ""
+
+        preflight = await probe_omni(
+            active.model,
+            active.base_url,
+            active.api_key,
+            active.api_protocol,
+        )
+        normal = await call_omni(_payload(), resolved)
+        streamed = "".join(
+            [chunk async for chunk in call_omni_stream(_payload(stream=True), resolved)]
+        )
+        adapter = get_adapter(resolved.api_protocol, resolved.model)
+        fused = await _call_omni_messages(
+            _build_messages(_payload(), adapter),
+            resolved,
+            adapter=adapter,
+        )
+        query = await call_omni(
+            build_query_prompt(
+                [_packet()],
+                "What is visible?",
+                media_mode=adapter.media_mode,
+            ),
+            resolved,
+            type="on_demand",
+        )
+
+    assert preflight["ok"] is True
+    assert parse_omni_response(normal).caption[0].description == "fixture saw the room"
+    assert "fixture saw the room" in streamed
+    assert fused["choices"][0]["message"]["content"]
+    assert query["choices"][0]["message"]["content"]
+    assert [(request.method, request.path) for request in fixture.requests] == [
+        ("GET", "/v1/models"),
+        ("POST", "/v1/responses"),
+        ("POST", "/v1/responses"),
+        ("POST", "/v1/responses"),
+        ("POST", "/v1/responses"),
+        ("POST", "/v1/responses"),
+    ]
+    assert all(request.auth_present is False for request in fixture.requests)
+    assert sentinel not in repr(fixture.requests)
 
 
 def _minimal_jpeg_data_url() -> str:

@@ -31,6 +31,7 @@ from miloco.observability.metrics_client import get_metrics_client
 from miloco.perception.engine.api import PerceptionEngine
 from miloco.perception.engine.config import InputConfig
 from miloco.perception.engine.omni.omni_client import OmniError, resolve_omni_api_key
+from miloco.perception.engine.omni.provider import get_adapter
 from miloco.perception.event_text_builder import (
     build_speeches_text,
     build_suggestions_text,
@@ -281,7 +282,16 @@ class PerceptionEngineProxy:
         engine_cfg = settings.perception.engine
 
         omni_kwargs = dict(engine_cfg.get("omni", {}))
-        omni_api_key = resolve_omni_api_key(omni_kwargs.get("api_key", ""))
+        omni_adapter = get_adapter(
+            omni_kwargs.get("api_protocol"),
+            str(omni_kwargs.get("model", "")),
+        )
+        configured_api_key = str(omni_kwargs.get("api_key") or "")
+        omni_api_key = (
+            resolve_omni_api_key(configured_api_key)
+            if omni_adapter.auth_required
+            else configured_api_key
+        )
 
         identity_kwargs = dict(engine_cfg.get("identity", {}))
         models_dir = identity_kwargs.get("perception_model_dir") or str(
@@ -289,7 +299,11 @@ class PerceptionEngineProxy:
         )
 
         mon = get_monitor()
-        validation = validate_resources(omni_api_key, models_dir)
+        validation = validate_resources(
+            omni_api_key,
+            models_dir,
+            auth_required=omni_adapter.auth_required,
+        )
 
         if validation.status == EngineReadiness.MODELS_MISSING:
             self._status = "models_missing"
