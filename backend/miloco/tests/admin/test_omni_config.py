@@ -93,6 +93,129 @@ def _get(client):
     return client.get("/api/admin/omni-config").json()["data"]
 
 
+def test_get_legacy_records_resolves_protocol_without_writing_config(client, tmp_path):
+    """旧记录缺字段时只在读取边界推断，返回值标明 inferred，不得偷偷迁移磁盘。"""
+    before = (tmp_path / "config.json").read_bytes()
+    data = _get(client)
+    assert data["active"]["api_protocol"] == "openai_chat_completions"
+    assert data["active"]["protocol_inferred"] is True
+    assert (tmp_path / "config.json").read_bytes() == before
+
+
+def test_put_requires_explicit_protocol_and_does_not_write(client, tmp_path):
+    """新增或编辑缺协议必须 422，不能回退到模型名推断或产生部分写。"""
+    before = (tmp_path / "config.json").read_bytes()
+    response = client.put(
+        "/api/admin/omni-config",
+        json={
+            "label": "local",
+            "model": "vision-local",
+            "base_url": "http://127.0.0.1:8000/v1",
+            "api_key": "",
+        },
+    )
+    assert response.status_code == 422
+    assert (tmp_path / "config.json").read_bytes() == before
+
+
+def test_put_rejects_invalid_protocol_without_writing(client, tmp_path):
+    before = (tmp_path / "config.json").read_bytes()
+    response = client.put(
+        "/api/admin/omni-config",
+        json={
+            "label": "local",
+            "model": "vision-local",
+            "base_url": "http://127.0.0.1:8000/v1",
+            "api_protocol": "responses",
+            "api_key": "",
+        },
+    )
+    assert response.status_code == 422
+    assert (tmp_path / "config.json").read_bytes() == before
+
+
+def test_put_responses_allows_blank_key_and_persists_protocol(client, monkeypatch):
+    """Responses 本地端点可以无 Key，但 probe 和持久化必须收到显式协议。"""
+    calls = []
+
+    async def _probe(model, base_url, api_key, api_protocol):
+        calls.append((model, base_url, api_key, api_protocol))
+        return {"ok": True, "code": "ok", "message": "连接正常"}
+
+    monkeypatch.setattr("miloco.admin.router._probe.probe_omni", _probe)
+    response = client.put(
+        "/api/admin/omni-config",
+        json={
+            "label": "local",
+            "model": "vision-local",
+            "base_url": "http://127.0.0.1:8000/v1",
+            "api_protocol": "openai_responses",
+            "api_key": "",
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["active"]["api_protocol"] == "openai_responses"
+    assert data["active"]["protocol_inferred"] is False
+    assert data["active"]["has_key"] is False
+    assert calls == [
+        (
+            "vision-local",
+            "http://127.0.0.1:8000/v1",
+            "",
+            "openai_responses",
+        )
+    ]
+
+
+def test_edit_legacy_gemini_profile_reuses_key_only_for_resolved_protocol(
+    client, monkeypatch
+):
+    """旧 Gemini 档案没有协议字段，显式升级为 gemini_native 时仍可沿用原 Key。"""
+    from miloco.config.settings import OmniModelSettings, get_settings
+
+    settings = get_settings()
+    settings.model.omni_profiles = [
+        OmniModelSettings(
+            label="legacy-gemini",
+            model="gemini-vision",
+            base_url="https://gemini.example/v1",
+            api_key="gemini-secret",
+            api_protocol=None,
+        )
+    ]
+    legacy = _get(client)["profiles"][0]
+    assert legacy["api_protocol"] == "gemini_native"
+    assert legacy["protocol_inferred"] is True
+    calls = []
+
+    async def _probe(model, base_url, api_key, api_protocol):
+        calls.append((model, base_url, api_key, api_protocol))
+        return {"ok": True, "code": "ok", "message": "连接正常"}
+
+    monkeypatch.setattr("miloco.admin.router._probe.probe_omni", _probe)
+    response = client.put(
+        "/api/admin/omni-config",
+        json={
+            "label": "legacy-gemini",
+            "original_label": "legacy-gemini",
+            "model": "gemini-vision",
+            "base_url": "https://gemini.example/v1",
+            "api_protocol": "gemini_native",
+            "activate": True,
+        },
+    )
+    assert response.status_code == 200
+    assert calls == [
+        (
+            "gemini-vision",
+            "https://gemini.example/v1",
+            "gemini-secret",
+            "gemini_native",
+        )
+    ]
+
+
 # ─── GET / PUT / 档案(label=id) ────────────────────────────────────────────
 
 
@@ -115,6 +238,7 @@ def test_active_with_key_not_in_profiles_is_synthesized(client):
             "label": "甲",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-k123456789",
         },
     )
@@ -145,6 +269,7 @@ def test_active_already_in_profiles_not_duplicated(client):
             "label": "甲",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-k123456789",
         },
     )  # 默认 activate=true,甲 已存档且生效
@@ -161,6 +286,7 @@ def test_put_creates_and_activates(client):
             "label": "配置1",
             "model": "qwen3-omni-flash",
             "base_url": "https://q/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-faketestkey1234abcd",
         },
     ).json()["data"]
@@ -180,6 +306,7 @@ def test_put_empty_label_400(client):
             "label": "  ",
             "model": "m",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-k123456789",
         },
     )
@@ -194,6 +321,7 @@ def test_second_profile_has_independent_key(client):
             "label": "甲",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-keyforjia12",
         },
     )
@@ -204,6 +332,7 @@ def test_second_profile_has_independent_key(client):
             "label": "乙",
             "model": "m2",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "activate": False,
         },
     ).json()["data"]
@@ -221,6 +350,7 @@ def test_update_same_label_blank_key_keeps_it(client):
             "label": "甲",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-keyforjia12",
         },
     )
@@ -231,6 +361,7 @@ def test_update_same_label_blank_key_keeps_it(client):
             "label": "甲",
             "model": "m2",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "original_label": "甲",
         },
     ).json()["data"]
@@ -246,6 +377,7 @@ def test_rename_via_original_label(client):
             "label": "配置1",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-keyforaaa12",
         },
     )
@@ -255,6 +387,7 @@ def test_rename_via_original_label(client):
             "label": "生产Q",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "original_label": "配置1",
         },
     ).json()["data"]
@@ -272,6 +405,7 @@ def test_put_activate_false_only_adds_to_list(client):
             "label": "甲",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-k123456789",
             "activate": False,
         },
@@ -289,6 +423,7 @@ def test_put_activate_false_editing_active_still_syncs(client):
             "label": "甲",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-k111111111",
         },
     )  # 默认 activate=true → 甲 成为当前
@@ -298,6 +433,7 @@ def test_put_activate_false_editing_active_still_syncs(client):
             "label": "甲",
             "model": "m2",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "original_label": "甲",
             "activate": False,
         },
@@ -313,6 +449,7 @@ def test_duplicate_label_409(client):
             "label": "甲",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-k111111111",
         },
     )
@@ -322,6 +459,7 @@ def test_duplicate_label_409(client):
             "label": "乙",
             "model": "m2",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "activate": False,
         },
     )
@@ -332,6 +470,7 @@ def test_duplicate_label_409(client):
             "label": "甲",
             "model": "m2",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "original_label": "乙",
         },
     )
@@ -345,6 +484,7 @@ def test_activate_by_label(client):
             "label": "甲",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-k111111111",
         },
     )
@@ -354,6 +494,7 @@ def test_activate_by_label(client):
             "label": "乙",
             "model": "m2",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-k222222222",
         },
     )
@@ -378,6 +519,7 @@ def test_delete_non_active_label(client):
             "label": "乙",
             "model": "m2",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-k222222222",
         },
     )
@@ -387,6 +529,7 @@ def test_delete_non_active_label(client):
             "label": "甲",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-k111111111",
         },
     )
@@ -407,6 +550,7 @@ def test_delete_active_resets_to_unconfigured(client):
             "label": "甲",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-k111111111",
         },
     )
@@ -416,6 +560,7 @@ def test_delete_active_resets_to_unconfigured(client):
             "label": "乙",
             "model": "m2",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-k222222222",
         },
     )
@@ -456,6 +601,7 @@ def test_delete_active_awaits_soft_stop(client, monkeypatch):
             "label": "甲",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-k111111111",
         },
     )  # 默认 activate=true → 甲 当前生效
@@ -479,6 +625,7 @@ def test_delete_non_active_does_not_soft_stop(client, monkeypatch):
             "label": "乙",
             "model": "m2",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-k222222222",
         },
     )
@@ -488,6 +635,7 @@ def test_delete_non_active_does_not_soft_stop(client, monkeypatch):
             "label": "甲",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-k111111111",
         },
     )  # 甲 当前生效
@@ -547,6 +695,7 @@ def test_edit_synthesized_active_empty_label_syncs_active(client):
             "label": synth_label,
             "model": "ad-hoc-v2",
             "base_url": "https://adhoc/v1",
+            "api_protocol": "openai_chat_completions",
             "original_label": synth_label,
             "activate": False,
         },
@@ -570,6 +719,7 @@ def test_deactivate_active_resets_keeps_profile_and_soft_stops(client, monkeypat
             "label": "甲",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-k111111111",
         },
     )  # 甲 当前生效
@@ -594,6 +744,7 @@ def test_deactivate_non_active_noop(client, monkeypatch):
             "label": "乙",
             "model": "m2",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-k222222222",
         },
     )
@@ -603,6 +754,7 @@ def test_deactivate_non_active_noop(client, monkeypatch):
             "label": "甲",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-k111111111",
         },
     )  # 甲 生效
@@ -624,6 +776,7 @@ def test_put_hot_reload_visible_to_resolve_live(client):
             "label": "热",
             "model": "hot-model",
             "base_url": "https://hot.example/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-hotkey123456",
         },
     )
@@ -686,7 +839,12 @@ def test_test_connection_ok_chat_succeeds(client, monkeypatch, real_probe):
     )
     data = client.post(
         "/api/admin/omni-config/test",
-        json={"model": "m1", "base_url": "https://x/v1", "api_key": "sk-xxx"},
+        json={
+            "model": "m1",
+            "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
+            "api_key": "sk-xxx",
+        },
     ).json()["data"]
     assert data["ok"] is True
     assert data["code"] == "ok"
@@ -709,7 +867,12 @@ def test_test_connection_ok_even_if_model_not_listed(client, monkeypatch, real_p
     )
     data = client.post(
         "/api/admin/omni-config/test",
-        json={"model": "m1", "base_url": "https://x/v1", "api_key": "sk-xxx"},
+        json={
+            "model": "m1",
+            "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
+            "api_key": "sk-xxx",
+        },
     ).json()["data"]
     assert data["ok"] is True
     assert data["code"] == "ok"  # 不在列表照样判 ok
@@ -728,7 +891,12 @@ def test_test_connection_not_found(client, monkeypatch, real_probe):
     )
     data = client.post(
         "/api/admin/omni-config/test",
-        json={"model": "m1", "base_url": "https://x/v1", "api_key": "sk-x"},
+        json={
+            "model": "m1",
+            "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
+            "api_key": "sk-x",
+        },
     ).json()["data"]
     assert data["ok"] is False
     assert data["code"] == "not_found"
@@ -747,7 +915,12 @@ def test_test_connection_rejected_authed(client, monkeypatch, real_probe):
     )
     data = client.post(
         "/api/admin/omni-config/test",
-        json={"model": "m1", "base_url": "https://x/v1", "api_key": "sk-x"},
+        json={
+            "model": "m1",
+            "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
+            "api_key": "sk-x",
+        },
     ).json()["data"]
     assert data["ok"] is False
     assert data["code"] == "rejected_authed"
@@ -763,7 +936,12 @@ def test_test_connection_bad_key(client, monkeypatch, real_probe):
     )
     data = client.post(
         "/api/admin/omni-config/test",
-        json={"model": "m1", "base_url": "https://x/v1", "api_key": "sk-bad"},
+        json={
+            "model": "m1",
+            "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
+            "api_key": "sk-bad",
+        },
     ).json()["data"]
     assert data["ok"] is False
     assert data["code"] == "bad_key"
@@ -780,7 +958,12 @@ def test_test_connection_unreachable(client, monkeypatch, real_probe):
     )
     data = client.post(
         "/api/admin/omni-config/test",
-        json={"model": "m1", "base_url": "https://nope.invalid/v1", "api_key": "sk-x"},
+        json={
+            "model": "m1",
+            "base_url": "https://nope.invalid/v1",
+            "api_protocol": "openai_chat_completions",
+            "api_key": "sk-x",
+        },
     ).json()["data"]
     assert data["ok"] is False
     assert data["code"] == "unreachable"
@@ -790,7 +973,11 @@ def test_test_connection_unreachable(client, monkeypatch, real_probe):
 def test_test_connection_no_key(client):
     data = client.post(
         "/api/admin/omni-config/test",
-        json={"model": "m1", "base_url": "https://x/v1"},
+        json={
+            "model": "m1",
+            "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
+        },
     ).json()["data"]
     assert data["ok"] is False
     assert data["code"] == "no_key"
@@ -807,7 +994,11 @@ def test_list_models_ok(client, monkeypatch):
     )
     data = client.post(
         "/api/admin/omni-config/models",
-        json={"base_url": "https://x/v1", "api_key": "sk-x"},
+        json={
+            "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
+            "api_key": "sk-x",
+        },
     ).json()["data"]
     assert data["ok"] is True
     assert data["models"] == ["a", "b"]  # sorted
@@ -901,6 +1092,7 @@ def test_test_connection_gemini_skips_preflight_uses_goog_key(
         json={
             "model": "gemini-3-flash-preview",
             "base_url": "https://generativelanguage.googleapis.com/v1beta",
+            "api_protocol": "gemini_native",
             "api_key": "k",
         },
     ).json()["data"]
@@ -916,17 +1108,31 @@ def test_fetch_models_gemini_parses_name_and_goog_key(client, monkeypatch):
     from miloco.perception.engine.omni import probe as p
 
     calls: list = []
-    resp = _FakeResp(200, {"models": [
-        {"name": "models/gemini-3.5-flash"},
-        {"name": "models/gemini-3-flash-preview"},
-    ]})
-    monkeypatch.setattr(p.httpx, "AsyncClient", _recording_async_client(calls, get_resp=resp))
+    resp = _FakeResp(
+        200,
+        {
+            "models": [
+                {"name": "models/gemini-3.5-flash"},
+                {"name": "models/gemini-3-flash-preview"},
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        p.httpx, "AsyncClient", _recording_async_client(calls, get_resp=resp)
+    )
     data = client.post(
         "/api/admin/omni-config/models",
-        json={"base_url": "https://generativelanguage.googleapis.com/v1beta", "api_key": "k"},
+        json={
+            "base_url": "https://generativelanguage.googleapis.com/v1beta",
+            "api_protocol": "openai_chat_completions",
+            "api_key": "k",
+        },
     ).json()["data"]
     assert data["ok"] is True
-    assert data["models"] == ["gemini-3-flash-preview", "gemini-3.5-flash"]  # 剥前缀 + sorted
+    assert data["models"] == [
+        "gemini-3-flash-preview",
+        "gemini-3.5-flash",
+    ]  # 剥前缀 + sorted
     get = next(c for c in calls if c[0] == "GET")
     assert "x-goog-api-key" in get[2] and "Authorization" not in get[2]
 
@@ -969,6 +1175,7 @@ def test_test_connection_ok_matching_active_clears_breaker(client):
             "label": "甲",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-active",
         },
     )
@@ -980,6 +1187,7 @@ def test_test_connection_ok_matching_active_clears_breaker(client):
             "label": "甲",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-active",
         },
     ).json()["data"]
@@ -1000,6 +1208,7 @@ def test_test_connection_ok_normalizes_base_url_trailing_slash(client):
             "label": "甲",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-active",
         },
     )
@@ -1010,7 +1219,8 @@ def test_test_connection_ok_normalizes_base_url_trailing_slash(client):
         json={
             "label": "甲",
             "model": "m1",
-            "base_url": "https://x/v1/",  # 结尾多一个斜杠
+            "base_url": "https://x/v1/",
+            "api_protocol": "openai_chat_completions",  # 结尾多一个斜杠
             "api_key": "sk-active",
         },
     )
@@ -1031,6 +1241,7 @@ def test_test_connection_ok_not_matching_active_leaves_breaker(client):
             "label": "甲",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-active",
         },
     )
@@ -1041,6 +1252,7 @@ def test_test_connection_ok_not_matching_active_leaves_breaker(client):
             "label": "乙",
             "model": "m2",
             "base_url": "https://y/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-other",
             "activate": False,
         },
@@ -1054,6 +1266,7 @@ def test_test_connection_ok_not_matching_active_leaves_breaker(client):
             "label": "乙",
             "model": "m2",
             "base_url": "https://y/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-other",
         },
     ).json()["data"]
@@ -1062,7 +1275,9 @@ def test_test_connection_ok_not_matching_active_leaves_breaker(client):
     assert get_omni_circuit_breaker().snapshot().state == "error"
 
 
-def test_test_connection_failure_does_not_touch_breaker(client, monkeypatch, real_probe):
+def test_test_connection_failure_does_not_touch_breaker(
+    client, monkeypatch, real_probe
+):
     """测失败(不管测的是不是 active) → 不动熔断状态。测失败本就没有"已验可用"的语义。"""
     from miloco.perception.engine.omni import probe
     from miloco.perception.engine.omni.circuit_breaker import (
@@ -1075,6 +1290,7 @@ def test_test_connection_failure_does_not_touch_breaker(client, monkeypatch, rea
             "label": "甲",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-active",
         },
     )
@@ -1092,6 +1308,7 @@ def test_test_connection_failure_does_not_touch_breaker(client, monkeypatch, rea
             "label": "甲",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-active",
         },
     ).json()["data"]

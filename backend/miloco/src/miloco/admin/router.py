@@ -25,11 +25,13 @@ from sse_starlette.sse import EventSourceResponse
 
 from miloco.admin import log_pack as _log_pack_mod
 from miloco.config import get_settings
+from miloco.config.settings import OmniApiProtocol
 from miloco.database.token_usage_repo import get_token_usage_repo
 from miloco.manager import get_manager
 from miloco.middleware import verify_token, verify_token_query_fallback
 from miloco.observability import debug as debug_mod
 from miloco.perception.engine.omni import probe as _probe
+from miloco.perception.engine.omni.provider import resolve_api_protocol
 from miloco.schema.common_schema import NormalResponse
 from miloco.utils.agent_config import update_shared_config
 from miloco.utils.paths import miloco_home
@@ -857,7 +859,13 @@ def _mask_api_key(key: str) -> str:
     return f"{key[:3]}…{key[-4:]}"
 
 
-def _key_by_label(label: str, provided: str | None, *, base_url: str | None = None) -> str:
+def _key_by_label(
+    label: str,
+    provided: str | None,
+    *,
+    base_url: str | None = None,
+    api_protocol: OmniApiProtocol | None = None,
+) -> str:
     """provided 非空用它;否则取该 label 档案(或当前生效配置)已存的 key。
 
     base_url 非 None 时,还要求档案里存的 base_url 与传入一致,否则不沿用 key
@@ -878,19 +886,29 @@ def _key_by_label(label: str, provided: str | None, *, base_url: str | None = No
         return ""
     m = get_settings().model
 
-    def _url_matches(stored: str) -> bool:
+    def _identity_matches(
+        stored_url: str,
+        stored_protocol: OmniApiProtocol | None,
+        stored_model: str,
+    ) -> bool:
         if base_url is None:
-            return True  # caller 没提供 base_url = 无 URL 上下文,按老语义沿用
-        return stored.rstrip("/") == base_url.rstrip("/")
+            url_matches = True
+        else:
+            url_matches = stored_url.rstrip("/") == base_url.rstrip("/")
+        protocol_matches = (
+            api_protocol is None
+            or resolve_api_protocol(stored_protocol, stored_model) == api_protocol
+        )
+        return url_matches and protocol_matches
 
     # 命中当前生效配置(含 label 为空、按展示 label 合成的「当前生效行」)→ 回退其 key。
     if m.omni.api_key and label in (m.omni.label, _active_display_label()):
-        if _url_matches(m.omni.base_url):
+        if _identity_matches(m.omni.base_url, m.omni.api_protocol, m.omni.model):
             return m.omni.api_key
         return ""
     for p in m.omni_profiles:
         if p.label == label and p.api_key:
-            if _url_matches(p.base_url):
+            if _identity_matches(p.base_url, p.api_protocol, p.model):
                 return p.api_key
             return ""
     return ""
@@ -930,6 +948,8 @@ def _full_omni_payload() -> dict:
             "label": p.label,
             "model": p.model,
             "base_url": p.base_url,
+            "api_protocol": resolve_api_protocol(p.api_protocol, p.model),
+            "protocol_inferred": p.api_protocol is None,
             "api_key_masked": _mask_api_key(p.api_key),
             "has_key": bool(p.api_key),
             "active": p.label == active.label,
@@ -943,6 +963,8 @@ def _full_omni_payload() -> dict:
                 "label": _active_display_label(),
                 "model": active.model,
                 "base_url": active.base_url,
+                "api_protocol": resolve_api_protocol(active.api_protocol, active.model),
+                "protocol_inferred": active.api_protocol is None,
                 "api_key_masked": _mask_api_key(active.api_key),
                 "has_key": True,
                 "active": True,
@@ -954,6 +976,8 @@ def _full_omni_payload() -> dict:
             "label": active.label,
             "model": active.model,
             "base_url": active.base_url,
+            "api_protocol": resolve_api_protocol(active.api_protocol, active.model),
+            "protocol_inferred": active.api_protocol is None,
             "api_key_masked": _mask_api_key(active.api_key),
             "has_key": bool(active.api_key),
             "health": health,
@@ -969,6 +993,7 @@ def _profiles_as_dicts() -> list[dict]:
             "model": p.model,
             "base_url": p.base_url,
             "api_key": p.api_key,
+            "api_protocol": p.api_protocol,
         }
         for p in get_settings().model.omni_profiles
     ]
@@ -978,6 +1003,7 @@ class OmniConfigBody(BaseModel):
     label: str  # 档案名 = 唯一 id(非空);base_url/api_key/model 都是它的可改属性
     base_url: str
     model: str
+    api_protocol: OmniApiProtocol
     api_key: str | None = None  # 留空 = 沿用该档案原 key(不被打码值覆盖)
     original_label: str | None = None  # 正在编辑的档案原名(支持改名/定位);None=新增
     activate: bool = True  # True=同时设为当前生效;False=只入列表(激活由 /activate 负责)
@@ -1032,16 +1058,27 @@ async def put_omni_config(
     if clash:
         raise HTTPException(status_code=409, detail=f"档案名「{label}」已存在")
     # 传 base_url 让 _key_by_label 校验"URL 未变才沿用旧 key",防跨 URL 复用凭证。
-    key = _key_by_label(orig or label, body.api_key, base_url=base_url)
-    entry = {"label": label, "base_url": base_url, "model": model, "api_key": key}
+    key = _key_by_label(
+        orig or label,
+        body.api_key,
+        base_url=base_url,
+        api_protocol=body.api_protocol,
+    )
+    entry = {
+        "label": label,
+        "base_url": base_url,
+        "model": model,
+        "api_key": key,
+        "api_protocol": body.api_protocol,
+    }
     tgt = orig or label
     will_activate = body.activate or _label_is_active(tgt)
     if will_activate:
-        if not key:
+        if not key and body.api_protocol != "openai_responses":
             raise HTTPException(
                 status_code=400, detail={"code": "no_key", "message": "未配置 API Key"}
             )
-        result = await _probe.probe_omni(model, base_url, key)
+        result = await _probe.probe_omni(model, base_url, key, body.api_protocol)
         if not result.get("ok"):
             raise HTTPException(status_code=400, detail=result)
     if target:
@@ -1076,12 +1113,13 @@ async def activate_omni_config(
     label = body.label.strip()
     for p in get_settings().model.omni_profiles:
         if p.label == label:
-            if not p.api_key:
+            protocol = resolve_api_protocol(p.api_protocol, p.model)
+            if not p.api_key and protocol != "openai_responses":
                 raise HTTPException(
                     status_code=400,
                     detail={"code": "no_key", "message": "未配置 API Key"},
                 )
-            result = await _probe.probe_omni(p.model, p.base_url, p.api_key)
+            result = await _probe.probe_omni(p.model, p.base_url, p.api_key, protocol)
             if not result.get("ok"):
                 raise HTTPException(status_code=400, detail=result)
             update_shared_config(
@@ -1091,6 +1129,7 @@ async def activate_omni_config(
                         "model": p.model,
                         "base_url": p.base_url,
                         "api_key": p.api_key,
+                        "api_protocol": p.api_protocol,
                     }
                 }
             )
@@ -1176,6 +1215,7 @@ class OmniTestBody(BaseModel):
     base_url: str | None = None
     api_key: str | None = None
     label: str | None = None
+    api_protocol: OmniApiProtocol
 
 
 @router.post(
@@ -1201,14 +1241,15 @@ async def test_omni_config(
         (body.label or omni.label or "").strip(),
         body.api_key,
         base_url=base_url,
+        api_protocol=body.api_protocol,
     )
-    if not api_key:
+    if not api_key and body.api_protocol != "openai_responses":
         return NormalResponse(
             code=0,
             message="ok",
             data={"ok": False, "code": "no_key", "message": "未配置 API Key"},
         )
-    result = await _probe.probe_omni(model, base_url, api_key)
+    result = await _probe.probe_omni(model, base_url, api_key, body.api_protocol)
     # 测通 + 三元组精确匹配当前 active + 熔断非 ok → 主动清熔断,与 put/activate/retry
     # 恢复路径对齐。护栏:测别的档案 / 未保存的新配置时不动状态。
     # OPEN_CONFIG 下 tick 不会自动探测(只探 OPEN_RECOVERABLE),不清则用户测通了红条仍不消失,
@@ -1225,6 +1266,7 @@ async def test_omni_config(
             model == live.model
             and base_url.rstrip("/") == live.base_url.rstrip("/")
             and api_key == live_key
+            and body.api_protocol == resolve_api_protocol(live.api_protocol, live.model)
         )
         if tested_is_active:
             cb = get_omni_circuit_breaker()
@@ -1388,7 +1430,8 @@ async def retry_omni_probe(current_user: str = Depends(verify_token)):
 
     await cb.retry_now()
     omni = get_settings().model.omni
-    if not omni.api_key:
+    protocol = resolve_api_protocol(omni.api_protocol, omni.model)
+    if not omni.api_key and protocol != "openai_responses":
         # 无 key:直接标记 probe 失败,回 OPEN_CONFIG
         await cb.record_probe_result(
             False,
@@ -1401,7 +1444,9 @@ async def retry_omni_probe(current_user: str = Depends(verify_token)):
         return NormalResponse(code=0, message="ok", data=_full_omni_payload())
 
     try:
-        result = await _probe.probe_omni(omni.model, omni.base_url, omni.api_key)
+        result = await _probe.probe_omni(
+            omni.model, omni.base_url, omni.api_key, protocol
+        )
     except asyncio.CancelledError:
         # 客户端断开 HTTP(用户切页/关 tab/网络抖动)时 FastAPI 抛 CancelledError。
         # 此前 retry_now() 已把 state 置 HALF_OPEN,若不复位则 before_call 永久短路、

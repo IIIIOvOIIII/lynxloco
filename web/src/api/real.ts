@@ -1962,6 +1962,7 @@ export async function realUpdateOmniConfig(
     label: input.label,
     model: input.model,
     base_url: input.base_url,
+    api_protocol: input.api_protocol,
   };
   if (input.api_key) body.api_key = input.api_key;
   if (input.original_label !== undefined)
@@ -2063,6 +2064,7 @@ export async function realTestOmniConfig(
     label: input.label,
     model: input.model,
     base_url: input.base_url,
+    api_protocol: input.api_protocol,
   };
   if (input.api_key) body.api_key = input.api_key;
   const r = await apiFetch<Normal<OmniTestResult>>(

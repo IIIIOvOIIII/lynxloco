@@ -495,6 +495,7 @@ describe("omni 配置契约 — 多档案", () => {
       label: "配置1",
       model: "m1",
       base_url: "https://p/v1",
+      api_protocol: "openai_responses",
       api_key: "sk-abcdef",
     });
     expect(cap.method).toBe("PUT");
@@ -502,6 +503,7 @@ describe("omni 配置契约 — 多档案", () => {
       label: "配置1",
       model: "m1",
       base_url: "https://p/v1",
+      api_protocol: "openai_responses",
       api_key: "sk-abcdef",
     });
     expect(s.active.model).toBe("m1");
@@ -513,6 +515,7 @@ describe("omni 配置契约 — 多档案", () => {
       label: "新名",
       model: "m2",
       base_url: "https://p/v1",
+      api_protocol: "gemini_native",
       original_label: "配置2",
     });
     expect("api_key" in (cap.body as object)).toBe(false);
@@ -520,6 +523,7 @@ describe("omni 配置契约 — 多档案", () => {
       label: "新名",
       model: "m2",
       base_url: "https://p/v1",
+      api_protocol: "gemini_native",
       original_label: "配置2",
     });
   });
@@ -564,6 +568,7 @@ describe("omni 配置契约 — 多档案", () => {
       label: "配置1",
       model: "m1",
       base_url: "https://p/v1",
+      api_protocol: "openai_chat_completions",
       api_key: "sk-x",
     });
     expect(res.ok).toBe(true);

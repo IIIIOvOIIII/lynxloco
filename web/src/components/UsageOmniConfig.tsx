@@ -23,13 +23,37 @@ import {
   listOmniModels,
   testOmniConfig,
 } from "@/api";
-import type { OmniConfigState, OmniProfile, OmniTestResult } from "@/lib/types";
+import type {
+  OmniApiProtocol,
+  OmniConfigState,
+  OmniProfile,
+  OmniTestResult,
+} from "@/lib/types";
 import { IconX, IconEye, IconEyeOff } from "@/lib/icons";
 import { toast } from "./Toast";
 
 const INPUT_CLS =
   "w-full px-3 py-2 rounded-lg bg-bg-primary border border-border " +
   "focus:border-brand-primary focus:outline-none text-text-primary num";
+
+export function omniProfileIdentity(config: {
+  model: string;
+  base_url: string;
+  api_protocol: OmniApiProtocol;
+}): string {
+  return `${config.api_protocol}\n${config.model.trim()}\n${config.base_url.trim().replace(/\/+$/, "")}`;
+}
+
+export function omniProtocolFormPolicy(protocol: OmniApiProtocol) {
+  const responses = protocol === "openai_responses";
+  return {
+    keyRequired: !responses,
+    mediaCopyKey: responses ? "usage.responsesImageSequence" : "usage.videoAudioPerception",
+    audioCopyKey: responses ? "usage.responsesNoCameraAudio" : null,
+    testLabelKey: responses ? "usage.testVisualPreflight" : "usage.testConnection",
+    samplingControlsVisible: !responses,
+  } as const;
+}
 
 // omni 测试 / 模型列表的后端机器码 → i18n key;命中走前端本地化,
 // 未命中(如 http_error,含动态 HTTP 细节)回退后端 message。
@@ -183,6 +207,9 @@ export function UsageOmniConfig() {
   const [apiKey, setApiKey] = useState("");
   const [showKey, setShowKey] = useState(false); // API Key 明文/密文切换(末端眼睛图标)
   const [model, setModel] = useState("");
+  const [apiProtocol, setApiProtocol] = useState<OmniApiProtocol>(
+    "openai_chat_completions",
+  );
   const [models, setModels] = useState<string[]>([]);
   const [modelsLoading, setModelsLoading] = useState(false);
   const [modelsMsg, setModelsMsg] = useState<string | null>(null);
@@ -222,11 +249,16 @@ export function UsageOmniConfig() {
 
   const profiles = state?.profiles ?? [];
   const active = state?.active;
-  const hasKey = active?.has_key ?? false;
+  const hasConfiguredModel =
+    active != null &&
+    (active.api_protocol === "openai_responses" || active.has_key);
   // 新增表单里同 (model, base_url) 是否已存(→ 改为更新该条)
   const existing = profiles.find(
-    (p) => p.base_url === baseUrl.trim() && p.model === model.trim(),
+    (p) =>
+      omniProfileIdentity(p) ===
+      omniProfileIdentity({ base_url: baseUrl, model, api_protocol: apiProtocol }),
   );
+  const protocolPolicy = omniProtocolFormPolicy(apiProtocol);
 
   function startAdd() {
     setAdding(true);
@@ -235,6 +267,7 @@ export function UsageOmniConfig() {
     setApiKey("");
     setShowKey(false);
     setModel("");
+    setApiProtocol("openai_chat_completions");
     setModels([]);
     setModelsMsg(null);
     setModelsErr(false);
@@ -250,6 +283,7 @@ export function UsageOmniConfig() {
     setApiKey("");
     setShowKey(false);
     setModel(p.model);
+    setApiProtocol(p.api_protocol);
     setModels([]);
     setModelsMsg(null);
     setModelsErr(false);
@@ -302,16 +336,17 @@ export function UsageOmniConfig() {
     // 目标条目:编辑态用被编辑的 label;否则按 (model, base_url) 命中已有(隐式 upsert)。
     // 用 ||(非 ??)让空串落空 → 当作新增并生成 label,绝不把空 original_label 发给后端。
     const target = editing || existing?.label || undefined;
-    if (!apiKey.trim() && !editTarget(target)?.has_key) {
+    if (protocolPolicy.keyRequired && !apiKey.trim() && !editTarget(target)?.has_key) {
       toast(t("usage.apiKeyRequired"), "warn");
       return;
     }
     setSaving(true);
     try {
       const s = await updateOmniConfig({
-        label: target ?? `${m} @ ${bu}`,
+        label: target ?? `${m} @ ${bu} · ${apiProtocol}`,
         model: m,
         base_url: bu,
+        api_protocol: apiProtocol,
         api_key: apiKey.trim() || undefined,
         original_label: target,
         activate: false, // 只入列表;启用由模型列表的「启用」负责
@@ -347,7 +382,7 @@ export function UsageOmniConfig() {
       return;
     }
     const target = editing || existing?.label || undefined;
-    if (!apiKey.trim() && !editTarget(target)?.has_key) {
+    if (protocolPolicy.keyRequired && !apiKey.trim() && !editTarget(target)?.has_key) {
       toast(t("usage.apiKeyRequiredBeforeTest"), "warn");
       return;
     }
@@ -358,6 +393,7 @@ export function UsageOmniConfig() {
         label: target ?? "",
         model: m,
         base_url: bu,
+        api_protocol: apiProtocol,
         api_key: apiKey.trim() || undefined,
       });
       setTestResult(res);
@@ -377,7 +413,12 @@ export function UsageOmniConfig() {
       return next;
     });
     try {
-      const res = await testOmniConfig({ label: p.label, model: p.model, base_url: p.base_url });
+      const res = await testOmniConfig({
+        label: p.label,
+        model: p.model,
+        base_url: p.base_url,
+        api_protocol: p.api_protocol,
+      });
       setRowTestResults((m) => ({ ...m, [p.label]: res }));
       // 测通当前生效那套时,后端已主动清熔断,前端触发一次 refetch 刷新 health,
       // 让状态列从"熔断红/黄"变回"测试结果"。stale 事件复用配置变更通道。
@@ -399,7 +440,12 @@ export function UsageOmniConfig() {
   async function onActivate(p: OmniProfile) {
     setActivating(p.label);
     try {
-      const res = await testOmniConfig({ label: p.label, model: p.model, base_url: p.base_url });
+      const res = await testOmniConfig({
+        label: p.label,
+        model: p.model,
+        base_url: p.base_url,
+        api_protocol: p.api_protocol,
+      });
       setRowTestResults((m) => ({ ...m, [p.label]: res }));
       if (severityOf(res) !== "ok") {
         toast(`${t("usage.cannotEnable")}：${testReason(res)}`, severityOf(res) === "warn" ? "warn" : "danger");
@@ -497,7 +543,9 @@ export function UsageOmniConfig() {
           {collapsed && active && (
             <span className="text-caption text-text-secondary num">
               {t("usage.currentPrefix")}
-              {hasKey ? `${active.model} · ${hostOf(active.base_url)}` : t("usage.noApiKeyConfigured")}
+              {hasConfiguredModel
+                ? `${active.model} · ${hostOf(active.base_url)}`
+                : t("usage.noApiKeyConfigured")}
             </span>
           )}
         </span>
@@ -515,7 +563,7 @@ export function UsageOmniConfig() {
           ) : (
             <>
               {/* 未配 key 才给警告;当前生效在列表里用橙色行 + 「当前模型」标记,不再单开字段 */}
-              {!hasKey && (
+              {!hasConfiguredModel && (
                 <div className="text-caption text-warning bg-warning-bg rounded-lg px-3 py-2 mb-3">
                   {t("usage.noKeyWarning")}
                 </div>
@@ -670,6 +718,30 @@ export function UsageOmniConfig() {
                   <div className="md:col-span-2 text-caption text-text-secondary">
                     {editing ? t("usage.editFormHint") : t("usage.addFormHint")}
                   </div>
+                  <Field label={t("usage.apiProtocolLabel")} className="md:col-span-2">
+                    <select
+                      value={apiProtocol}
+                      onChange={(e) => {
+                        setApiProtocol(e.target.value as OmniApiProtocol);
+                        setTestResult(null);
+                      }}
+                      className={INPUT_CLS}
+                    >
+                      <option value="openai_chat_completions">
+                        {t("usage.protocolChatCompletions")}
+                      </option>
+                      <option value="openai_responses">
+                        {t("usage.protocolResponses")}
+                      </option>
+                      <option value="gemini_native">{t("usage.protocolGemini")}</option>
+                    </select>
+                    <span className="text-caption mt-1 block text-text-tertiary">
+                      {t(protocolPolicy.mediaCopyKey)}
+                      {protocolPolicy.audioCopyKey
+                        ? ` · ${t(protocolPolicy.audioCopyKey)}`
+                        : ""}
+                    </span>
+                  </Field>
                   <Field label={t("usage.baseUrlLabel")} className="md:col-span-2">
                     <input
                       value={baseUrl}
@@ -767,7 +839,7 @@ export function UsageOmniConfig() {
                       disabled={saving || testing}
                       className="text-caption px-3 py-1.5 rounded-lg bg-bg-secondary border border-border text-text-primary hover:border-brand-primary disabled:opacity-60"
                     >
-                      {testing ? t("usage.testing") : t("usage.testConnection")}
+                      {testing ? t("usage.testing") : t(protocolPolicy.testLabelKey)}
                     </button>
                     <button
                       type="button"

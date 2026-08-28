@@ -430,11 +430,18 @@ export interface UsageStats {
 
 // ── omni 模型配置（在「模型」页内读/写，支持多档案切换） ──────────────
 /** 一套 omni 配置；api_key 仅给打码值（前3…后4），永不回全文。 */
+export type OmniApiProtocol =
+  | "openai_chat_completions"
+  | "openai_responses"
+  | "gemini_native";
+
 export interface OmniModelConfig {
   /** 档案显示名（可选）；为空时前端回退为 model · 域名。 */
   label: string;
   model: string;
   base_url: string;
+  api_protocol: OmniApiProtocol;
+  protocol_inferred: boolean;
   /** 打码后的 api_key，如 "sk-…79a8"；无 key 时为空串。 */
   api_key_masked: string;
   /** 是否已配置 api_key。 */
@@ -510,6 +517,7 @@ export interface OmniConfigUpdate {
   label: string;
   model: string;
   base_url: string;
+  api_protocol: OmniApiProtocol;
   /** 省略 / 留空 = 沿用该档案原 key（不被打码值覆盖）。 */
   api_key?: string;
   /** 正在编辑的档案原名（支持改名/定位）；省略=新增。 */

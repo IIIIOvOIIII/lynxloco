@@ -84,6 +84,40 @@ def mock_probe(monkeypatch):
     return _H()
 
 
+def test_activate_forwards_saved_protocol_to_probe(client, monkeypatch):
+    """重新激活必须使用档案协议，不能在 activate 路径丢失并重新推断。"""
+    calls = []
+
+    async def _probe(model, base_url, api_key, api_protocol):
+        calls.append((model, base_url, api_key, api_protocol))
+        return {"ok": True, "code": "ok", "message": "连接正常"}
+
+    monkeypatch.setattr("miloco.admin.router._probe.probe_omni", _probe)
+    saved = client.put(
+        "/api/admin/omni-config",
+        json={
+            "label": "local",
+            "model": "vision-local",
+            "base_url": "http://127.0.0.1:8000/v1",
+            "api_protocol": "openai_responses",
+            "api_key": "",
+            "activate": False,
+        },
+    )
+    assert saved.status_code == 200
+    activated = client.post("/api/admin/omni-config/activate", json={"label": "local"})
+    assert activated.status_code == 200
+    assert calls == [
+        (
+            "vision-local",
+            "http://127.0.0.1:8000/v1",
+            "",
+            "openai_responses",
+        )
+    ]
+    assert activated.json()["data"]["active"]["api_protocol"] == "openai_responses"
+
+
 # ─── PUT 加 preflight ───────────────────────────────────────────────────────
 
 
@@ -95,6 +129,7 @@ def test_put_activate_true_success_requires_probe_ok(client, mock_probe):
             "label": "甲",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-xxxxxx",
             "activate": True,
         },
@@ -110,6 +145,7 @@ def test_put_activate_true_rejects_when_probe_fails(client, mock_probe):
             "label": "甲",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-bad",
             "activate": True,
         },
@@ -126,6 +162,7 @@ def test_put_activate_true_rejects_unreachable(client, mock_probe):
             "label": "甲",
             "model": "m1",
             "base_url": "https://nope/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-x",
             "activate": True,
         },
@@ -142,6 +179,7 @@ def test_put_activate_true_no_key_400(client, mock_probe):
             "label": "甲",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "activate": True,
         },
     )
@@ -158,6 +196,7 @@ def test_put_activate_false_skips_preflight(client, mock_probe):
             "label": "备用",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-x",
             "activate": False,
         },
@@ -178,6 +217,7 @@ def test_activate_success_when_probe_ok(client, mock_probe):
             "label": "甲",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-xxxxxx",
             "activate": False,
         },
@@ -194,6 +234,7 @@ def test_activate_rejected_when_probe_fails(client, mock_probe):
             "label": "甲",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-xxxxxx",
             "activate": False,
         },
@@ -254,6 +295,7 @@ def test_retry_open_recoverable_probes_and_recovers(client, mock_probe):
             "label": "甲",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-xxxxxx",
             "activate": True,
         },
@@ -290,6 +332,7 @@ def test_retry_open_recoverable_probe_still_fails_stays_warn(client, mock_probe)
             "label": "甲",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-xxxxxx",
             "activate": True,
         },
@@ -327,6 +370,7 @@ def test_retry_open_config_bad_key_stays_error(client, mock_probe):
             "label": "甲",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-xxxxxx",
             "activate": True,
         },
@@ -387,6 +431,7 @@ def test_retry_cooldown_skips_second_probe(client, mock_probe):
             "label": "甲",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-xxxxxx",
             "activate": True,
         },
@@ -432,6 +477,7 @@ def test_retry_half_open_short_circuits_no_new_probe(client, mock_probe):
             "label": "甲",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-xxxxxx",
             "activate": True,
         },
@@ -567,6 +613,7 @@ def test_test_endpoint_rejects_cross_url_key_reuse(client, mock_probe):
             "label": "甲",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-realkey12",
             "activate": True,
         },
@@ -575,7 +622,12 @@ def test_test_endpoint_rejects_cross_url_key_reuse(client, mock_probe):
     n_before = mock_probe.call_count
     r = client.post(
         "/api/admin/omni-config/test",
-        json={"label": "甲", "base_url": "https://api.evil.com/v1", "model": "m1"},
+        json={
+            "label": "甲",
+            "base_url": "https://api.evil.com/v1",
+            "api_protocol": "openai_chat_completions",
+            "model": "m1",
+        },
     )
     data = r.json()["data"]
     assert data["ok"] is False
@@ -592,6 +644,7 @@ def test_list_models_rejects_cross_url_key_reuse(client, mock_probe):
             "label": "甲",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-realkey34",
             "activate": True,
         },
@@ -616,6 +669,7 @@ def test_upsert_rejects_cross_url_key_reuse(client, mock_probe):
             "label": "甲",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-realkey56",
             "activate": True,
         },
@@ -627,6 +681,7 @@ def test_upsert_rejects_cross_url_key_reuse(client, mock_probe):
             "label": "甲",
             "model": "m1",
             "base_url": "https://api.evil.com/v1",
+            "api_protocol": "openai_chat_completions",
             "original_label": "甲",
             "activate": True,
         },
@@ -644,6 +699,7 @@ def test_upsert_same_url_blank_key_still_reuses(client, mock_probe):
             "label": "甲",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-realkey78",
             "activate": True,
         },
@@ -653,7 +709,8 @@ def test_upsert_same_url_blank_key_still_reuses(client, mock_probe):
         json={
             "label": "甲",
             "model": "m2",
-            "base_url": "https://x/v1",  # URL 不变
+            "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",  # URL 不变
             "original_label": "甲",
         },
     )
@@ -699,6 +756,7 @@ def test_put_activate_resets_open_config_breaker(client, mock_probe):
             "label": "甲",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-newkey12",
             "activate": True,
         },
@@ -729,6 +787,7 @@ def test_activate_endpoint_resets_open_config_breaker(client, mock_probe):
             "label": "甲",
             "model": "m1",
             "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-key1",
             "activate": True,
         },
@@ -739,6 +798,7 @@ def test_activate_endpoint_resets_open_config_breaker(client, mock_probe):
             "label": "乙",
             "model": "m2",
             "base_url": "https://y/v1",
+            "api_protocol": "openai_chat_completions",
             "api_key": "sk-key2",
             "activate": False,
         },

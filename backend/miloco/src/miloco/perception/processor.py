@@ -90,12 +90,14 @@ async def _run_omni_probe() -> None:
         ClassifiedError,
         ErrorCategory,
     )
+    from miloco.perception.engine.omni.provider import resolve_api_protocol
 
     cb = get_omni_circuit_breaker()
     try:
         await cb.mark_half_open()
         omni = get_settings().model.omni
-        if not omni.api_key:
+        protocol = resolve_api_protocol(omni.api_protocol, omni.model)
+        if not omni.api_key and protocol != "openai_responses":
             # 用 no_key 而非 bad_key:语义"未配置"与"key 存在但无效"不同,前端两者
             # 各自有 i18n 条目;router.retry_omni_probe 无 key 分支也用 no_key,
             # 两端保持一致。
@@ -104,7 +106,9 @@ async def _run_omni_probe() -> None:
                 ClassifiedError("no_key", "未配置 API Key", ErrorCategory.CONFIG),
             )
             return
-        result = await _probe.probe_omni(omni.model, omni.base_url, omni.api_key)
+        result = await _probe.probe_omni(
+            omni.model, omni.base_url, omni.api_key, protocol
+        )
         if result.get("ok"):
             await cb.record_probe_result(True, None)
             return

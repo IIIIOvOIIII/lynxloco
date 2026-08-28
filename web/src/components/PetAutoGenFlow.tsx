@@ -16,6 +16,13 @@ import { InfoNote } from "./InfoNote";
 import { Spinner } from "./Spinner";
 import { toast } from "./Toast";
 
+export function hasConfiguredOmni(config: {
+  api_protocol: string;
+  has_key: boolean;
+}): boolean {
+  return config.api_protocol === "openai_responses" || config.has_key;
+}
+
 const MAX_IMAGES = 3;
 const VIDEO_RE = /\.(mp4|webm|mov|avi|mkv)$/i;
 // 首帧提取硬超时：视频能解码但 seek 不产生 seeked 事件时（onerror 也不来）兜底，
@@ -144,7 +151,7 @@ export function PetAutoGenFlow({
       try {
         const cfg = await getOmniConfig();
         if (!alive) return;
-        if (!cfg.active?.has_key) {
+        if (!cfg.active || !hasConfiguredOmni(cfg.active)) {
           setCheck("unconfigured");
           return;
         }
@@ -157,6 +164,7 @@ export function PetAutoGenFlow({
           label: activeLabel,
           model: cfg.active.model,
           base_url: cfg.active.base_url,
+          api_protocol: cfg.active.api_protocol,
         });
         if (!alive) return;
         if (res.ok) {
