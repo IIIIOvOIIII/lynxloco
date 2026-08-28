@@ -1,6 +1,6 @@
 # RTSP 摄像机与 OpenAI Responses 本地 Omni 支持设计
 
-- 状态：已批准；RTSP 感知基础与实时预览已实施，仓库级既有 type/format 与 macOS node-monitor 基线未清零；Responses 尚未实施
+- 状态：已批准；RTSP 感知基础、实时预览与 Responses 感知已实施，仓库级既有 type/format 与 macOS node-monitor 基线未清零；真实本地 VLM E2E 为 `not_measured`
 - 日期：2026-08-28
 - 基线提交：`e900529`
 - 仓库：`XiaoMi/xiaomi-miloco`
@@ -571,7 +571,7 @@ CLI 输出不得打印密码或完整带敏 URI。
 
 仓库级既有门禁仍未清零，因此本状态不等于整个仓库质量基线全绿：当前 changed-path `ty` 只剩 `perception/service.py` 两条本计划未改动的既有诊断；一次只读全库 `ty` 检查报告 946 条诊断；只读 `ruff check .` 通过，但最终 `ruff format --check .` 显示 303 个既有文件需要格式化。不得为关闭本批次而扩大范围修复这些存量债务。
 
-未提供 `MILOCO_RTSP_TEST_URL`，真实 RTSP 网络 E2E、真实解码启动时间与断线重连行为均为 `not_measured`；CPU 与可持续 fps 也为 `not_measured`。本批次没有部署到实验室主机，也没有接触生产环境。RTSP 浏览器实时预览/H.265 按观看者转码已在批次 2 实施，结果见下一节；OpenAI Responses Omni 属于批次 3，当前尚未实施。
+未提供 `MILOCO_RTSP_TEST_URL`，真实 RTSP 网络 E2E、真实解码启动时间与断线重连行为均为 `not_measured`；CPU 与可持续 fps 也为 `not_measured`。本批次没有部署到实验室主机，也没有接触生产环境。RTSP 浏览器实时预览/H.265 按观看者转码已在批次 2 实施，结果见下一节；OpenAI Responses Omni 已在批次 3 实施，结果见第 20 节。
 
 ## 19. RTSP 实时预览实施结果
 
@@ -587,4 +587,14 @@ round 3 将“不可中断等待”和“清理后传播 outcome”拆成集中�
 
 round 4 修正 fixture E2E 的证据口径：rolling perception window 的列表长度可能在新帧持续到达时保持不变，因此不得再用长度增长证明感知继续。测试现在记录 viewer detach 前 `DeviceData.video` 的最大 `stream_ts`，在最后 viewer 离开、transcoder/队列清理且状态回到 `idle` 后，要求同一 session 产生更大的 `stream_ts` 并进入新的 `DeviceData` 快照，同时维持 `open_count == 1`。修改前两次同类失败均来自等待 rolling list length 增长超时；修改后 H.265 单项一次通过，完整 focused 矩阵一次通过（217 passed、1 skipped），没有扩大 timeout、增加重试或改动生产代码。Task 6 独立复审最终为 CLEAN；Plan 2 整批审查另行核对全部提交和相关回归门禁。
 
-未提供可持久化实验室 H.264/H.265 RTSP 来源，因此真实摄像机的首帧延迟、30 秒 fps、CPU 差值、并发观看者、队列丢包、长时间浏览器播放和断线恢复继续为 `not_measured`。fixture E2E 与 fixture smoke 只证明 Miloco 契约，不替代真实摄像机测量。OpenAI Responses Omni 仍未实施。
+未提供可持久化实验室 H.264/H.265 RTSP 来源，因此真实摄像机的首帧延迟、30 秒 fps、CPU 差值、并发观看者、队列丢包、长时间浏览器播放和断线恢复继续为 `not_measured`。fixture E2E 与 fixture smoke 只证明 Miloco 契约，不替代真实摄像机测量。OpenAI Responses Omni 已在批次 3 实施，结果见下一节。
+
+## 20. OpenAI Responses Omni 实施结果
+
+截至 2026-08-28，批次 3 的 Responses 感知实现与强制自动化门禁已经完成。Miloco Omni 模型档案现在显式持久化 `openai_chat_completions`、`openai_responses` 或 `gemini_native`；仅旧档案缺字段时按模型名执行 legacy 解析，Base URL 不参与协议选择。Responses 仅接入 Miloco Omni 感知，不修改 OpenClaw/Hermes Agent 推理。运行时将感知窗口确定性编码为最多 6 张全景与 6 张优先 crop JPEG、总数不超过 12；不发送摄像机音频、视频、`temperature`、`top_p`、tools 或厂商私有字段。空 Key 不发 Authorization，非空 Key 只发 Bearer；协议、模型或 Base URL 改变时不跨端点继承旧 Key。
+
+严格本地 HTTP fixture 覆盖可选 `/models`、标准 `/responses` 非流式和 SSE，并拒绝缺少 `input_image`、超过 12 张图片、audio/video、采样/tools/私有字段、错误鉴权和错误路径。真实 `IdentityPacket -> production prompt -> httpx -> Responses adapter normalization -> existing response parser` 路径在 no-key 与 Bearer 两种模式通过；非流与 SSE 均归一化到现有 choices/usage，3 次 503 会打开既有 breaker，后续调用在本地短路。trace 仅保留图片块类型/计数等结构，不含 Key 或 `data:image/jpeg;base64,`；普通日志同样未发现上述敏感内容。Task 7 首轮 RED 还捕获到 `EncodedInputImage` 在 HTTP 客户端边界被误按 dict 下标访问的真实接线缺口，修复后整个 Omni 回归为 551 passed，严格 integration 为 21 passed。
+
+最终门禁：backend Omni/admin/integration 644 passed，CLI 全量 644 passed，Web 383 passed、1 skipped，Web typecheck 与 build 通过，`./scripts/local-ci.sh --tests` 按仓库定义 6/6 通过（backend 保留脚本既有 3 项 macOS node-monitor/smaps 排除）。只读 `ruff check .` 通过；Task 7 新文件的 Ruff format 与 `ty` 通过。仓库级 `ty` 仍有 1012 条既有诊断；Plan 3 入口记录的 format 基线为 303 个既有文件，当前 HEAD 的只读 `ruff format --check .` 为 298 个既有文件，未运行会改写全库的 `task lint`，也未为本批次扩大范围修复这些存量债务。
+
+`scripts/responses-vlm-smoke.sh` 只读取 `MILOCO_RESPONSES_BASE_URL`、`MILOCO_RESPONSES_MODEL` 与可选 `MILOCO_RESPONSES_API_KEY`，先执行真实图片视觉 preflight，再发送一个合成感知 packet；成功只输出协议、模型、延迟、图片数、输出存在性和 token 计数，HTTP/解析/不安全 URL/信号均非零退出且不回显 URL query、Key、base64 或 raw response。本批次没有获得实际本地 VLM endpoint，因此没有把该脚本对真实服务的运行冒充为兼容性证据：真实本地 VLM 的服务版本、视觉输出、延迟、usage 与 SSE 方言继续为 `not_measured`，严格 fixture 只证明标准契约，不代表兼容所有本地 VLM 服务。
