@@ -171,10 +171,37 @@ def test_model_defaults_align_with_schema() -> None:
     assert s.model.omni.model == "xiaomi/mimo-v2.5"
     assert s.model.omni.base_url == "https://api.xiaomimimo.com/v1"
     assert s.model.omni.api_key == ""
+    assert s.model.omni.api_protocol == "openai_chat_completions"
     assert s.agent.webhook_url == "http://127.0.0.1:18789/miloco/webhook"
     assert s.agent.auth_bearer == ""
     assert s.server.python_bin == ""
     assert s.debug is False
+
+
+def test_legacy_active_json_profile_keeps_protocol_missing_until_resolution(
+    tmp_path: Path,
+) -> None:
+    from miloco.perception.engine.omni.provider import resolve_api_protocol
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model": {
+                    "omni": {
+                        "model": "gemini-2.5-flash",
+                        "base_url": "http://127.0.0.1:8000/v1beta",
+                        "api_key": "",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    reset_settings()
+
+    legacy = get_settings().model.omni
+    assert legacy.api_protocol is None
+    assert resolve_api_protocol(legacy.api_protocol, legacy.model) == "gemini_native"
 
 
 # SSL 已废弃：backend 永远 HTTP，跨网加密走反代。原 ssl_enabled / ssl_certfile /

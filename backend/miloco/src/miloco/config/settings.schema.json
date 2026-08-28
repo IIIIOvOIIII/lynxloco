@@ -97,6 +97,16 @@
               "type": "string",
               "default": "",
               "description": "多模态模型 API Key；为空时视为未配置，插件与后端启动前校验"
+            },
+            "api_protocol": {
+              "enum": [
+                "openai_chat_completions",
+                "openai_responses",
+                "gemini_native",
+                null
+              ],
+              "default": null,
+              "description": "Omni API 协议；旧档案缺失时仅按模型名兼容推断，Base URL 不参与协议选择"
             }
           },
           "required": ["model", "base_url", "api_key"]

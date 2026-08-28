@@ -26,14 +26,18 @@ from miloco.perception.engine.omni.error_classifier import (
     classify_exception,
     classify_response,
 )
-from miloco.perception.engine.omni.provider import OmniProviderAdapter, get_adapter
+from miloco.perception.engine.omni.provider import (
+    OmniProviderAdapter,
+    get_adapter,
+    resolve_api_protocol,
+)
 from miloco.perception.snapshot_context import push_omni_trace
 
 logger = logging.getLogger(__name__)
 
 _ENV_KEY = "MILOCO_MODEL__OMNI__API_KEY"
 
-# 三元组变化触发的 fire-and-forget reset task 强引用集合;asyncio 只对 task 持弱引用,
+# 配置身份变化触发的 fire-and-forget reset task 强引用集合;asyncio 只对 task 持弱引用,
 # 不持强引用短协程可能被 GC 提前回收。done_callback 里自动 discard。
 _RESET_TASKS: set[asyncio.Task] = set()
 
@@ -135,7 +139,7 @@ def resolve_api_key(config: OmniConfig) -> str:
 
 
 def resolve_live_omni_config(base: OmniConfig) -> OmniConfig:
-    """Refresh the user-configurable omni fields (model / base_url / api_key) from
+    """Refresh user-configurable Omni fields from
     the current settings, keeping the engine snapshot's other fields
     (max_completion_tokens / temperature / top_p / timeout / stream).
 
@@ -144,7 +148,8 @@ def resolve_live_omni_config(base: OmniConfig) -> OmniConfig:
     ``reset_settings()`` 清缓存),即可让新模型在**下一个推理周期**自动生效,无需重启
     进程、不重建引擎。api_key 为空时退回快照值,最终调用点 ``resolve_api_key`` 仍会兜底环境变量。
 
-    副作用:三元组 (model, base_url, api_key) 变化时清熔断状态到 CLOSED。覆盖所有配置源
+    副作用:调用身份 (resolved protocol, model, base_url, resolved key) 变化时清熔断状态
+    到 CLOSED。覆盖所有配置源
     (web PUT/activate / CLI set / env / 直接改 config.json)——只要 settings 变了就自动重置。
     """
     from dataclasses import replace
@@ -157,15 +162,21 @@ def resolve_live_omni_config(base: OmniConfig) -> OmniConfig:
         model=o.model,
         base_url=o.base_url,
         api_key=o.api_key or base.api_key,
+        api_protocol=o.api_protocol,
     )
     _maybe_reset_breaker_on_config_change(resolved)
     return resolved
 
 
 def _maybe_reset_breaker_on_config_change(resolved: OmniConfig) -> None:
-    """检测 (model, base_url, api_key) 三元组变化,变了就清熔断。跨调用状态保存在
+    """检测 (protocol, model, base_url, api_key) 变化,变了就清熔断。跨调用状态保存在
     函数属性 ``._last_triple`` 上——比 module-level global 更内聚。"""
-    triple = (resolved.model, resolved.base_url, resolve_omni_api_key(resolved.api_key))
+    triple = (
+        resolve_api_protocol(resolved.api_protocol, resolved.model),
+        resolved.model,
+        resolved.base_url,
+        resolve_omni_api_key(resolved.api_key),
+    )
     prev = getattr(_maybe_reset_breaker_on_config_change, "_last_triple", None)
     if prev is not None and prev != triple:
         try:
@@ -176,7 +187,7 @@ def _maybe_reset_breaker_on_config_change(resolved: OmniConfig) -> None:
             task = loop.create_task(get_omni_circuit_breaker().reset_on_config_change())
             _RESET_TASKS.add(task)
             task.add_done_callback(_RESET_TASKS.discard)
-    _maybe_reset_breaker_on_config_change._last_triple = triple  # type: ignore[attr-defined]
+    setattr(_maybe_reset_breaker_on_config_change, "_last_triple", triple)
 
 
 async def call_omni(
@@ -193,7 +204,7 @@ async def call_omni(
             f"{_ENV_KEY} is not set. Provide it via config or environment variable."
         )
 
-    adapter = get_adapter(config.model)
+    adapter = get_adapter(config.api_protocol, config.model)
     messages = _build_messages(payload, adapter)
 
     body = adapter.build_request_body(
@@ -420,7 +431,7 @@ async def call_omni_stream(
             f"{_ENV_KEY} is not set. Provide it via config or environment variable."
         )
 
-    adapter = get_adapter(config.model)
+    adapter = get_adapter(config.api_protocol, config.model)
     messages = _build_messages(payload, adapter)
 
     body = adapter.build_request_body(

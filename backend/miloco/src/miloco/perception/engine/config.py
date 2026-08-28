@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from miloco.config.settings import OmniApiProtocol
+
 
 @dataclass
 class InputConfig:
@@ -391,6 +393,7 @@ class OmniConfig:
     model: str = "xiaomi/mimo-v2.5"
     api_key: str = ""  # Set via MILOCO_MODEL__OMNI__API_KEY env var or config
     base_url: str = "https://api.xiaomimimo.com/v1"
+    api_protocol: OmniApiProtocol | None = None
     max_completion_tokens: int = 512
     temperature: float = 0.1  # 低温更利于结构化感知判定：实测 grounded prompt 下温度越低误报/坏 JSON 越少
     top_p: float = 0.95

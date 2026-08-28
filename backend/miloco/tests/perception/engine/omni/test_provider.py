@@ -23,39 +23,51 @@ _MESSAGES = [{"role": "user", "content": "test"}]
 
 class TestGetAdapter:
     def test_mimo_default(self):
-        assert isinstance(get_adapter("xiaomi/mimo-v2.5"), MiMoAdapter)
+        assert isinstance(get_adapter(None, "xiaomi/mimo-v2.5"), MiMoAdapter)
 
     def test_mimo_unknown(self):
-        assert isinstance(get_adapter("some-unknown-model"), MiMoAdapter)
+        assert isinstance(get_adapter(None, "some-unknown-model"), MiMoAdapter)
 
     def test_mimo_empty(self):
-        assert isinstance(get_adapter(""), MiMoAdapter)
+        assert isinstance(get_adapter(None, ""), MiMoAdapter)
 
     def test_qwen_flash(self):
-        assert isinstance(get_adapter("qwen3.5-omni-flash"), QwenOmniAdapter)
+        assert isinstance(get_adapter(None, "qwen3.5-omni-flash"), QwenOmniAdapter)
 
     def test_qwen_plus(self):
-        assert isinstance(get_adapter("qwen3.5-omni-plus"), QwenOmniAdapter)
+        assert isinstance(get_adapter(None, "qwen3.5-omni-plus"), QwenOmniAdapter)
 
     def test_qwen_case_insensitive(self):
-        assert isinstance(get_adapter("Qwen3.5-Omni-Flash"), QwenOmniAdapter)
+        assert isinstance(get_adapter(None, "Qwen3.5-Omni-Flash"), QwenOmniAdapter)
 
     def test_gemini(self):
-        assert isinstance(get_adapter("gemini-3-flash-preview"), GeminiAdapter)
+        assert isinstance(get_adapter(None, "gemini-3-flash-preview"), GeminiAdapter)
 
     def test_gemini_case_insensitive(self):
-        assert isinstance(get_adapter("Gemini-3-Pro"), GeminiAdapter)
+        assert isinstance(get_adapter(None, "Gemini-3-Pro"), GeminiAdapter)
 
     def test_openai_compat_family(self):
         # MiMo / Qwen 都归 OpenAI 兼容族；Gemini 不是。
-        assert isinstance(get_adapter("xiaomi/mimo-v2.5"), OpenAICompatAdapter)
-        assert isinstance(get_adapter("qwen3.5-omni-flash"), OpenAICompatAdapter)
-        assert not isinstance(get_adapter("gemini-3-flash-preview"), OpenAICompatAdapter)
+        assert isinstance(
+            get_adapter(None, "xiaomi/mimo-v2.5"), OpenAICompatAdapter
+        )
+        assert isinstance(
+            get_adapter(None, "qwen3.5-omni-flash"), OpenAICompatAdapter
+        )
+        assert not isinstance(
+            get_adapter(None, "gemini-3-flash-preview"), OpenAICompatAdapter
+        )
 
     def test_singleton(self):
-        assert get_adapter("xiaomi/mimo-v2.5") is get_adapter("xiaomi/mimo-v2.5")
-        assert get_adapter("qwen3.5-omni-flash") is get_adapter("qwen3.5-omni-plus")
-        assert get_adapter("gemini-3-flash") is get_adapter("gemini-3-pro")
+        assert get_adapter(None, "xiaomi/mimo-v2.5") is get_adapter(
+            None, "xiaomi/mimo-v2.5"
+        )
+        assert get_adapter(None, "qwen3.5-omni-flash") is get_adapter(
+            None, "qwen3.5-omni-plus"
+        )
+        assert get_adapter(None, "gemini-3-flash") is get_adapter(
+            None, "gemini-3-pro"
+        )
 
 
 class TestMiMoAdapter:

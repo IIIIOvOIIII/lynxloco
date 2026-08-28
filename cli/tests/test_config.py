@@ -38,6 +38,7 @@ def test_load_config_returns_defaults_when_no_file():
     assert cfg["server"]["token"] == ""
     assert cfg["server"]["tls_verify"] is False
     assert cfg["model"]["omni"]["model"] == "xiaomi/mimo-v2.5"
+    assert cfg["model"]["omni"]["api_protocol"] == "openai_chat_completions"
     assert cfg["debug"] is False
     # 扁平兼容字段已移除：调用方必须使用嵌套 cfg["server"]["url"] 等路径
     assert "server_url" not in cfg
@@ -127,6 +128,20 @@ def test_set_value_rejects_bad_bool():
         set_value("server.tls_verify", "maybe")
 
 
+@pytest.mark.parametrize(
+    "protocol",
+    ["openai_chat_completions", "openai_responses", "gemini_native"],
+)
+def test_set_value_accepts_supported_omni_protocols(isolated_config, protocol):
+    assert set_value("model.omni.api_protocol", protocol) == protocol
+
+
+@pytest.mark.parametrize("protocol", ["responses", "chat", "gemini", ""])
+def test_set_value_rejects_unknown_omni_protocol(protocol):
+    with pytest.raises(ValueError, match="model.omni.api_protocol"):
+        set_value("model.omni.api_protocol", protocol)
+
+
 def test_min_suggestion_urgency_accepts_valid_values(isolated_config):
     """low / medium / high 三档均可写入(大小写不敏感由 _coerce 归一)。"""
     for v in ("low", "MEDIUM", "High"):
@@ -162,6 +177,7 @@ def test_known_paths_includes_all_scopes():
     assert "server.url" in paths
     assert "server.python_bin" in paths
     assert "model.omni.api_key" in paths
+    assert "model.omni.api_protocol" in paths
 
 
 def test_set_value_does_not_bake_env_var(isolated_config, monkeypatch):

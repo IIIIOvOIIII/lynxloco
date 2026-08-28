@@ -41,6 +41,12 @@ from miloco.utils.paths import miloco_home as _resolve_miloco_home
 
 logger = logging.getLogger(__name__)
 
+OmniApiProtocol = Literal[
+    "openai_chat_completions",
+    "openai_responses",
+    "gemini_native",
+]
+
 # ─── 路径常量 ────────────────────────────────────────────────────────────────
 
 _CONFIG_DIR = Path(__file__).parent
@@ -169,6 +175,12 @@ class OmniModelSettings(BaseModel):
     api_key: str = Field(
         default="",
         description="多模态模型 API Key；为空时视为未配置，插件与后端启动前校验",
+    )
+    api_protocol: OmniApiProtocol | None = Field(
+        default=None,
+        description=(
+            "Omni API 协议；旧档案缺失时仅按模型名兼容推断，Base URL 不参与协议选择"
+        ),
     )
 
 
@@ -647,7 +659,15 @@ class JsonConfigSource(PydanticBaseSettingsSource):
         return None, field_name, False
 
     def __call__(self) -> dict[str, Any]:  # type: ignore[override]
-        return _load_json_dict(self._path)
+        data = _load_json_dict(self._path)
+        model = data.get("model")
+        omni = model.get("omni") if isinstance(model, dict) else None
+        if isinstance(omni, dict) and "api_protocol" not in omni:
+            # The packaged YAML is explicitly Chat Completions, but an older
+            # active JSON profile must retain its missing-field semantics so
+            # model-name migration can still route legacy Gemini profiles.
+            omni["api_protocol"] = None
+        return data
 
 
 # ─── 顶层 Settings ───────────────────────────────────────────────────────────
@@ -780,6 +800,7 @@ class MilocoSettings(BaseSettings):
             "model": self.model.omni.model,
             "base_url": self.model.omni.base_url,
             "api_key": self.model.omni.api_key,
+            "api_protocol": self.model.omni.api_protocol,
         }
         if merged != existing:
             new_engine = {**self.perception.engine, "omni": merged}
@@ -921,6 +942,7 @@ __all__ = [
     "ModelSettings",
     "NotifySettings",
     "OmniModelSettings",
+    "OmniApiProtocol",
     "AgentSettings",
     "PerceptionCollectSettings",
     "PerceptionSettings",

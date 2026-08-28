@@ -88,6 +88,11 @@ _SCHEMA_PATHS: dict[str, tuple[type, Any, str]] = {
         "多模态模型服务 Base URL",
     ),
     "model.omni.api_key": (str, "", "多模态模型 API Key"),
+    "model.omni.api_protocol": (
+        str,
+        "openai_chat_completions",
+        "Omni API 协议",
+    ),
     "scheduler.enabled": (
         bool,
         True,
@@ -350,6 +355,18 @@ def _coerce(path: str, raw: str) -> Any:
                 f"timezone 需要合法 IANA 时区名（如 Asia/Shanghai、America/Los_Angeles），"
                 f"收到 {raw!r}"
             )
+    if path == "model.omni.api_protocol":
+        norm = raw.strip().lower()
+        supported = (
+            "openai_chat_completions",
+            "openai_responses",
+            "gemini_native",
+        )
+        if norm not in supported:
+            raise ValueError(
+                f"{path} 仅支持 {', '.join(supported)}，收到 {raw!r}"
+            )
+        return norm
     # media_resolution 仅 Gemini 有效档位 low/high（留空=默认 low）；拦住 medium/拼写错静默降级。
     if path == "perception.engine.input.media_resolution" and raw:
         norm = raw.strip().lower()

@@ -25,6 +25,7 @@ model:
     model: "xiaomi/mimo-v2.5"
     base_url: "https://api.xiaomimimo.com/v1"
     api_key: ""
+    api_protocol: "openai_chat_completions"
   omni_profiles: []
 
 # miloco 后端服务相关配置

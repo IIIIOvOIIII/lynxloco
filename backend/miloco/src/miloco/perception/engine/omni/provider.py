@@ -21,7 +21,9 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Never
+
+from miloco.config.settings import OmniApiProtocol
 
 logger = logging.getLogger(__name__)
 
@@ -451,6 +453,52 @@ class GeminiAdapter(OmniProviderAdapter):
         return delta, usage
 
 
+class OpenAIResponsesAdapter(OmniProviderAdapter):
+    """Responses protocol placeholder.
+
+    Task 1 makes protocol selection explicit. Payload construction and HTTP
+    normalization are intentionally implemented by the following plan tasks;
+    every method fails locally in the meantime so Responses can never silently
+    fall back to Chat Completions.
+    """
+
+    @staticmethod
+    def _not_implemented() -> Never:
+        raise NotImplementedError("OpenAI Responses adapter is not implemented yet")
+
+    def build_video_block(self, video_base64: str, media: LocalMediaInfo) -> dict[str, Any]:
+        self._not_implemented()
+
+    def build_audio_block(self, audio_base64: str, media: LocalMediaInfo) -> dict[str, Any]:
+        self._not_implemented()
+
+    def build_request_body(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        stream: bool = False,
+    ) -> dict[str, Any]:
+        self._not_implemented()
+
+    def endpoint(self, base_url: str, model: str, *, stream: bool) -> str:
+        self._not_implemented()
+
+    def auth_headers(self, api_key: str) -> dict[str, str]:
+        self._not_implemented()
+
+    def parse_response(self, raw: dict[str, Any]) -> dict[str, Any]:
+        self._not_implemented()
+
+    def parse_stream_chunk(
+        self, chunk: dict[str, Any]
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        self._not_implemented()
+
+
 def adjust_fps_for_omni(fps: int, omni_fps: int) -> int:
     """当 fps % omni_fps != 0 时，返回 omni_fps 的最小整数倍 >= fps。"""
     if omni_fps <= 0 or fps % omni_fps == 0:
@@ -463,19 +511,36 @@ def adjust_fps_for_omni(fps: int, omni_fps: int) -> int:
 _DEFAULT_ADAPTER = MiMoAdapter()
 _QWEN_ADAPTER = QwenOmniAdapter()
 _GEMINI_ADAPTER = GeminiAdapter()
+_RESPONSES_ADAPTER = OpenAIResponsesAdapter()
 
 
-def get_adapter(model: str) -> OmniProviderAdapter:
-    """按 model 字符串返回对应 adapter，默认 MiMo。
+def resolve_api_protocol(
+    configured: OmniApiProtocol | None,
+    model: str,
+) -> OmniApiProtocol:
+    """Resolve an old profile by model name only; explicit values always win."""
+    if configured is not None:
+        return configured
+    return "gemini_native" if "gemini" in model.lower() else "openai_chat_completions"
 
-    Qwen 侧仅支持 Qwen3.5-Omni 系列（qwen3.5-omni-plus / qwen3.5-omni-flash），
-    旧版 qwen3-omni-flash 不支持多模态组合输入，无法满足 fused 模式需求。
+
+def get_adapter(
+    protocol: OmniApiProtocol | None,
+    model: str,
+) -> OmniProviderAdapter:
+    """按显式协议返回 adapter；仅旧档案缺字段时按 model 兼容推断。
+
+    Chat Completions 协议内继续按 model 选择 MiMo/Qwen 请求特化。Base URL 永不
+    参与选择，显式 Responses/Gemini 也不受 model 名称影响。
 
     Gemini 走原生 generateContent 协议（OpenAI 兼容端点不支持视频输入）。
     """
+    resolved = resolve_api_protocol(protocol, model)
+    if resolved == "openai_responses":
+        return _RESPONSES_ADAPTER
+    if resolved == "gemini_native":
+        return _GEMINI_ADAPTER
     name = model.lower()
     if "qwen" in name:
         return _QWEN_ADAPTER
-    if "gemini" in name:
-        return _GEMINI_ADAPTER
     return _DEFAULT_ADAPTER

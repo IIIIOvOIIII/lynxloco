@@ -188,11 +188,11 @@ async def test_call_omni_bad_response_non_dict(monkeypatch):
     assert snap.state == "warn" and snap.code == "bad_response"
 
 
-# ─── resolve_live_omni_config × 三元组变化 ──────────────────────────────────
+# ─── resolve_live_omni_config × 调用身份变化 ────────────────────────────────
 
 
 async def test_resolve_live_config_no_change_keeps_state(monkeypatch):
-    """三元组不变时不动熔断。"""
+    """调用身份不变时不动熔断。"""
     from miloco.config import reset_settings
 
     reset_settings()
@@ -213,12 +213,13 @@ async def test_resolve_live_config_no_change_keeps_state(monkeypatch):
 
 
 async def test_resolve_live_config_change_resets_breaker(monkeypatch):
-    """settings.model.omni 三元组变化时清熔断。"""
+    """settings.model.omni 调用身份变化时清熔断。"""
     from miloco.config import reset_settings
 
     reset_settings()
     cb = get_omni_circuit_breaker()
     omni_client._maybe_reset_breaker_on_config_change._last_triple = (
+        "openai_chat_completions",
         "m1",
         "https://x/v1",
         "sk-OLD",
@@ -232,6 +233,7 @@ async def test_resolve_live_config_change_resets_breaker(monkeypatch):
         model = "m1"
         base_url = "https://x/v1"
         api_key = "sk-NEW"
+        api_protocol = "openai_responses"
 
     class _M:
         omni = _Mo()
@@ -255,6 +257,46 @@ async def test_resolve_live_config_change_resets_breaker(monkeypatch):
     import asyncio
 
     await asyncio.sleep(0)
+    assert cb.snapshot().state == "ok"
+
+
+async def test_resolve_live_protocol_change_resets_breaker(monkeypatch):
+    cb = get_omni_circuit_breaker()
+    omni_client._maybe_reset_breaker_on_config_change._last_triple = (
+        "openai_chat_completions",
+        "same-model",
+        "https://same/v1",
+        "sk-same",
+    )
+    for _ in range(3):
+        await cb.record_failure(ClassifiedError("bad_key", "m", ErrorCategory.CONFIG))
+
+    class _Mo:
+        model = "same-model"
+        base_url = "https://same/v1"
+        api_key = "sk-same"
+        api_protocol = "openai_responses"
+
+    class _M:
+        omni = _Mo()
+
+    class _S:
+        model = _M()
+
+    monkeypatch.setattr("miloco.config.get_settings", lambda: _S())
+    resolved = omni_client.resolve_live_omni_config(
+        OmniConfig(
+            model="same-model",
+            base_url="https://same/v1",
+            api_key="sk-same",
+            api_protocol="openai_chat_completions",
+        )
+    )
+    import asyncio
+
+    await asyncio.sleep(0)
+
+    assert resolved.api_protocol == "openai_responses"
     assert cb.snapshot().state == "ok"
 
 
@@ -289,7 +331,7 @@ async def test_call_omni_forced_stream_401_records_failure(monkeypatch):
     # 强制 forced_stream=True:让 adapter 生成 body["stream"]=True
     from miloco.perception.engine.omni import provider
 
-    orig_adapter = provider.get_adapter("m")
+    orig_adapter = provider.get_adapter(None, "m")
 
     class _StreamAdapter:
         def build_request_body(self, messages, **kw):
@@ -303,7 +345,7 @@ async def test_call_omni_forced_stream_401_records_failure(monkeypatch):
             return orig_adapter.auth_headers(api_key)
 
     monkeypatch.setattr(
-        omni_client, "get_adapter", lambda model: _StreamAdapter()
+        omni_client, "get_adapter", lambda protocol, model: _StreamAdapter()
     )
 
     # 让 _collect_stream_response 抛 401 的 HTTPStatusError,模拟真 SSE 401 场景
@@ -327,7 +369,7 @@ async def test_call_omni_forced_stream_500_records_failure(monkeypatch):
     """forced-stream 遇 5xx (recoverable) 同样要 record_failure 累计到熔断阈值。"""
     from miloco.perception.engine.omni import provider
 
-    orig_adapter = provider.get_adapter("m")
+    orig_adapter = provider.get_adapter(None, "m")
 
     class _StreamAdapter:
         def build_request_body(self, messages, **kw):
@@ -341,7 +383,7 @@ async def test_call_omni_forced_stream_500_records_failure(monkeypatch):
             return orig_adapter.auth_headers(api_key)
 
     monkeypatch.setattr(
-        omni_client, "get_adapter", lambda model: _StreamAdapter()
+        omni_client, "get_adapter", lambda protocol, model: _StreamAdapter()
     )
 
     async def _raise_500(*a, **k):

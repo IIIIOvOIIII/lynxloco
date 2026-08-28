@@ -80,6 +80,8 @@ def test_cli_schema_defaults_match_settings_yaml() -> None:
     defaults = _cli_defaults(cli_config.read_text(encoding="utf-8"))
     data = yaml.safe_load(_SETTINGS_YAML.read_text(encoding="utf-8"))
 
+    assert defaults["model.omni.api_protocol"] == "openai_chat_completions"
+
     # 只比 yaml 里存在的 key。yaml 没有的(timezone / server.* / agent.* / scheduler.* /
     # media_resolution)默认值来自 settings.py 的 pydantic 字段,不在本守卫范围。
     mismatched = {
