@@ -166,27 +166,24 @@ select_one() {
 }
 
 acceptance_fixture_path_is_safe() {
-    local relative_path="$1"
-    case "$relative_path" in
-        ""|/*|../*|*/../*|*/./*|*//*)
-            return 4
+    case "$1" in
+        h264_annexb_packets.bin|h264_avcc_packets.bin|h264_video_audio.mkv|h265_video_only.mkv)
+            return 0
             ;;
-        *.py|*.pyc|*.pyo|*/pyproject.toml|*/setup.py|*/setup.cfg)
-            return 4
-            ;;
-    esac
-    case "/$relative_path/" in
-        */.git/*|*/.env/*|*/.env.*/*|*/config.json/*|*/credentials.json/*|\
-        */.venv/*|*/venv/*|*/node_modules/*|*/__pycache__/*|*/.pytest_cache/*|\
-        */.mypy_cache/*|*/.ruff_cache/*|*/site-packages/*|*/src/*)
+        *)
             return 4
             ;;
     esac
-    return 0
 }
 
 copy_acceptance_payload() {
     local staging="$1" fixture_root fixture relative destination
+    local -a fixture_relative_paths=(
+        h264_annexb_packets.bin
+        h264_avcc_packets.bin
+        h264_video_audio.mkv
+        h265_video_only.mkv
+    )
     install -d -m 0755 \
         "$staging/acceptance" \
         "$staging/acceptance/integration" \
@@ -201,15 +198,15 @@ copy_acceptance_payload() {
         "$PROJECT_ROOT/backend/miloco/tests/integration/responses_fixture_server.py" \
         "$staging/acceptance/integration/"
     fixture_root="$PROJECT_ROOT/backend/miloco/tests/fixtures/rtsp"
-    [[ -z "$(find "$fixture_root" -type l -print -quit)" ]] || die 4 "RTSP fixture symlinks are forbidden"
-    while IFS= read -r -d '' fixture; do
-        relative="${fixture#"$fixture_root"/}"
+    for relative in "${fixture_relative_paths[@]}"; do
+        fixture="$fixture_root/$relative"
+        [[ -f "$fixture" && ! -L "$fixture" ]] || die 4 "missing RTSP fixture artifact"
         acceptance_fixture_path_is_safe "$relative" \
             || die 4 "forbidden RTSP fixture path"
         destination="$staging/acceptance/fixtures/rtsp/$relative"
         install -d -m 0755 "$(dirname "$destination")"
         install -m 0644 "$fixture" "$destination"
-    done < <(find "$fixture_root" -type f -print0)
+    done
     install -m 0555 \
         "$PROJECT_ROOT/scripts/rtsp-view-smoke.sh" \
         "$PROJECT_ROOT/scripts/responses-vlm-smoke.sh" \

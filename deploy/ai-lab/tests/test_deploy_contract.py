@@ -456,20 +456,18 @@ def test_acceptance_tree_contains_only_the_explicit_fixture_contract(tmp_path: P
     _stage_acceptance_payload(staging)
 
     acceptance = staging / "acceptance"
-    fixture_root = REPOSITORY_ROOT / "backend" / "miloco" / "tests" / "fixtures" / "rtsp"
     expected_files = {
         Path("pytest.ini"),
         Path("integration/test_rtsp_perception.py"),
         Path("integration/test_rtsp_live_view.py"),
         Path("integration/test_responses_perception.py"),
         Path("integration/responses_fixture_server.py"),
+        Path("fixtures/rtsp/h264_annexb_packets.bin"),
+        Path("fixtures/rtsp/h264_avcc_packets.bin"),
+        Path("fixtures/rtsp/h264_video_audio.mkv"),
+        Path("fixtures/rtsp/h265_video_only.mkv"),
         Path("scripts/rtsp-view-smoke.sh"),
         Path("scripts/responses-vlm-smoke.sh"),
-        *(
-            Path("fixtures/rtsp") / path.relative_to(fixture_root)
-            for path in fixture_root.rglob("*")
-            if path.is_file()
-        ),
     }
     actual_files = {path.relative_to(acceptance) for path in acceptance.rglob("*") if path.is_file()}
     assert actual_files == expected_files
@@ -500,13 +498,22 @@ def test_acceptance_tree_allowlist_accepts_the_exact_staged_fixture_contract(
 @pytest.mark.parametrize(
     ("relative_path", "expected_returncode"),
     [
+        ("h264_annexb_packets.bin", 0),
+        ("h264_avcc_packets.bin", 0),
         ("h264_video_audio.mkv", 0),
+        ("h265_video_only.mkv", 0),
+        ("extra.bin", 4),
+        ("nested/fixture.json", 4),
         (".env.local", 4),
         ("credentials.json", 4),
+        ("credentials.yaml", 4),
         (".pytest_cache/lastfailed", 4),
+        (".cache/blob", 4),
+        (".tox/state", 4),
         ("venv/bin/python", 4),
         ("source_package/__init__.py", 4),
         ("source_package/module.py", 4),
+        ("source_package/data.json", 4),
     ],
 )
 def test_acceptance_tree_fixture_classification_fails_closed(
@@ -522,9 +529,15 @@ def test_acceptance_tree_fixture_classification_fails_closed(
     [
         "acceptance/fixtures/rtsp/.env.local",
         "acceptance/fixtures/rtsp/credentials.json",
+        "acceptance/fixtures/rtsp/credentials.yaml",
         "acceptance/fixtures/rtsp/.pytest_cache/lastfailed",
+        "acceptance/fixtures/rtsp/.cache/blob",
+        "acceptance/fixtures/rtsp/.tox/state",
         "acceptance/fixtures/rtsp/venv/bin/python",
         "acceptance/fixtures/rtsp/source_package/module.py",
+        "acceptance/fixtures/rtsp/source_package/data.json",
+        "acceptance/fixtures/rtsp/extra.bin",
+        "acceptance/fixtures/rtsp/nested/fixture.json",
     ],
 )
 def test_acceptance_tree_allowlist_rejects_forbidden_path_variants(
