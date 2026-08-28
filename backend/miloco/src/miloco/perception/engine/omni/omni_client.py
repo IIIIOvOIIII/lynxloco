@@ -383,6 +383,52 @@ def _parse_sse_chunk(
     return adapter.parse_stream_chunk(event.data, event_type=event.event_type)
 
 
+@dataclass
+class _ResponsesStreamState:
+    required: bool
+    terminal_seen: bool = False
+    nonempty_text_seen: bool = False
+    completed_count: int = 0
+
+    def observe_event(
+        self,
+        event: _SSEChunk,
+        adapter: OmniProviderAdapter,
+    ) -> None:
+        if not self.required or event.done or event.malformed or event.data is None:
+            return
+        if self.completed_count:
+            raise ValueError("Responses stream event after response.completed")
+
+        resolved_type = adapter.resolve_stream_event_type(
+            event.data,
+            event_type=event.event_type,
+        )
+        if resolved_type in {
+            "response.completed",
+            "response.failed",
+            "response.incomplete",
+            "error",
+        }:
+            self.terminal_seen = True
+        if resolved_type == "response.completed":
+            self.completed_count += 1
+
+    def observe_delta(self, delta: str | None) -> None:
+        if self.required and delta and delta.strip():
+            self.nonempty_text_seen = True
+
+    def validate(self) -> None:
+        if not self.required:
+            return
+        if not self.terminal_seen or self.completed_count != 1:
+            raise ValueError(
+                "Responses stream ended without exactly one response.completed"
+            )
+        if not self.nonempty_text_seen:
+            raise ValueError("Responses stream contains no output text")
+
+
 async def _collect_stream_response(
     client: httpx.AsyncClient,
     url: str,
@@ -398,6 +444,7 @@ async def _collect_stream_response(
     """
     content_parts: list[str] = []
     usage: dict[str, Any] = {}
+    stream_state = _ResponsesStreamState(adapter.requires_complete_stream)
     async with client.stream(
         "POST",
         url,
@@ -418,14 +465,17 @@ async def _collect_stream_response(
                 )
             resp.raise_for_status()
         async for event in _iter_sse_chunks(resp):
+            stream_state.observe_event(event, adapter)
             parsed = _parse_sse_chunk(event, adapter)
             if parsed is None:
                 break
             delta, chunk_usage = parsed
+            stream_state.observe_delta(delta)
             if chunk_usage is not None:
                 usage = chunk_usage
             if delta:
                 content_parts.append(delta)
+    stream_state.validate()
     return {
         "choices": [{"message": {"content": "".join(content_parts)}}],
         "usage": usage,
@@ -533,6 +583,7 @@ async def call_omni_stream(
     # 跟 call_omni / _call_omni_messages 的非 stream 路径完全对齐。
     raw_usage_seen: dict | None = None
     response_chunks: list[str] = []
+    stream_state = _ResponsesStreamState(adapter.requires_complete_stream)
     error: dict[str, Any] | None = None
     short_circuited = False
     cb = get_omni_circuit_breaker()
@@ -555,10 +606,12 @@ async def call_omni_stream(
                     logger.error("Omni stream error %d", resp.status_code)
                     resp.raise_for_status()
                 async for event in _iter_sse_chunks(resp):
+                    stream_state.observe_event(event, adapter)
                     parsed = _parse_sse_chunk(event, adapter)
                     if parsed is None:
                         break
                     delta, chunk_usage = parsed
+                    stream_state.observe_delta(delta)
                     if chunk_usage is not None:
                         raw_usage_seen = chunk_usage
                         if usage_out is not None:
@@ -566,6 +619,7 @@ async def call_omni_stream(
                     if delta:
                         response_chunks.append(delta)
                         yield delta
+        stream_state.validate()
         await cb.record_success()
     except CircuitOpenError as ce:
         short_circuited = True

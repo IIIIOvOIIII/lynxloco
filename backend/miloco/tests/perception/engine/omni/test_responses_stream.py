@@ -119,19 +119,86 @@ def test_adapter_emits_delta_and_completed_usage_in_event_order() -> None:
     )
 
 
-def test_explicit_sse_event_type_takes_priority_over_json_type() -> None:
+@pytest.mark.parametrize("event_type", [None, "message", "vendor.unknown"])
+def test_recognized_json_type_wins_when_sse_event_is_not_recognized(
+    event_type: str | None,
+) -> None:
     adapter = OpenAIResponsesAdapter()
 
     parsed = adapter.parse_stream_chunk(
-        {
-            "type": "response.failed",
-            "delta": "kept",
-            "response": {"error": {"code": "must_not_win"}},
-        },
-        event_type="response.output_text.delta",
+        {"type": "response.output_text.delta", "delta": "kept"},
+        event_type=event_type,
     )
 
     assert parsed == ("kept", None)
+
+
+def test_recognized_sse_event_is_used_when_json_type_is_missing() -> None:
+    adapter = OpenAIResponsesAdapter()
+
+    assert adapter.parse_stream_chunk(
+        {"delta": "from-event"},
+        event_type="response.output_text.delta",
+    ) == ("from-event", None)
+
+
+def test_matching_recognized_sse_and_json_types_are_accepted() -> None:
+    adapter = OpenAIResponsesAdapter()
+
+    assert adapter.parse_stream_chunk(
+        {"type": "response.output_text.delta", "delta": "same"},
+        event_type="response.output_text.delta",
+    ) == ("same", None)
+
+
+def test_conflicting_recognized_sse_and_json_types_are_bad_response() -> None:
+    adapter = OpenAIResponsesAdapter()
+
+    with pytest.raises(ValueError, match="Responses stream event type conflict") as exc:
+        adapter.parse_stream_chunk(
+            {
+                "type": "response.failed",
+                "delta": "must-not-pass",
+                "response": {"error": {"code": "RAW_CONFLICT_SECRET"}},
+            },
+            event_type="response.output_text.delta",
+        )
+
+    assert "RAW_CONFLICT_SECRET" not in str(exc.value)
+
+
+def test_event_message_defers_to_standard_json_error() -> None:
+    adapter = OpenAIResponsesAdapter()
+
+    with pytest.raises(ValueError) as exc:
+        adapter.parse_stream_chunk(
+            {
+                "type": "error",
+                "code": "invalid_request",
+                "message": "RAW_MESSAGE_ERROR_SECRET",
+            },
+            event_type="message",
+        )
+
+    assert getattr(exc.value, "code") == "invalid_request"
+    assert "RAW_MESSAGE_ERROR_SECRET" not in str(exc.value)
+
+
+def test_two_unknown_types_are_counted_without_payload(caplog) -> None:
+    adapter = OpenAIResponsesAdapter()
+    caplog.set_level(logging.DEBUG, logger="miloco.perception.engine.omni.provider")
+
+    parsed = adapter.parse_stream_chunk(
+        {
+            "type": "response.future.secret_event",
+            "payload": "RAW_DOUBLE_UNKNOWN_SECRET",
+        },
+        event_type="vendor.future.event",
+    )
+
+    assert parsed == (None, None)
+    assert adapter.unknown_stream_event_count == 1
+    assert "RAW_DOUBLE_UNKNOWN_SECRET" not in caplog.text
 
 
 def test_unknown_event_is_counted_without_logging_payload(caplog) -> None:
@@ -261,8 +328,11 @@ async def test_collect_handles_fragmented_crlf_comments_and_multiline_data() -> 
 
 
 @pytest.mark.asyncio
-async def test_clean_close_dispatches_final_event_without_blank_line() -> None:
-    body = b'event: response.output_text.delta\ndata: {"delta":"tail"}'
+async def test_clean_close_dispatches_completed_event_without_blank_line() -> None:
+    body = _event(
+        "response.output_text.delta",
+        {"type": "response.output_text.delta", "delta": "tail"},
+    ) + (b'event: message\ndata: {"type":"response.completed","response":{"usage":{}}}')
     async with _stream_client([body]) as client:
         result = await omni_client._collect_stream_response(
             client,
@@ -273,7 +343,63 @@ async def test_clean_close_dispatches_final_event_without_blank_line() -> None:
         )
 
     assert result["choices"] == [{"message": {"content": "tail"}}]
-    assert result["usage"] == {}
+    assert result["usage"] == {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "prompt_tokens_details": {"cached_tokens": 0},
+    }
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        _event(None, {"type": "response.output_text.delta", "delta": "orphan"}),
+        _event(None, {"type": "response.output_text.delta", "delta": "orphan"})
+        + b"data: [DONE]\n\n",
+        _event(
+            None,
+            {"type": "response.completed", "response": {"usage": {}}},
+        ),
+        _event(None, {"type": "response.output_text.delta", "delta": "before"})
+        + _event(
+            None,
+            {"type": "response.completed", "response": {"usage": {}}},
+        )
+        + _event(None, {"type": "response.output_text.delta", "delta": "after"}),
+        _event(None, {"type": "response.output_text.delta", "delta": "before"})
+        + _event(
+            None,
+            {"type": "response.completed", "response": {"usage": {}}},
+        )
+        + _event(
+            None,
+            {"type": "response.completed", "response": {"usage": {}}},
+        ),
+    ],
+    ids=[
+        "delta-eof",
+        "delta-done-eof",
+        "completed-without-text",
+        "delta-after-completed",
+        "duplicate-completed",
+    ],
+)
+@pytest.mark.asyncio
+async def test_collect_rejects_incomplete_or_out_of_order_responses_stream(
+    body: bytes,
+) -> None:
+    async with _stream_client([body]) as client:
+        with pytest.raises(ValueError) as exc:
+            await omni_client._collect_stream_response(
+                client,
+                "http://local.test/v1/responses",
+                {},
+                {"stream": True},
+                OpenAIResponsesAdapter(),
+            )
+
+    assert "RAW" not in str(exc.value)
 
 
 @pytest.mark.asyncio
@@ -364,6 +490,34 @@ async def test_call_omni_stream_yields_fragments_and_normalizes_usage(
     assert calls[0].url == httpx.URL("http://local.test/v1/responses")
     assert json.loads(calls[0].content)["stream"] is True
     assert "Authorization" not in calls[0].headers
+
+
+@pytest.mark.asyncio
+async def test_call_omni_stream_rejects_eof_without_completed_and_records_breaker(
+    monkeypatch,
+) -> None:
+    body = _event(
+        "message",
+        {"type": "response.output_text.delta", "delta": "orphan"},
+    )
+    clients = iter([_stream_client([body]) for _ in range(3)])
+    monkeypatch.setattr(
+        omni_client.httpx,
+        "AsyncClient",
+        lambda *args, **kwargs: next(clients),
+    )
+    monkeypatch.setattr(omni_client, "fire_record", lambda *args: None)
+
+    for _ in range(3):
+        stream = omni_client.call_omni_stream(_responses_payload(), _responses_config())
+        assert await anext(stream) == "orphan"
+        with pytest.raises(omni_client.OmniError) as exc:
+            await anext(stream)
+        assert "response.completed" in str(exc.value)
+
+    snapshot = get_omni_circuit_breaker().snapshot()
+    assert snapshot.state == "warn"
+    assert snapshot.code == "bad_response"
 
 
 @pytest.mark.asyncio

@@ -50,6 +50,7 @@ class LocalMediaInfo:
 class OmniProviderAdapter(ABC):
     media_mode: OmniMediaMode = "video_audio"
     auth_required: bool = True
+    requires_complete_stream = False
 
     @abstractmethod
     def build_video_block(self, video_base64: str, media: LocalMediaInfo) -> dict[str, Any]:
@@ -98,6 +99,14 @@ class OmniProviderAdapter(ABC):
 
     strict_stream_json = False
     uses_done_sentinel = True
+
+    def resolve_stream_event_type(
+        self,
+        chunk: dict[str, Any],
+        *,
+        event_type: str | None = None,
+    ) -> str | None:
+        return event_type
 
 
 class OpenAICompatAdapter(OmniProviderAdapter):
@@ -504,6 +513,15 @@ class ResponsesStreamError(ValueError):
 
 
 _STABLE_STREAM_CODE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_RESPONSES_STREAM_EVENT_TYPES = frozenset(
+    {
+        "response.output_text.delta",
+        "response.completed",
+        "response.failed",
+        "response.incomplete",
+        "error",
+    }
+)
 
 
 def _stable_stream_code(value: Any, fallback: str) -> str:
@@ -524,6 +542,7 @@ class OpenAIResponsesAdapter(OmniProviderAdapter):
     auth_required = False
     strict_stream_json = True
     uses_done_sentinel = False
+    requires_complete_stream = True
 
     def __init__(self) -> None:
         self._unknown_stream_event_count = 0
@@ -665,9 +684,10 @@ class OpenAIResponsesAdapter(OmniProviderAdapter):
         *,
         event_type: str | None = None,
     ) -> tuple[str | None, dict[str, Any] | None]:
-        # The SSE envelope is the protocol dispatch field. JSON ``type`` is a
-        # compatibility fallback for servers that omit ``event:``.
-        resolved_type = event_type or chunk.get("type")
+        resolved_type = self.resolve_stream_event_type(
+            chunk,
+            event_type=event_type,
+        )
         if resolved_type == "response.output_text.delta":
             delta = chunk.get("delta")
             if not isinstance(delta, str):
@@ -714,6 +734,26 @@ class OpenAIResponsesAdapter(OmniProviderAdapter):
             self._unknown_stream_event_count,
         )
         return None, None
+
+    def resolve_stream_event_type(
+        self,
+        chunk: dict[str, Any],
+        *,
+        event_type: str | None = None,
+    ) -> str | None:
+        json_type = chunk.get("type")
+        if not isinstance(json_type, str):
+            json_type = None
+        event_recognized = event_type in _RESPONSES_STREAM_EVENT_TYPES
+        json_recognized = json_type in _RESPONSES_STREAM_EVENT_TYPES
+
+        if event_recognized and json_recognized and event_type != json_type:
+            raise ValueError("Responses stream event type conflict")
+        if json_recognized:
+            return json_type
+        if event_recognized:
+            return event_type
+        return json_type or event_type
 
 
 def adjust_fps_for_omni(fps: int, omni_fps: int) -> int:
