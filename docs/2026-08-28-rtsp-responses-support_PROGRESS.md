@@ -174,3 +174,10 @@
 - Expected result: 未设置 `MILOCO_RESPONSES_API_KEY` 时，即使父环境存在旧 `MILOCO_MODEL__OMNI__API_KEY`，所有 fixture 请求仍不得带 Authorization；smoke 在合成感知 HTTP 挂起期间只收到一次 SIGTERM，必须在 3 秒内 exit 143，且同进程组不得残留 uv/Python 进程，stdout/stderr 继续为空。
 - Result: Achieved。精确 inherited-key RED 为 exit 4，证明旧通用 Key 被 `call_omni` fallback 带往 no-key Responses fixture；精确信号 RED 为脚本 PID 收到 SIGTERM 后 3 秒超时，证明 shell trap 正等待未回收子进程。修复后脚本在 shell 和 Python 两层静默移除精确通用 fallback 变量，只以 Responses 专用 Key 构造配置；同时直接 `exec` 到仓库受控 `.venv/bin/python`，由同一 PID 的 Python signal handler 对 HUP/INT/TERM 返回 129/130/143。两个动态回归均通过：no-key 模式完整 GET+POST+POST 且三个请求 Authorization 全为 false；挂起 HTTP 期间只 kill 脚本 PID 后 3 秒内 exit 143，stdout/stderr 为空，进程组无残留 uv/Python。完整 strict integration 23 passed，scoped Ruff/format/ty、`bash -n`、0755 与 diff/leak 检查通过。
 - Next step: 提交 review 修复并由原独立审查人复核；复核 CLEAN 后再进行 Responses 整批审查。
+
+## 2026-08-28 13:15 SGT
+
+- Current work: 完成 Responses Task 7 smoke 两项审查修复的独立动态复核，并收口七个任务的执行账本。
+- Expected result: 父环境旧通用 Omni Key 不得进入无 Key Responses 的 models/preflight/perception 任一请求；挂起请求只收到脚本 PID 的 SIGTERM 时必须短边界 exit 143 且无残留进程；成功/失败输出、脚本权限和 fixture teardown 不回归。
+- Result: Achieved。原审查人复跑严格 integration 23 passed：旧通用 Key 在 shell exec 前和 Miloco import 前双重移除，完整 GET+POST+POST 均无 Authorization；专用 Responses Bearer 路径保持。脚本直接 exec 到受控 backend venv Python，挂起 HTTP 时只 kill smoke PID，3 秒内 exit 143，进程组无 uv/Python 残留；成功白名单输出、静默失败、0755、shell syntax 与 teardown 均通过。Task 7 独立复审 CLEAN，真实本地 VLM 继续为 `not_measured`。
+- Next step: 对 `fe15926..HEAD` 的 Responses 七任务、typed-image hotfix、fixture/smoke/docs执行整批 Critical/Important 审查；整批 CLEAN 后进入全分支回归、安全审查和 ai-lab 部署计划。
