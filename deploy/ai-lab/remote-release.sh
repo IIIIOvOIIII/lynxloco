@@ -290,13 +290,22 @@ validate_archive_members() {
 }
 
 receive_release_locked() {
-    local host="$1" sha="$2" expected_digest="$3" controller_digest="$4" allowlist_digest="$5"
+    local sha_state="$1" sha="$2" expected_digest="$3" controller_digest="$4" allowlist_digest="$5"
     [[ "$expected_digest" =~ ^[0-9a-f]{64}$ ]] || die 2 "invalid archive digest"
     [[ "$controller_digest" =~ ^[0-9a-f]{64}$ ]] || die 2 "invalid controller digest"
     [[ "$allowlist_digest" == "$REMOTE_ALLOWLIST_SHA256" ]] || die 4 "allowlist digest mismatch"
     [[ ! -L "$LAB_ROOT" && ! -L "$RELEASES_DIR" && ! -L "$INCOMING_DIR" && ! -L "$DEPLOY_STATE_DIR" ]] || die 4 "lab paths must not be symlinks"
-    install -d -o root -g root -m 0755 "$LAB_ROOT" "$RELEASES_DIR" "$DEPLOY_STATE_DIR" "$ARTIFACT_RECORDS_DIR"
-    install -d -o root -g root -m 0700 "$INCOMING_DIR"
+    case "$sha_state" in
+        new)
+            install -d -o root -g root -m 0755 "$LAB_ROOT" "$RELEASES_DIR" "$DEPLOY_STATE_DIR" "$ARTIFACT_RECORDS_DIR"
+            install -d -o root -g root -m 0700 "$INCOMING_DIR"
+            ;;
+        existing)
+            [[ -d "$INCOMING_DIR" && ! -L "$INCOMING_DIR" ]] \
+                || die 4 "existing release cannot receive private input"
+            ;;
+        probe_error|*) die 4 "release publication state is uncertain" ;;
+    esac
     local release="$RELEASES_DIR/$sha"
 
     local incoming staging published_release=""
@@ -313,7 +322,7 @@ receive_release_locked() {
     chmod 0600 "$incoming"
     verify_archive_digest "$incoming" "$expected_digest"
     validate_archive_members "$incoming"
-    if [[ -e "$release" || -L "$release" ]]; then
+    if [[ "$sha_state" == "existing" ]]; then
         [[ -d "$release" && ! -L "$release" ]] || die 4 "existing release path is unsafe"
         verify_release_tree "$release" "$sha"
         read_artifact_record "$sha" || die 4 "existing artifact digest record is missing"
@@ -337,7 +346,7 @@ receive_release_locked() {
         "$staging/acceptance/scripts/"*.sh
     chown -R root:root "$staging"
     verify_release_tree "$staging" "$sha"
-    [[ ! -e "$release" && ! -L "$release" ]] || die 4 "release already exists"
+    [[ "$(published_sha_state "$sha")" == "new" ]] || die 4 "release publication state changed"
     published_release="$release"
     mv -- "$staging" "$release"
     staging=""
@@ -406,7 +415,7 @@ verify_controller_self() {
 }
 
 transaction_release() {
-    local host="$1" sha="$2" archive_digest="$3" controller_digest="$4" allowlist_digest="$5"
+    local host="$1" sha="$2" archive_digest="$3" controller_digest="$4" allowlist_digest="$5" sha_state
     require_root
     validate_host "$host"
     validate_sha "$sha"
@@ -415,8 +424,9 @@ transaction_release() {
         && "$allowlist_digest" =~ ^[0-9a-f]{64}$ ]] || die 2 "invalid transaction digest"
     acquire_transition_lock
     verify_controller_self "$controller_digest"
-    receive_release_locked "$host" "$sha" "$archive_digest" "$controller_digest" "$allowlist_digest"
-    build_and_activate_locked "$host" "$sha"
+    sha_state="$(published_sha_state "$sha")"
+    receive_release_locked "$sha_state" "$sha" "$archive_digest" "$controller_digest" "$allowlist_digest"
+    build_and_activate_locked "$sha_state" "$host" "$sha"
 }
 
 compose_up() {
@@ -741,6 +751,30 @@ image_reference_state() {
     printf 'present:%s' "$image_id"
 }
 
+published_sha_state() {
+    local sha="$1" runtime_state acceptance_state
+    validate_sha "$sha"
+
+    if [[ -e "$RELEASES_DIR/$sha" || -L "$RELEASES_DIR/$sha" \
+        || -e "$ARTIFACT_RECORDS_DIR/$sha" || -L "$ARTIFACT_RECORDS_DIR/$sha" \
+        || -e "$ACCEPTED_DIR/$sha" || -L "$ACCEPTED_DIR/$sha" ]]; then
+        printf 'existing\n'
+        return 0
+    fi
+
+    runtime_state="$(image_reference_state "miloco-lab:$sha")"
+    acceptance_state="$(image_reference_state "miloco-lab-acceptance:$sha")"
+    if [[ "$runtime_state" == "absent" && "$acceptance_state" == "absent" ]]; then
+        printf 'new\n'
+    elif [[ "$runtime_state" == "probe_error" || "$acceptance_state" == "probe_error" ]]; then
+        printf 'probe_error\n'
+    elif [[ "$runtime_state" == present:sha256:* || "$acceptance_state" == present:sha256:* ]]; then
+        printf 'existing\n'
+    else
+        printf 'probe_error\n'
+    fi
+}
+
 release_contract_state() {
     local sha="$1" release state
     release="$RELEASES_DIR/$sha"
@@ -1023,35 +1057,13 @@ remove_image_references() {
     image_tag_absent "$acceptance_image" || return 1
 }
 
-remove_image_tags() {
-    local sha="$1"
-    remove_image_references "miloco-lab:$sha" "miloco-lab-acceptance:$sha"
-}
-
 remove_candidate_image_tags() {
     local sha="$1"
     remove_image_references "miloco-lab-candidate:$sha" "miloco-lab-acceptance-candidate:$sha"
 }
 
-protected_release_status() {
-    local sha="$1" record protected_sha
-    for record in "$CURRENT_FILE" "$PREVIOUS_FILE"; do
-        if [[ -e "$record" || -L "$record" ]]; then
-            require_safe_record "$record" || return 2
-            protected_sha="$(<"$record")"
-            [[ "$protected_sha" =~ ^[0-9a-f]{40}$ ]] || return 2
-            [[ "$protected_sha" != "$sha" ]] || return 0
-        fi
-    done
-    return 1
-}
-
 cleanup_unaccepted_candidate() {
-    local sha="$1" failed=0
-    invalidate_acceptance "$sha" || failed=1
-    remove_image_tags "$sha" || failed=1
-    remove_candidate_image_tags "$sha" || failed=1
-    (( failed == 0 ))
+    remove_candidate_image_tags "$1"
 }
 
 candidate_build_exit() {
@@ -1147,26 +1159,21 @@ release_capability() {
 }
 
 build_images_and_accept() {
-    local host="$1" sha="$2" release="$3" runtime_image_id acceptance_image_id protected_status capability
+    local sha_state="$1" host="$2" sha="$3" release="$4" runtime_image_id acceptance_image_id capability
     local runtime_image="miloco-lab:$sha" acceptance_image="miloco-lab-acceptance:$sha"
     local candidate_runtime="miloco-lab-candidate:$sha"
     local candidate_acceptance="miloco-lab-acceptance-candidate:$sha"
-    capability="$(release_capability "$sha")"
-    case "$capability" in
-        capable) return 0 ;;
-        probe_error) return 1 ;;
-        definitively_invalid) ;;
-        *) return 1 ;;
+    case "$sha_state" in
+        new) ;;
+        existing)
+            capability="$(release_capability "$sha")"
+            [[ "$capability" == "capable" ]] || die 4 "existing release is not reusable"
+            return 0
+            ;;
+        probe_error|*) die 4 "release publication state is uncertain" ;;
     esac
-    if protected_release_status "$sha"; then
-        return 1
-    else
-        protected_status="$?"
-        (( protected_status == 1 )) || return 1
-    fi
 
     arm_candidate_cleanup "$sha"
-    invalidate_acceptance "$sha" || abort_candidate_build "$sha"
     remove_candidate_image_tags "$sha" || abort_candidate_build "$sha"
     docker_command 3600 build --platform linux/amd64 --target runtime -t "$candidate_runtime" "$release" \
         || abort_candidate_build "$sha"
@@ -1176,7 +1183,9 @@ build_images_and_accept() {
         || abort_candidate_build "$sha"
     runtime_image_id="$(docker_image_id "$candidate_runtime")" || abort_candidate_build "$sha"
     acceptance_image_id="$(docker_image_id "$candidate_acceptance")" || abort_candidate_build "$sha"
-    remove_image_tags "$sha" || abort_candidate_build "$sha"
+    [[ "$(image_reference_state "$runtime_image")" == "absent" \
+        && "$(image_reference_state "$acceptance_image")" == "absent" ]] \
+        || abort_candidate_build "$sha"
     docker_command 30 image tag "$candidate_runtime" "$runtime_image" \
         || abort_candidate_build "$sha"
     docker_command 30 image tag "$candidate_acceptance" "$acceptance_image" \
@@ -1242,148 +1251,6 @@ commit_transition() {
     trap - EXIT HUP INT TERM
 }
 
-retain_rollback_history() {
-    local current_sha="$1"
-    local historical_kept=0 protected_previous="" record release candidate capability index release_records
-    local -a retention_candidates=() retention_capabilities=()
-    capability="$(release_capability "$current_sha")"
-    [[ "$capability" == "capable" ]] || {
-        log "retention_probe_error sha=$current_sha state=$capability"
-        return 1
-    }
-    if [[ -f "$PREVIOUS_FILE" && ! -L "$PREVIOUS_FILE" ]]; then
-        require_safe_record "$PREVIOUS_FILE" || {
-            log "retention_probe_error sha=previous state=unsafe_record"
-            return 1
-        }
-        protected_previous="$(<"$PREVIOUS_FILE")"
-        [[ "$protected_previous" =~ ^[0-9a-f]{40}$ ]] || {
-            log "retention_probe_error sha=previous state=invalid_sha"
-            return 1
-        }
-    fi
-    if [[ -n "$protected_previous" && "$protected_previous" != "$current_sha" ]]; then
-        capability="$(release_capability "$protected_previous")"
-        case "$capability" in
-            capable) historical_kept=1 ;;
-            definitively_invalid) ;;
-            probe_error|*)
-                log "retention_probe_error sha=$protected_previous state=$capability"
-                return 1
-                ;;
-        esac
-    fi
-    release_records="$(find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -rn)" || {
-        log "retention_probe_error sha=listing state=probe_error"
-        return 1
-    }
-    while IFS= read -r record; do
-        if [[ "$record" =~ ^[0-9]+([.][0-9]+)?[[:space:]]+(/.*)$ ]]; then
-            release="${BASH_REMATCH[2]}"
-        else
-            log "retention_probe_error sha=listing state=malformed_output"
-            return 1
-        fi
-        candidate="${release##*/}"
-        [[ "$candidate" =~ ^[0-9a-f]{40}$ ]] || {
-            log "retention_probe_error sha=listing state=unexpected_release"
-            return 1
-        }
-        [[ "$release" == "$RELEASES_DIR/$candidate" && -d "$release" && ! -L "$release" ]] || {
-            log "retention_probe_error sha=$candidate state=unsafe_release"
-            return 1
-        }
-        [[ "$candidate" != "$current_sha" ]] || continue
-        if [[ -n "$protected_previous" && "$candidate" == "$protected_previous" ]]; then
-            continue
-        fi
-        capability="$(release_capability "$candidate")"
-        case "$capability" in
-            capable|definitively_invalid) ;;
-            probe_error|*)
-                log "retention_probe_error sha=$candidate state=$capability"
-                return 1
-                ;;
-        esac
-        retention_candidates+=("$candidate")
-        retention_capabilities+=("$capability")
-    done <<< "$release_records"
-    for ((index = 0; index < ${#retention_candidates[@]}; index++)); do
-        candidate="${retention_candidates[$index]}"
-        capability="${retention_capabilities[$index]}"
-        if [[ "$capability" == "definitively_invalid" ]]; then
-            remove_release_pair "$candidate" || return 1
-        elif (( historical_kept < 2 )); then
-            historical_kept=$((historical_kept + 1))
-        else
-            remove_release_pair "$candidate" || return 1
-        fi
-    done
-}
-
-remove_release_pair() {
-    local sha="$1" release record protected_sha
-    validate_sha "$sha"
-    for record in "$CURRENT_FILE" "$PREVIOUS_FILE"; do
-        if [[ -e "$record" || -L "$record" ]]; then
-            require_safe_record "$record" || {
-                log "cleanup_failed sha=$sha reason=unsafe_state_record"
-                return 1
-            }
-            protected_sha="$(<"$record")"
-            [[ "$protected_sha" =~ ^[0-9a-f]{40}$ ]] || {
-                log "cleanup_failed sha=$sha reason=invalid_state_record"
-                return 1
-            }
-            if [[ "$protected_sha" == "$sha" ]]; then
-                log "cleanup_failed sha=$sha reason=protected_state"
-                return 1
-            fi
-        fi
-    done
-    release="$RELEASES_DIR/$sha"
-    [[ "$release" == "/opt/miloco-lab/releases/$sha" ]] || die 4 "release cleanup path mismatch"
-    if [[ -e "$release" || -L "$release" ]]; then
-        [[ ! -L "$release" ]] || die 4 "release cleanup symlink is forbidden"
-        require_safe_directory "$release" || {
-            log "cleanup_failed sha=$sha reason=unsafe_release"
-            return 1
-        }
-    fi
-    for record in "$ARTIFACT_RECORDS_DIR/$sha" "$ACCEPTED_DIR/$sha"; do
-        if [[ -e "$record" || -L "$record" ]]; then
-            require_safe_record "$record" || {
-                log "cleanup_failed sha=$sha reason=unsafe_record"
-                return 1
-            }
-        fi
-    done
-    remove_image_tags "$sha" || {
-        log "cleanup_failed sha=$sha reason=image_removal"
-        return 1
-    }
-    if [[ -e "$release" ]]; then
-        rm -rf -- "$release" || return 1
-    fi
-    [[ ! -e "$release" && ! -L "$release" ]] || {
-        log "cleanup_failed sha=$sha reason=release_present"
-        return 1
-    }
-    for record in "$ARTIFACT_RECORDS_DIR/$sha" "$ACCEPTED_DIR/$sha"; do
-        if [[ -e "$record" || -L "$record" ]]; then
-            require_safe_record "$record" || {
-                log "cleanup_failed sha=$sha reason=unsafe_record"
-                return 1
-            }
-            rm -f -- "$record" || return 1
-        fi
-        [[ ! -e "$record" && ! -L "$record" ]] || {
-            log "cleanup_failed sha=$sha reason=record_present"
-            return 1
-        }
-    done
-}
-
 activate_release() {
     local host="$1" sha="$2" capability
     validate_host "$host"
@@ -1408,18 +1275,15 @@ activate_release() {
     fi
     atomic_write "$CURRENT_FILE" "$sha"
     commit_transition
-    if ! retain_rollback_history "$sha"; then
-        log "activated_cleanup_failed sha=$sha"
-    fi
     return 0
 }
 
 build_and_activate_locked() {
-    local host="$1" sha="$2" release="$RELEASES_DIR/$sha"
+    local sha_state="$1" host="$2" sha="$3" release="$RELEASES_DIR/$sha"
     require_root
     validate_host "$host"
     verify_release "$sha"
-    build_images_and_accept "$host" "$sha" "$release"
+    build_images_and_accept "$sha_state" "$host" "$sha" "$release"
     [[ ! -L "$STATE_DIR" ]] || die 4 "persistent state path must not be a symlink"
     install -d -o 10001 -g 10001 -m 0700 "$STATE_DIR"
     activate_release "$host" "$sha"

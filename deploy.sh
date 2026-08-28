@@ -23,6 +23,7 @@ receipt_archive_digest=""
 receipt_controller_digest=""
 receipt_allowlist_digest=""
 receipt_artifact_path=""
+ssh_args=()
 
 log() {
     printf '[deploy] %s\n' "$*" >&2
@@ -53,6 +54,25 @@ validate_host() {
         "$ALLOWED_HOST_1"|"$ALLOWED_HOST_2") ;;
         *) die 2 "host is not an approved AI-lab target" ;;
     esac
+}
+
+configure_ssh_identity() {
+    local identity="${MILOCO_SSH_IDENTITY:-}" owner mode
+    [[ -n "$identity" ]] || die 2 "MILOCO_SSH_IDENTITY is required for remote operations"
+    [[ "$identity" == /* ]] || die 2 "MILOCO_SSH_IDENTITY must be an absolute path"
+    [[ -f "$identity" && ! -L "$identity" ]] || die 2 "MILOCO_SSH_IDENTITY must be a regular non-symlink file"
+
+    if owner="$(stat -f '%u' "$identity" 2>/dev/null)" \
+        && mode="$(stat -f '%Lp' "$identity" 2>/dev/null)"; then
+        :
+    else
+        owner="$(stat -c '%u' "$identity")" || die 2 "cannot inspect MILOCO_SSH_IDENTITY ownership"
+        mode="$(stat -c '%a' "$identity")" || die 2 "cannot inspect MILOCO_SSH_IDENTITY permissions"
+    fi
+    [[ "$owner" == "$(id -u)" ]] || die 2 "MILOCO_SSH_IDENTITY must be owned by the current user"
+    [[ "$mode" =~ ^[0-7]{3,4}$ && $((8#$mode & 8#77)) -eq 0 ]] \
+        || die 2 "MILOCO_SSH_IDENTITY must not grant group or other permissions"
+    ssh_args=(-o BatchMode=yes -o IdentitiesOnly=yes -i "$identity")
 }
 
 parse_arguments() {
@@ -415,7 +435,7 @@ local_release_archive() {
 run_remote_controller() {
     local target_host="$1"
     shift
-    ssh -- "$target_host" bash -s -- "$@" < "$PROJECT_ROOT/deploy/ai-lab/remote-release.sh"
+    ssh "${ssh_args[@]}" -- "$target_host" bash -s -- "$@" < "$PROJECT_ROOT/deploy/ai-lab/remote-release.sh"
 }
 
 preflight_remote() {
@@ -430,7 +450,7 @@ install_remote_controller() {
     [[ "$controller_digest" =~ ^[0-9a-f]{64}$ ]] || die 4 "invalid controller digest"
     controller_dir="${REMOTE_CONTROL_DIR}/${controller_digest}"
     controller_path="${REMOTE_CONTROL_DIR}/${controller_digest}/remote-release.sh"
-    ssh -- "$target_host" \
+    ssh "${ssh_args[@]}" -- "$target_host" \
         "set -euo pipefail; umask 077; test ! -L '${REMOTE_ROOT}'; install -d -o root -g root -m 0755 '${REMOTE_ROOT}'; test \"\$(stat -c '%u:%g' '${REMOTE_ROOT}')\" = 0:0; test ! -L '${REMOTE_CONTROL_DIR}'; install -d -o root -g root -m 0755 '${REMOTE_CONTROL_DIR}'; test \"\$(stat -c '%u:%g' '${REMOTE_CONTROL_DIR}')\" = 0:0; test ! -L '${controller_dir}'; install -d -o root -g root -m 0555 '${controller_dir}'; temporary=\$(mktemp '${REMOTE_CONTROL_DIR}/.${controller_digest}.XXXXXX'); trap 'rm -f -- \"\$temporary\"' EXIT; cat > \"\$temporary\"; printf '%s  %s\\n' '${controller_digest}' \"\$temporary\" | sha256sum -c - >/dev/null; chown root:root \"\$temporary\"; chmod 0555 \"\$temporary\"; if ! ln \"\$temporary\" '${controller_path}' 2>/dev/null; then test -e '${controller_path}'; fi; test -f '${controller_path}'; test ! -L '${controller_path}'; test \"\$(stat -c '%u:%g' '${controller_path}')\" = 0:0; printf '%s  %s\\n' '${controller_digest}' '${controller_path}' | sha256sum -c - >/dev/null; chmod 0555 '${controller_dir}'; test \"\$(realpath -e '${controller_path}')\" = '${controller_path}'" \
         < "$controller"
 }
@@ -443,8 +463,8 @@ deploy_remote() {
     read_release_receipt "$sha"
     controller_path="${REMOTE_CONTROL_DIR}/${receipt_controller_digest}/remote-release.sh"
     install_remote_controller "$target_host" "$receipt_controller_digest"
-    ssh -- "$target_host" "$controller_path" preflight "$target_host"
-    ssh -- "$target_host" "$controller_path" transaction "$target_host" "$sha" \
+    ssh "${ssh_args[@]}" -- "$target_host" "$controller_path" preflight "$target_host"
+    ssh "${ssh_args[@]}" -- "$target_host" "$controller_path" transaction "$target_host" "$sha" \
         "$receipt_archive_digest" "$receipt_controller_digest" "$receipt_allowlist_digest" \
         < "$archive"
 }
@@ -463,6 +483,7 @@ dispatch() {
             validate_host "$host"
             # HOST_VALIDATION_COMPLETE
             assert_clean_controller
+            configure_ssh_identity
             case "$operation" in
                 preflight) preflight_remote "$host" ;;
                 deploy) deploy_remote "$host" ;;
