@@ -771,7 +771,10 @@ def test_remote_checksum_and_acceptance_precede_activation() -> None:
         assert forbidden_type in remote
     assert build_body.index("invalidate_acceptance") < build_body.index("--target runtime")
     assert build_body.index("--target runtime") < build_body.index("--target acceptance")
-    assert build_body.index("--target acceptance") < build_body.index("miloco-lab-acceptance:$sha")
+    assert "miloco-lab-acceptance-candidate:$sha" in build_body
+    assert build_body.index("--target acceptance") < build_body.index(
+        'run --rm --network none "$candidate_acceptance"'
+    )
     assert build_body.index("miloco-lab-acceptance:$sha") < build_body.index("mark_acceptance_success")
     assert "runtime_image_id" in build_body
     assert "acceptance_image_id" in build_body
@@ -1100,7 +1103,7 @@ def test_rollback_requires_artifact_bound_acceptance_marker_before_images(tmp_pa
         + "\nverify_release() { return 0; }\n"
         + "require_safe_directory() { return 0; }\n"
         + "require_safe_record() { return 0; }\n"
-        + f"docker_image_id() {{ case \"$1\" in miloco-lab:*) printf '%s\\n' '{runtime_id}' ;; *) printf '%s\\n' '{acceptance_id}' ;; esac; }}\n"
+        + f"image_reference_state() {{ case \"$1\" in miloco-lab:*) printf 'present:%s\\n' '{runtime_id}' ;; *) printf 'present:%s\\n' '{acceptance_id}' ;; esac; }}\n"
         + 'release_capability "$1"\n',
         encoding="utf-8",
     )
@@ -1133,6 +1136,79 @@ def test_rollback_requires_artifact_bound_acceptance_marker_before_images(tmp_pa
     )
     assert mismatch.returncode == 0, mismatch.stderr
     assert mismatch.stdout.strip() == "definitively_invalid"
+
+
+@pytest.mark.parametrize(
+    ("probe_case", "expected_state"),
+    [
+        ("missing_image", "definitively_invalid"),
+        ("corrupt_release", "definitively_invalid"),
+        ("marker_mismatch", "definitively_invalid"),
+        ("daemon_error", "probe_error"),
+    ],
+)
+def test_release_capability_distinguishes_invalid_debris_from_probe_uncertainty(
+    tmp_path: Path, probe_case: str, expected_state: str
+) -> None:
+    """Exercises the real classifier instead of replacing it in retention tests."""
+    sha = "9" * 40
+    archive_digest = "a" * 64
+    runtime_id = "sha256:" + "b" * 64
+    acceptance_id = "sha256:" + "c" * 64
+    lab_root = tmp_path / "miloco-lab"
+    release = lab_root / "releases" / sha
+    artifacts = lab_root / "deploy-state" / "artifacts"
+    accepted = lab_root / "deploy-state" / "accepted"
+    release.mkdir(parents=True)
+    artifacts.mkdir(parents=True)
+    accepted.mkdir(parents=True)
+    (artifacts / sha).write_text(
+        "schema=1\n"
+        f"git_sha={sha}\n"
+        f"archive_sha256={archive_digest}\n"
+        f"controller_sha256={'d' * 64}\n"
+        f"allowlist_sha256={hashlib.sha256(ALLOWLIST.read_bytes()).hexdigest()}\n",
+        encoding="utf-8",
+    )
+    marker_runtime_id = "sha256:" + "e" * 64 if probe_case == "marker_mismatch" else runtime_id
+    (accepted / sha).write_text(
+        "schema=1\n"
+        f"archive_sha256={archive_digest}\n"
+        f"runtime_image_id={marker_runtime_id}\n"
+        f"acceptance_image_id={acceptance_id}\n",
+        encoding="utf-8",
+    )
+    source = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8").rsplit(
+        '\nmain "$@"', maxsplit=1
+    )[0]
+    source = source.replace('readonly LAB_ROOT="/opt/miloco-lab"', f'readonly LAB_ROOT="{lab_root}"')
+    harness = tmp_path / f"classifier-{probe_case}.sh"
+    verify_override = "" if probe_case == "corrupt_release" else "\nverify_release() { return 0; }\n"
+    harness.write_text(
+        source
+        + "\nrequire_safe_directory() { return 0; }\n"
+        + "require_safe_record() { return 0; }\n"
+        + verify_override
+        + "docker_command() {\n"
+        + f"  case '{probe_case}:$*' in\n"
+        + "    missing_image:*' image ls '*) return 0 ;;\n"
+        + "    missing_image:*' image inspect '*) return 1 ;;\n"
+        + "    daemon_error:*) return 75 ;;\n"
+        + "    corrupt_release:*) return 88 ;;\n"
+        + "    marker_mismatch:*' image ls '*) printf 'listed\\n' ;;\n"
+        + f"    marker_mismatch:*miloco-lab-acceptance:*) printf '%s\\n' '{acceptance_id}' ;;\n"
+        + f"    marker_mismatch:*) printf '%s\\n' '{runtime_id}' ;;\n"
+        + "  esac\n"
+        + "}\n"
+        + f'release_capability "{sha}"\n',
+        encoding="utf-8",
+    )
+    harness.chmod(0o755)
+    result = subprocess.run(
+        [str(harness)], text=True, capture_output=True, check=False, timeout=5
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == expected_state
 
 
 def test_failed_acceptance_invalidates_old_marker_and_cleans_rebuilt_tags(tmp_path: Path) -> None:
@@ -1168,7 +1244,122 @@ def test_failed_acceptance_invalidates_old_marker_and_cleans_rebuilt_tags(tmp_pa
     assert result.returncode != 0
     assert not marker.exists(), "same-SHA rebuild must atomically invalidate old acceptance"
     calls = call_log.read_text(encoding="utf-8")
-    assert calls.count("remove-tags") == 2, "tags must be cleared before build and after failure"
+    assert calls.count("remove-tags") == 1, (
+        "canonical tags must remain untouched until isolated-candidate acceptance fails"
+    )
+    assert calls.count("image rm miloco-lab-candidate:") == 2, (
+        "candidate tags must be cleared before build and again after failed acceptance"
+    )
+
+
+@pytest.mark.parametrize("protected_record", ["current", "previous"])
+def test_same_sha_retry_reuses_protected_accepted_images_without_mutation(
+    tmp_path: Path, protected_record: str
+) -> None:
+    """Catches a retry destroying the current or previous SHA's known-good proof."""
+    sha = "1" * 40
+    lab_root = tmp_path / "miloco-lab"
+    deploy_state = lab_root / "deploy-state"
+    accepted = deploy_state / "accepted"
+    accepted.mkdir(parents=True)
+    (deploy_state / protected_record).write_text(f"{sha}\n", encoding="utf-8")
+    marker = accepted / sha
+    marker.write_text("known-good-proof\n", encoding="utf-8")
+    mutation_log = tmp_path / f"protected-{protected_record}.log"
+    source = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8").rsplit(
+        '\nmain "$@"', maxsplit=1
+    )[0]
+    source = source.replace('readonly LAB_ROOT="/opt/miloco-lab"', f'readonly LAB_ROOT="{lab_root}"')
+    harness = tmp_path / f"protected-{protected_record}.sh"
+    harness.write_text(
+        source
+        + "\nrequire_safe_directory() { return 0; }\n"
+        + "require_safe_record() { return 0; }\n"
+        + "release_capability() { printf 'capable\\n'; }\n"
+        + f"docker_command() {{ printf 'docker:%s\\n' \"$*\" >> '{mutation_log}'; return 0; }}\n"
+        + f"remove_image_tags() {{ printf 'remove-canonical\\n' >> '{mutation_log}'; return 0; }}\n"
+        + f"mark_acceptance_success() {{ printf 'mark\\n' >> '{mutation_log}'; return 0; }}\n"
+        + f'build_images_and_accept "ai-lab01.esxi" "{sha}" "{lab_root}/releases/{sha}"\n',
+        encoding="utf-8",
+    )
+    harness.chmod(0o755)
+    result = subprocess.run(
+        [str(harness)], text=True, capture_output=True, check=False, timeout=5
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text(encoding="utf-8") == "known-good-proof\n"
+    assert not mutation_log.exists(), "protected accepted retry must be a mutation-free reuse"
+
+
+@pytest.mark.parametrize("interrupt_stage", ["build", "acceptance"])
+def test_unaccepted_candidate_signal_cleanup_is_armed_before_first_mutation(
+    tmp_path: Path, interrupt_stage: str
+) -> None:
+    """Catches session loss leaving unaccepted tags or touching another protected proof."""
+    sha = "2" * 40
+    protected_sha = "3" * 40
+    lab_root = tmp_path / "miloco-lab"
+    deploy_state = lab_root / "deploy-state"
+    accepted = deploy_state / "accepted"
+    accepted.mkdir(parents=True)
+    (deploy_state / "current").write_text(f"{protected_sha}\n", encoding="utf-8")
+    protected_marker = accepted / protected_sha
+    protected_marker.write_text("protected-proof\n", encoding="utf-8")
+    candidate_marker = accepted / sha
+    candidate_marker.write_text("stale-unprotected-proof\n", encoding="utf-8")
+    call_log = tmp_path / f"signal-{interrupt_stage}.log"
+    trap_log = tmp_path / f"signal-{interrupt_stage}-trap.log"
+    source = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8").rsplit(
+        '\nmain "$@"', maxsplit=1
+    )[0]
+    source = source.replace('readonly LAB_ROOT="/opt/miloco-lab"', f'readonly LAB_ROOT="{lab_root}"')
+    harness = tmp_path / f"signal-{interrupt_stage}.sh"
+    harness.write_text(
+        source
+        + "\nrequire_safe_directory() { return 0; }\n"
+        + "require_safe_record() { return 0; }\n"
+        + "invalidate_acceptance() {\n"
+        + f"  [[ -s '{trap_log}' ]] || trap -p EXIT > '{trap_log}'\n"
+        + f"  rm -f -- '{candidate_marker}'\n"
+        + "}\n"
+        + "docker_command() {\n"
+        + f"  printf 'docker:%s\\n' \"$*\" >> '{call_log}'\n"
+        + f"  case \"$*\" in *' build '*'--target runtime'*) [[ '{interrupt_stage}' != build ]] || {{ printf 'signal-build\\n' >> '{call_log}'; kill -TERM \"$$\"; }} ;; esac\n"
+        + f"  case \"$*\" in *' run --rm '*) [[ '{interrupt_stage}' != acceptance ]] || {{ printf 'signal-acceptance\\n' >> '{call_log}'; kill -TERM \"$$\"; }} ;; esac\n"
+        + "  case \"$*\" in *' image inspect '*) printf 'sha256:%064d\\n' 0 ;; esac\n"
+        + "  return 0\n"
+        + "}\n"
+        + f'build_images_and_accept "ai-lab01.esxi" "{sha}" "{lab_root}/releases/{sha}"\n',
+        encoding="utf-8",
+    )
+    harness.chmod(0o755)
+    result = subprocess.run(
+        [str(harness)], text=True, capture_output=True, check=False, timeout=5
+    )
+    assert result.returncode != 0
+    assert trap_log.read_text(encoding="utf-8").strip(), (
+        "EXIT cleanup must be armed before acceptance-marker invalidation"
+    )
+    calls = call_log.read_text(encoding="utf-8")
+    signal_line = f"signal-{interrupt_stage}"
+    assert signal_line in calls
+    after_signal = calls.split(signal_line, maxsplit=1)[1]
+    assert f"miloco-lab-candidate:{sha}" in calls
+    assert f"miloco-lab-acceptance-candidate:{sha}" in after_signal
+    assert not candidate_marker.exists()
+    assert protected_marker.read_text(encoding="utf-8") == "protected-proof\n"
+    assert protected_sha not in calls
+
+
+def test_candidate_cleanup_disarms_traps_before_clearing_cleanup_identity() -> None:
+    """Catches a signal observing an empty cleanup SHA while the EXIT trap remains armed."""
+    remote = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8")
+    disarm = remote.split("disarm_candidate_cleanup()", maxsplit=1)[1].split(
+        "\n}", maxsplit=1
+    )[0]
+    assert disarm.index("trap - EXIT HUP INT TERM") < disarm.index(
+        'candidate_cleanup_sha=""'
+    )
 
 
 def test_receive_retry_reuses_only_the_same_verified_artifact_without_extraction(tmp_path: Path) -> None:

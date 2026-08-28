@@ -19,10 +19,10 @@ readonly MINIMUM_DISK_KIB=5242880
 readonly ROLLBACK_FAILED_EXIT_CODE=70
 readonly ZERO_SHA="0000000000000000000000000000000000000000"
 
-transition_armed=0
 transition_host=""
 transition_candidate=""
 transition_previous=""
+candidate_cleanup_sha=""
 
 log() {
     printf '[remote-release] %s\n' "$*" >&2
@@ -201,7 +201,7 @@ verify_release_tree() {
     (
         cd "$release"
         sha256sum -c "SHA256SUMS"
-    ) >/dev/null
+    ) >/dev/null || die 4 "release checksum mismatch"
 }
 
 remote_path_is_allowlisted() {
@@ -631,6 +631,42 @@ docker_image_id() {
     printf '%s\n' "$image_id"
 }
 
+image_reference_state() {
+    local image="$1" listed image_id
+    if ! listed="$(docker_command 15 image ls --quiet --no-trunc "$image" 2>/dev/null)"; then
+        printf 'probe_error\n'
+        return 0
+    fi
+    if [[ -z "$listed" ]]; then
+        printf 'absent\n'
+        return 0
+    fi
+    if ! image_id="$(docker_command 15 image inspect --format '{{.Id}}' "$image" 2>/dev/null)"; then
+        printf 'probe_error\n'
+        return 0
+    fi
+    if [[ ! "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+        printf 'probe_error\n'
+        return 0
+    fi
+    printf 'present:%s\n' "$image_id"
+}
+
+release_contract_state() {
+    local sha="$1" verify_status
+    if (verify_release "$sha") >/dev/null 2>&1; then
+        printf 'valid\n'
+        return 0
+    else
+        verify_status="$?"
+    fi
+    if (( verify_status == 4 )); then
+        printf 'definitively_invalid\n'
+    else
+        printf 'probe_error\n'
+    fi
+}
+
 mark_acceptance_success() {
     local sha="$1" runtime_image_id="$2" acceptance_image_id="$3"
     read_artifact_record "$sha" || return 1
@@ -659,8 +695,8 @@ image_tag_absent() {
     [[ -z "$listed" ]]
 }
 
-remove_image_tags() {
-    local sha="$1" runtime_image="miloco-lab:$sha" acceptance_image="miloco-lab-acceptance:$sha"
+remove_image_references() {
+    local runtime_image="$1" acceptance_image="$2"
     if ! docker_command 30 image rm "$runtime_image" "$acceptance_image" >/dev/null 2>&1; then
         image_tag_absent "$runtime_image" || return 1
         image_tag_absent "$acceptance_image" || return 1
@@ -670,8 +706,79 @@ remove_image_tags() {
     image_tag_absent "$acceptance_image" || return 1
 }
 
+remove_image_tags() {
+    local sha="$1"
+    remove_image_references "miloco-lab:$sha" "miloco-lab-acceptance:$sha"
+}
+
+remove_candidate_image_tags() {
+    local sha="$1"
+    remove_image_references "miloco-lab-candidate:$sha" "miloco-lab-acceptance-candidate:$sha"
+}
+
+protected_release_status() {
+    local sha="$1" record protected_sha
+    for record in "$CURRENT_FILE" "$PREVIOUS_FILE"; do
+        if [[ -e "$record" || -L "$record" ]]; then
+            require_safe_record "$record" || return 2
+            protected_sha="$(<"$record")"
+            [[ "$protected_sha" =~ ^[0-9a-f]{40}$ ]] || return 2
+            [[ "$protected_sha" != "$sha" ]] || return 0
+        fi
+    done
+    return 1
+}
+
+cleanup_unaccepted_candidate() {
+    local sha="$1" failed=0
+    invalidate_acceptance "$sha" || failed=1
+    remove_image_tags "$sha" || failed=1
+    remove_candidate_image_tags "$sha" || failed=1
+    (( failed == 0 ))
+}
+
+candidate_build_exit() {
+    local original_exit="$?" cleanup_status
+    trap - EXIT
+    trap '' HUP INT TERM
+    set +e
+    cleanup_unaccepted_candidate "$candidate_cleanup_sha"
+    cleanup_status="$?"
+    set -e
+    if (( cleanup_status != 0 )); then
+        log "build_cleanup_failed sha=$candidate_cleanup_sha"
+        exit "$ROLLBACK_FAILED_EXIT_CODE"
+    fi
+    exit "$original_exit"
+}
+
+arm_candidate_cleanup() {
+    candidate_cleanup_sha="$1"
+    trap candidate_build_exit EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+}
+
+disarm_candidate_cleanup() {
+    trap - EXIT HUP INT TERM
+    candidate_cleanup_sha=""
+}
+
+abort_candidate_build() {
+    local sha="$1"
+    trap - EXIT
+    trap '' HUP INT TERM
+    if ! cleanup_unaccepted_candidate "$sha"; then
+        log "build_cleanup_failed sha=$sha"
+    fi
+    trap - HUP INT TERM
+    candidate_cleanup_sha=""
+    return 1
+}
+
 release_capability() {
-    local sha="$1" runtime_id acceptance_id
+    local sha="$1" contract_state runtime_state acceptance_state runtime_id acceptance_id
     validate_sha "$sha"
     if ! read_artifact_record "$sha" || ! read_acceptance_marker "$sha"; then
         printf 'definitively_invalid\n'
@@ -681,18 +788,30 @@ release_capability() {
         printf 'definitively_invalid\n'
         return 0
     fi
-    if ! (verify_release "$sha") >/dev/null 2>&1; then
-        printf 'probe_error\n'
-        return 0
-    fi
-    runtime_id="$(docker_image_id "miloco-lab:$sha")" || {
-        printf 'probe_error\n'
+    contract_state="$(release_contract_state "$sha")"
+    [[ "$contract_state" == "valid" ]] || {
+        printf '%s\n' "$contract_state"
         return 0
     }
-    acceptance_id="$(docker_image_id "miloco-lab-acceptance:$sha")" || {
-        printf 'probe_error\n'
-        return 0
-    }
+    runtime_state="$(image_reference_state "miloco-lab:$sha")"
+    acceptance_state="$(image_reference_state "miloco-lab-acceptance:$sha")"
+    case "$runtime_state:$acceptance_state" in
+        absent:*|*:absent)
+            printf 'definitively_invalid\n'
+            return 0
+            ;;
+        probe_error:*|*:probe_error)
+            printf 'probe_error\n'
+            return 0
+            ;;
+        present:sha256:*:present:sha256:*) ;;
+        *)
+            printf 'probe_error\n'
+            return 0
+            ;;
+    esac
+    runtime_id="${runtime_state#present:}"
+    acceptance_id="${acceptance_state#present:}"
     if [[ "$runtime_id" != "$marker_runtime_image_id" \
         || "$acceptance_id" != "$marker_acceptance_image_id" ]]; then
         printf 'definitively_invalid\n'
@@ -702,33 +821,41 @@ release_capability() {
 }
 
 build_images_and_accept() {
-    local host="$1" sha="$2" release="$3" runtime_image_id acceptance_image_id
-    invalidate_acceptance "$sha" || return 1
-    remove_image_tags "$sha" || return 1
-    if ! docker_command 3600 build --platform linux/amd64 --target runtime -t "miloco-lab:$sha" "$release"; then
-        remove_image_tags "$sha" || log "build_cleanup_failed sha=$sha"
-        return 1
+    local host="$1" sha="$2" release="$3" runtime_image_id acceptance_image_id protected_status
+    local runtime_image="miloco-lab:$sha" acceptance_image="miloco-lab-acceptance:$sha"
+    local candidate_runtime="miloco-lab-candidate:$sha"
+    local candidate_acceptance="miloco-lab-acceptance-candidate:$sha"
+    if protected_release_status "$sha"; then
+        [[ "$(release_capability "$sha")" == "capable" ]] || return 1
+        return 0
+    else
+        protected_status="$?"
+        (( protected_status == 1 )) || return 1
     fi
-    if ! docker_command 3600 build --platform linux/amd64 --target acceptance -t "miloco-lab-acceptance:$sha" "$release"; then
-        remove_image_tags "$sha" || log "build_cleanup_failed sha=$sha"
-        return 1
-    fi
-    if ! docker_command 900 run --rm --network none "miloco-lab-acceptance:$sha"; then
-        remove_image_tags "$sha" || log "build_cleanup_failed sha=$sha"
-        return 1
-    fi
-    runtime_image_id="$(docker_image_id "miloco-lab:$sha")" || {
-        remove_image_tags "$sha" || log "build_cleanup_failed sha=$sha"
-        return 1
-    }
-    acceptance_image_id="$(docker_image_id "miloco-lab-acceptance:$sha")" || {
-        remove_image_tags "$sha" || log "build_cleanup_failed sha=$sha"
-        return 1
-    }
-    if ! mark_acceptance_success "$sha" "$runtime_image_id" "$acceptance_image_id"; then
-        remove_image_tags "$sha" || log "build_cleanup_failed sha=$sha"
-        return 1
-    fi
+
+    arm_candidate_cleanup "$sha"
+    invalidate_acceptance "$sha" || abort_candidate_build "$sha"
+    remove_candidate_image_tags "$sha" || abort_candidate_build "$sha"
+    docker_command 3600 build --platform linux/amd64 --target runtime -t "$candidate_runtime" "$release" \
+        || abort_candidate_build "$sha"
+    docker_command 3600 build --platform linux/amd64 --target acceptance -t "$candidate_acceptance" "$release" \
+        || abort_candidate_build "$sha"
+    docker_command 900 run --rm --network none "$candidate_acceptance" \
+        || abort_candidate_build "$sha"
+    runtime_image_id="$(docker_image_id "$candidate_runtime")" || abort_candidate_build "$sha"
+    acceptance_image_id="$(docker_image_id "$candidate_acceptance")" || abort_candidate_build "$sha"
+    remove_image_tags "$sha" || abort_candidate_build "$sha"
+    docker_command 30 image tag "$candidate_runtime" "$runtime_image" \
+        || abort_candidate_build "$sha"
+    docker_command 30 image tag "$candidate_acceptance" "$acceptance_image" \
+        || abort_candidate_build "$sha"
+    [[ "$(docker_image_id "$runtime_image")" == "$runtime_image_id" \
+        && "$(docker_image_id "$acceptance_image")" == "$acceptance_image_id" ]] \
+        || abort_candidate_build "$sha"
+    remove_candidate_image_tags "$sha" || abort_candidate_build "$sha"
+    mark_acceptance_success "$sha" "$runtime_image_id" "$acceptance_image_id" \
+        || abort_candidate_build "$sha"
+    disarm_candidate_cleanup
 }
 
 restore_previous() {
@@ -743,21 +870,16 @@ restore_previous() {
 }
 
 remove_candidate() {
-    local host="$1" candidate_sha="$2" container_id query_status
+    local host="$1" candidate_sha="$2" container_id
     compose_command "$host" "$candidate_sha" 30 rm --stop --force miloco || return 1
-    if container_id="$(compose_command "$host" "$candidate_sha" 10 ps --all -q miloco 2>/dev/null)"; then
-        [[ -z "$container_id" ]] && return 0
-        return 1
-    else
-        query_status="$?"
-    fi
-    (( query_status == 0 ))
+    container_id="$(compose_command "$host" "$candidate_sha" 10 ps --all -q miloco 2>/dev/null)" \
+        || return 1
+    [[ -z "$container_id" ]]
 }
 
 transition_exit() {
     local original_exit="$?" recovery_status=1
     trap - EXIT HUP INT TERM
-    transition_armed=0
     set +e
     if [[ -n "$transition_previous" ]]; then
         restore_previous "$transition_host" "$transition_previous"
@@ -778,7 +900,6 @@ arm_transition() {
     transition_host="$1"
     transition_candidate="$2"
     transition_previous="$3"
-    transition_armed=1
     trap transition_exit EXIT
     trap 'exit 129' HUP
     trap 'exit 130' INT
@@ -786,7 +907,6 @@ arm_transition() {
 }
 
 commit_transition() {
-    transition_armed=0
     trap - EXIT HUP INT TERM
 }
 
@@ -859,7 +979,7 @@ retain_rollback_history() {
 }
 
 remove_release_pair() {
-    local sha="$1" release record marker protected_sha
+    local sha="$1" release record protected_sha
     validate_sha "$sha"
     for record in "$CURRENT_FILE" "$PREVIOUS_FILE"; do
         if [[ -e "$record" || -L "$record" ]]; then

@@ -89,12 +89,24 @@ state, and lock parent or record are required to be non-symlinks, root-owned,
 and resolved beneath `/opt/miloco-lab` before use. Atomic writes validate both
 their parent and final record.
 
-Before any same-SHA image build, an earlier acceptance marker is removed and old
-tags are removed. Successful acceptance creates an atomic marker bound to the
-archive digest and the inspected runtime and acceptance image IDs. Verify,
-activation, rollback, and retention re-inspect both image IDs and require an
-exact marker match. A failed build or acceptance removes and verifies absence of
-both tags, so an old marker plus a rebuilt tag cannot become rollback-capable.
+If the requested SHA is already `current` or `previous`, an intact release,
+marker, and exact image-ID pair is reused without any marker, tag, or build
+mutation. An incomplete protected proof fails before mutation. Every other
+build uses `miloco-lab-candidate:<sha>` and
+`miloco-lab-acceptance-candidate:<sha>` until acceptance succeeds; canonical
+tags are untouched during build and acceptance. EXIT, HUP, INT, and TERM cleanup
+is armed before the stale unprotected marker or any candidate tag is mutated.
+Failure or session loss invalidates the unaccepted marker and verifies absence
+of all candidate and unprotected canonical tags without touching a protected
+SHA.
+
+Only after isolated acceptance succeeds are candidate images promoted to the
+canonical tags and re-inspected. Successful acceptance creates an atomic marker
+bound to the archive digest and those canonical runtime and acceptance image
+IDs. Verify, activation, rollback, and retention re-inspect both image IDs and
+require an exact marker match. The cleanup trap remains armed through promotion
+and marker publication, so interruption cannot leave a newly tagged but
+unaccepted rollback candidate.
 
 After a candidate starts, exit and signal traps remain armed until the new
 `current` state is committed. An interrupted or unhealthy transition must
@@ -104,9 +116,13 @@ deadline: every Compose, inspect, and HTTP probe recomputes its remaining
 budget, and a command that consumes that budget is killed without added grace.
 
 Retention classifies every pair as rollback-capable, definitively invalid, or a
-probe error. Probe errors stop cleanup without deleting anything. Invalid debris
-does not consume a historical slot. The current release plus two rollback-
-capable historical pairs are kept, and `previous` consumes one historical slot.
+probe error. A missing image confirmed by a successful Docker listing, a
+contract/checksum-invalid release, or an explicit marker/image-ID mismatch is
+definitively invalid. Docker daemon/query failures, unexpected tool output, and
+other uncertain probes are probe errors. Probe errors stop cleanup without
+deleting anything. Invalid debris does not consume a historical slot. The
+current release plus two rollback-capable historical pairs are kept, and
+`previous` consumes one historical slot.
 Removal protects `current` and `previous`, removes and verifies both image tags
 first, then deletes the exact release and its artifact and acceptance records;
 any incomplete removal is reported. If cleanup fails after `current` is
