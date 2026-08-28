@@ -1434,6 +1434,170 @@ def test_test_connection_ok_matching_active_clears_breaker(client):
     assert get_omni_circuit_breaker().snapshot().state == "ok"
 
 
+def test_test_no_key_responses_ignores_generic_env_and_clears_breaker(
+    client, monkeypatch
+):
+    """Responses 的最终 key 是显式空串，不能被旧 Chat 通用环境变量替换。"""
+    from miloco.perception.engine.omni.circuit_breaker import (
+        get_omni_circuit_breaker,
+    )
+
+    client.put(
+        "/api/admin/omni-config",
+        json={
+            "label": "local-responses",
+            "model": "local-vlm",
+            "base_url": "http://127.0.0.1:8000/v1",
+            "api_protocol": "openai_responses",
+            "activate": True,
+        },
+    )
+    monkeypatch.setenv("MILOCO_MODEL__OMNI__API_KEY", "OLD_CHAT_SENTINEL")
+    calls = []
+
+    async def _visual_probe(model, base_url, api_key, api_protocol):
+        calls.append((model, base_url, api_key, api_protocol))
+        return {"ok": True, "code": "ok", "message": "视觉预检通过"}
+
+    monkeypatch.setattr("miloco.admin.router._probe.probe_omni", _visual_probe)
+    _force_breaker_open_config()
+
+    response = client.post(
+        "/api/admin/omni-config/test",
+        json={
+            "label": "local-responses",
+            "model": "local-vlm",
+            "base_url": "http://127.0.0.1:8000/v1",
+            "api_protocol": "openai_responses",
+        },
+    )
+
+    assert response.json()["data"]["ok"] is True
+    assert calls == [
+        (
+            "local-vlm",
+            "http://127.0.0.1:8000/v1",
+            "",
+            "openai_responses",
+        )
+    ]
+    assert get_omni_circuit_breaker().snapshot().state == "ok"
+
+
+def test_test_keyed_responses_matching_active_clears_breaker(client):
+    from miloco.perception.engine.omni.circuit_breaker import (
+        get_omni_circuit_breaker,
+    )
+
+    client.put(
+        "/api/admin/omni-config",
+        json={
+            "label": "keyed-responses",
+            "model": "local-vlm",
+            "base_url": "https://responses.example/v1",
+            "api_protocol": "openai_responses",
+            "api_key": "responses-key",
+            "activate": True,
+        },
+    )
+    _force_breaker_open_config()
+
+    response = client.post(
+        "/api/admin/omni-config/test",
+        json={
+            "label": "keyed-responses",
+            "model": "local-vlm",
+            "base_url": "https://responses.example/v1",
+            "api_protocol": "openai_responses",
+        },
+    )
+
+    assert response.json()["data"]["ok"] is True
+    assert get_omni_circuit_breaker().snapshot().state == "ok"
+
+
+def test_test_non_active_no_key_responses_does_not_clear_breaker(client):
+    from miloco.perception.engine.omni.circuit_breaker import (
+        get_omni_circuit_breaker,
+    )
+
+    client.put(
+        "/api/admin/omni-config",
+        json={
+            "label": "active-responses",
+            "model": "active-vlm",
+            "base_url": "http://127.0.0.1:8000/v1",
+            "api_protocol": "openai_responses",
+            "activate": True,
+        },
+    )
+    client.put(
+        "/api/admin/omni-config",
+        json={
+            "label": "other-responses",
+            "model": "other-vlm",
+            "base_url": "http://127.0.0.1:9000/v1",
+            "api_protocol": "openai_responses",
+            "activate": False,
+        },
+    )
+    _force_breaker_open_config()
+
+    response = client.post(
+        "/api/admin/omni-config/test",
+        json={
+            "label": "other-responses",
+            "model": "other-vlm",
+            "base_url": "http://127.0.0.1:9000/v1",
+            "api_protocol": "openai_responses",
+        },
+    )
+
+    assert response.json()["data"]["ok"] is True
+    assert get_omni_circuit_breaker().snapshot().state == "error"
+
+
+@pytest.mark.parametrize(
+    ("api_protocol", "model", "base_url"),
+    [
+        ("openai_chat_completions", "cloud-chat", "https://chat.example/v1"),
+        ("gemini_native", "gemini-vision", "https://gemini.example/v1beta"),
+    ],
+)
+def test_test_auth_required_active_keeps_generic_env_key_matching(
+    client, monkeypatch, api_protocol, model, base_url
+):
+    """Chat/Gemini 继续把通用环境变量解析为 runtime 最终 Key。"""
+    from miloco.config.settings import OmniModelSettings, get_settings
+    from miloco.perception.engine.omni.circuit_breaker import (
+        get_omni_circuit_breaker,
+    )
+
+    get_settings().model.omni = OmniModelSettings(
+        label="env-backed",
+        model=model,
+        base_url=base_url,
+        api_key="",
+        api_protocol=api_protocol,
+    )
+    monkeypatch.setenv("MILOCO_MODEL__OMNI__API_KEY", "OLD_CHAT_SENTINEL")
+    _force_breaker_open_config()
+
+    response = client.post(
+        "/api/admin/omni-config/test",
+        json={
+            "label": "env-backed",
+            "model": model,
+            "base_url": base_url,
+            "api_protocol": api_protocol,
+            "api_key": "OLD_CHAT_SENTINEL",
+        },
+    )
+
+    assert response.json()["data"]["ok"] is True
+    assert get_omni_circuit_breaker().snapshot().state == "ok"
+
+
 def test_test_connection_ok_normalizes_base_url_trailing_slash(client):
     """三元组匹配时 base_url 归一化(rstrip '/'):存 https://x/v1、测 https://x/v1/ 仍算匹配。"""
     from miloco.perception.engine.omni.circuit_breaker import (

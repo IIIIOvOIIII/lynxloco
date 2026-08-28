@@ -1254,22 +1254,38 @@ async def test_omni_config(
             data={"ok": False, "code": "no_key", "message": "未配置 API Key"},
         )
     result = await _probe.probe_omni(model, base_url, api_key, body.api_protocol)
-    # 测通 + 三元组精确匹配当前 active + 熔断非 ok → 主动清熔断,与 put/activate/retry
+    # 测通 + 完整 active identity / runtime 最终 key 匹配 + 熔断非 ok → 主动清熔断,与 put/activate/retry
     # 恢复路径对齐。护栏:测别的档案 / 未保存的新配置时不动状态。
     # OPEN_CONFIG 下 tick 不会自动探测(只探 OPEN_RECOVERABLE),不清则用户测通了红条仍不消失,
     # 只能靠横条上的「立即重试」或改配置重存才能恢复——「测通即恢复」是最直觉的路径。
     if result.get("ok"):
+        from miloco.perception.engine.config import OmniConfig
         from miloco.perception.engine.omni.circuit_breaker import (
             get_omni_circuit_breaker,
         )
-        from miloco.perception.engine.omni.omni_client import resolve_omni_api_key
+        from miloco.perception.engine.omni.omni_client import resolve_api_key
 
         live = get_settings().model.omni
-        live_key = resolve_omni_api_key(live.api_key)
+        tested_key = resolve_api_key(
+            OmniConfig(
+                model=model,
+                base_url=base_url,
+                api_key=api_key,
+                api_protocol=body.api_protocol,
+            )
+        )
+        live_key = resolve_api_key(
+            OmniConfig(
+                model=live.model,
+                base_url=live.base_url,
+                api_key=live.api_key,
+                api_protocol=live.api_protocol,
+            )
+        )
         tested_is_active = (
             model == live.model
             and base_url.rstrip("/") == live.base_url.rstrip("/")
-            and api_key == live_key
+            and tested_key == live_key
             and body.api_protocol == resolve_api_protocol(live.api_protocol, live.model)
         )
         if tested_is_active:
