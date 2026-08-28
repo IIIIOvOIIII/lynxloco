@@ -1,0 +1,14 @@
+Dockerfile
+compose.yaml
+container-entrypoint.sh
+remote-release.sh
+acceptance/
+requirements/backend.txt
+requirements/cli.txt
+requirements/acceptance.txt
+wheels/miloco-*.whl
+wheels/miloco_cli-*.whl
+wheels/miloco_miot-*-manylinux_2_28_x86_64.whl
+models/miloco-models-*.tar.gz
+release.json
+SHA256SUMS
