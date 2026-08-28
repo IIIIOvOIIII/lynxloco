@@ -107,3 +107,62 @@ The dynamic contract checks require an OS sandbox. macOS uses `sandbox-exec`;
 Linux CI must provide Bubblewrap. Both deny network access, keep the repository
 read-only, and permit writes only in the pytest temporary directory. If neither
 backend is available, the suite fails before starting `deploy.sh`.
+
+## Validated laboratory release
+
+The release validated on both laboratory hosts is Git SHA
+`644406e36c621dfad55939686d315a2d3ddc955c`, with archive SHA-256
+`8a057845415fa2a6d820449a9dc4744d4a18fb717300930174f3dd05e0522663`.
+This remains the deployed runtime identity. The later documentation evidence
+commit `3982f7a9484701eb826c1232cf8ab60e9cdbc94a` and post-deployment local
+smoke compatibility commit `8480c6c5956236b71fffc88df4f5dfe7cc6443b0`
+were not built or deployed. Any still-later closeout documentation commit is
+also not a runtime release.
+
+Both hosts passed the receipt-bound acceptance image before activation. The
+gate exercised H.264/H.265 RTSP perception, the shared-session RTSP live path,
+Responses JSON and SSE normalization, and Responses no-key and synthetic
+Bearer behavior. These are deterministic fixture results. No persistent real
+RTSP source or real local VLM endpoint was supplied, so
+`real_camera=not_measured` and `real_vlm=not_measured`.
+
+Final accepted runtime evidence:
+
+- `ai-lab01.esxi`: exact image SHA and healthy status, UID/GID `10001:10001`,
+  state mode `10001:10001:700`, CPU limit `3`, memory limit `3072m`, restart
+  count `0`, current-process OOM `false`, final free disk `9025812` KiB, HTTP
+  dashboard and RTSP/Responses/watch UI checks passed without console errors.
+- `ai-lab02.esxi`: exact image SHA and healthy status, UID/GID `10001:10001`,
+  state mode `10001:10001:700`, CPU limit `1.25`, memory limit `1536m`, restart
+  count `0`, current-process OOM `false`, final free disk `24126448` KiB, HTTP
+  `200`, dashboard build label `g644406e36`, navigation and console checks
+  passed. Ten bounded samples over five minutes remained healthy on the same
+  SHA.
+
+The lab01 rollback drill found no distinct capable `previous` SHA. It therefore
+re-activated the current capable runtime SHA without manufacturing history;
+version differentiation is `not_applicable`. Final `verify` and `status` were
+healthy, and the release tree, artifact record, acceptance marker, archive
+digest, and mode-`0444` local receipt remained intact.
+
+The repository release checks passed with explicit inherited baselines:
+`./scripts/local-ci.sh --tests` passed all six script gates while retaining its
+three documented Darwin node-monitor/smaps exclusions; the deployment contract
+reported 181 passed; CLI reported 646 passed; Web reported 383 passed and one
+skipped, with typecheck and build passing; Ruff lint and `git diff --check`
+passed. Read-only repository-wide checks still report 298 files needing Ruff
+formatting and 1007 `ty` diagnostics. `task lint` was not run and these
+unrelated baselines were not rewritten.
+
+The branch and recursive release-artifact scans found no private-key marker,
+cloud-token form, credential-bearing RTSP URI, long base64 image, raw runtime
+payload artifact, forbidden environment/config/repository/cache/venv path, or
+credential-like filename. Authorization literals were limited to synthetic
+tests. Structural inspection of both deployed containers found no API-key or
+RTSP-credential environment-variable name and did not expose values.
+
+`ai-lab02.esxi` required a user-performed memory expansion before its accepted
+deployment. `openobserve` and `openobserve-fluent-bit` remain stopped from the
+separately approved temporary action; `lab-mariadb` remained running and
+healthy. This rollout did not restart, remove, or otherwise operate on those
+unrelated services. No upstream push was performed.

@@ -1,6 +1,6 @@
 # RTSP 摄像机与 OpenAI Responses 本地 Omni 支持设计
 
-- 状态：已批准；RTSP 感知基础、实时预览与 Responses 感知已实施，仓库级既有 type/format 与 macOS node-monitor 基线未清零；真实本地 VLM E2E 为 `not_measured`
+- 状态：已实施并完成双机实验室 fixture/runtime 验收；仓库级既有 type/format 与 macOS node-monitor 基线未清零；真实 RTSP 摄像机与真实本地 VLM E2E 均为 `not_measured`
 - 日期：2026-08-28
 - 基线提交：`e900529`
 - 仓库：`XiaoMi/xiaomi-miloco`
@@ -598,3 +598,53 @@ round 4 修正 fixture E2E 的证据口径：rolling perception window 的列表
 最终门禁：backend Omni/admin/integration 644 passed，CLI 全量 644 passed，Web 383 passed、1 skipped，Web typecheck 与 build 通过，`./scripts/local-ci.sh --tests` 按仓库定义 6/6 通过（backend 保留脚本既有 3 项 macOS node-monitor/smaps 排除）。只读 `ruff check .` 通过；Task 7 新文件的 Ruff format 与 `ty` 通过。仓库级 `ty` 仍有 1012 条既有诊断；Plan 3 入口记录的 format 基线为 303 个既有文件，当前 HEAD 的只读 `ruff format --check .` 为 298 个既有文件，未运行会改写全库的 `task lint`，也未为本批次扩大范围修复这些存量债务。
 
 `scripts/responses-vlm-smoke.sh` 只读取 `MILOCO_RESPONSES_BASE_URL`、`MILOCO_RESPONSES_MODEL` 与可选 `MILOCO_RESPONSES_API_KEY`，先执行真实图片视觉 preflight，再发送一个合成感知 packet；成功只输出协议、模型、延迟、图片数、输出存在性和 token 计数，HTTP/解析/不安全 URL/信号均非零退出且不回显 URL query、Key、base64 或 raw response。本批次没有获得实际本地 VLM endpoint，因此没有把该脚本对真实服务的运行冒充为兼容性证据：真实本地 VLM 的服务版本、视觉输出、延迟、usage 与 SSE 方言继续为 `not_measured`，严格 fixture 只证明标准契约，不代表兼容所有本地 VLM 服务。
+
+## 21. 双机实验室与最终发布门禁
+
+双机实际部署使用的 feature/runtime SHA 是
+`644406e36c621dfad55939686d315a2d3ddc955c`，不可变 archive SHA-256 为
+`8a057845415fa2a6d820449a9dc4744d4a18fb717300930174f3dd05e0522663`。
+后续 documentation evidence commit
+`3982f7a9484701eb826c1232cf8ab60e9cdbc94a` 与 post-deployment local smoke
+compatibility commit `8480c6c5956236b71fffc88df4f5dfe7cc6443b0`
+均未 build/deploy；最终 closeout 文档 commit 同样晚于 runtime，不改变双机
+release identity。
+
+`ai-lab01.esxi` 与 `ai-lab02.esxi` 的最终 verify/status 均为 exact runtime
+SHA、exact canonical image 和 `healthy`。lab01 资源证据为 UID/GID
+`10001:10001`、state `10001:10001:700`、CPU `3`、memory `3072m`、restart
+`0`、current-process OOM `false`、free disk `9025812` KiB；lab02 为同一
+UID/GID/state、CPU `1.25`、memory `1536m`、restart `0`、OOM `false`、free
+disk `24126448` KiB。lab01 dashboard、RTSP 表单、Responses selector 与通用
+watch 授权页通过且无 console error；lab02 dashboard 显示 `g644406e36`，HTTP
+`200`、导航与 console 检查通过，五分钟十次有界采样持续保持同 SHA、healthy、
+restart `0`、OOM `false`。
+
+两机的 receipt-bound acceptance image 均在 activation 前通过：RTSP fixture
+覆盖 H.264/H.265 perception 与共享单 session live path；Responses fixture
+覆盖 JSON、SSE、no-key 和合成 Bearer。没有可持久化真实 RTSP 来源，也没有
+实际 local VLM endpoint，因此 `real_camera=not_measured`、
+`real_vlm=not_measured`；fixture 结果不得替代真实摄像机 fps/CPU/重连或真实
+VLM 视觉质量/延迟/SSE 方言。
+
+lab01 回滚演练前没有 distinct capable `previous` SHA，因此没有复制、创建或
+删除状态来制造历史；演练对当前 capable runtime 执行同 SHA re-activation，
+`version_differentiation=not_applicable`。最终 verify/status healthy，release
+tree checksum、artifact record、acceptance marker、archive digest 与 mode-`0444`
+receipt 保持完整。
+
+最终 gates 在 Task 5A `8480c6c...` 后重跑：`local-ci --tests` 6/6 通过，
+仅保留脚本既有 3 项 Darwin node-monitor/smaps 排除；deployment contract 181
+passed；CLI 646 passed；Web 383 passed/1 skipped，typecheck/build 通过；全库
+Ruff lint 与 `git diff --check` 通过。只读全库 format 与 type baseline 分别为
+298 个文件和 1007 条 diagnostics；未运行会改写全库的 `task lint`。全分支与
+递归 release artifact scan 未发现真实秘密、credential-bearing RTSP URI、长
+base64 图片、raw runtime payload artifact 或禁止路径；Authorization literals
+仅为合成测试。双机容器结构检查未发现 API-key 或 RTSP-credential env 名称，
+且未读取或输出 env 值。
+
+lab02 在用户扩容内存后通过部署门禁；此前经批准临时停止的 `openobserve` 与
+`openobserve-fluent-bit` 仍保持 stopped，`lab-mariadb` 保持 running/healthy，
+本次验收未操作这些无关服务。发布历史只做不可变累积，不自动 retention
+delete；free disk 无法证明至少 5 GiB 时部署只 fail closed 停止。没有向小米
+上游或其他远端 push。

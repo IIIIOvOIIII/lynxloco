@@ -1,10 +1,11 @@
 # Miloco ai-lab Simplified Immutable Deployment Design
 
-**Status:** Approved by user on 2026-08-28
+**Status:** Implemented and laboratory-validated on 2026-08-29
 
-**Approved direction:** Disable automatic historical retention deletion and
-same-SHA in-place rebuilds. Continue toward sequential lab deployment only
-after this design and its implementation review are approved.
+**Implemented direction:** Automatic historical retention deletion and
+same-SHA in-place rebuilds are disabled. One receipt-bound runtime SHA was
+deployed sequentially to both approved laboratory hosts, and rollback,
+regression, security, and artifact-boundary evidence is complete.
 
 ## 1. Context
 
@@ -253,3 +254,68 @@ The simplified deployment task is complete when:
 - executable deployment contracts pass;
 - independent review reports no open Critical or Important finding;
 - no real host access occurs before that approval.
+
+## 14. Implementation and Laboratory Evidence
+
+The deployed runtime and feature SHA is
+`644406e36c621dfad55939686d315a2d3ddc955c`. Its immutable archive SHA-256 is
+`8a057845415fa2a6d820449a9dc4744d4a18fb717300930174f3dd05e0522663`.
+Documentation evidence commit `3982f7a9484701eb826c1232cf8ab60e9cdbc94a`,
+post-deployment local smoke compatibility commit
+`8480c6c5956236b71fffc88df4f5dfe7cc6443b0`, and the final closeout
+documentation commit are later local branch states and were not built or
+deployed.
+
+Both `ai-lab01.esxi` and `ai-lab02.esxi` verify as healthy on the exact runtime
+SHA and canonical image. The receipt-bound acceptance image passed on each
+host before activation, covering H.264/H.265 RTSP perception, shared-session
+RTSP live viewing, Responses JSON/SSE, no-key behavior, and synthetic Bearer
+behavior. HTTP/UI checks passed on both hosts without console errors. Final
+resource evidence retained the declared non-root UID/GID, owner-only state,
+CPU/memory limits, restart count `0`, current-process OOM `false`, and free
+disk above the 5 GiB preflight threshold. lab02 additionally remained healthy
+for ten bounded samples over five minutes.
+
+No real RTSP camera or real local VLM endpoint was provided. Consequently,
+`real_camera=not_measured` and `real_vlm=not_measured`; fixture acceptance is
+not presented as real device/provider validation.
+
+The lab01 rollback drill found no distinct capable previous release. The only
+permitted fallback was therefore same-SHA re-activation of the current capable
+runtime, with version differentiation `not_applicable`. Final verification and
+status were healthy, and release-tree checksums, the artifact record,
+acceptance marker, archive digest, and local mode-`0444` receipt remained
+intact. No release or state was created, copied, or deleted to manufacture a
+prior version.
+
+Final repository evidence after the reviewed Task 5A compatibility fix:
+
+- `./scripts/local-ci.sh --tests`: all six script gates passed; the script's
+  three documented Darwin node-monitor/smaps exclusions remain explicit.
+- Deployment contract: 181 passed.
+- CLI: 646 passed.
+- Web: 383 passed, one skipped; typecheck and production build passed.
+- Ruff lint and `git diff --check`: passed.
+- Existing read-only baselines: 298 files require Ruff formatting and `ty`
+  reports 1007 diagnostics. `task lint` was not run and no repository-wide
+  rewrite was performed.
+
+The feature-base-to-code-HEAD scan and recursive release-archive scan found no
+private-key marker, cloud-token form, credential-bearing RTSP URI, long base64
+image, raw runtime request/response artifact, forbidden environment/config/
+repository/cache/venv path, unsafe archive member type, or credential-like
+filename. Authorization/Bearer literals were confined to synthetic tests.
+Structural inspection of both deployed containers found no API-key or
+RTSP-credential environment-variable name; values were never printed.
+
+The implemented operating model remains immutable accumulation: published
+release directories, canonical image pairs, artifact records, and acceptance
+markers are not automatically deleted. If preflight cannot prove at least
+5 GiB free disk, deployment stops without reclaiming history. Any future
+cleanup requires a separately authorized design.
+
+`ai-lab02.esxi` passed after the user expanded VM memory. The separately
+approved temporary stop of `openobserve` and `openobserve-fluent-bit` remains
+in effect; `lab-mariadb` remained running and healthy. This rollout did not
+restart, delete, or otherwise change those unrelated services. No upstream
+push was performed.
