@@ -6,6 +6,8 @@ readonly ALLOWED_HOST_1="ai-lab01.esxi"
 readonly ALLOWED_HOST_2="ai-lab02.esxi"
 readonly REMOTE_ROOT="/opt/miloco-lab"
 readonly REMOTE_RELEASES="${REMOTE_ROOT}/releases"
+readonly REMOTE_CONTROL_DIR="${REMOTE_ROOT}/control"
+readonly REMOTE_CONTROLLER="${REMOTE_CONTROL_DIR}/remote-release.sh"
 
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 case "$SCRIPT_PATH" in
@@ -112,6 +114,16 @@ assert_clean_worktree() {
     [[ -z "$dirty" ]] || die 3 "worktree must be clean"
     clean_sha="$(git rev-parse --verify HEAD)" || die 3 "cannot resolve Git HEAD"
     validate_sha "$clean_sha"
+}
+
+assert_clean_controller() {
+    assert_clean_worktree
+    git ls-files --error-unmatch -- \
+        deploy.sh deploy/ai-lab/remote-release.sh >/dev/null 2>&1 \
+        || die 3 "deployment controllers must be tracked"
+    git diff --quiet "$clean_sha" -- \
+        deploy.sh deploy/ai-lab/remote-release.sh \
+        || die 3 "deployment controllers must match clean Git HEAD"
 }
 
 select_one() {
@@ -223,6 +235,16 @@ generate_checksums() {
     done < <(find "$staging" -type f ! -name SHA256SUMS -print0)
 }
 
+sha256_file() {
+    local file="$1" output
+    if output="$(shasum -a 256 -- "$file" 2>/dev/null)"; then
+        printf '%s\n' "${output%% *}"
+        return 0
+    fi
+    output="$(sha256sum -- "$file")" || die 4 "cannot calculate SHA-256"
+    printf '%s\n' "${output%% *}"
+}
+
 build_release() (
     local sha="$clean_sha"
     local temp_root staging output_dir archive temporary_archive built_at
@@ -328,19 +350,29 @@ preflight_remote() {
     run_remote_controller "$target_host" preflight "$target_host"
 }
 
+install_remote_controller() {
+    local target_host="$1" controller="$PROJECT_ROOT/deploy/ai-lab/remote-release.sh"
+    local controller_digest temporary_controller
+    controller_digest="$(sha256_file "$controller")"
+    [[ "$controller_digest" =~ ^[0-9a-f]{64}$ ]] || die 4 "invalid controller digest"
+    temporary_controller="${REMOTE_CONTROL_DIR}/.remote-release.${controller_digest}.tmp"
+    ssh -- "$target_host" \
+        "set -euo pipefail; umask 077; test ! -L '${REMOTE_ROOT}'; install -d -o root -g root -m 0755 '${REMOTE_ROOT}'; test ! -L '${REMOTE_CONTROL_DIR}'; install -d -o root -g root -m 0755 '${REMOTE_CONTROL_DIR}'; cat > '${temporary_controller}'; printf '%s  %s\\n' '${controller_digest}' '${temporary_controller}' | sha256sum -c - >/dev/null; chown root:root '${temporary_controller}'; chmod 0555 '${temporary_controller}'; mv -f -- '${temporary_controller}' '${REMOTE_CONTROLLER}'" \
+        < "$controller"
+}
+
 deploy_remote() {
     local target_host="$1"
-    local archive sha remote_release
-    assert_clean_worktree
+    local archive sha archive_digest
     sha="$clean_sha"
     archive="$PROJECT_ROOT/dist/lab/$sha/miloco-lab-${sha}.tar.gz"
     [[ -f "$archive" && ! -L "$archive" ]] || die 4 "build the exact clean SHA before remote operations"
-    remote_release="${REMOTE_RELEASES}/${sha}"
+    archive_digest="$(sha256_file "$archive")"
+    [[ "$archive_digest" =~ ^[0-9a-f]{64}$ ]] || die 4 "invalid archive digest"
     preflight_remote "$target_host"
-    ssh -- "$target_host" \
-        "set -euo pipefail; umask 077; test ! -L '${REMOTE_ROOT}'; install -d -o root -g root -m 0755 '${REMOTE_ROOT}'; test ! -L '${REMOTE_RELEASES}'; install -d -o root -g root -m 0755 '${REMOTE_RELEASES}'; test ! -e '${remote_release}'; mkdir -m 0755 '${remote_release}'; trap 'rm -rf -- \"${remote_release}\"' EXIT; tar -xzf - -C '${remote_release}'; trap - EXIT" \
-        < "$archive"
-    run_remote_controller "$target_host" activate "$target_host" "$sha"
+    install_remote_controller "$target_host"
+    ssh -- "$target_host" "$REMOTE_CONTROLLER" receive "$target_host" "$sha" "$archive_digest" < "$archive"
+    ssh -- "$target_host" "$REMOTE_CONTROLLER" activate "$target_host" "$sha"
 }
 
 # DISPATCH_START
@@ -356,6 +388,7 @@ dispatch() {
             # HOST_GUARD_START
             validate_host "$host"
             # HOST_VALIDATION_COMPLETE
+            assert_clean_controller
             case "$operation" in
                 preflight) preflight_remote "$host" ;;
                 deploy) deploy_remote "$host" ;;

@@ -24,10 +24,13 @@ Run the canonical controller from the repository root:
 
 Use the same positional command shape with `ai-lab02.esxi` (or the equivalent
 `--host ai-lab02.esxi` form) for the second permitted host. `build` refuses a
-dirty worktree. `preflight` validates the
-selected host and release before any remote change. `deploy` automatically
-rolls back to the last known-good release when its post-deploy verification
-fails; an operator can also run the explicit `rollback` command.
+dirty worktree. Every remote operation also refuses to start SSH unless both
+controllers are tracked and the whole worktree is the exact clean `HEAD`.
+`preflight` validates the selected host and release before any remote change.
+`deploy` automatically rolls back to the last known-good release when its
+post-deploy verification fails; an operator can also run the explicit
+`rollback` command. A failed recovery is reported distinctly as
+`rollback_failed` with exit code `70`.
 
 `./deploy.sh --help` provides one machine-readable authoritative
 line: `Operations: build preflight deploy verify status rollback`. Its prose
@@ -54,6 +57,34 @@ is exposed on port `1810` only. `ai-lab01.esxi` uses 3.0 CPUs and 3072m;
 `compose.yaml` is required to declare CPU, memory, and process-count resource
 limits; the release validation checks that those limits survive the rendered
 Compose configuration.
+
+## Transfer and rollback safety
+
+The local controller calculates an independent SHA-256 digest for the release
+archive and sends that expected digest as a validated argument. The remote
+controller first receives the archive into a root-owned private temporary file.
+It checks the independent digest and rejects unsafe, duplicate, linked, special,
+or escaping archive members before extracting anything. Extraction occurs only
+in private staging, ignores archive ownership and modes, normalizes every member
+to root ownership and safe modes, verifies `SHA256SUMS`, and then publishes the
+exact release directory atomically. An identical verified artifact can be
+received again after a failed acceptance run without extracting over the
+existing release.
+
+Receive, activation, and explicit rollback share the host-wide transition lock.
+After a candidate starts, exit and signal traps remain armed until the new
+`current` state is committed. An interrupted or unhealthy transition must
+restore and re-check `previous`, or stop and verify removal of the first
+candidate when no previous release exists.
+
+Successful acceptance creates an atomic marker bound to the independently
+recorded archive digest. Verify, activation, rollback, and retention require the
+verified release, matching marker, and both runtime and acceptance images.
+Failed debris therefore cannot consume either of the two historical rollback
+slots. The current release plus two rollback-capable historical pairs are kept;
+`previous` consumes one historical slot. Failure evidence reports only bounded
+container presence, normalized health, and HTTP status codes. Application logs
+are never read or emitted by the release controller.
 
 When a real AI-lab endpoint, model service, camera, or other external endpoint
 is absent, record that validation as `not_measured`. Do not substitute a mock,
