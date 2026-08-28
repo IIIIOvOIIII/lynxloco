@@ -111,3 +111,10 @@
 - Expected result: Task 6 的 H.264/H.265 fixture 必须经同一输入会话同时进入感知与真实 Uvicorn WebSocket；最后观看者离开后的新感知帧证据必须有效；PyAV 容器生命周期修复不得再产生 native crash；仓库标准测试门禁必须通过，既有跨平台基线继续单列而不伪装为本功能成功。
 - Result: Achieved。Task 6 最终独立复审 CLEAN，focused 矩阵为 217 passed、1 skipped；H.264/H.265 均保持 `av.open == 1`，最后 viewer 离开后转码器与队列回到 idle/0，随后同一 session 产生更大 `stream_ts` 的新感知帧。修复容器跨线程 close 后，一次精确全后端序列不再出现 exit 139、abort、segfault 或新 macOS crash report，结果为 3641 passed、4 个既有 node-monitor 路径失败；`./scripts/local-ci.sh --tests` 与完整 `./scripts/local-ci.sh` 随后均通过 6/6 门禁，脚本按其既有规则排除 3 个 macOS node-monitor/smaps 用例。仓库仍保留 303 个既有 format baseline；真实 RTSP 摄像机的首帧、30 秒 fps、CPU、并发、丢包与重连仍为 `not_measured`，不以 fixture 结果替代。
 - Next step: 对 `0b9a908..HEAD` 的 RTSP 实时预览整批提交执行独立 Critical/Important 审查；整批 CLEAN 后进入 OpenAI Responses Omni 计划。实验室真实来源指标留待 `ai-lab01.esxi` / `ai-lab02.esxi` 部署阶段分别测量。
+
+## 2026-08-28 10:37 SGT
+
+- Current work: 完成 `0b9a908..399e6b9` 的 RTSP 实时预览整批独立审查，并建立 OpenAI Responses Omni 的独立执行账本与跨任务接口裁决。
+- Expected result: Plan 2 的单输入会话、H.264/H.265、转码资源、有界慢消费者、WebSocket 鉴权/关闭、MIoT 兼容、Web 管理并发、smoke 与 native cleanup 均不得存在 Critical/Important；设计文档必须与最终门禁事实一致，随后才能开始 Responses 生产代码。
+- Result: Achieved。整批代码审查未发现 Critical/Important；审查有界复跑 backend camera/Task6/session 为 215 passed、1 skipped，Web 为 368 passed、1 skipped，typecheck/build 与 scoped Ruff/ty 通过。唯一 Important 是设计文档 §18/§19 残留历史 `Partial` 表述；已在 `399e6b9` 修正并由同一审查人复核 CLEAN。Responses 账本已固定显式协议、旧档案兼容、Chat 内 MiMo/Qwen 特化、12 图硬上限、统一 normalization、视觉 preflight、管理面与 fixture/真实端点证据边界。
+- Next step: 执行 Responses Task 1，以 TDD 增加显式 `api_protocol`、旧档案解析和所有 Omni 调用点的协议感知 adapter 选择；不修改 OpenClaw/Hermes Agent 模型路径。
