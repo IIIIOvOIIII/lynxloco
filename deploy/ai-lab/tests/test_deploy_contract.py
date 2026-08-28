@@ -95,20 +95,27 @@ def command_stubs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path
     return call_log, tmp_path
 
 
-def _run_deploy(*arguments: str, sandbox_dir: Path | None = None) -> subprocess.CompletedProcess[str]:
-    _assert_deferred_cli_is_safe_to_execute()
-    command = [str(DEPLOY_SCRIPT), *arguments]
+def _sandboxed_deploy_command(arguments: tuple[str, ...], sandbox_dir: Path | None) -> list[str]:
+    """Build the only command shape allowed to execute the deferred CLI."""
+    if sandbox_dir is None or not sandbox_dir.is_dir():
+        pytest.skip("dynamic deploy CLI tests require an isolated writable sandbox directory")
     sandbox_exec = shutil.which("sandbox-exec")
-    if sandbox_exec and sandbox_dir:
-        sandbox_profile = (
-            "(version 1) "
-            "(deny default) "
-            "(allow file-read*) "
-            "(allow process*) "
-            f'(allow file-write* (subpath "{sandbox_dir}")) '
-            "(deny network*)"
-        )
-        command = [sandbox_exec, "-p", sandbox_profile, *command]
+    if not sandbox_exec:
+        pytest.skip("dynamic deploy CLI tests require a network-denying, write-restricted OS sandbox")
+    sandbox_profile = (
+        "(version 1) "
+        "(deny default) "
+        "(allow file-read*) "
+        "(allow process*) "
+        f'(allow file-write* (subpath "{sandbox_dir}")) '
+        "(deny network*)"
+    )
+    return [sandbox_exec, "-p", sandbox_profile, str(DEPLOY_SCRIPT), *arguments]
+
+
+def _run_deploy(*arguments: str, sandbox_dir: Path | None = None) -> subprocess.CompletedProcess[str]:
+    command = _sandboxed_deploy_command(arguments, sandbox_dir)
+    _assert_deferred_cli_is_safe_to_execute()
     return subprocess.run(
         command,
         cwd=REPOSITORY_ROOT,
@@ -196,10 +203,41 @@ def test_artifact_manifest_never_admits_forbidden_path_components() -> None:
     assert forbidden_entries == set()
 
 
-def test_help_exposes_only_the_release_operations() -> None:
+def test_help_exposes_only_the_release_operations(
+    command_stubs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Catches an undocumented or missing deploy CLI operation."""
     _require_deploy_script()
-    result = _run_deploy("--help")
+    _, sandbox_dir = command_stubs
+
+    def unexpected_subprocess(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("dynamic CLI execution must not proceed without OS isolation")
+
+    with monkeypatch.context() as context:
+        context.setattr(subprocess, "run", unexpected_subprocess)
+        with pytest.raises(pytest.skip.Exception):
+            _run_deploy("--help")
+    with monkeypatch.context() as context:
+        context.setattr(subprocess, "run", unexpected_subprocess)
+        context.setattr(shutil, "which", lambda _name: None)
+        with pytest.raises(pytest.skip.Exception):
+            _run_deploy("--help", sandbox_dir=sandbox_dir)
+
+    captured_commands: list[list[str]] = []
+
+    def record_sandboxed_command(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured_commands.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    with monkeypatch.context() as context:
+        context.setattr(subprocess, "run", record_sandboxed_command)
+        _run_deploy("--help", sandbox_dir=sandbox_dir)
+    assert captured_commands and captured_commands[0][0] == shutil.which("sandbox-exec")
+    assert "(deny default)" in captured_commands[0][2]
+    assert "(deny network*)" in captured_commands[0][2]
+    assert "(allow file-write*" in captured_commands[0][2]
+
+    result = _run_deploy("--help", sandbox_dir=sandbox_dir)
     assert result.returncode == 0, result.stderr
     assert _help_operations(result.stdout) == EXPECTED_COMMANDS
     assert _help_operations(
