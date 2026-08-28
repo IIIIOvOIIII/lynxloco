@@ -124,6 +124,9 @@ def _sandboxed_deploy_command(arguments: tuple[str, ...], sandbox_dir: Path | No
             "--ro-bind",
             "/",
             "/",
+            "--ro-bind",
+            str(REPOSITORY_ROOT),
+            str(REPOSITORY_ROOT),
             "--bind",
             str(sandbox_dir),
             str(sandbox_dir),
@@ -261,7 +264,7 @@ def test_existing_deploy_script_without_os_sandbox_fails_contract(
 def test_bubblewrap_sandbox_is_read_only_except_for_test_temp_and_denies_network(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Catches a Linux fallback that can write source files or reach the network."""
+    """Catches a Linux fallback that exposes any writable path beyond test temp."""
     deploy_script = tmp_path / "deploy.sh"
     deploy_script.write_text("#!/usr/bin/env sh\nexit 0\n", encoding="utf-8")
     monkeypatch.setitem(globals(), "DEPLOY_SCRIPT", deploy_script)
@@ -276,12 +279,25 @@ def test_bubblewrap_sandbox_is_read_only_except_for_test_temp_and_denies_network
     except pytest.skip.Exception as error:
         pytest.fail(f"bubblewrap must be a supported dynamic contract sandbox: {error}")
 
-    assert command[0] == "/usr/bin/bwrap"
-    assert "--unshare-net" in command
-    assert ["--ro-bind", "/", "/"] == command[command.index("--ro-bind") :][:3]
-    assert ["--bind", str(tmp_path), str(tmp_path)] == command[command.index("--bind") :][:3]
-    assert ["--chdir", str(REPOSITORY_ROOT)] == command[command.index("--chdir") :][:2]
-    assert command[-2:] == [str(deploy_script), "--help"]
+    assert command == [
+        "/usr/bin/bwrap",
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-net",
+        "--ro-bind",
+        "/",
+        "/",
+        "--ro-bind",
+        str(REPOSITORY_ROOT),
+        str(REPOSITORY_ROOT),
+        "--bind",
+        str(tmp_path),
+        str(tmp_path),
+        "--chdir",
+        str(REPOSITORY_ROOT),
+        str(deploy_script),
+        "--help",
+    ]
 
 
 def test_help_exposes_only_the_release_operations(
