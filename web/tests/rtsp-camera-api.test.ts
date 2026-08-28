@@ -168,6 +168,21 @@ describe("generic camera API", () => {
     } satisfies Partial<ApiError>);
   });
 
+  it("shows a safe stable conflict when an RTSP edit loses its revision", async () => {
+    mockError(409, {
+      detail: {
+        code: "camera_configuration_changed",
+        message: "Camera configuration changed; retry the update",
+        private: "rtsp://private.example/secret-path",
+      },
+    });
+    await expect(realEditRtspCamera("rtsp:source/1", input)).rejects.toMatchObject({
+      status: 409,
+      code: "camera_configuration_changed",
+      message: "Camera configuration changed; retry the update",
+    } satisfies Partial<ApiError>);
+  });
+
   it("preserves validation code/message from a 422 detail object", async () => {
     mockError(422, {
       detail: {

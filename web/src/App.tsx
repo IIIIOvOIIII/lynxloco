@@ -63,9 +63,10 @@ import { useTheme } from "./hooks/useTheme";
 import { useTranslation } from "react-i18next";
 import { LanguageSwitcher } from "./components/LanguageSwitcher";
 import {
+  cameraSummaryAvailability,
+  createRtspRefreshCoordinator,
   isTerminalRtspError,
   rtspPollingPlan,
-  runSingleFlight,
 } from "./lib/rtspPolling";
 
 /** URL hash 是 #perf 时,App 整屏渲染性能调试视图,跳过主框架。 */
@@ -219,17 +220,32 @@ function MainApp() {
     () => typeof document === "undefined" || document.visibilityState === "visible",
   );
   const [rtspPollRevision, setRtspPollRevision] = useState(0);
+  const [rtspRecoveryAttempt, setRtspRecoveryAttempt] = useState(0);
   const rtspFastAttempts = useRef<Record<string, number>>({});
-  const rtspRefreshPromise = useRef<Promise<void> | null>(null);
+  const [refreshRtsp] = useState(() =>
+    createRtspRefreshCoordinator(cameraSummaries.reload),
+  );
+  const cameraSummaryState = cameraSummaryAvailability(
+    cameraSummaries.data,
+    cameraSummaries.error,
+  );
 
   const refreshRtspSummaries = (): Promise<void> => {
-    return runSingleFlight(rtspRefreshPromise, cameraSummaries.reload);
+    return refreshRtsp.poll();
+  };
+
+  const refreshRtspAfterMutation = (): Promise<void> => {
+    return refreshRtsp.afterMutation();
   };
 
   const resetRtspFastPoll = (cameraId: string) => {
     rtspFastAttempts.current[cameraId] = 0;
     setRtspPollRevision((revision) => revision + 1);
   };
+
+  useEffect(() => {
+    if (!cameraSummaries.error) setRtspRecoveryAttempt(0);
+  }, [cameraSummaries.error]);
 
   useEffect(() => {
     const onVisibility = () => setPageVisible(document.visibilityState === "visible");
@@ -254,6 +270,10 @@ function MainApp() {
       cameraSummaries.data ?? [],
       rtspFastAttempts.current,
       pageVisible,
+      {
+        staleError: cameraSummaryState.stale,
+        recoveryAttempt: rtspRecoveryAttempt,
+      },
     );
     if (!plan) return;
     const timer = window.setTimeout(() => {
@@ -263,12 +283,22 @@ function MainApp() {
             (rtspFastAttempts.current[cameraId] ?? 0) + 1;
         }
       }
+      if (plan.mode === "recovery") {
+        setRtspRecoveryAttempt((attempt) => attempt + 1);
+      }
       void refreshRtspSummaries();
     }, plan.delayMs);
     return () => window.clearTimeout(timer);
     // reload is stable; revision explicitly re-plans after an edit/enable.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cameraSummaries.data, cameraSummaries.loading, pageVisible, rtspPollRevision]);
+  }, [
+    cameraSummaries.data,
+    cameraSummaries.loading,
+    cameraSummaryState.stale,
+    pageVisible,
+    rtspPollRevision,
+    rtspRecoveryAttempt,
+  ]);
 
   // 米家家庭名直接走 backend `/api/miot/home::home_name`，米家给啥前端就显啥；
   // 未绑或 backend 没返时**不渲染** HomeSwitcher（未登录提示由头像 button 承担，
@@ -286,7 +316,7 @@ function MainApp() {
         // devices 也纳入聚合:HeroNow 用 devices 推 miotHasCamera,devices 拉
         // 失败时 `(devices.data ?? []).some(...)` 会兜底成 false → 米家上明明有
         // 摄像头但 hero 显"家里还没有摄像头",住户被误导去米家 app 加而非排查网络。
-        const err = persons.error ?? cameras.error ?? cameraSummaries.error ?? scopeCameras.error ?? devices.error;
+        const err = persons.error ?? cameras.error ?? cameraSummaryState.fatalError ?? scopeCameras.error ?? devices.error;
         if (err) {
           return (
             <TabPanelError
@@ -312,6 +342,7 @@ function MainApp() {
               petsEnabled={features.data?.petRecognition ?? false}
               scopeCameras={scopeCameras.data}
               cameraSummaries={cameraSummaries.data}
+              cameraStatusStale={cameraSummaryState.stale}
               miotHasCamera={devices.data.some(
                 (d) => d.category === "camera",
               )}
@@ -341,7 +372,7 @@ function MainApp() {
                   else await realDisableCamera(camera.id);
                   if (enabled) resetRtspFastPoll(camera.id);
                   else delete rtspFastAttempts.current[camera.id];
-                  await refreshRtspSummaries();
+                  await refreshRtspAfterMutation();
                 } catch (error) {
                   toast(
                     error instanceof Error ? error.message : t("rtspCamera.operationFailed"),
@@ -354,7 +385,7 @@ function MainApp() {
                 try {
                   await realDeleteCamera(camera.id);
                   delete rtspFastAttempts.current[camera.id];
-                  await refreshRtspSummaries();
+                  await refreshRtspAfterMutation();
                   toast(t("rtspCamera.deleted"), "ok");
                 } catch (error) {
                   toast(
@@ -779,7 +810,7 @@ function MainApp() {
         onClose={() => setEditingRtsp(undefined)}
         onSaved={async () => {
           if (editingRtsp) resetRtspFastPoll(editingRtsp.id);
-          await refreshRtspSummaries();
+          await refreshRtspAfterMutation();
         }}
       />
 

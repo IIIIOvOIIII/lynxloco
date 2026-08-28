@@ -90,6 +90,7 @@ describe("RTSP camera localization", () => {
     "disable",
     "offline",
     "reconnecting",
+    "statusStale",
     "liveTranscode",
   ];
 

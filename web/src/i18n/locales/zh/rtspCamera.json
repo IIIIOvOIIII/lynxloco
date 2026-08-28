@@ -3,6 +3,7 @@
     "title": "RTSP 摄像头",
     "add": "添加 RTSP 摄像头",
     "refresh": "刷新 RTSP 摄像头状态",
+    "statusStale": "摄像头状态暂时无法刷新；现有实时画面会保留，Miloco 正在重试。",
     "edit": "编辑 RTSP 摄像头",
     "name": "摄像头名称",
     "url": "RTSP 地址",

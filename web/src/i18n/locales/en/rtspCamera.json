@@ -3,6 +3,7 @@
     "title": "RTSP cameras",
     "add": "Add RTSP camera",
     "refresh": "Refresh RTSP camera status",
+    "statusStale": "Camera status could not be refreshed. Live views remain available while Miloco retries.",
     "edit": "Edit RTSP camera",
     "name": "Camera name",
     "url": "RTSP URL",

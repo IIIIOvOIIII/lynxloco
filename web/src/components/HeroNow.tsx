@@ -66,6 +66,7 @@ interface Props {
   scopeCameras: ScopeCamera[];
   /** 通用列表中的 RTSP 来源；不含任何 URI 或凭据。 */
   cameraSummaries?: CameraSummary[];
+  cameraStatusStale?: boolean;
   /** miot 上是否有 camera 类设备——区分两种空态 */
   miotHasCamera: boolean;
   /** 最多投喂给 miloco 的摄像头数(后端 MAX_ENABLED_CAMERAS，经 /api/miot/status 下发)。
@@ -112,6 +113,7 @@ export function HeroNow({
   petsEnabled = false,
   scopeCameras,
   cameraSummaries = [],
+  cameraStatusStale = false,
   miotHasCamera,
   maxStreamCams,
   onPersonClick,
@@ -225,6 +227,14 @@ export function HeroNow({
       )}
 
       {/* 摄像头 */}
+      {cameraStatusStale && (
+        <div
+          className="mb-3 rounded-lg border border-warning/40 bg-warning/10 px-3 py-2 text-caption text-warning"
+          role="status"
+        >
+          {t("rtspCamera.statusStale")}
+        </div>
+      )}
       <CameraSection
         scopeCameras={scopeCameras}
         streamingCams={streamingCams}

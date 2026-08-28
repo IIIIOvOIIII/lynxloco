@@ -83,7 +83,6 @@ class _ConfigStore:
     def mutate(self, mutation):
         with self._lock:
             self.events.append("persist")
-            self.write_count += 1
             if self.fail_write:
                 raise OSError("disk private detail")
             current = [source.model_dump() for source in self.sources]
@@ -91,6 +90,7 @@ class _ConfigStore:
             self.sources = [
                 RtspSourceSettings.model_validate(item) for item in raw_sources
             ]
+            self.write_count += 1
             return {"camera": {"rtsp_sources": raw_sources}}
 
 
@@ -787,6 +787,158 @@ async def test_two_service_instances_edit_different_sources_without_lost_update(
         SOURCE_ID: "First Updated",
         SECOND_SOURCE_ID: "Second Updated",
     }
+
+
+@pytest.mark.asyncio
+async def test_stale_blank_password_edit_cannot_overwrite_concurrent_password_update() -> (
+    None
+):
+    store = _ConfigStore([_source(enabled=True)])
+    perception = _Perception()
+    stale_probe_started = asyncio.Event()
+    release_stale_probe = asyncio.Event()
+
+    async def stale_probe(_candidate: RtspSourceSettings) -> RtspProbeResult:
+        stale_probe_started.set()
+        await release_stale_probe.wait()
+        return _probe_result()
+
+    stale = _transactional_service(store, perception, probe=stale_probe)
+    fresh = _transactional_service(store, perception)
+    stale_task = asyncio.create_task(
+        stale.edit_rtsp(SOURCE_ID, _upsert(name="Stale", password=""))
+    )
+    await stale_probe_started.wait()
+    await fresh.edit_rtsp(
+        SOURCE_ID, _upsert(name="Fresh", password="new-private-password")
+    )
+    release_stale_probe.set()
+
+    with pytest.raises(CameraConflictError) as caught:
+        await stale_task
+
+    assert caught.value.code == "camera_configuration_changed"
+    assert caught.value.safe_message == "Camera configuration changed; retry the update"
+    assert "new-private-password" not in repr(caught.value)
+    assert store.sources[0].name == "Fresh"
+    assert store.sources[0].password == "new-private-password"
+    assert store.write_count == 1
+    assert perception.sync_count == 1
+
+
+@pytest.mark.asyncio
+async def test_disabled_edit_cannot_become_enabled_without_probing_candidate() -> None:
+    store = _ConfigStore([_source(enabled=False)])
+    perception = _Perception()
+    stale_commit_started = threading.Event()
+    release_stale_commit = threading.Event()
+
+    def delayed_mutator(mutation):
+        stale_commit_started.set()
+        release_stale_commit.wait()
+        return store.mutate(mutation)
+
+    stale = CameraService(
+        _Miot(),
+        perception,
+        settings_loader=store.load,
+        sources_mutator=delayed_mutator,
+    )
+    fresh = _transactional_service(store, perception)
+    stale_task = asyncio.create_task(
+        stale.edit_rtsp(SOURCE_ID, _upsert(name="Unprobed edit"))
+    )
+    await asyncio.to_thread(stale_commit_started.wait)
+    await fresh.enable(SOURCE_ID)
+    release_stale_commit.set()
+
+    with pytest.raises(CameraConflictError) as caught:
+        await stale_task
+
+    assert caught.value.code == "camera_configuration_changed"
+    assert store.sources[0].enabled is True
+    assert store.sources[0].name == "Living Room"
+    assert store.write_count == 1
+    assert perception.sync_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("concurrent_change", ["disable", "delete", "connection"])
+async def test_enabled_edit_rejects_any_concurrent_source_revision_change(
+    concurrent_change: str,
+) -> None:
+    store = _ConfigStore([_source(enabled=True)])
+    perception = _Perception()
+    stale_probe_started = asyncio.Event()
+    release_stale_probe = asyncio.Event()
+
+    async def stale_probe(_candidate: RtspSourceSettings) -> RtspProbeResult:
+        stale_probe_started.set()
+        await release_stale_probe.wait()
+        return _probe_result()
+
+    stale = _transactional_service(store, perception, probe=stale_probe)
+    fresh = _transactional_service(store, perception)
+    stale_task = asyncio.create_task(
+        stale.edit_rtsp(SOURCE_ID, _upsert(name="Stale edit"))
+    )
+    await stale_probe_started.wait()
+    if concurrent_change == "disable":
+        await fresh.disable(SOURCE_ID)
+    elif concurrent_change == "delete":
+        await fresh.delete(SOURCE_ID)
+    else:
+        await fresh.edit_rtsp(
+            SOURCE_ID,
+            _upsert(name="Fresh connection", uri="rtsps://fresh.local/live"),
+        )
+    release_stale_probe.set()
+
+    with pytest.raises(CameraConflictError) as caught:
+        await stale_task
+
+    assert caught.value.code == "camera_configuration_changed"
+    assert store.write_count == 1
+    assert perception.sync_count == 1
+    if concurrent_change == "disable":
+        assert store.sources[0].enabled is False
+    elif concurrent_change == "delete":
+        assert store.sources == []
+    else:
+        assert store.sources[0].uri == "rtsps://fresh.local/live"
+        assert store.sources[0].name == "Fresh connection"
+
+
+@pytest.mark.asyncio
+async def test_edit_probe_does_not_hold_instance_write_lock() -> None:
+    store = _ConfigStore(
+        [_source(enabled=True), _source(SECOND_SOURCE_ID, enabled=True)]
+    )
+    probe_started = asyncio.Event()
+    release_probe = asyncio.Event()
+
+    async def probe(candidate: RtspSourceSettings) -> RtspProbeResult:
+        if candidate.id == SOURCE_ID:
+            probe_started.set()
+            await release_probe.wait()
+        return _probe_result()
+
+    service = _transactional_service(store, probe=probe)
+    edit_task = asyncio.create_task(
+        service.edit_rtsp(SOURCE_ID, _upsert(name="Updated"))
+    )
+    await probe_started.wait()
+    disable_task = asyncio.create_task(service.disable(SECOND_SOURCE_ID))
+    try:
+        await asyncio.wait_for(asyncio.shield(disable_task), timeout=0.5)
+        completed_while_probe_blocked = True
+    except TimeoutError:
+        completed_while_probe_blocked = False
+    finally:
+        release_probe.set()
+    await asyncio.gather(edit_task, disable_task)
+    assert completed_while_probe_blocked
+    assert store.sources[1].enabled is False
 
 
 @pytest.mark.asyncio
