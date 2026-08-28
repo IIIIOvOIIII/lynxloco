@@ -585,4 +585,6 @@ round 2 进一步把 owned task 的 reap/join 设为不可被重复 cancel 中�
 
 round 3 将“不可中断等待”和“清理后传播 outcome”拆成集中但独立的 helper。传播优先级固定为 cancellation-first：没有 owned failure 时重新抛原 `CancelledError`；单个 decode/opener/close failure 直接作为 cancellation cause；多个失败以 `BaseExceptionGroup` 作为 cause。没有 cancellation 时，单 failure 或 failure group 必须正常抛给既有安全错误分类或 task result，不得返回成功。close failure 不再被静默吞掉，decode 与 close 同时失败时两者都保留；实现不新增 raw error、URI 或凭据日志。session 42 passed，double-cancel 两族 25 轮共 175 cases 稳定通过，focused 矩阵为 217 passed、1 skipped，scoped Ruff/format/ty 与 diff/leak 门禁通过；独立复审前本节仍保持 `Partial`。
 
+round 4 修正 fixture E2E 的证据口径：rolling perception window 的列表长度可能在新帧持续到达时保持不变，因此不得再用长度增长证明感知继续。测试现在记录 viewer detach 前 `DeviceData.video` 的最大 `stream_ts`，在最后 viewer 离开、transcoder/队列清理且状态回到 `idle` 后，要求同一 session 产生更大的 `stream_ts` 并进入新的 `DeviceData` 快照，同时维持 `open_count == 1`。修改前两次同类失败均来自等待 rolling list length 增长超时；修改后 H.265 单项一次通过，完整 focused 矩阵一次通过（217 passed、1 skipped），没有扩大 timeout、增加重试或改动生产代码。独立复审前本节仍保持 `Partial`。
+
 未提供可持久化实验室 H.264/H.265 RTSP 来源，因此真实摄像机的首帧延迟、30 秒 fps、CPU 差值、并发观看者、队列丢包、长时间浏览器播放和断线恢复继续为 `not_measured`。fixture E2E 与 fixture smoke 只证明 Miloco 契约，不替代真实摄像机测量。OpenAI Responses Omni 仍未实施。

@@ -153,18 +153,27 @@ async def _wait_for_device_data(
     return result
 
 
-async def _wait_for_more_video(
+def _latest_video_stream_ts(data: DeviceData) -> int:
+    assert data.video
+    return max(frame.stream_ts for frame in data.video)
+
+
+async def _wait_for_newer_video(
     collector: MultimodalCollector,
     camera_id: str,
     *,
-    previous_count: int,
+    previous_stream_ts: int,
 ) -> DeviceData:
     result: DeviceData | None = None
 
     def ready() -> bool:
         nonlocal result
         result = collector.collect(camera_id, drain=False)
-        return result is not None and len(result.video) > previous_count
+        return (
+            result is not None
+            and bool(result.video)
+            and _latest_video_stream_ts(result) > previous_stream_ts
+        )
 
     await _wait_until(ready)
     assert result is not None
@@ -353,17 +362,19 @@ async def test_fixture_perception_and_uvicorn_live_view_share_one_rtsp_session(
         await _wait_until(lambda: hub.state(camera_id).viewer_count == 1)
         controlled.release_after_first.set()
         await asyncio.to_thread(controlled.after_six.wait, 3)
-        mid_data = await _wait_for_more_video(
+        first_latest_stream_ts = _latest_video_stream_ts(first_data)
+        mid_data = await _wait_for_newer_video(
             collector,
             camera_id,
-            previous_count=len(first_data.video),
+            previous_stream_ts=first_latest_stream_ts,
         )
         await _wait_until(lambda: hub.state(camera_id).dropped_packets > 0)
         slow_state = hub.state(camera_id)
         assert slow_state.viewer_count == 1
         assert slow_state.queue_depth <= 2
         assert slow_state.dropped_packets > 0
-        assert len(mid_data.video) > len(first_data.video)
+        mid_latest_stream_ts = _latest_video_stream_ts(mid_data)
+        assert mid_latest_stream_ts > first_latest_stream_ts
 
         await slow_viewer.aclose()
         slow_viewer = None
@@ -374,12 +385,12 @@ async def test_fixture_perception_and_uvicorn_live_view_share_one_rtsp_session(
 
         controlled.release_after_six.set()
         await asyncio.to_thread(controlled.eof.wait, 3)
-        final_data = await _wait_for_more_video(
+        final_data = await _wait_for_newer_video(
             collector,
             camera_id,
-            previous_count=len(mid_data.video),
+            previous_stream_ts=mid_latest_stream_ts,
         )
-        assert len(final_data.video) > len(mid_data.video)
+        assert _latest_video_stream_ts(final_data) > mid_latest_stream_ts
         assert opener.open_count == 1
     finally:
         if slow_first is not None and not slow_first.done():
