@@ -7,7 +7,6 @@ readonly ALLOWED_HOST_2="ai-lab02.esxi"
 readonly REMOTE_ROOT="/opt/miloco-lab"
 readonly REMOTE_RELEASES="${REMOTE_ROOT}/releases"
 readonly REMOTE_CONTROL_DIR="${REMOTE_ROOT}/control"
-readonly REMOTE_CONTROLLER="${REMOTE_CONTROL_DIR}/remote-release.sh"
 
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 case "$SCRIPT_PATH" in
@@ -20,6 +19,10 @@ operation=""
 host=""
 rollback_sha=""
 clean_sha=""
+receipt_archive_digest=""
+receipt_controller_digest=""
+receipt_allowlist_digest=""
+receipt_artifact_path=""
 
 log() {
     printf '[deploy] %s\n' "$*" >&2
@@ -119,10 +122,10 @@ assert_clean_worktree() {
 assert_clean_controller() {
     assert_clean_worktree
     git ls-files --error-unmatch -- \
-        deploy.sh deploy/ai-lab/remote-release.sh >/dev/null 2>&1 \
+        deploy.sh deploy/ai-lab/remote-release.sh deploy/ai-lab/artifact-files.txt >/dev/null 2>&1 \
         || die 3 "deployment controllers must be tracked"
     git diff --quiet "$clean_sha" -- \
-        deploy.sh deploy/ai-lab/remote-release.sh \
+        deploy.sh deploy/ai-lab/remote-release.sh deploy/ai-lab/artifact-files.txt \
         || die 3 "deployment controllers must match clean Git HEAD"
 }
 
@@ -245,15 +248,81 @@ sha256_file() {
     printf '%s\n' "${output%% *}"
 }
 
+write_build_receipt() {
+    local sha="$1" archive="$2" receipt="$3" temporary_receipt="$4"
+    local archive_digest controller_digest allowlist_digest artifact_path
+    archive_digest="$(sha256_file "$archive")"
+    controller_digest="$(sha256_file "$PROJECT_ROOT/deploy/ai-lab/remote-release.sh")"
+    allowlist_digest="$(sha256_file "$PROJECT_ROOT/deploy/ai-lab/artifact-files.txt")"
+    artifact_path="${archive#"$PROJECT_ROOT"/}"
+    [[ "$archive_digest" =~ ^[0-9a-f]{64}$ ]] || die 4 "invalid archive receipt digest"
+    [[ "$controller_digest" =~ ^[0-9a-f]{64}$ ]] || die 4 "invalid controller receipt digest"
+    [[ "$allowlist_digest" =~ ^[0-9a-f]{64}$ ]] || die 4 "invalid allowlist receipt digest"
+    [[ "$artifact_path" == "dist/lab/$sha/miloco-lab-${sha}.tar.gz" ]] \
+        || die 4 "invalid receipt artifact path"
+    printf 'schema=1\ngit_sha=%s\narchive_sha256=%s\ncontroller_sha256=%s\nallowlist_sha256=%s\nartifact_path=%s\n' \
+        "$sha" "$archive_digest" "$controller_digest" "$allowlist_digest" "$artifact_path" \
+        > "$temporary_receipt"
+    chmod 0444 "$temporary_receipt"
+    mv -f -- "$temporary_receipt" "$receipt"
+}
+
+read_release_receipt() {
+    local sha="$1" receipt line key value line_count=0 schema="" receipt_sha=""
+    local expected_archive expected_receipt actual_archive actual_controller actual_allowlist
+    expected_archive="$PROJECT_ROOT/dist/lab/$sha/miloco-lab-${sha}.tar.gz"
+    expected_receipt="$PROJECT_ROOT/dist/lab/$sha/miloco-lab-${sha}.receipt"
+    [[ -f "$expected_archive" && ! -L "$expected_archive" ]] || die 4 "receipt artifact is missing"
+    [[ -f "$expected_receipt" && ! -L "$expected_receipt" ]] || die 4 "build receipt is missing"
+    receipt_archive_digest=""
+    receipt_controller_digest=""
+    receipt_allowlist_digest=""
+    receipt_artifact_path=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line_count=$((line_count + 1))
+        key="${line%%=*}"
+        value="${line#*=}"
+        [[ "$key" != "$line" && -n "$value" ]] || die 4 "invalid build receipt"
+        case "$key" in
+            schema) [[ -z "$schema" ]] || die 4 "duplicate build receipt field"; schema="$value" ;;
+            git_sha) [[ -z "$receipt_sha" ]] || die 4 "duplicate build receipt field"; receipt_sha="$value" ;;
+            archive_sha256) [[ -z "$receipt_archive_digest" ]] || die 4 "duplicate build receipt field"; receipt_archive_digest="$value" ;;
+            controller_sha256) [[ -z "$receipt_controller_digest" ]] || die 4 "duplicate build receipt field"; receipt_controller_digest="$value" ;;
+            allowlist_sha256) [[ -z "$receipt_allowlist_digest" ]] || die 4 "duplicate build receipt field"; receipt_allowlist_digest="$value" ;;
+            artifact_path) [[ -z "$receipt_artifact_path" ]] || die 4 "duplicate build receipt field"; receipt_artifact_path="$value" ;;
+            *) die 4 "unknown build receipt field" ;;
+        esac
+    done < "$expected_receipt"
+    [[ "$line_count" -eq 6 && "$schema" == "1" && "$receipt_sha" == "$sha" ]] \
+        || die 4 "build receipt identity mismatch"
+    [[ "$receipt_archive_digest" =~ ^[0-9a-f]{64}$ \
+        && "$receipt_controller_digest" =~ ^[0-9a-f]{64}$ \
+        && "$receipt_allowlist_digest" =~ ^[0-9a-f]{64}$ ]] \
+        || die 4 "build receipt digest is invalid"
+    [[ "$receipt_artifact_path" == "dist/lab/$sha/miloco-lab-${sha}.tar.gz" ]] \
+        || die 4 "build receipt artifact path mismatch"
+    actual_archive="$(sha256_file "$expected_archive")"
+    actual_controller="$(sha256_file "$PROJECT_ROOT/deploy/ai-lab/remote-release.sh")"
+    actual_allowlist="$(sha256_file "$PROJECT_ROOT/deploy/ai-lab/artifact-files.txt")"
+    [[ "$actual_archive" == "$receipt_archive_digest" \
+        && "$actual_controller" == "$receipt_controller_digest" \
+        && "$actual_allowlist" == "$receipt_allowlist_digest" ]] \
+        || die 4 "build receipt content mismatch"
+}
+
 build_release() (
     local sha="$clean_sha"
-    local temp_root staging output_dir archive temporary_archive built_at
+    local temp_root staging output_dir archive receipt temporary_archive temporary_receipt built_at
     temp_root="$(mktemp -d)"
     temporary_archive=""
+    temporary_receipt=""
     cleanup_build_staging() {
         rm -rf -- "$temp_root"
         if [[ -n "$temporary_archive" && -e "$temporary_archive" ]]; then
             rm -f -- "$temporary_archive"
+        fi
+        if [[ -n "$temporary_receipt" && -e "$temporary_receipt" ]]; then
+            rm -f -- "$temporary_receipt"
         fi
     }
     trap cleanup_build_staging EXIT
@@ -311,7 +380,7 @@ build_release() (
         uv export --locked --no-dev --no-emit-workspace > "$staging/requirements/cli.txt"
     )
 
-    assert_clean_worktree
+    assert_clean_controller
     [[ "$clean_sha" == "$sha" ]] || die 3 "Git HEAD changed during build"
 
     built_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
@@ -324,11 +393,15 @@ build_release() (
 
     output_dir="$PROJECT_ROOT/dist/lab/$sha"
     archive="$output_dir/miloco-lab-${sha}.tar.gz"
+    receipt="$output_dir/miloco-lab-${sha}.receipt"
     install -d -m 0755 "$output_dir"
     temporary_archive="$(mktemp "$output_dir/.miloco-lab-${sha}.tar.gz.XXXXXX")"
     COPYFILE_DISABLE=1 tar -czf "$temporary_archive" -C "$staging" -- .
     mv -f -- "$temporary_archive" "$archive"
     temporary_archive=""
+    temporary_receipt="$(mktemp "$output_dir/.miloco-lab-${sha}.receipt.XXXXXX")"
+    write_build_receipt "$sha" "$archive" "$receipt" "$temporary_receipt"
+    temporary_receipt=""
     printf '%s\n' "$archive"
 )
 
@@ -351,28 +424,29 @@ preflight_remote() {
 }
 
 install_remote_controller() {
-    local target_host="$1" controller="$PROJECT_ROOT/deploy/ai-lab/remote-release.sh"
-    local controller_digest temporary_controller
-    controller_digest="$(sha256_file "$controller")"
+    local target_host="$1" controller_digest="$2"
+    local controller="$PROJECT_ROOT/deploy/ai-lab/remote-release.sh"
+    local controller_dir controller_path
     [[ "$controller_digest" =~ ^[0-9a-f]{64}$ ]] || die 4 "invalid controller digest"
-    temporary_controller="${REMOTE_CONTROL_DIR}/.remote-release.${controller_digest}.tmp"
+    controller_dir="${REMOTE_CONTROL_DIR}/${controller_digest}"
+    controller_path="${REMOTE_CONTROL_DIR}/${controller_digest}/remote-release.sh"
     ssh -- "$target_host" \
-        "set -euo pipefail; umask 077; test ! -L '${REMOTE_ROOT}'; install -d -o root -g root -m 0755 '${REMOTE_ROOT}'; test ! -L '${REMOTE_CONTROL_DIR}'; install -d -o root -g root -m 0755 '${REMOTE_CONTROL_DIR}'; cat > '${temporary_controller}'; printf '%s  %s\\n' '${controller_digest}' '${temporary_controller}' | sha256sum -c - >/dev/null; chown root:root '${temporary_controller}'; chmod 0555 '${temporary_controller}'; mv -f -- '${temporary_controller}' '${REMOTE_CONTROLLER}'" \
+        "set -euo pipefail; umask 077; test ! -L '${REMOTE_ROOT}'; install -d -o root -g root -m 0755 '${REMOTE_ROOT}'; test \"\$(stat -c '%u:%g' '${REMOTE_ROOT}')\" = 0:0; test ! -L '${REMOTE_CONTROL_DIR}'; install -d -o root -g root -m 0755 '${REMOTE_CONTROL_DIR}'; test \"\$(stat -c '%u:%g' '${REMOTE_CONTROL_DIR}')\" = 0:0; test ! -L '${controller_dir}'; install -d -o root -g root -m 0555 '${controller_dir}'; temporary=\$(mktemp '${REMOTE_CONTROL_DIR}/.${controller_digest}.XXXXXX'); trap 'rm -f -- \"\$temporary\"' EXIT; cat > \"\$temporary\"; printf '%s  %s\\n' '${controller_digest}' \"\$temporary\" | sha256sum -c - >/dev/null; chown root:root \"\$temporary\"; chmod 0555 \"\$temporary\"; if ! ln \"\$temporary\" '${controller_path}' 2>/dev/null; then test -e '${controller_path}'; fi; test -f '${controller_path}'; test ! -L '${controller_path}'; test \"\$(stat -c '%u:%g' '${controller_path}')\" = 0:0; printf '%s  %s\\n' '${controller_digest}' '${controller_path}' | sha256sum -c - >/dev/null; chmod 0555 '${controller_dir}'; test \"\$(realpath -e '${controller_path}')\" = '${controller_path}'" \
         < "$controller"
 }
 
 deploy_remote() {
     local target_host="$1"
-    local archive sha archive_digest
+    local archive sha controller_path
     sha="$clean_sha"
     archive="$PROJECT_ROOT/dist/lab/$sha/miloco-lab-${sha}.tar.gz"
-    [[ -f "$archive" && ! -L "$archive" ]] || die 4 "build the exact clean SHA before remote operations"
-    archive_digest="$(sha256_file "$archive")"
-    [[ "$archive_digest" =~ ^[0-9a-f]{64}$ ]] || die 4 "invalid archive digest"
-    preflight_remote "$target_host"
-    install_remote_controller "$target_host"
-    ssh -- "$target_host" "$REMOTE_CONTROLLER" receive "$target_host" "$sha" "$archive_digest" < "$archive"
-    ssh -- "$target_host" "$REMOTE_CONTROLLER" activate "$target_host" "$sha"
+    read_release_receipt "$sha"
+    controller_path="${REMOTE_CONTROL_DIR}/${receipt_controller_digest}/remote-release.sh"
+    install_remote_controller "$target_host" "$receipt_controller_digest"
+    ssh -- "$target_host" "$controller_path" preflight "$target_host"
+    ssh -- "$target_host" "$controller_path" transaction "$target_host" "$sha" \
+        "$receipt_archive_digest" "$receipt_controller_digest" "$receipt_allowlist_digest" \
+        < "$archive"
 }
 
 # DISPATCH_START

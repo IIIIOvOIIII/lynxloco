@@ -9,9 +9,11 @@ readonly DEPLOY_STATE_DIR="$LAB_ROOT/deploy-state"
 readonly CURRENT_FILE="$DEPLOY_STATE_DIR/current"
 readonly PREVIOUS_FILE="$DEPLOY_STATE_DIR/previous"
 readonly INCOMING_DIR="$LAB_ROOT/incoming"
+readonly CONTROL_DIR="$LAB_ROOT/control"
 readonly ARTIFACT_RECORDS_DIR="$DEPLOY_STATE_DIR/artifacts"
 readonly ACCEPTED_DIR="$DEPLOY_STATE_DIR/accepted"
 readonly TRANSITION_LOCK_FILE="$DEPLOY_STATE_DIR/transition.lock"
+readonly REMOTE_ALLOWLIST_SHA256="02852c989db9f4efd27d1df7e3872f60af982175eb7e1e9f4bf9b751f1754ddd"
 readonly HEALTH_TIMEOUT_SECONDS=120
 readonly MINIMUM_DISK_KIB=5242880
 readonly ROLLBACK_FAILED_EXIT_CODE=70
@@ -71,7 +73,7 @@ compose_command() {
     MILOCO_RELEASE_SHA="$sha" \
     MILOCO_CPU_LIMIT="$cpu_limit" \
     MILOCO_MEMORY_LIMIT="$memory_limit" \
-        timeout --signal=TERM --kill-after=2s "${timeout_seconds}s" \
+        timeout --signal=KILL "${timeout_seconds}s" \
         docker compose "${compose_args[@]}"
 }
 
@@ -79,7 +81,7 @@ docker_command() {
     local timeout_seconds="$1"
     shift
     [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] || return 2
-    timeout --signal=TERM --kill-after=2s "${timeout_seconds}s" docker "$@"
+    timeout --signal=KILL "${timeout_seconds}s" docker "$@"
 }
 
 version_at_least() {
@@ -129,6 +131,7 @@ preflight_release() {
     listeners="$(ss -H -ltnp 'sport = :1810' 2>/dev/null || true)"
     if [[ -n "$listeners" ]]; then
         [[ -f "$CURRENT_FILE" && ! -L "$CURRENT_FILE" ]] || die 4 "port 1810 is owned by an unrelated listener"
+        require_safe_record "$CURRENT_FILE" || die 4 "current state record is unsafe"
         current_sha="$(<"$CURRENT_FILE")"
         validate_sha "$current_sha"
         container_id="$(compose_command "$host" "$current_sha" 15 ps -q miloco 2>/dev/null || true)"
@@ -185,6 +188,7 @@ verify_release_tree() {
     while IFS= read -r -d '' file; do
         relative="${file#"$release"/}"
         [[ "$relative" == "SHA256SUMS" ]] && continue
+        remote_path_is_allowlisted "$relative" || die 4 "release contains a non-allowlisted file"
         local checksum_match=0 checksummed_path
         for checksummed_path in "${checksummed_paths[@]}"; do
             if [[ "$checksummed_path" == "$relative" ]]; then
@@ -200,12 +204,26 @@ verify_release_tree() {
     ) >/dev/null
 }
 
+remote_path_is_allowlisted() {
+    case "$1" in
+        Dockerfile|compose.yaml|container-entrypoint.sh|remote-release.sh|release.json|SHA256SUMS) ;;
+        requirements/backend.txt|requirements/cli.txt|requirements/acceptance.txt) ;;
+        acceptance/*) ;;
+        wheels/miloco-*.whl|wheels/miloco_cli-*.whl|wheels/miloco_miot-*-manylinux_2_28_x86_64.whl) ;;
+        models/miloco-models-*.tar.gz) ;;
+        *) return 1 ;;
+    esac
+}
+
 verify_release() {
     local sha="$1"
     validate_sha "$sha"
     local release="$RELEASES_DIR/$sha"
     [[ "$release" == "/opt/miloco-lab/releases/$sha" ]] || die 4 "release path mismatch"
     [[ ! -L "$LAB_ROOT" && ! -L "$RELEASES_DIR" && ! -L "$STATE_DIR" && ! -L "$DEPLOY_STATE_DIR" ]] || die 4 "lab paths must not be symlinks"
+    require_safe_directory "$LAB_ROOT" || die 4 "lab root is unsafe"
+    require_safe_directory "$RELEASES_DIR" || die 4 "release parent is unsafe"
+    require_safe_directory "$release" || die 4 "release directory is unsafe"
     verify_release_tree "$release" "$sha"
 }
 
@@ -271,19 +289,17 @@ validate_archive_members() {
     done
 }
 
-receive_release() {
-    local host="$1" sha="$2" expected_digest="$3"
-    require_root
-    validate_host "$host"
-    validate_sha "$sha"
+receive_release_locked() {
+    local host="$1" sha="$2" expected_digest="$3" controller_digest="$4" allowlist_digest="$5"
     [[ "$expected_digest" =~ ^[0-9a-f]{64}$ ]] || die 2 "invalid archive digest"
+    [[ "$controller_digest" =~ ^[0-9a-f]{64}$ ]] || die 2 "invalid controller digest"
+    [[ "$allowlist_digest" == "$REMOTE_ALLOWLIST_SHA256" ]] || die 4 "allowlist digest mismatch"
     [[ ! -L "$LAB_ROOT" && ! -L "$RELEASES_DIR" && ! -L "$INCOMING_DIR" && ! -L "$DEPLOY_STATE_DIR" ]] || die 4 "lab paths must not be symlinks"
-    acquire_transition_lock
     install -d -o root -g root -m 0755 "$LAB_ROOT" "$RELEASES_DIR" "$DEPLOY_STATE_DIR" "$ARTIFACT_RECORDS_DIR"
     install -d -o root -g root -m 0700 "$INCOMING_DIR"
     local release="$RELEASES_DIR/$sha"
 
-    local incoming staging published_release="" recorded_digest
+    local incoming staging published_release=""
     incoming="$(mktemp "$INCOMING_DIR/archive.${sha}.XXXXXX.tar.gz")"
     staging=""
     receive_cleanup() {
@@ -300,8 +316,11 @@ receive_release() {
     if [[ -e "$release" || -L "$release" ]]; then
         [[ -d "$release" && ! -L "$release" ]] || die 4 "existing release path is unsafe"
         verify_release_tree "$release" "$sha"
-        recorded_digest="$(artifact_digest_for "$sha")" || die 4 "existing artifact digest record is missing"
-        [[ "$recorded_digest" == "$expected_digest" ]] || die 4 "existing release artifact digest mismatch"
+        read_artifact_record "$sha" || die 4 "existing artifact digest record is missing"
+        [[ "$artifact_archive_digest" == "$expected_digest" \
+            && "$artifact_controller_digest" == "$controller_digest" \
+            && "$artifact_allowlist_digest" == "$allowlist_digest" ]] \
+            || die 4 "existing release artifact receipt mismatch"
         trap - EXIT
         rm -f -- "$incoming"
         return 0
@@ -322,7 +341,12 @@ receive_release() {
     published_release="$release"
     mv -- "$staging" "$release"
     staging=""
-    atomic_write "$ARTIFACT_RECORDS_DIR/$sha" "$expected_digest"
+    atomic_write "$ARTIFACT_RECORDS_DIR/$sha" \
+        "schema=1
+git_sha=$sha
+archive_sha256=$expected_digest
+controller_sha256=$controller_digest
+allowlist_sha256=$allowlist_digest"
     published_release=""
     trap - EXIT
     rm -f -- "$incoming"
@@ -330,8 +354,18 @@ receive_release() {
 
 atomic_write() {
     local destination="$1" value="$2"
-    local temporary="${destination}.tmp.$$"
+    local parent basename temporary
+    parent="${destination%/*}"
+    basename="${destination##*/}"
+    [[ "$parent" != "$destination" && "$basename" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+    require_safe_directory "$parent" || return 1
+    [[ ! -L "$destination" ]] || return 1
+    if [[ -e "$destination" ]]; then
+        require_safe_record "$destination" || return 1
+    fi
+    temporary="$(mktemp "$parent/.${basename}.XXXXXX")" || return 1
     if ! printf '%s\n' "$value" > "$temporary"; then
+        rm -f -- "$temporary"
         return 1
     fi
     if ! chown root:root "$temporary" || ! chmod 0644 "$temporary"; then
@@ -342,13 +376,46 @@ atomic_write() {
         rm -f -- "$temporary"
         return 1
     fi
+    require_safe_record "$destination"
 }
 
 acquire_transition_lock() {
-    [[ ! -L "$DEPLOY_STATE_DIR" && ! -L "$TRANSITION_LOCK_FILE" ]] || die 4 "deployment lock path must not be a symlink"
-    install -d -o root -g root -m 0755 "$DEPLOY_STATE_DIR"
+    prepare_transaction_paths
+    [[ ! -L "$TRANSITION_LOCK_FILE" ]] || die 4 "deployment lock path must not be a symlink"
     exec 9> "$TRANSITION_LOCK_FILE"
+    chown root:root "$TRANSITION_LOCK_FILE"
+    chmod 0600 "$TRANSITION_LOCK_FILE"
+    require_safe_record "$TRANSITION_LOCK_FILE" || die 4 "deployment lock is unsafe"
     flock -n 9 || die 6 "deployment transition is locked"
+}
+
+verify_controller_self() {
+    local expected_digest="$1" expected_path actual_digest actual_path
+    [[ "$expected_digest" =~ ^[0-9a-f]{64}$ ]] || die 2 "invalid controller digest"
+    expected_path="$CONTROL_DIR/$expected_digest/remote-release.sh"
+    require_safe_directory "$CONTROL_DIR" || die 4 "control directory is unsafe"
+    require_safe_directory "$CONTROL_DIR/$expected_digest" || die 4 "controller digest directory is unsafe"
+    actual_path="$(realpath -e "$0")" || die 4 "controller path cannot be resolved"
+    [[ "$actual_path" == "$expected_path" && -f "$actual_path" && ! -L "$actual_path" ]] \
+        || die 4 "controller path is not digest-addressed"
+    [[ "$(stat -c '%u:%g' "$actual_path")" == "0:0" ]] || die 4 "controller must be root owned"
+    actual_digest="$(sha256sum "$actual_path")"
+    actual_digest="${actual_digest%% *}"
+    [[ "$actual_digest" == "$expected_digest" ]] || die 4 "controller digest mismatch"
+}
+
+transaction_release() {
+    local host="$1" sha="$2" archive_digest="$3" controller_digest="$4" allowlist_digest="$5"
+    require_root
+    validate_host "$host"
+    validate_sha "$sha"
+    [[ "$archive_digest" =~ ^[0-9a-f]{64}$ \
+        && "$controller_digest" =~ ^[0-9a-f]{64}$ \
+        && "$allowlist_digest" =~ ^[0-9a-f]{64}$ ]] || die 2 "invalid transaction digest"
+    acquire_transition_lock
+    verify_controller_self "$controller_digest"
+    receive_release_locked "$host" "$sha" "$archive_digest" "$controller_digest" "$allowlist_digest"
+    build_and_activate_locked "$host" "$sha"
 }
 
 compose_up() {
@@ -385,7 +452,7 @@ probe_http_status() {
     }
     probe_timeout="$remaining"
     (( probe_timeout <= 3 )) || probe_timeout=3
-    http_status="$(timeout --signal=TERM --kill-after=1s "${remaining}s" \
+    http_status="$(timeout --signal=KILL "${remaining}s" \
         curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
         --connect-timeout "$probe_timeout" --max-time "$probe_timeout" \
         http://127.0.0.1:1810/health 2>/dev/null || true)"
@@ -439,54 +506,252 @@ collect_failure_evidence() {
         "$container_present" "$health_status" "$http_status" >&2
 }
 
-artifact_digest_for() {
-    local sha="$1" record="$ARTIFACT_RECORDS_DIR/$sha" digest
+require_safe_directory() {
+    local directory="$1" lab_real directory_real
+    [[ -d "$directory" && ! -L "$directory" ]] || return 1
+    [[ "$(stat -c '%u:%g' "$directory")" == "0:0" ]] || return 1
+    lab_real="$(realpath -e "$LAB_ROOT")" || return 1
+    directory_real="$(realpath -e "$directory")" || return 1
+    case "$directory_real" in
+        "$lab_real"|"$lab_real"/*) ;;
+        *) return 1 ;;
+    esac
+}
+
+ensure_safe_directory() {
+    local directory="$1" mode="$2" owner="$3" group="$4"
+    case "$directory" in
+        "$LAB_ROOT"|"$LAB_ROOT"/*) ;;
+        *) die 4 "directory escapes lab root" ;;
+    esac
+    [[ ! -L "$directory" ]] || die 4 "lab child symlink is forbidden"
+    if [[ ! -e "$directory" ]]; then
+        install -d -o "$owner" -g "$group" -m "$mode" "$directory"
+    fi
+    require_safe_directory "$directory" || die 4 "lab directory is not root-owned and contained"
+}
+
+prepare_transaction_paths() {
+    local child
+    for child in "$LAB_ROOT" "$RELEASES_DIR" "$DEPLOY_STATE_DIR" "$INCOMING_DIR" \
+        "$ARTIFACT_RECORDS_DIR" "$ACCEPTED_DIR"; do
+        [[ ! -L "$child" ]] || die 4 "lab child symlink is forbidden"
+    done
+    ensure_safe_directory "$LAB_ROOT" 0755 root root
+    ensure_safe_directory "$RELEASES_DIR" 0755 root root
+    ensure_safe_directory "$DEPLOY_STATE_DIR" 0755 root root
+    ensure_safe_directory "$INCOMING_DIR" 0700 root root
+    ensure_safe_directory "$ARTIFACT_RECORDS_DIR" 0755 root root
+    ensure_safe_directory "$ACCEPTED_DIR" 0755 root root
+}
+
+require_safe_record() {
+    local record="$1" parent basename lab_real record_real
+    parent="${record%/*}"
+    basename="${record##*/}"
+    [[ "$parent" != "$record" && "$basename" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+    require_safe_directory "$parent" || return 1
     [[ -f "$record" && ! -L "$record" ]] || return 1
-    digest="$(<"$record")"
-    [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
-    printf '%s\n' "$digest"
+    [[ "$(stat -c '%u:%g' "$record")" == "0:0" ]] || return 1
+    lab_real="$(realpath -e "$LAB_ROOT")" || return 1
+    record_real="$(realpath -e "$record")" || return 1
+    case "$record_real" in
+        "$lab_real"/*) ;;
+        *) return 1 ;;
+    esac
+}
+
+read_artifact_record() {
+    local sha="$1" record="$ARTIFACT_RECORDS_DIR/$sha" line key value count=0
+    artifact_archive_digest=""
+    artifact_controller_digest=""
+    artifact_allowlist_digest=""
+    artifact_record_sha=""
+    artifact_record_schema=""
+    require_safe_directory "$DEPLOY_STATE_DIR" || return 1
+    require_safe_directory "$ARTIFACT_RECORDS_DIR" || return 1
+    require_safe_record "$record" || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        count=$((count + 1))
+        key="${line%%=*}"
+        value="${line#*=}"
+        [[ "$key" != "$line" && -n "$value" ]] || return 1
+        case "$key" in
+            schema) [[ -z "$artifact_record_schema" ]] || return 1; artifact_record_schema="$value" ;;
+            git_sha) [[ -z "$artifact_record_sha" ]] || return 1; artifact_record_sha="$value" ;;
+            archive_sha256) [[ -z "$artifact_archive_digest" ]] || return 1; artifact_archive_digest="$value" ;;
+            controller_sha256) [[ -z "$artifact_controller_digest" ]] || return 1; artifact_controller_digest="$value" ;;
+            allowlist_sha256) [[ -z "$artifact_allowlist_digest" ]] || return 1; artifact_allowlist_digest="$value" ;;
+            *) return 1 ;;
+        esac
+    done < "$record"
+    [[ "$count" -eq 5 && "$artifact_record_schema" == "1" && "$artifact_record_sha" == "$sha" \
+        && "$artifact_archive_digest" =~ ^[0-9a-f]{64}$ \
+        && "$artifact_controller_digest" =~ ^[0-9a-f]{64}$ \
+        && "$artifact_allowlist_digest" == "$REMOTE_ALLOWLIST_SHA256" ]]
+}
+
+artifact_digest_for() {
+    read_artifact_record "$1" || return 1
+    printf '%s\n' "$artifact_archive_digest"
+}
+
+read_acceptance_marker() {
+    local sha="$1" marker="$ACCEPTED_DIR/$sha" line key value count=0
+    marker_schema=""
+    marker_archive_digest=""
+    marker_runtime_image_id=""
+    marker_acceptance_image_id=""
+    require_safe_directory "$DEPLOY_STATE_DIR" || return 1
+    require_safe_directory "$ACCEPTED_DIR" || return 1
+    require_safe_record "$marker" || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        count=$((count + 1))
+        key="${line%%=*}"
+        value="${line#*=}"
+        [[ "$key" != "$line" && -n "$value" ]] || return 1
+        case "$key" in
+            schema) [[ -z "$marker_schema" ]] || return 1; marker_schema="$value" ;;
+            archive_sha256) [[ -z "$marker_archive_digest" ]] || return 1; marker_archive_digest="$value" ;;
+            runtime_image_id) [[ -z "$marker_runtime_image_id" ]] || return 1; marker_runtime_image_id="$value" ;;
+            acceptance_image_id) [[ -z "$marker_acceptance_image_id" ]] || return 1; marker_acceptance_image_id="$value" ;;
+            *) return 1 ;;
+        esac
+    done < "$marker"
+    [[ "$count" -eq 4 && "$marker_schema" == "1" \
+        && "$marker_archive_digest" =~ ^[0-9a-f]{64}$ \
+        && "$marker_runtime_image_id" =~ ^sha256:[0-9a-f]{64}$ \
+        && "$marker_acceptance_image_id" =~ ^sha256:[0-9a-f]{64}$ ]]
+}
+
+docker_image_id() {
+    local image="$1" image_id
+    image_id="$(docker_command 15 image inspect --format '{{.Id}}' "$image" 2>/dev/null)" || return 2
+    [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]] || return 2
+    printf '%s\n' "$image_id"
 }
 
 mark_acceptance_success() {
-    local sha="$1" digest
-    digest="$(artifact_digest_for "$sha")" || die 4 "artifact digest record is missing"
-    [[ ! -L "$ACCEPTED_DIR" ]] || die 4 "acceptance marker path must not be a symlink"
-    install -d -o root -g root -m 0755 "$ACCEPTED_DIR"
-    atomic_write "$ACCEPTED_DIR/$sha" "$digest"
+    local sha="$1" runtime_image_id="$2" acceptance_image_id="$3"
+    read_artifact_record "$sha" || return 1
+    [[ "$runtime_image_id" =~ ^sha256:[0-9a-f]{64}$ \
+        && "$acceptance_image_id" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+    atomic_write "$ACCEPTED_DIR/$sha" \
+        "schema=1
+archive_sha256=$artifact_archive_digest
+runtime_image_id=$runtime_image_id
+acceptance_image_id=$acceptance_image_id"
 }
 
-rollback_capable() {
-    local sha="$1" digest marker runtime_image acceptance_image
+invalidate_acceptance() {
+    local sha="$1" marker="$ACCEPTED_DIR/$sha"
+    [[ ! -L "$ACCEPTED_DIR" && ! -L "$marker" ]] || return 1
+    if [[ -e "$marker" ]]; then
+        require_safe_record "$marker" || return 1
+        rm -f -- "$marker" || return 1
+    fi
+    [[ ! -e "$marker" && ! -L "$marker" ]]
+}
+
+image_tag_absent() {
+    local image="$1" listed
+    listed="$(docker_command 15 image ls --quiet --no-trunc "$image" 2>/dev/null)" || return 1
+    [[ -z "$listed" ]]
+}
+
+remove_image_tags() {
+    local sha="$1" runtime_image="miloco-lab:$sha" acceptance_image="miloco-lab-acceptance:$sha"
+    if ! docker_command 30 image rm "$runtime_image" "$acceptance_image" >/dev/null 2>&1; then
+        image_tag_absent "$runtime_image" || return 1
+        image_tag_absent "$acceptance_image" || return 1
+        return 0
+    fi
+    image_tag_absent "$runtime_image" || return 1
+    image_tag_absent "$acceptance_image" || return 1
+}
+
+release_capability() {
+    local sha="$1" runtime_id acceptance_id
     validate_sha "$sha"
-    (verify_release "$sha") >/dev/null 2>&1 || return 1
-    digest="$(artifact_digest_for "$sha")" || return 1
-    marker="$ACCEPTED_DIR/$sha"
-    [[ -f "$marker" && ! -L "$marker" && "$(<"$marker")" == "$digest" ]] || return 1
-    runtime_image="miloco-lab:$sha"
-    acceptance_image="miloco-lab-acceptance:$sha"
-    docker_command 15 image inspect "$runtime_image" >/dev/null 2>&1 || return 1
-    docker_command 15 image inspect "$acceptance_image" >/dev/null 2>&1 || return 1
+    if ! read_artifact_record "$sha" || ! read_acceptance_marker "$sha"; then
+        printf 'definitively_invalid\n'
+        return 0
+    fi
+    if [[ "$marker_archive_digest" != "$artifact_archive_digest" ]]; then
+        printf 'definitively_invalid\n'
+        return 0
+    fi
+    if ! (verify_release "$sha") >/dev/null 2>&1; then
+        printf 'probe_error\n'
+        return 0
+    fi
+    runtime_id="$(docker_image_id "miloco-lab:$sha")" || {
+        printf 'probe_error\n'
+        return 0
+    }
+    acceptance_id="$(docker_image_id "miloco-lab-acceptance:$sha")" || {
+        printf 'probe_error\n'
+        return 0
+    }
+    if [[ "$runtime_id" != "$marker_runtime_image_id" \
+        || "$acceptance_id" != "$marker_acceptance_image_id" ]]; then
+        printf 'definitively_invalid\n'
+        return 0
+    fi
+    printf 'capable\n'
+}
+
+build_images_and_accept() {
+    local host="$1" sha="$2" release="$3" runtime_image_id acceptance_image_id
+    invalidate_acceptance "$sha" || return 1
+    remove_image_tags "$sha" || return 1
+    if ! docker_command 3600 build --platform linux/amd64 --target runtime -t "miloco-lab:$sha" "$release"; then
+        remove_image_tags "$sha" || log "build_cleanup_failed sha=$sha"
+        return 1
+    fi
+    if ! docker_command 3600 build --platform linux/amd64 --target acceptance -t "miloco-lab-acceptance:$sha" "$release"; then
+        remove_image_tags "$sha" || log "build_cleanup_failed sha=$sha"
+        return 1
+    fi
+    if ! docker_command 900 run --rm --network none "miloco-lab-acceptance:$sha"; then
+        remove_image_tags "$sha" || log "build_cleanup_failed sha=$sha"
+        return 1
+    fi
+    runtime_image_id="$(docker_image_id "miloco-lab:$sha")" || {
+        remove_image_tags "$sha" || log "build_cleanup_failed sha=$sha"
+        return 1
+    }
+    acceptance_image_id="$(docker_image_id "miloco-lab-acceptance:$sha")" || {
+        remove_image_tags "$sha" || log "build_cleanup_failed sha=$sha"
+        return 1
+    }
+    if ! mark_acceptance_success "$sha" "$runtime_image_id" "$acceptance_image_id"; then
+        remove_image_tags "$sha" || log "build_cleanup_failed sha=$sha"
+        return 1
+    fi
 }
 
 restore_previous() {
-    local host="$1" previous_sha="$2"
+    local host="$1" previous_sha="$2" capability
     [[ -n "$previous_sha" ]] || return 1
     validate_sha "$previous_sha"
-    rollback_capable "$previous_sha" || return 1
+    capability="$(release_capability "$previous_sha")"
+    [[ "$capability" == "capable" ]] || return 1
     compose_up "$host" "$previous_sha" || return 1
     wait_for_health "$host" "$previous_sha" || return 1
     atomic_write "$CURRENT_FILE" "$previous_sha" || return 1
 }
 
-stop_candidate() {
+remove_candidate() {
     local host="$1" candidate_sha="$2" container_id query_status
-    compose_command "$host" "$candidate_sha" 30 stop --timeout 15 miloco || return 1
-    if container_id="$(compose_container_id "$host" "$candidate_sha" 10)"; then
+    compose_command "$host" "$candidate_sha" 30 rm --stop --force miloco || return 1
+    if container_id="$(compose_command "$host" "$candidate_sha" 10 ps --all -q miloco 2>/dev/null)"; then
+        [[ -z "$container_id" ]] && return 0
         return 1
     else
         query_status="$?"
     fi
-    (( query_status == 1 ))
+    (( query_status == 0 ))
 }
 
 transition_exit() {
@@ -498,7 +763,7 @@ transition_exit() {
         restore_previous "$transition_host" "$transition_previous"
         recovery_status="$?"
     else
-        stop_candidate "$transition_host" "$transition_candidate"
+        remove_candidate "$transition_host" "$transition_candidate"
         recovery_status="$?"
     fi
     set -e
@@ -527,20 +792,39 @@ commit_transition() {
 
 retain_rollback_history() {
     local current_sha="$1"
-    local historical_kept=0 protected_previous="" record release candidate
-    rollback_capable "$current_sha" || die 4 "current release is not rollback capable"
+    local historical_kept=0 protected_previous="" record release candidate capability index release_records
+    local -a retention_candidates=() retention_capabilities=()
+    capability="$(release_capability "$current_sha")"
+    [[ "$capability" == "capable" ]] || {
+        log "retention_probe_error sha=$current_sha state=$capability"
+        return 1
+    }
     if [[ -f "$PREVIOUS_FILE" && ! -L "$PREVIOUS_FILE" ]]; then
+        require_safe_record "$PREVIOUS_FILE" || {
+            log "retention_probe_error sha=previous state=unsafe_record"
+            return 1
+        }
         protected_previous="$(<"$PREVIOUS_FILE")"
-        [[ "$protected_previous" =~ ^[0-9a-f]{40}$ ]] || protected_previous=""
+        [[ "$protected_previous" =~ ^[0-9a-f]{40}$ ]] || {
+            log "retention_probe_error sha=previous state=invalid_sha"
+            return 1
+        }
     fi
     if [[ -n "$protected_previous" && "$protected_previous" != "$current_sha" ]]; then
-        if rollback_capable "$protected_previous"; then
-            historical_kept=1
-        else
-            remove_release_pair "$protected_previous"
-            protected_previous=""
-        fi
+        capability="$(release_capability "$protected_previous")"
+        case "$capability" in
+            capable) historical_kept=1 ;;
+            definitively_invalid) ;;
+            probe_error|*)
+                log "retention_probe_error sha=$protected_previous state=$capability"
+                return 1
+                ;;
+        esac
     fi
+    release_records="$(find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -rn)" || {
+        log "retention_probe_error sha=listing state=probe_error"
+        return 1
+    }
     while IFS= read -r record; do
         release="${record#* }"
         candidate="${release##*/}"
@@ -550,35 +834,105 @@ retain_rollback_history() {
         if [[ -n "$protected_previous" && "$candidate" == "$protected_previous" ]]; then
             continue
         fi
-        if ! rollback_capable "$candidate"; then
-            remove_release_pair "$candidate"
+        capability="$(release_capability "$candidate")"
+        case "$capability" in
+            capable|definitively_invalid) ;;
+            probe_error|*)
+                log "retention_probe_error sha=$candidate state=$capability"
+                return 1
+                ;;
+        esac
+        retention_candidates+=("$candidate")
+        retention_capabilities+=("$capability")
+    done <<< "$release_records"
+    for ((index = 0; index < ${#retention_candidates[@]}; index++)); do
+        candidate="${retention_candidates[$index]}"
+        capability="${retention_capabilities[$index]}"
+        if [[ "$capability" == "definitively_invalid" ]]; then
+            remove_release_pair "$candidate" || return 1
         elif (( historical_kept < 2 )); then
             historical_kept=$((historical_kept + 1))
         else
-            remove_release_pair "$candidate"
+            remove_release_pair "$candidate" || return 1
         fi
-    done < <(find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -rn)
+    done
 }
 
 remove_release_pair() {
-    local sha="$1" release
+    local sha="$1" release record marker protected_sha
     validate_sha "$sha"
+    for record in "$CURRENT_FILE" "$PREVIOUS_FILE"; do
+        if [[ -e "$record" || -L "$record" ]]; then
+            require_safe_record "$record" || {
+                log "cleanup_failed sha=$sha reason=unsafe_state_record"
+                return 1
+            }
+            protected_sha="$(<"$record")"
+            [[ "$protected_sha" =~ ^[0-9a-f]{40}$ ]] || {
+                log "cleanup_failed sha=$sha reason=invalid_state_record"
+                return 1
+            }
+            if [[ "$protected_sha" == "$sha" ]]; then
+                log "cleanup_failed sha=$sha reason=protected_state"
+                return 1
+            fi
+        fi
+    done
     release="$RELEASES_DIR/$sha"
     [[ "$release" == "/opt/miloco-lab/releases/$sha" ]] || die 4 "release cleanup path mismatch"
-    [[ ! -L "$release" ]] || die 4 "release cleanup symlink is forbidden"
-    [[ ! -e "$release" ]] || rm -rf -- "$release"
-    docker_command 30 image rm "miloco-lab:$sha" "miloco-lab-acceptance:$sha" >/dev/null 2>&1 || true
+    if [[ -e "$release" || -L "$release" ]]; then
+        [[ ! -L "$release" ]] || die 4 "release cleanup symlink is forbidden"
+        require_safe_directory "$release" || {
+            log "cleanup_failed sha=$sha reason=unsafe_release"
+            return 1
+        }
+    fi
+    for record in "$ARTIFACT_RECORDS_DIR/$sha" "$ACCEPTED_DIR/$sha"; do
+        if [[ -e "$record" || -L "$record" ]]; then
+            require_safe_record "$record" || {
+                log "cleanup_failed sha=$sha reason=unsafe_record"
+                return 1
+            }
+        fi
+    done
+    remove_image_tags "$sha" || {
+        log "cleanup_failed sha=$sha reason=image_removal"
+        return 1
+    }
+    if [[ -e "$release" ]]; then
+        rm -rf -- "$release" || return 1
+    fi
+    [[ ! -e "$release" && ! -L "$release" ]] || {
+        log "cleanup_failed sha=$sha reason=release_present"
+        return 1
+    }
+    for record in "$ARTIFACT_RECORDS_DIR/$sha" "$ACCEPTED_DIR/$sha"; do
+        if [[ -e "$record" || -L "$record" ]]; then
+            require_safe_record "$record" || {
+                log "cleanup_failed sha=$sha reason=unsafe_record"
+                return 1
+            }
+            rm -f -- "$record" || return 1
+        fi
+        [[ ! -e "$record" && ! -L "$record" ]] || {
+            log "cleanup_failed sha=$sha reason=record_present"
+            return 1
+        }
+    done
 }
 
 activate_release() {
-    local host="$1" sha="$2"
+    local host="$1" sha="$2" capability
     validate_host "$host"
-    rollback_capable "$sha" || die 4 "release is not verified and acceptance-approved"
+    capability="$(release_capability "$sha")"
+    [[ "$capability" == "capable" ]] || die 4 "release is not verified and acceptance-approved"
     [[ ! -L "$DEPLOY_STATE_DIR" ]] || die 4 "deployment state path must not be a symlink"
+    [[ ! -L "$CURRENT_FILE" && ! -L "$PREVIOUS_FILE" ]] || die 4 "deployment state record is unsafe"
     install -d -o root -g root -m 0755 "$DEPLOY_STATE_DIR"
 
     local previous_sha=""
     if [[ -f "$CURRENT_FILE" && ! -L "$CURRENT_FILE" ]]; then
+        require_safe_record "$CURRENT_FILE" || die 4 "current state record is unsafe"
         previous_sha="$(<"$CURRENT_FILE")"
         validate_sha "$previous_sha"
         atomic_write "$PREVIOUS_FILE" "$previous_sha"
@@ -591,20 +945,18 @@ activate_release() {
     fi
     atomic_write "$CURRENT_FILE" "$sha"
     commit_transition
-    retain_rollback_history "$sha"
+    if ! retain_rollback_history "$sha"; then
+        log "activated_cleanup_failed sha=$sha"
+    fi
+    return 0
 }
 
-build_and_activate() {
+build_and_activate_locked() {
     local host="$1" sha="$2" release="$RELEASES_DIR/$sha"
     require_root
     validate_host "$host"
-    acquire_transition_lock
     verify_release "$sha"
-    preflight_release "$host"
-    docker_command 3600 build --platform linux/amd64 --target runtime -t "miloco-lab:$sha" "$release"
-    docker_command 3600 build --platform linux/amd64 --target acceptance -t "miloco-lab-acceptance:$sha" "$release"
-    docker_command 900 run --rm --network none "miloco-lab-acceptance:$sha"
-    mark_acceptance_success "$sha"
+    build_images_and_accept "$host" "$sha" "$release"
     [[ ! -L "$STATE_DIR" ]] || die 4 "persistent state path must not be a symlink"
     install -d -o 10001 -g 10001 -m 0700 "$STATE_DIR"
     activate_release "$host" "$sha"
@@ -615,9 +967,10 @@ verify_running() {
     require_root
     validate_host "$host"
     [[ -f "$CURRENT_FILE" && ! -L "$CURRENT_FILE" ]] || die 4 "not deployed"
+    require_safe_record "$CURRENT_FILE" || die 4 "current state record is unsafe"
     local sha="$(<"$CURRENT_FILE")"
     validate_sha "$sha"
-    rollback_capable "$sha" || die 4 "current release is not rollback capable"
+    [[ "$(release_capability "$sha")" == "capable" ]] || die 4 "current release is not rollback capable"
     wait_for_health "$host" "$sha" || die 5 "current release is unhealthy"
     printf 'verified host=%s sha=%s\n' "$host" "$sha"
 }
@@ -626,10 +979,12 @@ status_release() {
     local host="$1"
     require_root
     validate_host "$host"
-    if [[ ! -f "$CURRENT_FILE" || -L "$CURRENT_FILE" ]]; then
+    [[ ! -L "$CURRENT_FILE" ]] || die 4 "current state record is unsafe"
+    if [[ ! -f "$CURRENT_FILE" ]]; then
         printf 'not_deployed host=%s\n' "$host"
         return 0
     fi
+    require_safe_record "$CURRENT_FILE" || die 4 "current state record is unsafe"
     local sha="$(<"$CURRENT_FILE")"
     validate_sha "$sha"
     local container_id image health observed_image
@@ -649,12 +1004,13 @@ status_release() {
 }
 
 rollback_release() {
-    local host="$1" sha="$2"
+    local host="$1" sha="$2" capability
     require_root
     validate_host "$host"
     acquire_transition_lock
     validate_sha "$sha"
-    rollback_capable "$sha" || die 4 "rollback release is not verified and acceptance-approved"
+    capability="$(release_capability "$sha")"
+    [[ "$capability" == "capable" ]] || die 4 "rollback release is not verified and acceptance-approved"
     activate_release "$host" "$sha"
 }
 
@@ -663,17 +1019,13 @@ main() {
     local operation="$1" host="$2"
     shift 2
     case "$operation" in
-        receive)
-            [[ "$#" -eq 2 ]] || die 2 "receive requires SHA and archive digest"
-            receive_release "$host" "$1" "$2"
+        transaction)
+            [[ "$#" -eq 4 ]] || die 2 "transaction requires SHA and three digests"
+            transaction_release "$host" "$1" "$2" "$3" "$4"
             ;;
         preflight)
             [[ "$#" -eq 0 ]] || die 2 "unexpected preflight argument"
             preflight_release "$host"
-            ;;
-        activate)
-            [[ "$#" -eq 1 ]] || die 2 "activate requires one SHA"
-            build_and_activate "$host" "$1"
             ;;
         verify)
             [[ "$#" -eq 0 ]] || die 2 "unexpected verify argument"

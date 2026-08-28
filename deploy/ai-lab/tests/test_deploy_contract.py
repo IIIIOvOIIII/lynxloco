@@ -156,6 +156,23 @@ def _write_stub(path: Path, name: str, log: Path, body: str = "exit 0") -> None:
     command.chmod(command.stat().st_mode | stat.S_IXUSR)
 
 
+def _write_release_receipt(repository: Path, sha: str, archive: Path) -> Path:
+    controller = repository / "deploy" / "ai-lab" / "remote-release.sh"
+    allowlist = repository / "deploy" / "ai-lab" / "artifact-files.txt"
+    receipt = archive.with_name(f"miloco-lab-{sha}.receipt")
+    receipt.write_text(
+        "schema=1\n"
+        f"git_sha={sha}\n"
+        f"archive_sha256={hashlib.sha256(archive.read_bytes()).hexdigest()}\n"
+        f"controller_sha256={hashlib.sha256(controller.read_bytes()).hexdigest()}\n"
+        f"allowlist_sha256={hashlib.sha256(allowlist.read_bytes()).hexdigest()}\n"
+        f"artifact_path={archive.relative_to(repository).as_posix()}\n",
+        encoding="utf-8",
+    )
+    receipt.chmod(0o444)
+    return receipt
+
+
 @pytest.fixture
 def command_stubs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
     """Record external command names without ever recording environment data."""
@@ -686,6 +703,17 @@ def test_build_contract_is_content_addressed_locked_and_bounded() -> None:
     assert "release.json" in controller
     assert "SHA256SUMS" in controller
     assert "miloco-lab-${sha}.tar.gz" in controller
+    assert "miloco-lab-${sha}.receipt" in controller
+    for receipt_field in (
+        "schema=1",
+        "git_sha=",
+        "archive_sha256=",
+        "controller_sha256=",
+        "allowlist_sha256=",
+        "artifact_path=",
+    ):
+        assert receipt_field in controller
+    assert "read_release_receipt" in controller
     assert "tar -czf -" not in controller
     assert not re.search(r"tar\b[^\n]*-C\s+\"?\$?PROJECT_ROOT", controller)
     for credential_name in (
@@ -713,9 +741,11 @@ def test_preflight_and_transfer_are_bounded_to_the_two_labs() -> None:
     assert re.search(r"\[\[?\s+!?\s*-L\s+\"\$LAB_ROOT\"", remote)
     assert 'docker_command 10 top "$container_id" -eo pid' in remote
     assert "listener_pid" in remote
-    assert 'REMOTE_CONTROLLER="${REMOTE_CONTROL_DIR}/remote-release.sh"' in controller
+    assert 'REMOTE_CONTROL_DIR="${REMOTE_ROOT}/control"' in controller
+    assert "controller_digest" in controller
+    assert "${REMOTE_CONTROL_DIR}/${controller_digest}/remote-release.sh" in controller
     assert "sha256_file" in controller
-    assert "receive" in controller
+    assert "transaction" in controller
     assert "remote-release.sh" in controller
     assert not re.search(r"\b(?:scp|sftp|rclone|oras|skopeo)\b", controller)
     assert not re.search(r"rsync\b[^\n]*\s\.\s", controller)
@@ -726,7 +756,12 @@ def test_remote_checksum_and_acceptance_precede_activation() -> None:
     """Catches building or switching from an unverified/unaccepted release."""
     remote = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8")
     verify_body = remote.split("verify_release_tree()", maxsplit=1)[1].split("\n}", maxsplit=1)[0]
-    build_body = remote.split("build_and_activate()", maxsplit=1)[1].split("\n}", maxsplit=1)[0]
+    locked_body = remote.split("build_and_activate_locked()", maxsplit=1)[1].split(
+        "\n}", maxsplit=1
+    )[0]
+    build_body = remote.split("build_images_and_accept()", maxsplit=1)[1].split(
+        "\n}", maxsplit=1
+    )[0]
     assert 'sha256sum -c "SHA256SUMS"' in verify_body
     assert "verify_archive_digest" in remote
     assert "validate_archive_members" in remote
@@ -734,11 +769,17 @@ def test_remote_checksum_and_acceptance_precede_activation() -> None:
     assert remote.index("validate_archive_members") < remote.index("--extract")
     for forbidden_type in ("fifo", "device", "socket", "hardlink", "symlink"):
         assert forbidden_type in remote
-    assert build_body.index("verify_release") < build_body.index("--target runtime")
+    assert build_body.index("invalidate_acceptance") < build_body.index("--target runtime")
     assert build_body.index("--target runtime") < build_body.index("--target acceptance")
     assert build_body.index("--target acceptance") < build_body.index("miloco-lab-acceptance:$sha")
     assert build_body.index("miloco-lab-acceptance:$sha") < build_body.index("mark_acceptance_success")
-    assert build_body.index("mark_acceptance_success") < build_body.index("activate_release")
+    assert "runtime_image_id" in build_body
+    assert "acceptance_image_id" in build_body
+    assert build_body.index("miloco-lab-acceptance:$sha") < build_body.index(
+        "mark_acceptance_success"
+    )
+    assert locked_body.index("verify_release") < locked_body.index("build_images_and_accept")
+    assert locked_body.index("build_images_and_accept") < locked_body.index("activate_release")
     assert "--platform linux/amd64" in remote
     assert 'install -d -o 10001 -g 10001 -m 0700 "$STATE_DIR"' in remote
     assert 'ai-lab01.esxi) cpu_limit="3.0"; memory_limit="3072m"' in remote
@@ -765,7 +806,7 @@ def test_activation_and_health_failure_preserve_rollback_state() -> None:
     assert "trap 'exit 130' INT" in remote
     assert "trap 'exit 143' TERM" in remote
     assert "restore_previous" in remote
-    assert "stop_candidate" in remote
+    assert "remove_candidate" in remote
     assert "rollback_failed" in remote
     assert "restore_previous" not in remote.split("|| true")[-1]
 
@@ -774,7 +815,7 @@ def test_explicit_rollback_requires_verified_release_and_image_without_state_del
     """Catches rollback to an unknown SHA or destructive state cleanup."""
     remote = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8")
     rollback = remote.split("rollback_release()", maxsplit=1)[1]
-    assert "rollback_capable" in rollback
+    assert "release_capability" in rollback
     assert "activate_release" in rollback
     assert not re.search(r"rm\s+(?:-[A-Za-z]*r[A-Za-z]*f?|--recursive)[^\n]*\$STATE_DIR", remote)
     assert not re.search(r"rm\s+[^\n]*\$CURRENT_FILE|rm\s+[^\n]*\$PREVIOUS_FILE", remote)
@@ -798,12 +839,14 @@ def test_success_retains_current_and_two_prior_releases_and_images() -> None:
     assert "historical_kept=0" in retention_body
     assert "historical_kept < 2" in retention_body
     assert "PREVIOUS_FILE" in retention_body
-    assert "rollback_capable" in retention_body
+    assert "release_capability" in retention_body
     assert "remove_release_pair" in retention_body
+    assert "probe_error" in retention_body
     activate_body = remote.split("activate_release()", maxsplit=1)[1].split("\n}", maxsplit=1)[0]
     assert activate_body.index('atomic_write "$CURRENT_FILE"') < activate_body.index(
         "retain_rollback_history"
     )
+    assert "activated_cleanup_failed" in activate_body
 
 
 def test_deploy_streams_one_archive_through_stubbed_ssh(tmp_path: Path) -> None:
@@ -815,11 +858,14 @@ def test_deploy_streams_one_archive_through_stubbed_ssh(tmp_path: Path) -> None:
     remote_dir.mkdir(parents=True)
     shutil.copy2(DEPLOY_SCRIPT, controller)
     shutil.copy2(REMOTE_RELEASE_SCRIPT, remote_dir / "remote-release.sh")
+    shutil.copy2(ALLOWLIST, remote_dir / "artifact-files.txt")
     archive = repository / "dist" / "lab" / sha / f"miloco-lab-{sha}.tar.gz"
     archive.parent.mkdir(parents=True)
     archive.write_bytes(b"stubbed-release-archive")
     archive_digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     controller_digest = hashlib.sha256(REMOTE_RELEASE_SCRIPT.read_bytes()).hexdigest()
+    allowlist_digest = hashlib.sha256(ALLOWLIST.read_bytes()).hexdigest()
+    _write_release_receipt(repository, sha, archive)
 
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -859,15 +905,129 @@ def test_deploy_streams_one_archive_through_stubbed_ssh(tmp_path: Path) -> None:
         env={**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"},
     )
     assert result.returncode == 0, result.stderr
-    assert (tmp_path / "ssh-count").read_text(encoding="utf-8").strip() == "4"
-    install_args = (tmp_path / "ssh-args-2").read_text(encoding="utf-8")
+    assert (tmp_path / "ssh-count").read_text(encoding="utf-8").strip() == "3"
+    install_args = (tmp_path / "ssh-args-1").read_text(encoding="utf-8")
     assert controller_digest in install_args
-    assert (tmp_path / "ssh-stdin-2").read_bytes() == REMOTE_RELEASE_SCRIPT.read_bytes()
-    receive_args = (tmp_path / "ssh-args-3").read_text(encoding="utf-8")
-    assert f"receive ai-lab01.esxi {sha} {archive_digest}" in receive_args
+    assert f"/opt/miloco-lab/control/{controller_digest}/remote-release.sh" in install_args
+    assert (tmp_path / "ssh-stdin-1").read_bytes() == REMOTE_RELEASE_SCRIPT.read_bytes()
+    preflight_args = (tmp_path / "ssh-args-2").read_text(encoding="utf-8")
+    assert f"/opt/miloco-lab/control/{controller_digest}/remote-release.sh" in preflight_args
+    assert "preflight ai-lab01.esxi" in preflight_args
+    assert (tmp_path / "ssh-stdin-2").read_bytes() == b""
+    transaction_args = (tmp_path / "ssh-args-3").read_text(encoding="utf-8")
+    assert f"/opt/miloco-lab/control/{controller_digest}/remote-release.sh" in transaction_args
+    assert (
+        f"transaction ai-lab01.esxi {sha} {archive_digest} {controller_digest} "
+        f"{allowlist_digest}"
+    ) in transaction_args
     assert (tmp_path / "ssh-stdin-3").read_bytes() == archive.read_bytes()
-    activation_args = (tmp_path / "ssh-args-4").read_text(encoding="utf-8")
-    assert f"activate ai-lab01.esxi {sha}" in activation_args
+
+
+@pytest.mark.parametrize("replacement_target", ["archive", "controller"])
+def test_deploy_rejects_replacement_after_clean_build_receipt(
+    tmp_path: Path, replacement_target: str
+) -> None:
+    """Catches deploy endorsing replaced archive or controller bytes after clean build."""
+    sha = "1" * 40
+    repository = tmp_path / "receipt-repo"
+    remote_dir = repository / "deploy" / "ai-lab"
+    remote_dir.mkdir(parents=True)
+    controller = repository / "deploy.sh"
+    shutil.copy2(DEPLOY_SCRIPT, controller)
+    shutil.copy2(REMOTE_RELEASE_SCRIPT, remote_dir / "remote-release.sh")
+    shutil.copy2(ALLOWLIST, remote_dir / "artifact-files.txt")
+    archive = repository / "dist" / "lab" / sha / f"miloco-lab-{sha}.tar.gz"
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"receipt-bound-archive")
+    _write_release_receipt(repository, sha, archive)
+    if replacement_target == "archive":
+        archive.write_bytes(b"replacement-after-build")
+    else:
+        (remote_dir / "remote-release.sh").write_bytes(b"replacement-controller-after-build")
+
+    bin_dir = tmp_path / "receipt-bin"
+    bin_dir.mkdir()
+    git_stub = bin_dir / "git"
+    git_stub.write_text(
+        "#!/usr/bin/env bash\n"
+        "case \"$*\" in\n"
+        "  *status*|*ls-files*|*diff*) exit 0 ;;\n"
+        f"  *rev-parse*) printf '%s\\n' '{sha}' ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    git_stub.chmod(0o755)
+    ssh_log = tmp_path / "receipt-ssh.log"
+    _write_stub(bin_dir, "ssh", ssh_log)
+    result = subprocess.run(
+        [str(controller), "deploy", "ai-lab01.esxi"],
+        cwd=repository,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+        env={**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"},
+    )
+    assert result.returncode == 4
+    assert "receipt" in result.stderr
+    assert not ssh_log.exists(), "receipt mismatch must fail before preflight SSH"
+
+
+def test_transaction_rehashes_exact_controller_inside_one_lock(tmp_path: Path) -> None:
+    """Catches split receive/build locks or a digest-addressed controller swap."""
+    sha = "2" * 40
+    digest = "3" * 64
+    source = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8").rsplit(
+        '\nmain "$@"', maxsplit=1
+    )[0]
+    call_log = tmp_path / "transaction.log"
+    harness = tmp_path / "transaction-harness.sh"
+    harness.write_text(
+        source
+        + "\nrequire_root() { :; }\n"
+        + f"acquire_transition_lock() {{ lock_held=1; printf 'lock\\n' >> '{call_log}'; }}\n"
+        + "verify_controller_self() { [[ \"${lock_held:-0}\" == 1 ]]; "
+        + f"printf 'controller:%s\\n' \"$1\" >> '{call_log}'; }}\n"
+        + "receive_release_locked() { [[ \"${lock_held:-0}\" == 1 ]]; "
+        + f"printf 'receive\\n' >> '{call_log}'; /bin/cat >/dev/null; }}\n"
+        + "build_and_activate_locked() { [[ \"${lock_held:-0}\" == 1 ]]; "
+        + f"printf 'build-activate\\n' >> '{call_log}'; }}\n"
+        + f'transaction_release "ai-lab01.esxi" "{sha}" "{digest}" "{digest}" "{digest}"\n',
+        encoding="utf-8",
+    )
+    harness.chmod(0o755)
+    result = subprocess.run(
+        [str(harness)],
+        input="archive",
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+    assert result.returncode == 0, result.stderr
+    assert call_log.read_text(encoding="utf-8").splitlines() == [
+        "lock",
+        f"controller:{digest}",
+        "receive",
+        "build-activate",
+    ]
+
+
+def test_remote_allowlist_rejects_extra_regular_files() -> None:
+    """Catches a checksum-complete but locally non-allowlisted regular file on the host."""
+    source = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8").rsplit(
+        '\nmain "$@"', maxsplit=1
+    )[0]
+    command = (
+        source
+        + "\nremote_path_is_allowlisted Dockerfile\n"
+        + "remote_path_is_allowlisted acceptance/integration/test_rtsp_perception.py\n"
+        + "if remote_path_is_allowlisted extra-regular.txt; then exit 91; fi\n"
+    )
+    result = subprocess.run(
+        ["/bin/bash"], input=command, text=True, capture_output=True, check=False, timeout=5
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_all_compose_calls_use_one_resource_and_timeout_wrapper(tmp_path: Path) -> None:
@@ -911,52 +1071,104 @@ def test_all_compose_calls_use_one_resource_and_timeout_wrapper(tmp_path: Path) 
 
 
 def test_rollback_requires_artifact_bound_acceptance_marker_before_images(tmp_path: Path) -> None:
-    """Catches runtime images becoming rollback candidates after failed acceptance."""
+    """Catches an old marker approving rebuilt image tags with different immutable IDs."""
     sha = "4" * 40
     digest = "5" * 64
+    controller_digest = "6" * 64
+    allowlist_digest = hashlib.sha256(ALLOWLIST.read_bytes()).hexdigest()
+    runtime_id = "sha256:" + "7" * 64
+    acceptance_id = "sha256:" + "8" * 64
     lab_root = tmp_path / "miloco-lab"
     artifact_dir = lab_root / "deploy-state" / "artifacts"
     accepted_dir = lab_root / "deploy-state" / "accepted"
     artifact_dir.mkdir(parents=True)
     accepted_dir.mkdir(parents=True)
-    (artifact_dir / sha).write_text(f"{digest}\n", encoding="utf-8")
+    (artifact_dir / sha).write_text(
+        "schema=1\n"
+        f"git_sha={sha}\n"
+        f"archive_sha256={digest}\n"
+        f"controller_sha256={controller_digest}\n"
+        f"allowlist_sha256={allowlist_digest}\n",
+        encoding="utf-8",
+    )
     source = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8")
     source = source.rsplit('\nmain "$@"', maxsplit=1)[0]
     source = source.replace('readonly LAB_ROOT="/opt/miloco-lab"', f'readonly LAB_ROOT="{lab_root}"')
     harness = tmp_path / "rollback-capable.sh"
     harness.write_text(
-        source + '\nverify_release() { return 0; }\nrollback_capable "$1"\n',
+        source
+        + "\nverify_release() { return 0; }\n"
+        + "require_safe_directory() { return 0; }\n"
+        + "require_safe_record() { return 0; }\n"
+        + f"docker_image_id() {{ case \"$1\" in miloco-lab:*) printf '%s\\n' '{runtime_id}' ;; *) printf '%s\\n' '{acceptance_id}' ;; esac; }}\n"
+        + 'release_capability "$1"\n',
         encoding="utf-8",
     )
     harness.chmod(0o755)
-    bin_dir = tmp_path / "marker-bin"
-    bin_dir.mkdir()
-    docker_log = tmp_path / "marker-docker.log"
-    _write_stub(bin_dir, "docker", docker_log)
-    timeout_stub = bin_dir / "timeout"
-    timeout_stub.write_text(
-        "#!/usr/bin/env bash\n"
-        "while [[ \"$#\" -gt 0 && \"$1\" != docker ]]; do shift; done\n"
-        "[[ \"$#\" -gt 0 ]] || exit 2\n"
-        "exec \"$@\"\n",
+    missing = subprocess.run(
+        [str(harness), sha], text=True, capture_output=True, check=False, timeout=5
+    )
+    assert missing.returncode == 0, missing.stderr
+    assert missing.stdout.strip() == "definitively_invalid"
+
+    (accepted_dir / sha).write_text(
+        "schema=1\n"
+        f"archive_sha256={digest}\n"
+        f"runtime_image_id={runtime_id}\n"
+        f"acceptance_image_id={acceptance_id}\n",
         encoding="utf-8",
     )
-    timeout_stub.chmod(0o755)
-    environment = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
-    missing = subprocess.run(
-        [str(harness), sha], text=True, capture_output=True, check=False, timeout=5, env=environment
-    )
-    assert missing.returncode != 0
-    assert not docker_log.exists(), "image lookup must follow acceptance-marker proof"
-
-    (accepted_dir / sha).write_text(f"{digest}\n", encoding="utf-8")
     accepted = subprocess.run(
-        [str(harness), sha], text=True, capture_output=True, check=False, timeout=5, env=environment
+        [str(harness), sha], text=True, capture_output=True, check=False, timeout=5
     )
     assert accepted.returncode == 0, accepted.stderr
-    calls = docker_log.read_text(encoding="utf-8")
-    assert f"miloco-lab:{sha}" in calls
-    assert f"miloco-lab-acceptance:{sha}" in calls
+    assert accepted.stdout.strip() == "capable"
+
+    mismatched_source = harness.read_text(encoding="utf-8").replace(runtime_id, "sha256:" + "9" * 64)
+    mismatch_harness = tmp_path / "rollback-mismatch.sh"
+    mismatch_harness.write_text(mismatched_source, encoding="utf-8")
+    mismatch_harness.chmod(0o755)
+    mismatch = subprocess.run(
+        [str(mismatch_harness), sha], text=True, capture_output=True, check=False, timeout=5
+    )
+    assert mismatch.returncode == 0, mismatch.stderr
+    assert mismatch.stdout.strip() == "definitively_invalid"
+
+
+def test_failed_acceptance_invalidates_old_marker_and_cleans_rebuilt_tags(tmp_path: Path) -> None:
+    """Catches old acceptance proof surviving a same-SHA rebuild that later fails tests."""
+    sha = "a" * 40
+    lab_root = tmp_path / "miloco-lab"
+    accepted_dir = lab_root / "deploy-state" / "accepted"
+    accepted_dir.mkdir(parents=True)
+    marker = accepted_dir / sha
+    marker.write_text("old-marker\n", encoding="utf-8")
+    source = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8").rsplit(
+        '\nmain "$@"', maxsplit=1
+    )[0]
+    source = source.replace('readonly LAB_ROOT="/opt/miloco-lab"', f'readonly LAB_ROOT="{lab_root}"')
+    call_log = tmp_path / "rebuild.log"
+    harness = tmp_path / "failed-acceptance.sh"
+    harness.write_text(
+        source
+        + "\nrequire_safe_directory() { return 0; }\n"
+        + "require_safe_record() { return 0; }\n"
+        + f"remove_image_tags() {{ printf 'remove-tags\\n' >> '{call_log}'; return 0; }}\n"
+        + "docker_command() {\n"
+        + f"  printf 'docker:%s\\n' \"$*\" >> '{call_log}'\n"
+        + "  case \"$*\" in *' run '*) return 17 ;; *) return 0 ;; esac\n"
+        + "}\n"
+        + f'build_images_and_accept "ai-lab01.esxi" "{sha}" "{lab_root}/releases/{sha}"\n',
+        encoding="utf-8",
+    )
+    harness.chmod(0o755)
+    result = subprocess.run(
+        [str(harness)], text=True, capture_output=True, check=False, timeout=5
+    )
+    assert result.returncode != 0
+    assert not marker.exists(), "same-SHA rebuild must atomically invalidate old acceptance"
+    calls = call_log.read_text(encoding="utf-8")
+    assert calls.count("remove-tags") == 2, "tags must be cleared before build and after failure"
 
 
 def test_receive_retry_reuses_only_the_same_verified_artifact_without_extraction(tmp_path: Path) -> None:
@@ -983,8 +1195,8 @@ def test_receive_retry_reuses_only_the_same_verified_artifact_without_extraction
         + f"verify_archive_digest() {{ printf 'digest\\n' >> '{call_log}'; }}\n"
         + f"validate_archive_members() {{ printf 'members\\n' >> '{call_log}'; }}\n"
         + f"verify_release_tree() {{ printf 'release\\n' >> '{call_log}'; }}\n"
-        + f"artifact_digest_for() {{ printf '%s\\n' '{digest}'; }}\n"
-        + f'receive_release "ai-lab01.esxi" "{sha}" "{digest}"\n',
+        + f"read_artifact_record() {{ artifact_archive_digest='{digest}'; artifact_controller_digest='{digest}'; artifact_allowlist_digest='{hashlib.sha256(ALLOWLIST.read_bytes()).hexdigest()}'; }}\n"
+        + f'receive_release_locked "ai-lab01.esxi" "{sha}" "{digest}" "{digest}" "{hashlib.sha256(ALLOWLIST.read_bytes()).hexdigest()}"\n',
         encoding="utf-8",
     )
     harness.chmod(0o755)
@@ -1028,8 +1240,9 @@ def test_retention_counts_only_two_rollback_capable_historical_pairs(tmp_path: P
     harness = tmp_path / "retention.sh"
     harness.write_text(
         source
-        + "\nrollback_capable() {\n"
-        + f"  case \"$1\" in {current}|{previous}|{retained}|{expired}) return 0 ;; *) return 1 ;; esac\n"
+        + "\nrequire_safe_record() { return 0; }\n"
+        + "\nrelease_capability() {\n"
+        + f"  case \"$1\" in {current}|{previous}|{retained}|{expired}) printf 'capable\\n' ;; *) printf 'definitively_invalid\\n' ;; esac\n"
         + "}\n"
         + f"remove_release_pair() {{ printf '%s\\n' \"$1\" >> '{removal_log}'; }}\n"
         + f"retain_rollback_history '{current}'\n",
@@ -1056,6 +1269,253 @@ def test_retention_counts_only_two_rollback_capable_historical_pairs(tmp_path: P
     assert result.returncode == 0, result.stderr
     removed = set(removal_log.read_text(encoding="utf-8").splitlines())
     assert removed == {debris, expired}
+
+
+def test_retention_probe_error_stops_without_deleting_any_pair(tmp_path: Path) -> None:
+    """Catches a transient Docker/verification error being classified as removable debris."""
+    current, previous, transient, later = (character * 40 for character in "1234")
+    lab_root = tmp_path / "miloco-lab"
+    releases = lab_root / "releases"
+    deploy_state = lab_root / "deploy-state"
+    releases.mkdir(parents=True)
+    deploy_state.mkdir(parents=True)
+    for candidate in (current, previous, transient, later):
+        (releases / candidate).mkdir()
+    (deploy_state / "previous").write_text(previous + "\n", encoding="utf-8")
+    source = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8").rsplit(
+        '\nmain "$@"', maxsplit=1
+    )[0]
+    source = source.replace('readonly LAB_ROOT="/opt/miloco-lab"', f'readonly LAB_ROOT="{lab_root}"')
+    removal_log = tmp_path / "transient-removal.log"
+    harness = tmp_path / "retention-probe-error.sh"
+    harness.write_text(
+        source
+        + "\nrequire_safe_record() { return 0; }\n"
+        + "\nrelease_capability() {\n"
+        + f"  case \"$1\" in {current}|{previous}) printf 'capable\\n' ;; {transient}) printf 'probe_error\\n' ;; *) printf 'definitively_invalid\\n' ;; esac\n"
+        + "}\n"
+        + f"remove_release_pair() {{ printf '%s\\n' \"$1\" >> '{removal_log}'; }}\n"
+        + f"retain_rollback_history '{current}'\n",
+        encoding="utf-8",
+    )
+    harness.chmod(0o755)
+    bin_dir = tmp_path / "retention-probe-bin"
+    bin_dir.mkdir()
+    find_stub = bin_dir / "find"
+    find_stub.write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf '%s\\n' '4 {releases / current}' '3 {releases / previous}' '2 {releases / transient}' '1 {releases / later}'\n",
+        encoding="utf-8",
+    )
+    find_stub.chmod(0o755)
+    result = subprocess.run(
+        [str(harness)],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+        env={**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"},
+    )
+    assert result.returncode != 0
+    assert "probe_error" in result.stderr
+    assert not removal_log.exists(), "cleanup must stop before any delete on probe error"
+
+
+def test_remove_pair_protects_state_and_verifies_full_removal(tmp_path: Path) -> None:
+    """Catches release-first deletion, state-target deletion, or leftover records/images."""
+    current, previous, candidate = (character * 40 for character in "567")
+    lab_root = tmp_path / "miloco-lab"
+    release = lab_root / "releases" / candidate
+    artifacts = lab_root / "deploy-state" / "artifacts"
+    accepted = lab_root / "deploy-state" / "accepted"
+    release.mkdir(parents=True)
+    artifacts.mkdir(parents=True)
+    accepted.mkdir(parents=True)
+    (lab_root / "deploy-state" / "current").write_text(current + "\n", encoding="utf-8")
+    (lab_root / "deploy-state" / "previous").write_text(previous + "\n", encoding="utf-8")
+    (artifacts / candidate).write_text("record\n", encoding="utf-8")
+    (accepted / candidate).write_text("marker\n", encoding="utf-8")
+    source = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8").rsplit(
+        '\nmain "$@"', maxsplit=1
+    )[0]
+    source = source.replace('readonly LAB_ROOT="/opt/miloco-lab"', f'readonly LAB_ROOT="{lab_root}"')
+    source = source.replace(
+        '"/opt/miloco-lab/releases/$sha"', f'"{lab_root}/releases/$sha"'
+    )
+    call_log = tmp_path / "full-removal.log"
+    harness = tmp_path / "full-removal.sh"
+    harness.write_text(
+        source
+        + "\nrequire_safe_directory() { return 0; }\n"
+        + "require_safe_record() { return 0; }\n"
+        + "docker_command() {\n"
+        + f"  printf 'docker:%s\\n' \"$*\" >> '{call_log}'\n"
+        + "  case \"$*\" in *' image ls '*) return 0 ;; *) return 0 ;; esac\n"
+        + "}\n"
+        + 'remove_release_pair "$1"\n',
+        encoding="utf-8",
+    )
+    harness.chmod(0o755)
+    result = subprocess.run(
+        [str(harness), candidate], text=True, capture_output=True, check=False, timeout=5
+    )
+    assert result.returncode == 0, result.stderr
+    assert not release.exists()
+    assert not (artifacts / candidate).exists()
+    assert not (accepted / candidate).exists()
+    calls = call_log.read_text(encoding="utf-8")
+    assert "image rm" in calls and calls.count("image ls") >= 2
+
+    call_count = len(calls.splitlines())
+    protected = subprocess.run(
+        [str(harness), current],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+    assert protected.returncode != 0
+    assert len(call_log.read_text(encoding="utf-8").splitlines()) == call_count
+
+
+def test_remove_pair_prevalidates_child_records_before_images(tmp_path: Path) -> None:
+    """Catches cleanup mutating image state before discovering an escaping record symlink."""
+    sha = "9" * 40
+    lab_root = tmp_path / "miloco-lab"
+    artifacts = lab_root / "deploy-state" / "artifacts"
+    accepted = lab_root / "deploy-state" / "accepted"
+    outside = tmp_path / "outside-record"
+    artifacts.mkdir(parents=True)
+    accepted.mkdir(parents=True)
+    outside.write_text("outside\n", encoding="utf-8")
+    (artifacts / sha).symlink_to(outside)
+    source = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8").rsplit(
+        '\nmain "$@"', maxsplit=1
+    )[0]
+    source = source.replace('readonly LAB_ROOT="/opt/miloco-lab"', f'readonly LAB_ROOT="{lab_root}"')
+    source = source.replace(
+        '"/opt/miloco-lab/releases/$sha"', f'"{lab_root}/releases/$sha"'
+    )
+    docker_log = tmp_path / "prevalidation-docker.log"
+    harness = tmp_path / "prevalidate-removal.sh"
+    harness.write_text(
+        source
+        + "\nrequire_safe_directory() { return 0; }\n"
+        + f"docker_command() {{ printf 'docker\\n' >> '{docker_log}'; return 0; }}\n"
+        + f"remove_release_pair '{sha}'\n",
+        encoding="utf-8",
+    )
+    harness.chmod(0o755)
+    result = subprocess.run(
+        [str(harness)], text=True, capture_output=True, check=False, timeout=5
+    )
+    assert result.returncode != 0
+    assert not docker_log.exists(), "all filesystem targets must validate before image mutation"
+
+
+def test_status_rejects_current_record_symlink_without_docker(tmp_path: Path) -> None:
+    """Catches read-only status treating a child record symlink as ordinary undeployed state."""
+    lab_root = tmp_path / "miloco-lab"
+    deploy_state = lab_root / "deploy-state"
+    outside = tmp_path / "outside-current"
+    deploy_state.mkdir(parents=True)
+    outside.write_text("a" * 40 + "\n", encoding="utf-8")
+    (deploy_state / "current").symlink_to(outside)
+    source = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8").rsplit(
+        '\nmain "$@"', maxsplit=1
+    )[0]
+    source = source.replace('readonly LAB_ROOT="/opt/miloco-lab"', f'readonly LAB_ROOT="{lab_root}"')
+    docker_log = tmp_path / "status-symlink-docker.log"
+    harness = tmp_path / "status-record-symlink.sh"
+    harness.write_text(
+        source
+        + "\nrequire_root() { :; }\n"
+        + f"docker_command() {{ printf docker > '{docker_log}'; }}\n"
+        + 'status_release "ai-lab01.esxi"\n',
+        encoding="utf-8",
+    )
+    harness.chmod(0o755)
+    result = subprocess.run(
+        [str(harness)], text=True, capture_output=True, check=False, timeout=5
+    )
+    assert result.returncode == 4
+    assert "unsafe" in result.stderr
+    assert not docker_log.exists()
+
+
+def test_transaction_rejects_child_symlink_before_docker(tmp_path: Path) -> None:
+    """Catches accepted/artifact/incoming child paths escaping the root-owned lab tree."""
+    lab_root = tmp_path / "miloco-lab"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (lab_root / "deploy-state").mkdir(parents=True)
+    (lab_root / "deploy-state" / "accepted").symlink_to(outside, target_is_directory=True)
+    source = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8").rsplit(
+        '\nmain "$@"', maxsplit=1
+    )[0]
+    source = source.replace('readonly LAB_ROOT="/opt/miloco-lab"', f'readonly LAB_ROOT="{lab_root}"')
+    harness = tmp_path / "child-symlink.sh"
+    harness.write_text(source + "\nprepare_transaction_paths\n", encoding="utf-8")
+    harness.chmod(0o755)
+    bin_dir = tmp_path / "child-symlink-bin"
+    bin_dir.mkdir()
+    docker_log = tmp_path / "child-symlink-docker.log"
+    _write_stub(bin_dir, "docker", docker_log)
+    stat_stub = bin_dir / "stat"
+    stat_stub.write_text("#!/usr/bin/env bash\nprintf '0:0\\n'\n", encoding="utf-8")
+    stat_stub.chmod(0o755)
+    result = subprocess.run(
+        [str(harness)],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+        env={**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"},
+    )
+    assert result.returncode == 4
+    assert "symlink" in result.stderr
+    assert not docker_log.exists()
+
+
+def test_health_deadline_has_no_hidden_kill_grace() -> None:
+    """Catches timeout kill-after grace extending a nominal 120-second health deadline."""
+    remote = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8")
+    assert "--kill-after" not in remote
+    assert remote.count("--signal=KILL") >= 3
+    health = remote.split("wait_for_health()", maxsplit=1)[1].split("\n}", maxsplit=1)[0]
+    assert health.count("deadline - SECONDS") >= 4
+
+
+def test_post_commit_retention_failure_keeps_activation_success(tmp_path: Path) -> None:
+    """Catches cleanup failure being reported as activation or rollback failure after commit."""
+    sha = "8" * 40
+    lab_root = tmp_path / "miloco-lab"
+    (lab_root / "deploy-state").mkdir(parents=True)
+    source = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8").rsplit(
+        '\nmain "$@"', maxsplit=1
+    )[0]
+    source = source.replace('readonly LAB_ROOT="/opt/miloco-lab"', f'readonly LAB_ROOT="{lab_root}"')
+    harness = tmp_path / "activated-cleanup-failed.sh"
+    harness.write_text(
+        source
+        + "\nrelease_capability() { printf 'capable\\n'; }\n"
+        + "install() { :; }\n"
+        + "atomic_write() { :; }\n"
+        + "arm_transition() { :; }\n"
+        + "commit_transition() { :; }\n"
+        + "compose_up() { return 0; }\n"
+        + "wait_for_health() { return 0; }\n"
+        + "retain_rollback_history() { return 17; }\n"
+        + f'activate_release "ai-lab01.esxi" "{sha}"\n',
+        encoding="utf-8",
+    )
+    harness.chmod(0o755)
+    result = subprocess.run(
+        [str(harness)], text=True, capture_output=True, check=False, timeout=5
+    )
+    assert result.returncode == 0, result.stderr
+    assert "activated_cleanup_failed" in result.stderr
+    assert "rollback_failed" not in result.stderr
 
 
 def test_failure_evidence_never_reads_or_emits_application_logs(tmp_path: Path) -> None:
@@ -1119,10 +1579,15 @@ def test_receive_rejects_special_or_link_members_before_extraction(
     digest = "2" * 64
     lab_root = tmp_path / "miloco-lab"
     remote_copy = tmp_path / "remote-release.sh"
+    remote_source = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8").rsplit(
+        '\nmain "$@"', maxsplit=1
+    )[0]
+    remote_source = remote_source.replace(
+        'readonly LAB_ROOT="/opt/miloco-lab"', f'readonly LAB_ROOT="{lab_root}"'
+    ).replace('"/opt/miloco-lab/releases/$sha"', f'"{lab_root}/releases/$sha"')
     remote_copy.write_text(
-        REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8")
-        .replace('readonly LAB_ROOT="/opt/miloco-lab"', f'readonly LAB_ROOT="{lab_root}"')
-        .replace('"/opt/miloco-lab/releases/$sha"', f'"{lab_root}/releases/$sha"'),
+        remote_source
+        + f'\nreceive_release_locked "ai-lab01.esxi" "{sha}" "{digest}" "{digest}" "{hashlib.sha256(ALLOWLIST.read_bytes()).hexdigest()}"\n',
         encoding="utf-8",
     )
     remote_copy.chmod(0o755)
@@ -1162,7 +1627,7 @@ def test_receive_rejects_special_or_link_members_before_extraction(
     )
     tar_stub.chmod(0o755)
     result = subprocess.run(
-        [str(remote_copy), "receive", "ai-lab01.esxi", sha, digest],
+        [str(remote_copy)],
         input=b"archive-bytes",
         capture_output=True,
         check=False,
@@ -1204,6 +1669,17 @@ def test_remote_status_and_unknown_rollback_are_safe_under_stubs(tmp_path: Path)
     )
     install_stub.chmod(0o755)
     _write_stub(bin_dir, "flock", external_log)
+    _write_stub(bin_dir, "stat", external_log, 'printf "0:0\\n"')
+    _write_stub(bin_dir, "chown", external_log)
+    _write_stub(bin_dir, "chmod", external_log)
+    realpath_stub = bin_dir / "realpath"
+    realpath_stub.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"${1:-}\" == -e ]]; then shift; fi\n"
+        "exec /bin/realpath \"$1\"\n",
+        encoding="utf-8",
+    )
+    realpath_stub.chmod(0o755)
     environment = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
 
     status = subprocess.run(
@@ -1255,6 +1731,17 @@ def test_transition_lock_conflict_exits_before_state_machine(tmp_path: Path) -> 
     )
     install_stub.chmod(0o755)
     _write_stub(bin_dir, "flock", call_log, "exit 1")
+    _write_stub(bin_dir, "stat", call_log, 'printf "0:0\\n"')
+    _write_stub(bin_dir, "chown", call_log)
+    _write_stub(bin_dir, "chmod", call_log)
+    realpath_stub = bin_dir / "realpath"
+    realpath_stub.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"${1:-}\" == -e ]]; then shift; fi\n"
+        "exec /bin/realpath \"$1\"\n",
+        encoding="utf-8",
+    )
+    realpath_stub.chmod(0o755)
     result = subprocess.run(
         [str(harness)],
         text=True,
@@ -1285,7 +1772,7 @@ def test_armed_signal_compensation_restores_or_reports_rollback_failure(
         + f"  printf 'restore %s %s\\n' \"$1\" \"$2\" >> '{recovery_log}'\n"
         + f"  return {recovery_result}\n"
         + "}\n"
-        + "stop_candidate() { return 99; }\n"
+        + "remove_candidate() { return 99; }\n"
         + 'arm_transition "ai-lab01.esxi" "' + "2" * 40 + '" "' + "1" * 40 + '"\n'
         + "kill -TERM $$\n",
         encoding="utf-8",
@@ -1306,8 +1793,8 @@ def test_armed_signal_compensation_restores_or_reports_rollback_failure(
         assert "rollback_failed" not in result.stderr
 
 
-def test_stop_compensation_fails_closed_when_absence_cannot_be_verified(tmp_path: Path) -> None:
-    """Catches a failed Compose query being misreported as a successfully stopped candidate."""
+def test_candidate_removal_fails_closed_when_absence_cannot_be_verified(tmp_path: Path) -> None:
+    """Catches a failed Compose query being misreported as a removed candidate."""
     source = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8").rsplit(
         '\nmain "$@"', maxsplit=1
     )[0]
@@ -1315,9 +1802,9 @@ def test_stop_compensation_fails_closed_when_absence_cannot_be_verified(tmp_path
     harness.write_text(
         source
         + "\ncompose_command() {\n"
-        + "  case \"$*\" in *' stop '*) return 0 ;; *' ps -q '*) return 17 ;; esac\n"
+        + "  case \"$*\" in *' rm --stop --force '*) return 0 ;; *' ps --all -q '*) return 17 ;; esac\n"
         + "}\n"
-        + 'stop_candidate "ai-lab01.esxi" "' + "a" * 40 + '"\n',
+        + 'remove_candidate "ai-lab01.esxi" "' + "a" * 40 + '"\n',
         encoding="utf-8",
     )
     harness.chmod(0o755)
@@ -1336,7 +1823,7 @@ def test_restore_compensation_cannot_continue_after_failed_restart(tmp_path: Pat
     harness = tmp_path / "restore-failure.sh"
     harness.write_text(
         source
-        + "\nrollback_capable() { return 0; }\n"
+        + "\nrelease_capability() { printf 'capable\\n'; }\n"
         + "compose_up() { return 17; }\n"
         + "wait_for_health() { return 0; }\n"
         + f"atomic_write() {{ printf 'state-write\\n' > '{state_log}'; }}\n"
