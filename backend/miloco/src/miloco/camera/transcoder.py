@@ -92,6 +92,11 @@ class SharedH264Transcoder:
 
         return stream()
 
+    async def attach_ready(self) -> AsyncGenerator[bytes, None]:
+        """Register a viewer before returning its stream to a frame producer."""
+        viewer_id, queue = await self._attach_viewer()
+        return self._viewer_stream(viewer_id, queue)
+
     async def detach(self) -> None:
         """Detach all current viewers and synchronously release this generation."""
         await self.stop()
@@ -163,6 +168,20 @@ class SharedH264Transcoder:
                 queue: asyncio.Queue[bytes | object] = asyncio.Queue(maxsize=8)
                 self._viewers[viewer_id] = queue
                 return viewer_id, queue
+
+    async def _viewer_stream(
+        self,
+        viewer_id: int,
+        queue: asyncio.Queue[bytes | object],
+    ) -> AsyncGenerator[bytes, None]:
+        try:
+            while True:
+                item = await queue.get()
+                if item is _VIEWER_CLOSED:
+                    return
+                yield cast(bytes, item)
+        finally:
+            await self._detach_viewer(viewer_id)
 
     async def _detach_viewer(self, viewer_id: int) -> None:
         async with self._lifecycle_lock:

@@ -572,3 +572,13 @@ CLI 输出不得打印密码或完整带敏 URI。
 仓库级既有门禁仍未清零，因此本状态不等于整个仓库质量基线全绿：当前 changed-path `ty` 只剩 `perception/service.py` 两条本计划未改动的既有诊断；一次只读全库 `ty` 检查报告 946 条诊断；只读 `ruff check .` 通过，但最终 `ruff format --check .` 显示 303 个既有文件需要格式化。不得为关闭本批次而扩大范围修复这些存量债务。
 
 未提供 `MILOCO_RTSP_TEST_URL`，真实 RTSP 网络 E2E、真实解码启动时间与断线重连行为均为 `not_measured`；CPU 与可持续 fps 也为 `not_measured`。本批次没有部署到实验室主机，也没有接触生产环境。RTSP 浏览器实时预览/H.265 按观看者转码属于批次 2，当前明确尚未实施；OpenAI Responses Omni 属于批次 3，当前也尚未实施。
+
+## 19. RTSP 实时预览实施进展（Partial）
+
+截至 2026-08-28，批次 2 的功能实现与聚焦验收已经完成：通用 WebSocket/观看页、H.264 保守透传、H.265 或不兼容 H.264 的按观看者共享软件转码、RTSP Web 管理闭环、父子页面同源内存鉴权、只读去敏直播状态和本地/实验室 smoke 均已有实现。转码输出的观看者现在通过显式 ready attach 注册后才接收首个解码帧，避免调度边界静默丢失首帧；零观看者仍不会保留转码实例。
+
+确定性 H.264 与 H.265 fixture 已通过真实 `RtspSession -> RtspCameraSource -> CameraDeviceAdapter -> MultimodalCollector/DeviceData` 与同一 source/session 的 `LiveStreamHub -> Uvicorn WebSocket client` 并行路径。两种 codec 均只打开一次 fixture；浏览器输出可被 public PyAV 解码为 64x48 H.264，慢观看者产生有界本地丢包而感知继续，最后观看者离开后转码与队列释放，零观看者期间后续媒体仍继续进入 `DeviceData`。直播状态端点只返回 `viewer_count`、`mode`、输入/输出 codec、队列深度、丢包计数和稳定错误码；不返回 URI、用户名、密码或原始错误。smoke 仅接受 camera ID 与 backend URL，鉴权从 owner-only Miloco 配置读取，可输出首帧延迟、30 秒输出 fps、进程 CPU 百分比差值、观看者数、队列深度和丢包数。
+
+当前聚焦门禁为 camera+Task6 164 passed，Web 368 passed/1 skipped，Web typecheck/build 与 scoped Ruff/format/ty 均通过；全库只读 Ruff lint 通过。mandatory 本地 CI 仍未通过：macOS backend 全序列在 PyAV `packet.decode()` 出现 native abort/segfault（exit 139），并触发 `local-ci.sh` 的既有零计数算术错误；全库 format 仍保留 303 文件既有基线。由于 mandatory 自动门禁未全部通过，本设计顶部状态不得升级为“RTSP 实时预览已实施”，本节明确保持 `Partial`。
+
+未提供可持久化实验室 H.264/H.265 RTSP 来源，因此真实摄像机的首帧延迟、30 秒 fps、CPU 差值、并发观看者、队列丢包、长时间浏览器播放和断线恢复继续为 `not_measured`。fixture E2E 与 fixture smoke 只证明 Miloco 契约，不替代真实摄像机测量。OpenAI Responses Omni 仍未实施。

@@ -482,7 +482,8 @@ class LiveStreamHub:
         transcoder = self._transcoder_factory(on_error)
         feed.transcoder = transcoder
         feed.mode = "transcoding"
-        stream = transcoder.attach()
+        ready_attach = getattr(transcoder, "attach_ready", None)
+        stream = await ready_attach() if callable(ready_attach) else transcoder.attach()
         feed.transcode_stream = stream
         feed.transcode_task = asyncio.create_task(
             self._consume_transcoder(camera_id, feed, transcoder, stream)

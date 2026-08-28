@@ -453,6 +453,70 @@ class _FakeTranscoder:
         await self.queue.put(None)
 
 
+class _ReadyBoundaryTranscoder:
+    """Expose whether the hub registers output before accepting a frame."""
+
+    def __init__(self) -> None:
+        self.queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+        self.lazy_attach_release = asyncio.Event()
+        self.attached = False
+        self.lost_frames = 0
+
+    async def _stream(self) -> AsyncGenerator[bytes, None]:
+        try:
+            while (item := await self.queue.get()) is not None:
+                yield item
+        finally:
+            self.attached = False
+
+    def attach(self) -> AsyncGenerator[bytes, None]:
+        async def lazy_stream() -> AsyncGenerator[bytes, None]:
+            await self.lazy_attach_release.wait()
+            self.attached = True
+            async for chunk in self._stream():
+                yield chunk
+
+        return lazy_stream()
+
+    async def attach_ready(self) -> AsyncGenerator[bytes, None]:
+        self.attached = True
+        return self._stream()
+
+    async def push_frame(self, frame: np.ndarray, pts: int | None) -> None:
+        del pts
+        if not self.attached:
+            self.lost_frames += 1
+            return
+        await self.queue.put(b"encoded:" + bytes([int(frame[0, 0, 0])]))
+
+    async def stop(self) -> None:
+        self.lazy_attach_release.set()
+        await self.queue.put(None)
+
+
+@pytest.mark.asyncio
+async def test_transcoder_output_is_attached_before_first_decoded_frame() -> None:
+    backend = _PacketBackend()
+    transcoder = _ReadyBoundaryTranscoder()
+
+    async def resolve(_camera_id: str) -> LiveStreamSource:
+        return _source(backend, codec="hevc", source_type="rtsp")
+
+    hub = LiveStreamHub(
+        resolve,
+        transcoder_factory=lambda _on_error: transcoder,
+    )
+    viewer = hub.subscribe("rtsp:camera")
+    pending = asyncio.create_task(_next(viewer))
+    await asyncio.sleep(0)
+
+    backend.emit_frame(23, 100)
+
+    assert await asyncio.wait_for(pending, 0.5) == b"encoded:\x17"
+    assert transcoder.lost_frames == 0
+    await viewer.aclose()
+
+
 @pytest.mark.asyncio
 async def test_new_viewer_waits_for_previous_transcoder_shutdown() -> None:
     first_backend = _PacketBackend()

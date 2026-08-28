@@ -507,6 +507,66 @@ def test_watch_page_does_not_resolve_or_disclose_camera_state(
     assert service.resolved == []
 
 
+def test_stream_state_is_authenticated_and_returns_only_safe_live_fields(
+    client: TestClient,
+    service: _Service,
+    hub: _Hub,
+) -> None:
+    hub.error_code = "transcode_failed"
+
+    unauthenticated = client.get("/api/cameras/rtsp%3Acamera/stream/state")
+    response = client.get(
+        "/api/cameras/rtsp%3Acamera/stream/state",
+        headers={"Authorization": "Bearer service-token"},
+    )
+
+    assert unauthenticated.status_code == 401
+    assert response.status_code == 200
+    assert response.json()["data"] == {
+        "viewer_count": 0,
+        "mode": "error",
+        "input_codec": "h264",
+        "output_codec": None,
+        "queue_depth": 0,
+        "dropped_packets": 0,
+        "error_code": "transcode_failed",
+    }
+    assert service.resolved == ["rtsp:camera"]
+    rendered = response.text
+    assert "rtsp://" not in rendered
+    assert "password" not in rendered
+    assert "username" not in rendered
+
+
+@pytest.mark.parametrize(
+    ("error", "status_code", "safe_code"),
+    [
+        (CameraNotFoundError(), 404, "camera_not_found"),
+        (
+            CameraConflictError("camera_disabled", "Camera is disabled"),
+            409,
+            "camera_disabled",
+        ),
+    ],
+)
+def test_stream_state_preserves_missing_and_disabled_semantics(
+    client: TestClient,
+    service: _Service,
+    error: BaseException,
+    status_code: int,
+    safe_code: str,
+) -> None:
+    service.error = error
+
+    response = client.get(
+        "/api/cameras/rtsp%3Acamera/stream/state",
+        headers={"Authorization": "Bearer service-token"},
+    )
+
+    assert response.status_code == status_code
+    assert response.json()["detail"]["code"] == safe_code
+
+
 @pytest.mark.asyncio
 async def test_manager_owns_one_hub_and_shutdown_is_idempotent(
     monkeypatch: pytest.MonkeyPatch,

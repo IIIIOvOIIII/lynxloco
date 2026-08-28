@@ -242,6 +242,27 @@ async def camera_watch_page(camera_id: str) -> HTMLResponse:
     return HTMLResponse(template, headers={"Cache-Control": "no-store"})
 
 
+@router.get(
+    "/{camera_id}/stream/state",
+    dependencies=[Depends(verify_token)],
+    summary="Safe live camera stream state",
+)
+async def camera_stream_state(
+    camera_id: str,
+    service: CameraServiceDependency,
+    hub: LiveStreamHubDependency,
+) -> NormalResponse:
+    try:
+        await service.resolve_live_stream(camera_id)
+    except CameraServiceError as error:
+        _raise_management_error(error)
+    return NormalResponse(
+        code=0,
+        message="Camera stream state retrieved",
+        data=asdict(hub.state(camera_id)),
+    )
+
+
 async def _watch_for_disconnect(websocket: WebSocket) -> None:
     try:
         while True:

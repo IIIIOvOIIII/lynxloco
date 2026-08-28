@@ -69,3 +69,10 @@
 - Expected result: 长期 bearer 不进入 query、fragment 或浏览器存储；已启用来源的新连接配置必须在服务端探测成功后才替换运行连接；配置并发变化必须 fail closed；操作后页面必须取得 mutation 之后的新快照，短暂后台刷新失败不得卸载已有 MIoT/RTSP 播放器。
 - Result: Achieved。最终独立复审 CLEAN。后端使用完整来源基线和共享配置锁内精确比较实现乐观并发，冲突返回稳定 409 且零写入/零热同步；前端区分普通 single-flight 与 mutation trailing barrier，并采用 stale-while-error 与 2/5/10 秒有界恢复。最终 backend camera 157 passed、Web 368 passed/1 skipped，typecheck/build 与 scoped Ruff/format/ty/diff/leak 通过。Vite 主包约 503.58 KB 仅触发既有提示线，不作为本批次阻断。
 - Next step: 执行 Plan 2 Task 6：fixture RTSP session 到 perception/live hub/WebSocket 的 H.264 透传与 H.265 转码 E2E、单输入/有界队列/最后观看者资源释放、smoke 指标和设计状态更新；随后进行 Plan 2 整批独立审查。真实摄像机与浏览器长时间行为继续保持 `not_measured`，待实验室验收。
+
+## 2026-08-28 09:16 SGT
+
+- Current work: 完成 Plan 2 Task 6 的真实 fixture WebSocket E2E、直播 smoke、首帧转码 attach 同步修复和只读流状态端点；执行聚焦回归、Web 全套门禁和仓库本地 CI。
+- Expected result: H.264/H.265 必须共用感知侧唯一 `RtspSession`，同时经真实 Uvicorn WebSocket 输出 public-PyAV 可解码 Annex B H.264；慢观看者不得反压感知，最后观看者离开后必须清空转码与队列，smoke 只能接受 camera ID/backend URL 并从 owner-only 配置读取鉴权；只有 mandatory 自动门禁全部通过后才把设计状态升级为“RTSP 实时预览已实施”。
+- Result: Partial。fixture E2E 2 passed，证明 H.264 透传与 H.265 共享转码均只调用一次 `av.open`，感知持续产生 `DeviceData`，慢观看者队列深度保持不超过 2 且产生可观察丢包，最后观看者离开后状态回到 `idle`/零队列，随后感知帧仍继续增长；特殊字符 WebSocket token、RTSP URI、用户名和密码不进入 Uvicorn access log。TDD 另捕获并修复首个解码帧恰逢转码 attach 时的静默丢失，确定性单测由 RED 变为 GREEN；鉴权只读 `/api/cameras/{camera_id}/stream/state` 只返回 `LiveStreamState` 安全字段。camera+Task6 为 164 passed；Web 为 368 passed/1 skipped，typecheck/build 通过；scoped Ruff/format/ty、全库只读 Ruff lint、shell 语法和 diff check 通过。mandatory `./scripts/local-ci.sh --tests` 与 `./scripts/local-ci.sh` 均为 `not_green`：其内部 backend pytest 在 macOS 全序列约 11% 后于 `RtspSession._decode_container_captured_sync` 的 PyAV `packet.decode()` native abort/segfault，直接等价命令退出 139；脚本随后又因既有 `grep -c ... || echo 0` 生成 `0\n0` 而报告算术语法错误。按同类恢复上限停止继续重跑或猜修，未修改超范围 `local-ci.sh`。全库 `ruff format --check .` 仍是既有 303 文件需格式化基线。因此设计顶部状态未升级，Plan 2 Task 6 保持 Partial。
+- Next step: 对 native PyAV 全序列崩溃另开有界稳定性定位/修复并重新跑 mandatory local CI；全部通过后再升级设计状态并执行 Plan 2 整批审查。真实 H.264/H.265 摄像机、30 秒首帧/fps/CPU/并发/丢包测量仍为 `not_measured`，fixture smoke 不冒充实验室实测。
