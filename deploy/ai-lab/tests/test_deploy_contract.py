@@ -98,19 +98,45 @@ def command_stubs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path
 def _sandboxed_deploy_command(arguments: tuple[str, ...], sandbox_dir: Path | None) -> list[str]:
     """Build the only command shape allowed to execute the deferred CLI."""
     if sandbox_dir is None or not sandbox_dir.is_dir():
-        pytest.skip("dynamic deploy CLI tests require an isolated writable sandbox directory")
+        pytest.fail(
+            "dynamic deploy CLI contract cannot run safely without an isolated writable "
+            "sandbox directory"
+        )
     sandbox_exec = shutil.which("sandbox-exec")
-    if not sandbox_exec:
-        pytest.skip("dynamic deploy CLI tests require a network-denying, write-restricted OS sandbox")
-    sandbox_profile = (
-        "(version 1) "
-        "(deny default) "
-        "(allow file-read*) "
-        "(allow process*) "
-        f'(allow file-write* (subpath "{sandbox_dir}")) '
-        "(deny network*)"
+    if sandbox_exec:
+        sandbox_profile = (
+            "(version 1) "
+            "(deny default) "
+            "(allow file-read*) "
+            "(allow process*) "
+            f'(allow file-write* (subpath "{sandbox_dir}")) '
+            "(deny network*)"
+        )
+        return [sandbox_exec, "-p", sandbox_profile, str(DEPLOY_SCRIPT), *arguments]
+
+    bubblewrap = shutil.which("bwrap")
+    if bubblewrap:
+        return [
+            bubblewrap,
+            "--die-with-parent",
+            "--new-session",
+            "--unshare-net",
+            "--ro-bind",
+            "/",
+            "/",
+            "--bind",
+            str(sandbox_dir),
+            str(sandbox_dir),
+            "--chdir",
+            str(REPOSITORY_ROOT),
+            str(DEPLOY_SCRIPT),
+            *arguments,
+        ]
+
+    pytest.fail(
+        "dynamic deploy CLI contract cannot run safely without an OS sandbox; "
+        "install macOS sandbox-exec or Linux bubblewrap"
     )
-    return [sandbox_exec, "-p", sandbox_profile, str(DEPLOY_SCRIPT), *arguments]
 
 
 def _run_deploy(*arguments: str, sandbox_dir: Path | None = None) -> subprocess.CompletedProcess[str]:
@@ -203,6 +229,61 @@ def test_artifact_manifest_never_admits_forbidden_path_components() -> None:
     assert forbidden_entries == set()
 
 
+def test_existing_deploy_script_without_os_sandbox_fails_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches a green dynamic contract suite that never exercised deploy.sh."""
+    deploy_script = tmp_path / "deploy.sh"
+    deploy_script.write_text("#!/usr/bin/env sh\nexit 0\n", encoding="utf-8")
+    monkeypatch.setitem(globals(), "DEPLOY_SCRIPT", deploy_script)
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    subprocess_calls: list[list[str]] = []
+
+    def record_subprocess(
+        command: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        subprocess_calls.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", record_subprocess)
+    signal = "none"
+    try:
+        _run_deploy("--help", sandbox_dir=tmp_path)
+    except pytest.skip.Exception:
+        signal = "skipped"
+    except pytest.fail.Exception as error:
+        assert "cannot run safely without an OS sandbox" in str(error)
+        signal = "failed"
+    assert subprocess_calls == []
+    assert signal == "failed", "an existing deploy.sh without OS isolation must fail the suite"
+
+
+def test_bubblewrap_sandbox_is_read_only_except_for_test_temp_and_denies_network(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches a Linux fallback that can write source files or reach the network."""
+    deploy_script = tmp_path / "deploy.sh"
+    deploy_script.write_text("#!/usr/bin/env sh\nexit 0\n", encoding="utf-8")
+    monkeypatch.setitem(globals(), "DEPLOY_SCRIPT", deploy_script)
+    monkeypatch.setattr(
+        shutil,
+        "which",
+        lambda name: "/usr/bin/bwrap" if name == "bwrap" else None,
+    )
+
+    try:
+        command = _sandboxed_deploy_command(("--help",), tmp_path)
+    except pytest.skip.Exception as error:
+        pytest.fail(f"bubblewrap must be a supported dynamic contract sandbox: {error}")
+
+    assert command[0] == "/usr/bin/bwrap"
+    assert "--unshare-net" in command
+    assert ["--ro-bind", "/", "/"] == command[command.index("--ro-bind") :][:3]
+    assert ["--bind", str(tmp_path), str(tmp_path)] == command[command.index("--bind") :][:3]
+    assert ["--chdir", str(REPOSITORY_ROOT)] == command[command.index("--chdir") :][:2]
+    assert command[-2:] == [str(deploy_script), "--help"]
+
+
 def test_help_exposes_only_the_release_operations(
     command_stubs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -211,16 +292,16 @@ def test_help_exposes_only_the_release_operations(
     _, sandbox_dir = command_stubs
 
     def unexpected_subprocess(*_args: object, **_kwargs: object) -> None:
-        pytest.fail("dynamic CLI execution must not proceed without OS isolation")
+        raise AssertionError("dynamic CLI execution must not proceed without OS isolation")
 
     with monkeypatch.context() as context:
         context.setattr(subprocess, "run", unexpected_subprocess)
-        with pytest.raises(pytest.skip.Exception):
+        with pytest.raises(pytest.fail.Exception, match="cannot run safely"):
             _run_deploy("--help")
     with monkeypatch.context() as context:
         context.setattr(subprocess, "run", unexpected_subprocess)
         context.setattr(shutil, "which", lambda _name: None)
-        with pytest.raises(pytest.skip.Exception):
+        with pytest.raises(pytest.fail.Exception, match="cannot run safely without an OS sandbox"):
             _run_deploy("--help", sandbox_dir=sandbox_dir)
 
     captured_commands: list[list[str]] = []
@@ -232,10 +313,21 @@ def test_help_exposes_only_the_release_operations(
     with monkeypatch.context() as context:
         context.setattr(subprocess, "run", record_sandboxed_command)
         _run_deploy("--help", sandbox_dir=sandbox_dir)
-    assert captured_commands and captured_commands[0][0] == shutil.which("sandbox-exec")
-    assert "(deny default)" in captured_commands[0][2]
-    assert "(deny network*)" in captured_commands[0][2]
-    assert "(allow file-write*" in captured_commands[0][2]
+    assert captured_commands
+    sandbox_command = captured_commands[0]
+    if Path(sandbox_command[0]).name == "sandbox-exec":
+        assert "(deny default)" in sandbox_command[2]
+        assert "(deny network*)" in sandbox_command[2]
+        assert "(allow file-write*" in sandbox_command[2]
+    else:
+        assert Path(sandbox_command[0]).name == "bwrap"
+        assert "--unshare-net" in sandbox_command
+        assert ["--ro-bind", "/", "/"] == sandbox_command[
+            sandbox_command.index("--ro-bind") :
+        ][:3]
+        assert ["--bind", str(sandbox_dir), str(sandbox_dir)] == sandbox_command[
+            sandbox_command.index("--bind") :
+        ][:3]
 
     result = _run_deploy("--help", sandbox_dir=sandbox_dir)
     assert result.returncode == 0, result.stderr

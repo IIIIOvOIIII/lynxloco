@@ -33,6 +33,15 @@ line: `Operations: build preflight deploy verify status rollback`. Its prose
 may describe those operations in any layout, but it must not declare a second
 operations list or advertise a concrete operation in `Usage:`.
 
+## Contract-test isolation
+
+Once `deploy.sh` exists, the dynamic contract checks require an OS sandbox:
+macOS uses the built-in `sandbox-exec`, while Linux CI must install Bubblewrap
+and expose its `bwrap` executable. Both paths deny network access, make the
+repository read-only, and permit writes only in the pytest temporary directory.
+If neither backend is available, the suite fails before starting `deploy.sh`;
+it never skips or runs the deployment CLI without isolation.
+
 ## Runtime boundary
 
 Remote release state, including the active and last-known-good revisions, is
