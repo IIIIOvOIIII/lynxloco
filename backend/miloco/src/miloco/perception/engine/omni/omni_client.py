@@ -313,19 +313,74 @@ async def call_omni(
         )
 
 
-async def _iter_sse_chunks(resp) -> AsyncGenerator[dict, None]:
-    """从 SSE 响应逐行解析 JSON chunks，跳过空行、非 data 行和畸形 JSON。"""
-    async for line in resp.aiter_lines():
-        line = line.strip()
-        if not line or not line.startswith("data: "):
+@dataclass(frozen=True)
+class _SSEChunk:
+    data: dict[str, Any] | None
+    event_type: str | None = None
+    done: bool = False
+    malformed: bool = False
+
+
+def _decode_sse_chunk(event_type: str | None, data_lines: list[str]) -> _SSEChunk:
+    raw_data = "\n".join(data_lines)
+    if raw_data.strip() == "[DONE]":
+        return _SSEChunk(None, event_type=event_type, done=True)
+    try:
+        parsed = json.loads(raw_data)
+    except json.JSONDecodeError:
+        return _SSEChunk(None, event_type=event_type, malformed=True)
+    if not isinstance(parsed, dict):
+        return _SSEChunk(None, event_type=event_type, malformed=True)
+    return _SSEChunk(parsed, event_type=event_type)
+
+
+async def _iter_sse_chunks(resp) -> AsyncGenerator[_SSEChunk, None]:
+    """Parse complete SSE events while preserving the optional event name.
+
+    httpx's ``aiter_lines`` handles arbitrary byte fragmentation. This layer
+    implements SSE field framing, including CRLF, comments, multiline data,
+    blank-line dispatch, and final dispatch on a clean close.
+    """
+    event_type: str | None = None
+    data_lines: list[str] = []
+    async for raw_line in resp.aiter_lines():
+        line = raw_line[:-1] if raw_line.endswith("\r") else raw_line
+        if line == "":
+            if data_lines:
+                yield _decode_sse_chunk(event_type, data_lines)
+            event_type = None
+            data_lines = []
             continue
-        data = line[6:]
-        if data == "[DONE]":
-            break
-        try:
-            yield json.loads(data)
-        except json.JSONDecodeError:
+        if line.startswith(":"):
             continue
+
+        field, separator, value = line.partition(":")
+        if not separator:
+            value = ""
+        elif value.startswith(" "):
+            value = value[1:]
+        if field == "event":
+            event_type = value or None
+        elif field == "data":
+            data_lines.append(value)
+
+    if data_lines:
+        yield _decode_sse_chunk(event_type, data_lines)
+
+
+def _parse_sse_chunk(
+    event: _SSEChunk,
+    adapter: OmniProviderAdapter,
+) -> tuple[str | None, dict[str, Any] | None] | None:
+    if event.done:
+        return None if adapter.uses_done_sentinel else (None, None)
+    if event.malformed:
+        if adapter.strict_stream_json:
+            raise ValueError("Responses stream event is malformed")
+        return (None, None)
+    if event.data is None:
+        return (None, None)
+    return adapter.parse_stream_chunk(event.data, event_type=event.event_type)
 
 
 async def _collect_stream_response(
@@ -344,7 +399,10 @@ async def _collect_stream_response(
     content_parts: list[str] = []
     usage: dict[str, Any] = {}
     async with client.stream(
-        "POST", url, headers=headers, json=body,
+        "POST",
+        url,
+        headers=headers,
+        json=body,
     ) as resp:
         if resp.status_code != 200:
             await resp.aread()
@@ -353,13 +411,17 @@ async def _collect_stream_response(
                 from miloco.perception.engine.omni.omni import (
                     _summarize_multimodal_payload,
                 )
+
                 logger.error(
                     "[omni] stream 400 payload 摘要 | %s",
                     _summarize_multimodal_payload(body.get("messages", [])),
                 )
             resp.raise_for_status()
-        async for chunk in _iter_sse_chunks(resp):
-            delta, chunk_usage = adapter.parse_stream_chunk(chunk)
+        async for event in _iter_sse_chunks(resp):
+            parsed = _parse_sse_chunk(event, adapter)
+            if parsed is None:
+                break
+            delta, chunk_usage = parsed
             if chunk_usage is not None:
                 usage = chunk_usage
             if delta:
@@ -492,8 +554,11 @@ async def call_omni_stream(
                     await cb.record_failure(classified)
                     logger.error("Omni stream error %d", resp.status_code)
                     resp.raise_for_status()
-                async for chunk in _iter_sse_chunks(resp):
-                    delta, chunk_usage = adapter.parse_stream_chunk(chunk)
+                async for event in _iter_sse_chunks(resp):
+                    parsed = _parse_sse_chunk(event, adapter)
+                    if parsed is None:
+                        break
+                    delta, chunk_usage = parsed
                     if chunk_usage is not None:
                         raw_usage_seen = chunk_usage
                         if usage_out is not None:

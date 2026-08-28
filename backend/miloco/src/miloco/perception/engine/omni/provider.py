@@ -19,9 +19,10 @@ OpenAI 兼容族（MiMo / Qwen）继承 ``OpenAICompatAdapter``，协议方法�
 from __future__ import annotations
 
 import logging
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Literal, Never
+from typing import Any, Literal
 
 from miloco.config.settings import OmniApiProtocol
 
@@ -85,12 +86,18 @@ class OmniProviderAdapter(ABC):
 
     @abstractmethod
     def parse_stream_chunk(
-        self, chunk: dict[str, Any]
+        self,
+        chunk: dict[str, Any],
+        *,
+        event_type: str | None = None,
     ) -> tuple[str | None, dict[str, Any] | None]:
         """把单个流式 chunk 反解析成 ``(content_delta, usage)``。
 
         无内容/无 usage 时对应位返回 None；usage 一旦返回即为 OpenAI 形态。
         """
+
+    strict_stream_json = False
+    uses_done_sentinel = True
 
 
 class OpenAICompatAdapter(OmniProviderAdapter):
@@ -111,7 +118,10 @@ class OpenAICompatAdapter(OmniProviderAdapter):
         return raw
 
     def parse_stream_chunk(
-        self, chunk: dict[str, Any]
+        self,
+        chunk: dict[str, Any],
+        *,
+        event_type: str | None = None,
     ) -> tuple[str | None, dict[str, Any] | None]:
         usage = chunk["usage"] if isinstance(chunk.get("usage"), dict) else None
         try:
@@ -449,12 +459,57 @@ class GeminiAdapter(OmniProviderAdapter):
         return {"choices": choices, "usage": usage}
 
     def parse_stream_chunk(
-        self, chunk: dict[str, Any]
+        self,
+        chunk: dict[str, Any],
+        *,
+        event_type: str | None = None,
     ) -> tuple[str | None, dict[str, Any] | None]:
         delta = _gemini_extract_text(chunk)
         usage_meta = chunk.get("usageMetadata") if isinstance(chunk, dict) else None
         usage = _gemini_usage_to_openai(usage_meta) if usage_meta else None
         return delta, usage
+
+
+def _responses_usage_to_openai(usage_in: Any) -> dict[str, Any]:
+    """Normalize Responses usage without retaining provider-private fields."""
+    if usage_in is None:
+        usage_in = {}
+    if not isinstance(usage_in, dict):
+        raise ValueError("Responses usage is malformed")
+    input_details = usage_in.get("input_tokens_details") or {}
+    if not isinstance(input_details, dict):
+        raise ValueError("Responses usage is malformed")
+    try:
+        prompt_tokens = int(usage_in.get("input_tokens") or 0)
+        completion_tokens = int(usage_in.get("output_tokens") or 0)
+        total_tokens = int(usage_in.get("total_tokens") or 0)
+        cached_tokens = int(input_details.get("cached_tokens") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Responses usage is malformed") from exc
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "prompt_tokens_details": {"cached_tokens": cached_tokens},
+    }
+
+
+class ResponsesStreamError(ValueError):
+    """Sanitized terminal error from a Responses SSE stream."""
+
+    def __init__(self, code: str, message: str):
+        self.code = code
+        self.message = message
+        super().__init__(f"{code}: {message}")
+
+
+_STABLE_STREAM_CODE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+
+
+def _stable_stream_code(value: Any, fallback: str) -> str:
+    if isinstance(value, str) and _STABLE_STREAM_CODE.fullmatch(value):
+        return value
+    return fallback
 
 
 class OpenAIResponsesAdapter(OmniProviderAdapter):
@@ -467,10 +522,15 @@ class OpenAIResponsesAdapter(OmniProviderAdapter):
 
     media_mode: OmniMediaMode = "image_sequence"
     auth_required = False
+    strict_stream_json = True
+    uses_done_sentinel = False
 
-    @staticmethod
-    def _not_implemented() -> Never:
-        raise NotImplementedError("OpenAI Responses adapter is not implemented yet")
+    def __init__(self) -> None:
+        self._unknown_stream_event_count = 0
+
+    @property
+    def unknown_stream_event_count(self) -> int:
+        return self._unknown_stream_event_count
 
     def build_video_block(
         self, video_base64: str, media: LocalMediaInfo
@@ -594,34 +654,66 @@ class OpenAIResponsesAdapter(OmniProviderAdapter):
         if not text.strip():
             raise ValueError("Responses output contains no output_text")
 
-        usage_in = raw.get("usage") or {}
-        if not isinstance(usage_in, dict):
-            raise ValueError("Responses usage is malformed")
-        input_details = usage_in.get("input_tokens_details") or {}
-        if not isinstance(input_details, dict):
-            raise ValueError("Responses usage is malformed")
-        try:
-            prompt_tokens = int(usage_in.get("input_tokens") or 0)
-            completion_tokens = int(usage_in.get("output_tokens") or 0)
-            total_tokens = int(usage_in.get("total_tokens") or 0)
-            cached_tokens = int(input_details.get("cached_tokens") or 0)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("Responses usage is malformed") from exc
-
         return {
             "choices": [{"message": {"content": text}}],
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": total_tokens,
-                "prompt_tokens_details": {"cached_tokens": cached_tokens},
-            },
+            "usage": _responses_usage_to_openai(raw.get("usage")),
         }
 
     def parse_stream_chunk(
-        self, chunk: dict[str, Any]
+        self,
+        chunk: dict[str, Any],
+        *,
+        event_type: str | None = None,
     ) -> tuple[str | None, dict[str, Any] | None]:
-        self._not_implemented()
+        # The SSE envelope is the protocol dispatch field. JSON ``type`` is a
+        # compatibility fallback for servers that omit ``event:``.
+        resolved_type = event_type or chunk.get("type")
+        if resolved_type == "response.output_text.delta":
+            delta = chunk.get("delta")
+            if not isinstance(delta, str):
+                raise ValueError("Responses stream delta is malformed")
+            return delta, None
+        if resolved_type == "response.completed":
+            response = chunk.get("response")
+            if not isinstance(response, dict):
+                raise ValueError("Responses completed event is malformed")
+            return None, _responses_usage_to_openai(response.get("usage"))
+        if resolved_type == "response.failed":
+            response = chunk.get("response")
+            error = response.get("error") if isinstance(response, dict) else None
+            code = error.get("code") if isinstance(error, dict) else None
+            raise ResponsesStreamError(
+                _stable_stream_code(code, "response_failed"),
+                "Responses stream failed",
+            )
+        if resolved_type == "response.incomplete":
+            response = chunk.get("response")
+            details = (
+                response.get("incomplete_details")
+                if isinstance(response, dict)
+                else None
+            )
+            reason = details.get("reason") if isinstance(details, dict) else None
+            raise ResponsesStreamError(
+                _stable_stream_code(reason, "response_incomplete"),
+                "Responses stream incomplete",
+            )
+        if resolved_type == "error":
+            error = chunk.get("error")
+            code = error.get("code") if isinstance(error, dict) else chunk.get("code")
+            raise ResponsesStreamError(
+                _stable_stream_code(code, "response_error"),
+                "Responses stream error",
+            )
+
+        self._unknown_stream_event_count += 1
+        safe_type = _stable_stream_code(resolved_type, "unknown")
+        logger.debug(
+            "Ignoring unknown Responses stream event type=%s count=%d",
+            safe_type,
+            self._unknown_stream_event_count,
+        )
+        return None, None
 
 
 def adjust_fps_for_omni(fps: int, omni_fps: int) -> int:
