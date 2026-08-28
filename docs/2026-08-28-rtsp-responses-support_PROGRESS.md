@@ -181,3 +181,10 @@
 - Expected result: 父环境旧通用 Omni Key 不得进入无 Key Responses 的 models/preflight/perception 任一请求；挂起请求只收到脚本 PID 的 SIGTERM 时必须短边界 exit 143 且无残留进程；成功/失败输出、脚本权限和 fixture teardown 不回归。
 - Result: Achieved。原审查人复跑严格 integration 23 passed：旧通用 Key 在 shell exec 前和 Miloco import 前双重移除，完整 GET+POST+POST 均无 Authorization；专用 Responses Bearer 路径保持。脚本直接 exec 到受控 backend venv Python，挂起 HTTP 时只 kill smoke PID，3 秒内 exit 143，进程组无 uv/Python 残留；成功白名单输出、静默失败、0755、shell syntax 与 teardown 均通过。Task 7 独立复审 CLEAN，真实本地 VLM 继续为 `not_measured`。
 - Next step: 对 `fe15926..HEAD` 的 Responses 七任务、typed-image hotfix、fixture/smoke/docs执行整批 Critical/Important 审查；整批 CLEAN 后进入全分支回归、安全审查和 ai-lab 部署计划。
+
+## 2026-08-28 14:14 SGT
+
+- Current work: 完成 Responses 七任务的整批独立审查及两轮集成修复，并启动全分支发布前回归。
+- Expected result: no-key Responses 必须能在真实 proxy 中 READY；旧 Chat/Gemini 通用环境 Key 不得进入显式 Responses；env 同源显式 Responses Key 必须正常发送 Bearer；协议、模型、规范化 URL 与最终 Key 必须共同决定 admin/runtime identity；测试成功后只清理当前 active breaker。
+- Result: Achieved。首轮整批审查发现 2 Critical/2 Important；`ab99c3e`、`006d137`、`9a87c34`、`e090af2` 依次关闭 proxy readiness、协议感知凭据隔离、显式协议/模型身份、env source 归属和 admin breaker 恢复。最终原审查人复核 CLEAN，无 Critical/Important；生产聚焦矩阵 259 passed，strict localhost HTTP integration 25 passed，真实 Bearer 与 no-Authorization 两类路径均经 HTTP fixture 证明。随后当前 HEAD 的 `./scripts/local-ci.sh --tests` 6/6 通过，Hermes 185 passed/2 skipped，backend 仅保留脚本既有的 3 项 macOS node-monitor/smaps 排除。真实本地 VLM 服务版本、视觉效果、延迟、usage 与具体 SSE 方言继续为 `not_measured`。
+- Next step: 完成全分支只读静态检查、凭据泄漏扫描和独立发布前审查；通过后编写并审查 ai-lab01/02 可回滚部署计划，再分别部署和验收。
