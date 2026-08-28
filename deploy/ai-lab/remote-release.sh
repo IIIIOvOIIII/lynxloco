@@ -308,13 +308,12 @@ receive_release_locked() {
     esac
     local release="$RELEASES_DIR/$sha"
 
-    local incoming staging published_release=""
+    local incoming staging
     incoming="$(mktemp "$INCOMING_DIR/archive.${sha}.XXXXXX.tar.gz")"
     staging=""
     receive_cleanup() {
         rm -f -- "$incoming"
         [[ -z "$staging" || ! -e "$staging" ]] || rm -rf -- "$staging"
-        [[ -z "$published_release" || ! -e "$published_release" ]] || rm -rf -- "$published_release"
     }
     trap receive_cleanup EXIT
     cat > "$incoming"
@@ -347,7 +346,6 @@ receive_release_locked() {
     chown -R root:root "$staging"
     verify_release_tree "$staging" "$sha"
     [[ "$(published_sha_state "$sha")" == "new" ]] || die 4 "release publication state changed"
-    published_release="$release"
     mv -- "$staging" "$release"
     staging=""
     atomic_write "$ARTIFACT_RECORDS_DIR/$sha" \
@@ -356,7 +354,6 @@ git_sha=$sha
 archive_sha256=$expected_digest
 controller_sha256=$controller_digest
 allowlist_sha256=$allowlist_digest"
-    published_release=""
     trap - EXIT
     rm -f -- "$incoming"
 }

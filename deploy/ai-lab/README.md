@@ -39,6 +39,12 @@ known-good release when post-deploy verification fails; an operator can also
 run `rollback`. A failed restoration is reported as `rollback_failed` with
 exit code `70`.
 
+The two-host rollout is one build and two deployments: run `./deploy.sh build`
+once, preserve its exact SHA-addressed archive and receipt unchanged, then
+deploy that same full 40-character SHA first to `ai-lab01.esxi` and then to
+`ai-lab02.esxi`. Do not rebuild, replace the archive, or create another SHA
+between the two host deployments.
+
 `./deploy.sh --help` provides one machine-readable authoritative line:
 `Operations: build preflight deploy verify status rollback`.
 

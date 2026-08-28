@@ -974,6 +974,82 @@ def test_remote_operation_refuses_missing_ssh_identity_before_ssh(tmp_path: Path
     assert not ssh_log.exists()
 
 
+@pytest.mark.parametrize("identity_case", ["relative", "symlink", "unsafe_mode", "wrong_owner"])
+def test_remote_operation_refuses_unsafe_ssh_identity_before_ssh(
+    tmp_path: Path, identity_case: str
+) -> None:
+    """Every invalid identity form must stop before the SSH transport is called."""
+    repository = tmp_path / "repo"
+    remote_dir = repository / "deploy" / "ai-lab"
+    remote_dir.mkdir(parents=True)
+    controller = repository / "deploy.sh"
+    shutil.copy2(DEPLOY_SCRIPT, controller)
+    shutil.copy2(REMOTE_RELEASE_SCRIPT, remote_dir / "remote-release.sh")
+    shutil.copy2(ALLOWLIST, remote_dir / "artifact-files.txt")
+    identity = tmp_path / "identity"
+    identity.write_text("test-only-identity\n", encoding="utf-8")
+    identity.chmod(0o644 if identity_case == "unsafe_mode" else 0o600)
+    identity_value = str(identity)
+    if identity_case == "relative":
+        identity_value = "identity"
+    if identity_case == "symlink":
+        linked = tmp_path / "identity-link"
+        linked.symlink_to(identity)
+        identity_value = str(linked)
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    git_stub = bin_dir / "git"
+    git_stub.write_text(
+        "#!/usr/bin/env bash\n"
+        "case \"$*\" in\n"
+        "  *status*|*ls-files*|*diff*) exit 0 ;;\n"
+        f"  *rev-parse*) printf '%s\\n' '{'a' * 40}' ;;\n"
+        "  *) exit 2 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    git_stub.chmod(0o755)
+    if identity_case == "wrong_owner":
+        stat_stub = bin_dir / "stat"
+        stat_stub.write_text(
+            "#!/usr/bin/env bash\n"
+            "case \"$2\" in '%u') printf '99999\\n' ;; '%Lp') printf '600\\n' ;; *) exec /usr/bin/stat \"$@\" ;; esac\n",
+            encoding="utf-8",
+        )
+        stat_stub.chmod(0o755)
+    ssh_log = tmp_path / "ssh.log"
+    _write_stub(bin_dir, "ssh", ssh_log)
+    result = subprocess.run(
+        [str(controller), "status", "ai-lab01.esxi"],
+        cwd=repository,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            "MILOCO_SSH_IDENTITY": identity_value,
+        },
+    )
+    assert result.returncode != 0
+    assert "MILOCO_SSH_IDENTITY" in result.stderr
+    assert not ssh_log.exists()
+
+
+def test_build_and_help_do_not_require_ssh_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The explicit remote identity guard must remain outside build and help paths."""
+    monkeypatch.delenv("MILOCO_SSH_IDENTITY", raising=False)
+    help_result = _run_deploy("--help", sandbox_dir=tmp_path)
+    build_result = _run_deploy("build", sandbox_dir=tmp_path)
+    assert help_result.returncode == 0
+    assert "MILOCO_SSH_IDENTITY" not in help_result.stderr
+    assert "MILOCO_SSH_IDENTITY" not in build_result.stderr
+
+
 @pytest.mark.parametrize("replacement_target", ["archive", "controller"])
 def test_deploy_rejects_replacement_after_clean_build_receipt(
     tmp_path: Path, replacement_target: str
@@ -1309,6 +1385,7 @@ def _run_published_sha_state_harness(
         + "    *) return 91 ;;\n"
         + "  esac\n"
         + "  [[ \"$state\" != probe_error ]] || return 75\n"
+        + "  [[ \"$state\" != malformed ]] || { printf 'not-an-image-id\\n'; return 0; }\n"
         + f"  [[ \"$state\" != present ]] || printf '%s\\n' '{image_id}'\n"
         + "}\n"
         + f'published_sha_state "{sha}"\n',
@@ -1329,6 +1406,7 @@ def _run_published_sha_state_harness(
         ("none", "present", "absent", "existing"),
         ("none", "absent", "present", "existing"),
         ("none", "probe_error", "absent", "probe_error"),
+        ("none", "malformed", "absent", "probe_error"),
     ],
 )
 def test_published_sha_state_is_new_only_when_every_durable_object_is_absent(
@@ -1353,10 +1431,13 @@ def test_published_sha_state_is_new_only_when_every_durable_object_is_absent(
 def _run_existing_sha_transaction_harness(
     tmp_path: Path, *, capability: str, state_pointer: str
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
-    """Exercise the real existing-SHA build decision while recording attempted mutations."""
+    """Exercise transaction receive and build branches while recording forbidden mutations."""
     sha = "c" * 40
+    digest = "d" * 64
     lab_root = tmp_path / "miloco-lab"
     state_dir = lab_root / "deploy-state"
+    (lab_root / "releases" / sha).mkdir(parents=True)
+    (lab_root / "incoming").mkdir(parents=True)
     if state_pointer != "none":
         state_dir.mkdir(parents=True)
         (state_dir / state_pointer).write_text(f"{sha}\\n", encoding="utf-8")
@@ -1364,18 +1445,31 @@ def _run_existing_sha_transaction_harness(
     harness = tmp_path / f"existing-{capability}-{state_pointer}.sh"
     harness.write_text(
         _remote_source_for_harness(lab_root)
+        + "\nrequire_root() { :; }\n"
+        + "acquire_transition_lock() { :; }\n"
+        + "verify_controller_self() { :; }\n"
+        + "published_sha_state() { printf 'existing\\n'; }\n"
+        + "verify_archive_digest() { :; }\n"
+        + "validate_archive_members() { :; }\n"
+        + "verify_release_tree() { :; }\n"
+        + "chown() { :; }\n"
+        + "chmod() { :; }\n"
+        + f"read_artifact_record() {{ artifact_archive_digest='{digest}'; artifact_controller_digest='{digest}'; artifact_allowlist_digest='{hashlib.sha256(ALLOWLIST.read_bytes()).hexdigest()}'; }}\n"
         + f"\nrelease_capability() {{ printf '{capability}\\n'; }}\n"
+        + f"build_and_activate_locked() {{ build_images_and_accept \"$1\" \"$2\" \"$3\" \"{lab_root}/releases/{sha}\"; }}\n"
         + f"atomic_write() {{ printf 'atomic-write\\n' >> '{mutation_log}'; }}\n"
         + f"mark_acceptance_success() {{ printf 'marker-write\\n' >> '{mutation_log}'; }}\n"
         + f"remove_candidate_image_tags() {{ printf 'candidate-tag-removal\\n' >> '{mutation_log}'; }}\n"
         + f"remove_image_tags() {{ printf 'canonical-tag-removal\\n' >> '{mutation_log}'; }}\n"
         + f"invalidate_acceptance() {{ printf 'marker-removal\\n' >> '{mutation_log}'; }}\n"
         + f"docker_command() {{ printf 'docker-mutation\\n' >> '{mutation_log}'; }}\n"
-        + f'build_images_and_accept existing "ai-lab01.esxi" "{sha}" "{lab_root}/releases/{sha}"\n',
+        + f'transaction_release "ai-lab01.esxi" "{sha}" "{digest}" "{digest}" "{hashlib.sha256(ALLOWLIST.read_bytes()).hexdigest()}"\n',
         encoding="utf-8",
     )
     harness.chmod(0o755)
-    result = subprocess.run([str(harness)], text=True, capture_output=True, check=False, timeout=5)
+    result = subprocess.run(
+        [str(harness)], input="archive", text=True, capture_output=True, check=False, timeout=5
+    )
     return result, mutation_log.read_text(encoding="utf-8").splitlines() if mutation_log.exists() else []
 
 
@@ -2183,6 +2277,76 @@ def test_activation_failure_preserves_published_proof(tmp_path: Path) -> None:
     result = subprocess.run([str(harness)], text=True, capture_output=True, check=False, timeout=5)
     assert result.returncode != 0
     after = [path.read_bytes() if path.is_file() else tuple(path.iterdir()) for path in proof_paths]
+    assert after == before
+
+
+def test_receipt_write_failure_preserves_newly_published_release(tmp_path: Path) -> None:
+    """A receipt failure after the atomic move must not delete the canonical release directory."""
+    sha = "d" * 40
+    digest = "e" * 64
+    lab_root = tmp_path / "miloco-lab"
+    release = lab_root / "releases" / sha
+    incoming = lab_root / "incoming"
+    staging = incoming / "release-staging"
+    archive = incoming / "archive.tar.gz"
+    harness = tmp_path / "receipt-failure.sh"
+    harness.write_text(
+        _remote_source_for_harness(lab_root)
+        + "\ninstall() { for path in \"$@\"; do [[ \"$path\" == /* ]] && /bin/mkdir -p -- \"$path\"; done; }\n"
+        + "chown() { :; }\n"
+        + "chmod() { :; }\n"
+        + "find() { :; }\n"
+        + "verify_archive_digest() { :; }\n"
+        + "validate_archive_members() { :; }\n"
+        + "verify_release_tree() { :; }\n"
+        + "published_sha_state() { printf 'new\\n'; }\n"
+        + f"mktemp() {{ case \"$1\" in *archive.*) : > '{archive}'; printf '%s\\n' '{archive}' ;; *) /bin/mkdir -p '{staging}'; printf '%s\\n' '{staging}' ;; esac; }}\n"
+        + "tar() { :; }\n"
+        + "atomic_write() { return 17; }\n"
+        + f'receive_release_locked new "{sha}" "{digest}" "{digest}" "{hashlib.sha256(ALLOWLIST.read_bytes()).hexdigest()}"\n',
+        encoding="utf-8",
+    )
+    harness.chmod(0o755)
+    result = subprocess.run(
+        [str(harness)], input="archive", text=True, capture_output=True, check=False, timeout=5
+    )
+    assert result.returncode != 0
+    assert release.is_dir(), "post-publication cleanup must not remove immutable release proof"
+
+
+def test_activation_success_preserves_published_proof_and_image_ids(tmp_path: Path) -> None:
+    """Successful activation changes pointers only, never the accepted SHA's proof."""
+    candidate = "f" * 40
+    lab_root = tmp_path / "miloco-lab"
+    state = lab_root / "deploy-state"
+    release = lab_root / "releases" / candidate
+    artifact = state / "artifacts" / candidate
+    marker = state / "accepted" / candidate
+    release.mkdir(parents=True)
+    artifact.parent.mkdir(parents=True)
+    marker.parent.mkdir(parents=True)
+    artifact.write_text("receipt\n", encoding="utf-8")
+    runtime_id = "sha256:" + "1" * 64
+    acceptance_id = "sha256:" + "2" * 64
+    marker.write_text(
+        f"runtime_image_id={runtime_id}\nacceptance_image_id={acceptance_id}\n", encoding="utf-8"
+    )
+    before = (tuple(release.iterdir()), artifact.read_bytes(), marker.read_bytes(), runtime_id, acceptance_id)
+    harness = tmp_path / "published-proof-success.sh"
+    harness.write_text(
+        _remote_source_for_harness(lab_root)
+        + "\nrelease_capability() { printf 'capable\\n'; }\n"
+        + "install() { :; }\n"
+        + "atomic_write() { :; }\n"
+        + "compose_up() { :; }\n"
+        + "wait_for_health() { :; }\n"
+        + f'activate_release "ai-lab01.esxi" "{candidate}"\n',
+        encoding="utf-8",
+    )
+    harness.chmod(0o755)
+    result = subprocess.run([str(harness)], text=True, capture_output=True, check=False, timeout=5)
+    assert result.returncode == 0, result.stderr
+    after = (tuple(release.iterdir()), artifact.read_bytes(), marker.read_bytes(), runtime_id, acceptance_id)
     assert after == before
 
 
