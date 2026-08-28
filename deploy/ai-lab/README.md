@@ -89,10 +89,13 @@ state, and lock parent or record are required to be non-symlinks, root-owned,
 and resolved beneath `/opt/miloco-lab` before use. Atomic writes validate both
 their parent and final record.
 
-If the requested SHA is already `current` or `previous`, an intact release,
-marker, and exact image-ID pair is reused without any marker, tag, or build
-mutation. An incomplete protected proof fails before mutation. Every other
-build uses `miloco-lab-candidate:<sha>` and
+If the requested SHA already has an intact release, marker, and exact image-ID
+pair, it is reused without any marker, tag, or build mutation whether it is
+`current`, `previous`, or one of the retained historical pairs. Any uncertainty
+about such a pair fails closed without mutation. A confirmed-invalid protected
+proof also fails before mutation; only a confirmed-invalid unprotected SHA may
+enter isolated candidate rebuild. Every such build uses
+`miloco-lab-candidate:<sha>` and
 `miloco-lab-acceptance-candidate:<sha>` until acceptance succeeds; canonical
 tags are untouched during build and acceptance. EXIT, HUP, INT, and TERM cleanup
 is armed before the stale unprotected marker or any candidate tag is mutated.
@@ -118,10 +121,13 @@ budget, and a command that consumes that budget is killed without added grace.
 Retention classifies every pair as rollback-capable, definitively invalid, or a
 probe error. A missing image confirmed by a successful Docker listing, a
 contract/checksum-invalid release, or an explicit marker/image-ID mismatch is
-definitively invalid. Docker daemon/query failures, unexpected tool output, and
-other uncertain probes are probe errors. Probe errors stop cleanup without
-deleting anything. Invalid debris does not consume a historical slot. The
-current release plus two rollback-capable historical pairs are kept, and
+definitively invalid. Contract verification distinguishes a successfully
+computed checksum or metadata mismatch from uncertainty: missing tools,
+unexpected exit codes or output, and filesystem, read, `find`, `stat`, `grep`,
+or checksum I/O failures are probe errors. Docker daemon/query failures and
+unexpected image output are probe errors as well. Probe errors stop cleanup
+without deleting anything. Invalid debris does not consume a historical slot.
+The current release plus two rollback-capable historical pairs are kept, and
 `previous` consumes one historical slot.
 Removal protects `current` and `previous`, removes and verifies both image tags
 first, then deletes the exact release and its artifact and acceptance records;

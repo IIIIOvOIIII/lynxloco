@@ -1101,8 +1101,11 @@ def test_rollback_requires_artifact_bound_acceptance_marker_before_images(tmp_pa
     harness.write_text(
         source
         + "\nverify_release() { return 0; }\n"
+        + "release_contract_state() { printf 'valid\\n'; }\n"
         + "require_safe_directory() { return 0; }\n"
         + "require_safe_record() { return 0; }\n"
+        + "safe_directory_state() { [[ -d \"$1\" && ! -L \"$1\" ]] || return 1; return 0; }\n"
+        + "safe_record_state() { [[ -f \"$1\" && ! -L \"$1\" ]] || return 1; return 0; }\n"
         + f"image_reference_state() {{ case \"$1\" in miloco-lab:*) printf 'present:%s\\n' '{runtime_id}' ;; *) printf 'present:%s\\n' '{acceptance_id}' ;; esac; }}\n"
         + 'release_capability "$1"\n',
         encoding="utf-8",
@@ -1183,11 +1186,17 @@ def test_release_capability_distinguishes_invalid_debris_from_probe_uncertainty(
     )[0]
     source = source.replace('readonly LAB_ROOT="/opt/miloco-lab"', f'readonly LAB_ROOT="{lab_root}"')
     harness = tmp_path / f"classifier-{probe_case}.sh"
-    verify_override = "" if probe_case == "corrupt_release" else "\nverify_release() { return 0; }\n"
+    verify_override = (
+        "\nrelease_contract_state() { printf 'definitively_invalid\\n'; }\n"
+        if probe_case == "corrupt_release"
+        else "\nverify_release() { return 0; }\nrelease_contract_state() { printf 'valid\\n'; }\n"
+    )
     harness.write_text(
         source
         + "\nrequire_safe_directory() { return 0; }\n"
         + "require_safe_record() { return 0; }\n"
+        + "safe_directory_state() { [[ -d \"$1\" && ! -L \"$1\" ]] || return 1; return 0; }\n"
+        + "safe_record_state() { [[ -f \"$1\" && ! -L \"$1\" ]] || return 1; return 0; }\n"
         + verify_override
         + "docker_command() {\n"
         + f"  case '{probe_case}:$*' in\n"
@@ -1229,6 +1238,8 @@ def test_failed_acceptance_invalidates_old_marker_and_cleans_rebuilt_tags(tmp_pa
         source
         + "\nrequire_safe_directory() { return 0; }\n"
         + "require_safe_record() { return 0; }\n"
+        + "safe_directory_state() { [[ -d \"$1\" && ! -L \"$1\" ]] || return 1; return 0; }\n"
+        + "safe_record_state() { [[ -f \"$1\" && ! -L \"$1\" ]] || return 1; return 0; }\n"
         + f"remove_image_tags() {{ printf 'remove-tags\\n' >> '{call_log}'; return 0; }}\n"
         + "docker_command() {\n"
         + f"  printf 'docker:%s\\n' \"$*\" >> '{call_log}'\n"
@@ -1275,6 +1286,8 @@ def test_same_sha_retry_reuses_protected_accepted_images_without_mutation(
         source
         + "\nrequire_safe_directory() { return 0; }\n"
         + "require_safe_record() { return 0; }\n"
+        + "safe_directory_state() { [[ -d \"$1\" && ! -L \"$1\" ]] || return 1; return 0; }\n"
+        + "safe_record_state() { [[ -f \"$1\" && ! -L \"$1\" ]] || return 1; return 0; }\n"
         + "release_capability() { printf 'capable\\n'; }\n"
         + f"docker_command() {{ printf 'docker:%s\\n' \"$*\" >> '{mutation_log}'; return 0; }}\n"
         + f"remove_image_tags() {{ printf 'remove-canonical\\n' >> '{mutation_log}'; return 0; }}\n"
@@ -1289,6 +1302,212 @@ def test_same_sha_retry_reuses_protected_accepted_images_without_mutation(
     assert result.returncode == 0, result.stderr
     assert marker.read_text(encoding="utf-8") == "known-good-proof\n"
     assert not mutation_log.exists(), "protected accepted retry must be a mutation-free reuse"
+
+
+@pytest.mark.parametrize(
+    ("capability", "expected_returncode", "expects_mutation"),
+    [
+        ("capable", 0, False),
+        ("probe_error", 1, False),
+        ("definitively_invalid", 1, True),
+    ],
+)
+def test_same_sha_retry_classifies_non_pointer_history_before_any_mutation(
+    tmp_path: Path,
+    capability: str,
+    expected_returncode: int,
+    expects_mutation: bool,
+) -> None:
+    """All historical pairs are classified before a same-SHA candidate is touched."""
+    sha = "6" * 40
+    lab_root = tmp_path / "miloco-lab"
+    accepted = lab_root / "deploy-state" / "accepted"
+    accepted.mkdir(parents=True)
+    marker = accepted / sha
+    marker.write_text("historical-proof\n", encoding="utf-8")
+    mutation_log = tmp_path / f"historical-{capability}.log"
+    source = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8").rsplit(
+        '\nmain "$@"', maxsplit=1
+    )[0]
+    source = source.replace('readonly LAB_ROOT="/opt/miloco-lab"', f'readonly LAB_ROOT="{lab_root}"')
+    harness = tmp_path / f"historical-{capability}.sh"
+    harness.write_text(
+        source
+        + "\nrequire_safe_directory() { return 0; }\n"
+        + "require_safe_record() { return 0; }\n"
+        + "safe_directory_state() { [[ -d \"$1\" && ! -L \"$1\" ]] || return 1; return 0; }\n"
+        + "safe_record_state() { [[ -f \"$1\" && ! -L \"$1\" ]] || return 1; return 0; }\n"
+        + f"release_capability() {{ printf '{capability}\\n'; }}\n"
+        + f"invalidate_acceptance() {{ printf 'marker\\n' >> '{mutation_log}'; return 0; }}\n"
+        + f"remove_candidate_image_tags() {{ printf 'candidate-tags\\n' >> '{mutation_log}'; return 0; }}\n"
+        + f"remove_image_tags() {{ printf 'canonical-tags\\n' >> '{mutation_log}'; return 0; }}\n"
+        + "docker_command() { return 17; }\n"
+        + f'build_images_and_accept "ai-lab01.esxi" "{sha}" "{lab_root}/releases/{sha}"\n',
+        encoding="utf-8",
+    )
+    harness.chmod(0o755)
+    result = subprocess.run(
+        [str(harness)], text=True, capture_output=True, check=False, timeout=5
+    )
+    assert result.returncode == expected_returncode, result.stderr
+    if expects_mutation:
+        assert mutation_log.exists(), "only confirmed invalid history may enter candidate rebuild"
+        assert "marker" in mutation_log.read_text(encoding="utf-8")
+    else:
+        assert marker.read_text(encoding="utf-8") == "historical-proof\n"
+        assert not mutation_log.exists(), (
+            "capable or uncertain historical pairs must be a mutation-free reuse/failure"
+        )
+
+
+@pytest.mark.parametrize(
+    ("probe_case", "expected_state"),
+    [
+        ("checksum_mismatch", "definitively_invalid"),
+        ("sha256sum_absent", "probe_error"),
+        ("sha256sum_io_error", "probe_error"),
+        ("find_error", "probe_error"),
+        ("find_malformed_output", "probe_error"),
+        ("stat_error", "probe_error"),
+        ("stat_mode_malformed", "probe_error"),
+        ("unsafe_mode", "definitively_invalid"),
+        ("grep_error", "probe_error"),
+        ("contract_mismatch", "definitively_invalid"),
+    ],
+)
+def test_release_contract_classifier_separates_mismatch_from_tool_or_io_uncertainty(
+    tmp_path: Path, probe_case: str, expected_state: str
+) -> None:
+    """The real classifier only calls a successfully confirmed mismatch invalid."""
+    sha = "7" * 40
+    lab_root = tmp_path / "miloco-lab"
+    release = lab_root / "releases" / sha
+    release.mkdir(parents=True)
+    release_json = release / "release.json"
+    release_json.write_text(
+        '{"schema": 1, "git_sha": "'
+        + (("8" * 40) if probe_case == "contract_mismatch" else sha)
+        + '", "platform": "linux/amd64"}\n',
+        encoding="utf-8",
+    )
+    payload = release / "remote-release.sh"
+    payload.write_text("payload\n", encoding="utf-8")
+    digest = hashlib.sha256(payload.read_bytes()).hexdigest()
+    if probe_case == "checksum_mismatch":
+        digest = "0" * 64
+    (release / "SHA256SUMS").write_text(
+        f"{hashlib.sha256(release_json.read_bytes()).hexdigest()}  release.json\n"
+        f"{digest}  remote-release.sh\n",
+        encoding="utf-8",
+    )
+
+    source = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8").rsplit(
+        '\nmain "$@"', maxsplit=1
+    )[0]
+    source = source.replace('readonly LAB_ROOT="/opt/miloco-lab"', f'readonly LAB_ROOT="{lab_root}"')
+    normal_stat = (
+        "stat() { case \"$2\" in '%u:%g') printf '0:0\\n' ;; '%a') "
+        "case \"$3\" in */remote-release.sh) printf '555\\n' ;; *) "
+        "[[ -d \"$3\" ]] && printf '755\\n' || printf '644\\n' ;; esac ;; *) return 74 ;; esac; }"
+    )
+    overrides = [normal_stat]
+    if probe_case == "stat_error":
+        overrides = ["stat() { return 74; }"]
+    if probe_case == "stat_mode_malformed":
+        overrides = [
+            "stat() { case \"$2\" in '%u:%g') printf '0:0\\n' ;; '%a') printf 'not-a-mode\\n' ;; esac; }"
+        ]
+    if probe_case == "unsafe_mode":
+        overrides = [
+            "stat() { case \"$2\" in '%u:%g') printf '0:0\\n' ;; '%a') "
+            "case \"$3\" in */remote-release.sh) printf '666\\n' ;; *) [[ -d \"$3\" ]] && printf '755\\n' || printf '644\\n' ;; esac ;; esac; }"
+        ]
+    if probe_case == "find_error":
+        overrides.append("find() { return 74; }")
+    if probe_case == "find_malformed_output":
+        overrides.append("find() { printf '/outside-release\\n'; }")
+    if probe_case == "grep_error":
+        overrides.append("grep() { return 2; }")
+    if probe_case == "sha256sum_absent":
+        overrides.append("sha256sum() { return 127; }")
+    if probe_case == "sha256sum_io_error":
+        overrides.append("sha256sum() { return 74; }")
+    harness = tmp_path / f"contract-classifier-{probe_case}.sh"
+    harness.write_text(
+        source
+        + "\n"
+        + "\n".join(overrides)
+        + "\n"
+        + f'release_contract_state "{sha}"\n',
+        encoding="utf-8",
+    )
+    harness.chmod(0o755)
+    result = subprocess.run(
+        [str(harness)], text=True, capture_output=True, check=False, timeout=5
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == expected_state
+
+
+@pytest.mark.parametrize(
+    ("record_case", "expected_state"),
+    [
+        ("missing", "definitively_invalid"),
+        ("malformed", "definitively_invalid"),
+        ("read_error", "probe_error"),
+        ("stat_error", "probe_error"),
+    ],
+)
+def test_release_capability_propagates_record_semantics_and_read_uncertainty(
+    tmp_path: Path, record_case: str, expected_state: str
+) -> None:
+    sha = "5" * 40
+    lab_root = tmp_path / "miloco-lab"
+    artifacts = lab_root / "deploy-state" / "artifacts"
+    accepted = lab_root / "deploy-state" / "accepted"
+    artifacts.mkdir(parents=True)
+    accepted.mkdir(parents=True)
+    artifact_record = artifacts / sha
+    if record_case != "missing":
+        artifact_record.write_text(
+            "malformed\n"
+            if record_case == "malformed"
+            else (
+                "schema=1\n"
+                f"git_sha={sha}\n"
+                f"archive_sha256={'a' * 64}\n"
+                f"controller_sha256={'b' * 64}\n"
+                f"allowlist_sha256={hashlib.sha256(ALLOWLIST.read_bytes()).hexdigest()}\n"
+            ),
+            encoding="utf-8",
+        )
+    source = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8").rsplit(
+        '\nmain "$@"', maxsplit=1
+    )[0]
+    source = source.replace('readonly LAB_ROOT="/opt/miloco-lab"', f'readonly LAB_ROOT="{lab_root}"')
+    overrides = [
+        "stat() { case \"$2\" in '%u:%g') printf '0:0\\n' ;; '%a') "
+        "[[ -d \"$3\" ]] && printf '755\\n' || printf '644\\n' ;; *) return 74 ;; esac; }"
+    ]
+    if record_case == "stat_error":
+        overrides = ["stat() { return 74; }"]
+    if record_case == "read_error":
+        overrides.append("read_file_content() { return 74; }")
+    harness = tmp_path / f"record-classifier-{record_case}.sh"
+    harness.write_text(
+        source
+        + "\n"
+        + "\n".join(overrides)
+        + "\n"
+        + f'release_capability "{sha}"\n',
+        encoding="utf-8",
+    )
+    harness.chmod(0o755)
+    result = subprocess.run(
+        [str(harness)], text=True, capture_output=True, check=False, timeout=5
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == expected_state
 
 
 @pytest.mark.parametrize("interrupt_stage", ["build", "acceptance"])
@@ -1318,6 +1537,7 @@ def test_unaccepted_candidate_signal_cleanup_is_armed_before_first_mutation(
         source
         + "\nrequire_safe_directory() { return 0; }\n"
         + "require_safe_record() { return 0; }\n"
+        + "release_capability() { printf 'definitively_invalid\\n'; }\n"
         + "invalidate_acceptance() {\n"
         + f"  [[ -s '{trap_log}' ]] || trap -p EXIT > '{trap_log}'\n"
         + f"  rm -f -- '{candidate_marker}'\n"
@@ -1510,6 +1730,47 @@ def test_retention_probe_error_stops_without_deleting_any_pair(tmp_path: Path) -
     assert result.returncode != 0
     assert "probe_error" in result.stderr
     assert not removal_log.exists(), "cleanup must stop before any delete on probe error"
+
+
+def test_retention_malformed_listing_stops_without_deleting_any_pair(tmp_path: Path) -> None:
+    current = "8" * 40
+    lab_root = tmp_path / "miloco-lab"
+    releases = lab_root / "releases"
+    releases.mkdir(parents=True)
+    (releases / current).mkdir()
+    source = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8").rsplit(
+        '\nmain "$@"', maxsplit=1
+    )[0]
+    source = source.replace('readonly LAB_ROOT="/opt/miloco-lab"', f'readonly LAB_ROOT="{lab_root}"')
+    removal_log = tmp_path / "malformed-listing-removal.log"
+    harness = tmp_path / "retention-malformed-listing.sh"
+    harness.write_text(
+        source
+        + "\nrelease_capability() { printf 'capable\\n'; }\n"
+        + f"remove_release_pair() {{ printf '%s\\n' \"$1\" >> '{removal_log}'; }}\n"
+        + f"retain_rollback_history '{current}'\n",
+        encoding="utf-8",
+    )
+    harness.chmod(0o755)
+    bin_dir = tmp_path / "retention-malformed-bin"
+    bin_dir.mkdir()
+    find_stub = bin_dir / "find"
+    find_stub.write_text(
+        "#!/usr/bin/env bash\nprintf 'malformed-tool-output\\n'\n",
+        encoding="utf-8",
+    )
+    find_stub.chmod(0o755)
+    result = subprocess.run(
+        [str(harness)],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+        env={**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"},
+    )
+    assert result.returncode != 0
+    assert "probe_error" in result.stderr
+    assert not removal_log.exists()
 
 
 def test_remove_pair_protects_state_and_verifies_full_removal(tmp_path: Path) -> None:
