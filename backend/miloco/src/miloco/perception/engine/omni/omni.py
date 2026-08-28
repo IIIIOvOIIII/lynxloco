@@ -93,7 +93,8 @@ async def run_omni(
     edge_packet: IdentityPacket, context: OmniContext, config: OmniConfig
 ) -> OmniOutput:
     """Run Omni layer: build prompt → call model → parse response."""
-    payload = build_prompt(edge_packet, context)
+    adapter = get_adapter(config.api_protocol, config.model)
+    payload = build_prompt(edge_packet, context, media_mode=adapter.media_mode)
     raw_response = await call_omni(payload, config)
     output = parse_omni_response(raw_response, _rule_name_to_id(context))
     output.usage = extract_usage(raw_response)
@@ -104,7 +105,10 @@ async def run_omni_batch(
     edge_packets: list[IdentityPacket], context: OmniContext, config: OmniConfig
 ) -> OmniOutput:
     """Run Omni layer for multiple devices in the same room."""
-    payload = build_batch_prompt(edge_packets, context)
+    adapter = get_adapter(config.api_protocol, config.model)
+    payload = build_batch_prompt(
+        edge_packets, context, media_mode=adapter.media_mode
+    )
     raw_response = await call_omni(payload, config)
     output = parse_omni_response(raw_response, _rule_name_to_id(context))
     output.usage = extract_usage(raw_response)
@@ -476,7 +480,10 @@ async def run_omni_stream(
     on_early_suggestions: Callable[[list[Suggestion]], Awaitable[None]] | None = None,
 ) -> OmniOutput:
     """Run Omni layer with streaming — extracts actionable fields early via callbacks."""
-    payload = build_stream_prompt(edge_packet, context)
+    adapter = get_adapter(config.api_protocol, config.model)
+    payload = build_stream_prompt(
+        edge_packet, context, media_mode=adapter.media_mode
+    )
     return await _stream_and_parse(
         payload,
         config,
@@ -497,7 +504,10 @@ async def run_omni_batch_stream(
     on_early_suggestions: Callable[[list[Suggestion]], Awaitable[None]] | None = None,
 ) -> OmniOutput:
     """Run Omni layer for multiple devices with streaming — extracts actionable fields early."""
-    payload = build_batch_stream_prompt(edge_packets, context)
+    adapter = get_adapter(config.api_protocol, config.model)
+    payload = build_batch_stream_prompt(
+        edge_packets, context, media_mode=adapter.media_mode
+    )
     return await _stream_and_parse(
         payload,
         config,

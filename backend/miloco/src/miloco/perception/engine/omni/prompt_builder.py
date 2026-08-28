@@ -58,7 +58,7 @@ from .constants import (
 from .field_registry import SceneDescriptor, render_field_spec, render_schema
 from .home_profile_loader import get_home_profile_prefix, home_profile_has_pets
 from .pet_refs import build_pet_reference_content
-from .provider import LocalMediaInfo, OmniProviderAdapter
+from .provider import LocalMediaInfo, OmniMediaMode, OmniProviderAdapter
 
 
 def _has_pets_for_scene() -> bool:
@@ -80,6 +80,16 @@ if TYPE_CHECKING:
     from miloco.perception.engine.identity.library import GallerySamples
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class EncodedInputImage:
+    """One immutable JPEG image prepared for an Omni request payload."""
+
+    source: Literal["panorama", "crop"]
+    data: str
+    media_type: Literal["image/jpeg"] = "image/jpeg"
+    track_id: int | None = None
 
 
 
@@ -115,6 +125,76 @@ class FusedPromptConfig:
     max_pet_refs: int = 3
 
 
+def _even_indices(length: int, limit: int) -> list[int]:
+    """Select deterministic, endpoint-preserving indices across a sequence."""
+    if length <= 0 or limit <= 0:
+        return []
+    if limit == 1:
+        return [0]
+    if length <= limit:
+        return list(range(length))
+    return sorted(
+        {round(index * (length - 1) / (limit - 1)) for index in range(limit)}
+    )
+
+
+def _encode_input_jpeg(image: NDArray[np.uint8], *, is_crop: bool) -> bytes:
+    resized = (
+        cv2.resize(image, _CROP_SIZE)
+        if is_crop
+        else _resize_short_edge(image, _effective_panorama_short_edge())
+    )
+    ok, encoded = cv2.imencode(
+        ".jpg", resized, [cv2.IMWRITE_JPEG_QUALITY, 85]
+    )
+    if not ok:
+        raise ValueError("failed to encode Omni input image as JPEG")
+    return encoded.tobytes()
+
+
+def encode_responses_images(
+    packets: list[IdentityPacket],
+    *,
+    panorama_limit: int = 6,
+    crop_limit: int = 6,
+) -> list[EncodedInputImage]:
+    """Build a bounded panorama-first JPEG sequence without mutating packets."""
+    panorama_limit = min(max(panorama_limit, 0), 6)
+    crop_limit = min(max(crop_limit, 0), 6)
+    panoramas = [frame for packet in packets for frame in packet.all_frames]
+    result: list[EncodedInputImage] = []
+    for index in _even_indices(len(panoramas), panorama_limit):
+        jpeg = _encode_input_jpeg(panoramas[index], is_crop=False)
+        result.append(
+            EncodedInputImage(
+                source="panorama",
+                data=base64.b64encode(jpeg).decode("ascii"),
+            )
+        )
+
+    seen_crops: set[tuple[int, bytes]] = set()
+    for packet in packets:
+        for selected_frame in packet.frames:
+            for crop in selected_frame.crops:
+                if len(result) >= panorama_limit + crop_limit:
+                    return result
+                jpeg = _encode_input_jpeg(crop.image, is_crop=True)
+                key = (crop.track_id, jpeg)
+                if key in seen_crops:
+                    continue
+                seen_crops.add(key)
+                result.append(
+                    EncodedInputImage(
+                        source="crop",
+                        data=base64.b64encode(jpeg).decode("ascii"),
+                        track_id=crop.track_id,
+                    )
+                )
+                if len(seen_crops) >= crop_limit:
+                    return result
+    return result
+
+
 # =============================================================================
 # Public API — signatures unchanged, callers need no modification
 # =============================================================================
@@ -124,6 +204,8 @@ def build_prompt(
     identity_packet: IdentityPacket,
     context: OmniContext,
     label_lookup: "dict[str, str] | None" = None,
+    *,
+    media_mode: OmniMediaMode = "video_audio",
 ) -> dict:
     """Build the prompt payload for the omni model (single device).
 
@@ -133,34 +215,64 @@ def build_prompt(
 
     Returns dict with keys: system_prompt, user_content, video_base64, media_info, crops.
     """
-    return _build_payload([identity_packet], context, stream=False, label_lookup=label_lookup)
+    return _build_payload(
+        [identity_packet],
+        context,
+        stream=False,
+        label_lookup=label_lookup,
+        media_mode=media_mode,
+    )
 
 
 def build_batch_prompt(
     identity_packets: list[IdentityPacket],
     context: OmniContext,
     label_lookup: "dict[str, str] | None" = None,
+    *,
+    media_mode: OmniMediaMode = "video_audio",
 ) -> dict:
     """Build the prompt payload for multi-device omni inference (same room)."""
-    return _build_payload(identity_packets, context, stream=False, label_lookup=label_lookup)
+    return _build_payload(
+        identity_packets,
+        context,
+        stream=False,
+        label_lookup=label_lookup,
+        media_mode=media_mode,
+    )
 
 
 def build_stream_prompt(
     identity_packet: IdentityPacket,
     context: OmniContext,
     label_lookup: "dict[str, str] | None" = None,
+    *,
+    media_mode: OmniMediaMode = "video_audio",
 ) -> dict:
     """Build prompt payload for streaming omni call (single device, speeches first)."""
-    return _build_payload([identity_packet], context, stream=True, label_lookup=label_lookup)
+    return _build_payload(
+        [identity_packet],
+        context,
+        stream=True,
+        label_lookup=label_lookup,
+        media_mode=media_mode,
+    )
 
 
 def build_batch_stream_prompt(
     identity_packets: list[IdentityPacket],
     context: OmniContext,
     label_lookup: "dict[str, str] | None" = None,
+    *,
+    media_mode: OmniMediaMode = "video_audio",
 ) -> dict:
     """Build prompt payload for streaming omni call (multi-device, speeches first)."""
-    return _build_payload(identity_packets, context, stream=True, label_lookup=label_lookup)
+    return _build_payload(
+        identity_packets,
+        context,
+        stream=True,
+        label_lookup=label_lookup,
+        media_mode=media_mode,
+    )
 
 
 def build_query_prompt(
@@ -168,6 +280,8 @@ def build_query_prompt(
     query: str,
     last_caption: str | None = None,
     label_lookup: "dict[str, str] | None" = None,
+    *,
+    media_mode: OmniMediaMode = "video_audio",
 ) -> dict:
     """Build prompt for active user query — uses Identity results, free-text output."""
     parts = [
@@ -180,16 +294,22 @@ def build_query_prompt(
         parts.append(home_profile)
     # query 不接 crop(v1 范围外);走 _effective_panorama_short_edge() 兜掉历史 config.json 里
     # 可能残留的 0(早期哨兵),否则 _encode_video_mp4 会算出 scale=0 崩掉按需查询。
-    video_b64, media_info = _encode_batch_video(
-        identity_packets, short_edge=_effective_panorama_short_edge()
-    )
-    return {
+    payload: dict[str, object] = {
         "system_prompt": "\n\n".join(parts),
         "user_content": _build_query_user_content(identity_packets, query, last_caption, label_lookup),
-        "video_base64": video_b64,
-        "media_info": media_info,
         "crops": [],
     }
+    if media_mode == "image_sequence":
+        images = encode_responses_images(identity_packets)
+        payload["images"] = images
+        payload["text_only"] = not images
+    else:
+        video_b64, media_info = _encode_batch_video(
+            identity_packets, short_edge=_effective_panorama_short_edge()
+        )
+        payload["video_base64"] = video_b64
+        payload["media_info"] = media_info
+    return payload
 
 
 def build_fused_payload(
@@ -232,17 +352,15 @@ def build_fused_payload(
     """
     cfg = config or FusedPromptConfig()
     if adapter is None:
-        from miloco.config import get_settings
+        from .provider import MiMoAdapter
 
-        from .provider import get_adapter as _get_adapter
-        omni = get_settings().model.omni
-        adapter = _get_adapter(omni.api_protocol, omni.model)
+        adapter = MiMoAdapter()
     if not packets:
         raise ValueError("build_fused_payload: packets 不能为空")
 
     if label_lookup is None:
         label_lookup = {
-            pid: format_person_label(s.name, s.role)
+            pid: (format_person_label(s.name, s.role) or pid)
             for pid, s in gallery_snapshot.items()
             if s.name
         }
@@ -251,10 +369,20 @@ def build_fused_payload(
     # 各自独立 user 消息）；本轮事实只放"当前时间 + 音频"——audio 无视频，不渲染名册/gallery/
     # 待识别 track（名册的 bbox 是为"把姓名对应到视频里的人"，audio 场景无意义）。
     if _resolve_route(packets) == "audio":
-        scene = SceneDescriptor(route="audio", has_identity=False, stream=False)
+        scene = SceneDescriptor(
+            route="audio",
+            has_identity=False,
+            stream=False,
+            has_audio=adapter.media_mode == "video_audio",
+            has_speech=adapter.media_mode == "video_audio",
+        )
         system_prompt = build_system_prompt(scene, include_home_profile=False, camera_prompt=context.camera_prompt)
         ep = packets[0]
-        audio_b64 = _encode_audio_only_mp4(ep.audio_clip, ep.sample_rate)
+        audio_b64 = (
+            _encode_audio_only_mp4(ep.audio_clip, ep.sample_rate)
+            if adapter.media_mode == "video_audio"
+            else None
+        )
         user_content: list[dict] = []
         if context.current_time:
             user_content.append({"type": "text", "text": f"当前时间: {context.current_time}"})
@@ -277,6 +405,7 @@ def build_fused_payload(
                 readonly_history=_build_readonly_history(context),
             ),
             "candidate_track_ids": [],
+            "text_only": adapter.media_mode == "image_sequence",
         }
 
     # 自适应分辨率(Smart Crop)。prompt 里所有 bbox 都按**全景整帧**归一化到 [0,1000],
@@ -344,26 +473,34 @@ def build_fused_payload(
                 return False
         return True
 
-    adaptive = _maybe_encode_adaptive(packets, region_ok=_candidate_bbox_ok)
-    if adaptive is not None:
-        video_b64, media_info = adaptive.video_b64, adaptive.media_info
-        ref_image_jpeg = adaptive.ref_image_jpeg
-        _region, _frame_size = adaptive.region, adaptive.frame_size
+    input_images: list[EncodedInputImage] = []
+    if adapter.media_mode == "image_sequence":
+        input_images = encode_responses_images(packets)
+    else:
+        adaptive = _maybe_encode_adaptive(packets, region_ok=_candidate_bbox_ok)
+        if adaptive is not None:
+            video_b64, media_info = adaptive.video_b64, adaptive.media_info
+            ref_image_jpeg = adaptive.ref_image_jpeg
+            _region, _frame_size = adaptive.region, adaptive.frame_size
 
-        def bbox_remap(b: tuple[int, int, int, int]) -> tuple[int, int, int, int] | None:
-            return remap_bbox_norm_to_crop(b, _region, _frame_size)
-    if video_b64 is None:
-        video_b64, media_info = _encode_batch_video(
-            packets, short_edge=_effective_panorama_short_edge()
-        )
+            def bbox_remap(b: tuple[int, int, int, int]) -> tuple[int, int, int, int] | None:
+                return remap_bbox_norm_to_crop(b, _region, _frame_size)
+        if video_b64 is None:
+            video_b64, media_info = _encode_batch_video(
+                packets, short_edge=_effective_panorama_short_edge()
+            )
 
     # has_speech 只由本轮 VAD 决定：本轮真有人声（含 pending 的延续语音）→ VAD 自然过、
     # 保留 speeches、模型把 <pending_speech> 拼成完整句；本轮无人声 → 剥 speeches，挂着的
     # pending 半句不强行补全（否则模型会就着噪声脑补出一个完成句，正是要根除的幻觉）。
     scene = SceneDescriptor(
         route="video", has_identity=bool(candidates), stream=False,
-        has_audio=_batch_video_has_audio(packets),
-        has_speech=_batch_video_has_speech(packets),
+        has_audio=(
+            adapter.media_mode == "video_audio" and _batch_video_has_audio(packets)
+        ),
+        has_speech=(
+            adapter.media_mode == "video_audio" and _batch_video_has_speech(packets)
+        ),
         has_pets=_has_pets_for_scene(),
         identity_match_disabled=matching_moot,
     )
@@ -375,6 +512,7 @@ def build_fused_payload(
         gallery_snapshot=gallery_snapshot,
         video_b64=video_b64,
         media_info=media_info,
+        input_images=input_images,
         ref_image_jpeg=ref_image_jpeg,
         bbox_remap=bbox_remap,
         adapter=adapter,
@@ -382,6 +520,7 @@ def build_fused_payload(
         label_lookup=label_lookup,
         has_pets=scene.has_pets,  # 复用 scene 已算好的 has_pets，避免注入点再读一次 profile.md
         matching_moot=matching_moot,
+        allow_reference_media=adapter.media_mode == "video_audio",
     )
 
     messages = _assemble_fused_messages(
@@ -394,6 +533,7 @@ def build_fused_payload(
     return {
         "messages": messages,
         "candidate_track_ids": [c.track_id for c in candidates],
+        "text_only": adapter.media_mode == "image_sequence" and not input_images,
     }
 
 
@@ -470,16 +610,25 @@ def _build_payload(
     stream: bool,
     label_lookup: "dict[str, str] | None" = None,
     include_home_profile: bool = True,
+    media_mode: OmniMediaMode = "video_audio",
 ) -> dict:
     route = _resolve_route(packets)
     # has_audio：video 路由下音频未过 gate 时为 False → schema 剥掉 speeches/env_sounds，
     # 避免模型就着画面脑补人声。audio 路由恒有音频。
     # has_speech：video 路由下 VAD 判无人声时为 False → 只剥 speeches、保留 env_sounds。
-    has_audio = True if route == "audio" else _batch_video_has_audio(packets)
+    has_audio = (
+        False
+        if media_mode == "image_sequence"
+        else (True if route == "audio" else _batch_video_has_audio(packets))
+    )
     # has_speech 只由本轮 VAD 决定：本轮真有人声（含 pending 的延续语音）→ VAD 自然过、
     # 拼接照常；本轮无人声 → 剥 speeches，挂着的 pending 半句不强行补全（否则模型会就着
     # 噪声脑补出完成句，正是要根除的幻觉）。
-    has_speech = True if route == "audio" else _batch_video_has_speech(packets)
+    has_speech = (
+        False
+        if media_mode == "image_sequence"
+        else (True if route == "audio" else _batch_video_has_speech(packets))
+    )
     scene = SceneDescriptor(
         route=route, has_identity=False, stream=stream,
         has_audio=has_audio, has_speech=has_speech,
@@ -493,7 +642,11 @@ def _build_payload(
         "user_content": user_text,
         "crops": [],
     }
-    if route == "audio":
+    if media_mode == "image_sequence":
+        images = encode_responses_images(packets)
+        base["images"] = images
+        base["text_only"] = not images
+    elif route == "audio":
         ep = packets[0]
         base["audio_base64"] = _encode_audio_only_mp4(ep.audio_clip, ep.sample_rate)
         base["media_info"] = _audio_only_media_info(ep.sample_rate)
@@ -708,6 +861,7 @@ def _build_fused_user_content(
     gallery_snapshot: dict[str, "GallerySamples"],
     video_b64: str | None,
     media_info: LocalMediaInfo | None,
+    input_images: list[EncodedInputImage],
     ref_image_jpeg: bytes | None = None,
     bbox_remap: "Callable[[tuple[int, int, int, int]], tuple[int, int, int, int] | None] | None" = None,
     adapter: OmniProviderAdapter,
@@ -715,6 +869,7 @@ def _build_fused_user_content(
     label_lookup: "dict[str, str] | None" = None,
     has_pets: bool = False,
     matching_moot: bool = False,
+    allow_reference_media: bool = True,
 ) -> list[dict]:
     """构建 user 消息的 content 列表（text/image_url/video_url 块交错）。
 
@@ -736,7 +891,7 @@ def _build_fused_user_content(
     #
     # matching_moot（身份库为空）→ 整段跳过：库空无成员可比对，精简版 identities spec 已
     # 指示只判 unknown/no_person，不需要 gallery 图，也不再塞"库为空"占位文本。
-    if candidates and not matching_moot:
+    if candidates and not matching_moot and allow_reference_media:
         if gallery_snapshot:
             # 渲染上限保护：超出 cfg.max_gallery_persons 仅取前 N 人，避免 prompt token 爆
             gallery_items = list(gallery_snapshot.items())
@@ -879,7 +1034,7 @@ def _build_fused_user_content(
 
     # 4.5. 已登记宠物多姿态参考图（P2）——仅 has_pets 时注入（用上游 scene 已算好的值，不重读盘）；
     # 读盘/编码失败或无图则空，退化为纯文字（PET_NAMING_SPEC + 档案「## 宠物」段仍在，不阻断识别）。
-    if has_pets:
+    if has_pets and allow_reference_media:
         content.extend(build_pet_reference_content(max_pets=cfg.max_pet_refs))
 
     # 4.6 自适应分辨率:全景参考帧(置于 video 前,「全景图在前、活动区域放大视频在后」)。
@@ -895,11 +1050,23 @@ def _build_fused_user_content(
         )})
         content.append(ref_block)
 
-    # 5. 主 video
+    # 5. 主媒体：Responses 是有界 JPEG 序列，其它协议保持原视频块。
+    content.extend(
+        {
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:{image.media_type};base64,{image.data}"
+            },
+        }
+        for image in input_images
+    )
+
+    # 主 video
     # video_b64 size sanity check — PyAV 编码异常情况下可能返回非空但损坏的极短
     # base64 串, 入 payload 会让 omni 服务端 400 Multimodal data is corrupted。
     # 太短 → 跳过 video_url 块, 退化为"无视频窗口"(text + gallery 仍能识别)。
     if video_b64 and len(video_b64) >= _MIN_VIDEO_B64_LEN:
+        assert media_info is not None
         content.append(adapter.build_video_block(video_b64, media_info))
     elif video_b64:
         logger.warning(

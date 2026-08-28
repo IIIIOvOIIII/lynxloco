@@ -21,11 +21,13 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Never
+from typing import Any, Literal, Never
 
 from miloco.config.settings import OmniApiProtocol
 
 logger = logging.getLogger(__name__)
+
+OmniMediaMode = Literal["video_audio", "image_sequence"]
 
 # 已对哪些非 flash 的 gemini model 打过 thinkingBudget=0 告警——进程内按 model 去重,
 # 避免每个推理窗口刷屏(build_request_body 在热路径上每窗调一次)。
@@ -45,6 +47,8 @@ class LocalMediaInfo:
 
 
 class OmniProviderAdapter(ABC):
+    media_mode: OmniMediaMode = "video_audio"
+    auth_required: bool = True
 
     @abstractmethod
     def build_video_block(self, video_base64: str, media: LocalMediaInfo) -> dict[str, Any]:
@@ -461,6 +465,9 @@ class OpenAIResponsesAdapter(OmniProviderAdapter):
     every method fails locally in the meantime so Responses can never silently
     fall back to Chat Completions.
     """
+
+    media_mode: OmniMediaMode = "image_sequence"
+    auth_required = False
 
     @staticmethod
     def _not_implemented() -> Never:
