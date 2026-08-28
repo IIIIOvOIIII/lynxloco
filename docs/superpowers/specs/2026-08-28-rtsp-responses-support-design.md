@@ -1,6 +1,6 @@
 # RTSP 摄像机与 OpenAI Responses 本地 Omni 支持设计
 
-- 状态：已批准；RTSP 感知基础已实施，仓库级既有 type/format 与 macOS node-monitor 基线未清零；RTSP 实时预览与 Responses 尚未实施
+- 状态：已批准；RTSP 感知基础与实时预览已实施，仓库级既有 type/format 与 macOS node-monitor 基线未清零；Responses 尚未实施
 - 日期：2026-08-28
 - 基线提交：`e900529`
 - 仓库：`XiaoMi/xiaomi-miloco`
