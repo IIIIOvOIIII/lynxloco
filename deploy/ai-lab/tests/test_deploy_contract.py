@@ -152,6 +152,8 @@ def _stage_acceptance_payload(staging: Path) -> None:
         input=(
             "set -euo pipefail\n"
             f"PROJECT_ROOT={shlex.quote(str(REPOSITORY_ROOT))}\n"
+            'die() { exit "$1"; }\n'
+            f"{_deploy_function('acceptance_fixture_path_is_safe')}\n"
             f"{function.group()}\n"
             f"copy_acceptance_payload {shlex.quote(str(staging))}\n"
         ),
@@ -161,6 +163,51 @@ def _stage_acceptance_payload(staging: Path) -> None:
         timeout=5,
     )
     assert result.returncode == 0, result.stderr
+
+
+def _deploy_function(name: str) -> str:
+    controller = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    function = re.search(
+        rf"(?ms)^{re.escape(name)}\(\) \{{\n.*?^\}}\n",
+        controller,
+    )
+    assert function is not None, f"deploy.sh must define {name}"
+    return function.group()
+
+
+def _run_acceptance_fixture_path_classification(relative_path: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", "-s", relative_path],
+        input=(
+            "set -euo pipefail\n"
+            f"{_deploy_function('acceptance_fixture_path_is_safe')}\n"
+            'acceptance_fixture_path_is_safe "$1"\n'
+        ),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+
+
+def _run_staging_allowlist_validation(staging: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", "-s", str(staging)],
+        input=(
+            "set -euo pipefail\n"
+            f"PROJECT_ROOT={shlex.quote(str(REPOSITORY_ROOT))}\n"
+            'die() { exit "$1"; }\n'
+            f"{_deploy_function('acceptance_fixture_path_is_safe')}\n"
+            f"{_deploy_function('path_is_allowlisted')}\n"
+            f"{_deploy_function('release_path_is_forbidden')}\n"
+            f"{_deploy_function('validate_staging_allowlist')}\n"
+            'validate_staging_allowlist "$1"\n'
+        ),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
 
 
 def _compose_service() -> dict[str, object]:
@@ -437,6 +484,60 @@ def test_acceptance_tree_contains_only_the_explicit_fixture_contract(tmp_path: P
             assert stat.S_IMODE(path.stat().st_mode) == 0o555
         else:
             assert stat.S_IMODE(path.stat().st_mode) == 0o644
+
+
+def test_acceptance_tree_allowlist_accepts_the_exact_staged_fixture_contract(
+    tmp_path: Path,
+) -> None:
+    """Catches a fail-closed classifier rejecting the allowed RTSP fixture root itself."""
+    staging = tmp_path / "release"
+    _stage_acceptance_payload(staging)
+
+    result = _run_staging_allowlist_validation(staging)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "expected_returncode"),
+    [
+        ("h264_video_audio.mkv", 0),
+        (".env.local", 4),
+        ("credentials.json", 4),
+        (".pytest_cache/lastfailed", 4),
+        ("venv/bin/python", 4),
+        ("source_package/__init__.py", 4),
+        ("source_package/module.py", 4),
+    ],
+)
+def test_acceptance_tree_fixture_classification_fails_closed(
+    relative_path: str, expected_returncode: int
+) -> None:
+    """Catches forbidden local state or source trees before fixture files are copied."""
+    result = _run_acceptance_fixture_path_classification(relative_path)
+    assert result.returncode == expected_returncode
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "acceptance/fixtures/rtsp/.env.local",
+        "acceptance/fixtures/rtsp/credentials.json",
+        "acceptance/fixtures/rtsp/.pytest_cache/lastfailed",
+        "acceptance/fixtures/rtsp/venv/bin/python",
+        "acceptance/fixtures/rtsp/source_package/module.py",
+    ],
+)
+def test_acceptance_tree_allowlist_rejects_forbidden_path_variants(
+    tmp_path: Path, relative_path: str
+) -> None:
+    """Catches forbidden acceptance paths even if they bypass fixture-copy classification."""
+    staging = tmp_path / "release"
+    target = staging / relative_path
+    target.parent.mkdir(parents=True)
+    target.write_text("forbidden\n", encoding="utf-8")
+
+    result = _run_staging_allowlist_validation(staging)
+    assert result.returncode == 4
 
 
 def test_smoke_python_override_is_direct_and_fails_closed(tmp_path: Path) -> None:

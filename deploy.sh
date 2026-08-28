@@ -165,6 +165,26 @@ select_one() {
     printf '%s\n' "${matches[0]}"
 }
 
+acceptance_fixture_path_is_safe() {
+    local relative_path="$1"
+    case "$relative_path" in
+        ""|/*|../*|*/../*|*/./*|*//*)
+            return 4
+            ;;
+        *.py|*.pyc|*.pyo|*/pyproject.toml|*/setup.py|*/setup.cfg)
+            return 4
+            ;;
+    esac
+    case "/$relative_path/" in
+        */.git/*|*/.env/*|*/.env.*/*|*/config.json/*|*/credentials.json/*|\
+        */.venv/*|*/venv/*|*/node_modules/*|*/__pycache__/*|*/.pytest_cache/*|\
+        */.mypy_cache/*|*/.ruff_cache/*|*/site-packages/*|*/src/*)
+            return 4
+            ;;
+    esac
+    return 0
+}
+
 copy_acceptance_payload() {
     local staging="$1" fixture_root fixture relative destination
     install -d -m 0755 \
@@ -184,6 +204,8 @@ copy_acceptance_payload() {
     [[ -z "$(find "$fixture_root" -type l -print -quit)" ]] || die 4 "RTSP fixture symlinks are forbidden"
     while IFS= read -r -d '' fixture; do
         relative="${fixture#"$fixture_root"/}"
+        acceptance_fixture_path_is_safe "$relative" \
+            || die 4 "forbidden RTSP fixture path"
         destination="$staging/acceptance/fixtures/rtsp/$relative"
         install -d -m 0755 "$(dirname "$destination")"
         install -m 0644 "$fixture" "$destination"
@@ -217,6 +239,22 @@ path_is_allowlisted() {
     return 1
 }
 
+release_path_is_forbidden() {
+    local relative_path="$1" fixture_relative
+    case "/$relative_path/" in
+        */.git/*|*/.env/*|*/.env.*/*|*/config.json/*|*/credentials.json/*|\
+        */.venv/*|*/venv/*|*/node_modules/*|*/__pycache__/*|*/.pytest_cache/*|\
+        */.mypy_cache/*|*/.ruff_cache/*|*/site-packages/*)
+            return 0
+            ;;
+    esac
+    if [[ "$relative_path" == acceptance/fixtures/rtsp/?* ]]; then
+        fixture_relative="${relative_path#acceptance/fixtures/rtsp/}"
+        acceptance_fixture_path_is_safe "${fixture_relative%/}" || return 0
+    fi
+    return 1
+}
+
 validate_staging_allowlist() {
     local staging="$1"
     local path relative
@@ -229,11 +267,7 @@ validate_staging_allowlist() {
         elif [[ ! -f "$path" ]]; then
             die 4 "release path must be a regular file or directory"
         fi
-        case "/$relative/" in
-            */.git/*|*/.env/*|*/config.json/*|*/.venv/*|*/node_modules/*|*/__pycache__/*)
-                die 4 "forbidden release path"
-                ;;
-        esac
+        release_path_is_forbidden "$relative" && die 4 "forbidden release path"
         path_is_allowlisted "$relative" || die 4 "release path is not allowlisted: $relative"
     done < <(find "$staging" -mindepth 1 -print0)
 }
