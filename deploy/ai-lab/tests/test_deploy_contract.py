@@ -511,6 +511,46 @@ def test_acceptance_tree_contains_only_the_explicit_fixture_contract(tmp_path: P
             assert stat.S_IMODE(path.stat().st_mode) == 0o644
 
 
+def test_staged_live_view_acceptance_collects_from_shallow_package_layout(
+    tmp_path: Path,
+) -> None:
+    """Catches live-view collection assuming a deeper repository tree than packages provide."""
+    staging = tmp_path / "release"
+    _stage_acceptance_payload(staging)
+
+    staged_test = staging / "acceptance" / "integration" / "test_rtsp_live_view.py"
+    sitecustomize = tmp_path / "shallow-package-sitecustomize"
+    sitecustomize.mkdir()
+    (sitecustomize / "sitecustomize.py").write_text(
+        "from pathlib import Path\n"
+        "import os\n"
+        "\n"
+        "target = os.environ['MILOCO_SHALLOW_ACCEPTANCE_TEST']\n"
+        "original_parents = Path.parents\n"
+        "\n"
+        "def shallow_parents(path):\n"
+        "    parents = original_parents.fget(path)\n"
+        "    return parents[:4] if str(path) == target else parents\n"
+        "\n"
+        "Path.parents = property(shallow_parents)\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", str(staged_test)],
+        cwd=staging / "acceptance",
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=15,
+        env={
+            **os.environ,
+            "MILOCO_SHALLOW_ACCEPTANCE_TEST": str(staged_test),
+            "PYTHONPATH": f"{sitecustomize}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+        },
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_acceptance_tree_allowlist_accepts_the_exact_staged_fixture_contract(
     tmp_path: Path,
 ) -> None:

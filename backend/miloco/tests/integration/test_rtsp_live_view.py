@@ -36,7 +36,6 @@ from websockets.asyncio.client import connect
 from websockets.typing import Subprotocol
 
 _FIXTURES = Path(__file__).parents[1] / "fixtures" / "rtsp"
-_REPO_ROOT = Path(__file__).parents[4]
 _FIXED_PROTOCOL = Subprotocol("miloco.camera.v1")
 
 
@@ -158,6 +157,16 @@ def _latest_video_stream_ts(data: DeviceData) -> int:
     return max(frame.stream_ts for frame in data.video)
 
 
+def _smoke_script_root() -> Path:
+    current = Path(__file__).resolve()
+    while True:
+        if (current / "scripts" / "rtsp-view-smoke.sh").is_file():
+            return current
+        if current == current.parent:
+            raise FileNotFoundError("could not locate scripts/rtsp-view-smoke.sh")
+        current = current.parent
+
+
 async def _wait_for_newer_video(
     collector: MultimodalCollector,
     camera_id: str,
@@ -196,11 +205,12 @@ async def _run_view_smoke(
     environment["MILOCO_RTSP_VIEW_SMOKE_DURATION_SEC"] = str(duration_sec)
     if environment_overrides is not None:
         environment.update(environment_overrides)
+    smoke_root = _smoke_script_root()
     process = await asyncio.create_subprocess_exec(
-        str(_REPO_ROOT / "scripts" / "rtsp-view-smoke.sh"),
+        str(smoke_root / "scripts" / "rtsp-view-smoke.sh"),
         camera_id,
         backend_url,
-        cwd=_REPO_ROOT,
+        cwd=smoke_root,
         env=environment,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -677,11 +687,12 @@ async def test_view_smoke_signal_exits_nonzero_and_closes_websocket(
         environment.pop("MILOCO_SERVER__TOKEN", None)
         environment["MILOCO_HOME"] = str(tmp_path)
         environment["MILOCO_RTSP_VIEW_SMOKE_DURATION_SEC"] = "30"
+        smoke_root = _smoke_script_root()
         process = await asyncio.create_subprocess_exec(
-            str(_REPO_ROOT / "scripts" / "rtsp-view-smoke.sh"),
+            str(smoke_root / "scripts" / "rtsp-view-smoke.sh"),
             camera_id,
             f"http://127.0.0.1:{port}",
-            cwd=_REPO_ROOT,
+            cwd=smoke_root,
             env=environment,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
