@@ -202,3 +202,10 @@
 - Expected result: 在任何真实 Docker、SSH 或实验机访问前，控制器必须证明 exact clean SHA/receipt/controller/allowlist 绑定、单次 SSH/单锁事务、隔离候选镜像、image-ID-bound acceptance、current/previous/历史回滚 proof 保护、signal cleanup、严格 120 秒健康期限、fail-closed 三态 retention、完整 path/symlink/owner/mode 边界和无凭据失败证据；五轮上限内独立审查必须批准。
 - Result: Not achieved，已 fail closed 停止外部动作。Task 1/2 独立审查 CLEAN；Task 3 当前提交 `38b6a12` 的本地 contract 为 105 passed，shell syntax、Ruff、diff 和 help 检查通过，且已关闭 controller race、split transaction、marker/image identity、protected same-SHA retry、signal cleanup、retention uncertainty 和多数精确输出/路径检查。但最终 round 5 复审仍有 3 个 Important：完整树/file-only/checksum 文件集尚未三方严格相等，`release.json` 尚未强制 builder 的完整必需 artifact identity，read-only `status` 尚未在首次 Docker 查询前验证全部 release/artifact/accepted parent/proof chain。没有 Critical；未执行真实 build、Docker、SSH、status、transfer、deploy、verify 或 rollback，ai-lab01/02 均未访问。
 - Next step: 因同一失败类已达到五轮修复预算，等待用户明确选择：额外授权一次只限上述三项的定点修复与原审查人复核，或重新批准一个更简单的部署设计。未经新授权不得访问实验机；真实 RTSP 摄像机与真实 Responses VLM 继续为 `not_measured`。
+
+## 2026-08-28 20:16 SGT
+
+- Current work: 执行用户明确批准的一次 Task 3 例外定点修复，并由原独立审查人完成最终复审。
+- Expected result: 只关闭完整树/file-only/checksum 三方集合证明、builder-compatible 完整 `release.json` artifact identity，以及 `status` 的全路径 Docker 前证明；完整契约通过且原审查人 `Approved` 后才允许进入 Task 4 或访问实验机。
+- Result: Not achieved，最终 fail closed。例外提交 `0ffc42d` 仅修改 remote release controller、deployment contract tests 和 README；本地完整 contract 为 134 passed，Ruff、shell syntax、diff 和 help 通过。原审查人确认 `status` 前置证明已 ADDRESSED，JSON schema/artifact identity 与三方集合主体均显著收紧，但仍保留 2 个 Important：两个 walk 同时漏掉一个已由 checksum 成功证明存在的文件时被误判 `definitively_invalid`；artifact `lstat` 的任意 `OSError`（包括 EIO/权限/临时 FS 错误）被误判为 contract invalid。两者都可能让 retention 在证据不确定时删除历史 release。无 Critical；未执行真实 build、Docker、SSH、status、transfer、deploy、verify 或 rollback，ai-lab01/02 仍未访问。
+- Next step: 例外修复授权已耗尽，停止继续修改和部署。建议重新批准更简单的实验室部署设计：默认禁用自动 retention 删除，将不确定和无效历史都只报告/保留，并把历史清理拆成独立、显式、另行审查的运维操作。未经用户新的设计授权，不访问实验机；真实 RTSP/VLM 继续为 `not_measured`。
