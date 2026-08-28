@@ -228,11 +228,11 @@ verify_release() {
 }
 
 verify_archive_digest() {
-    local archive="$1" expected_digest="$2" actual_digest
+    local archive="$1" expected_digest="$2" hash_output
     [[ "$expected_digest" =~ ^[0-9a-f]{64}$ ]] || die 2 "invalid archive digest"
-    actual_digest="$(sha256sum "$archive")"
-    actual_digest="${actual_digest%% *}"
-    [[ "$actual_digest" == "$expected_digest" ]] || die 4 "archive SHA-256 mismatch"
+    capture_tool_output hash_output sha256sum "$archive" || die 4 "archive SHA-256 probe failed"
+    [[ "$hash_output" == "$expected_digest  $archive"$'\n' ]] \
+        || die 4 "archive SHA-256 output is invalid or mismatched"
 }
 
 archive_type_label() {
@@ -390,18 +390,19 @@ acquire_transition_lock() {
 }
 
 verify_controller_self() {
-    local expected_digest="$1" expected_path actual_digest actual_path
+    local expected_digest="$1" expected_path hash_output actual_path owner
     [[ "$expected_digest" =~ ^[0-9a-f]{64}$ ]] || die 2 "invalid controller digest"
     expected_path="$CONTROL_DIR/$expected_digest/remote-release.sh"
     require_safe_directory "$CONTROL_DIR" || die 4 "control directory is unsafe"
     require_safe_directory "$CONTROL_DIR/$expected_digest" || die 4 "controller digest directory is unsafe"
-    actual_path="$(realpath -e "$0")" || die 4 "controller path cannot be resolved"
-    [[ "$actual_path" == "$expected_path" && -f "$actual_path" && ! -L "$actual_path" ]] \
+    capture_tool_output actual_path realpath -e "$0" || die 4 "controller path cannot be resolved"
+    [[ "$actual_path" == "$expected_path"$'\n' && -f "$expected_path" && ! -L "$expected_path" ]] \
         || die 4 "controller path is not digest-addressed"
-    [[ "$(stat -c '%u:%g' "$actual_path")" == "0:0" ]] || die 4 "controller must be root owned"
-    actual_digest="$(sha256sum "$actual_path")"
-    actual_digest="${actual_digest%% *}"
-    [[ "$actual_digest" == "$expected_digest" ]] || die 4 "controller digest mismatch"
+    capture_tool_output owner stat -c '%u:%g' "$expected_path" || die 4 "controller owner probe failed"
+    [[ "$owner" == $'0:0\n' ]] || die 4 "controller must be root owned"
+    capture_tool_output hash_output sha256sum "$expected_path" || die 4 "controller digest probe failed"
+    [[ "$hash_output" == "$expected_digest  $expected_path"$'\n' ]] \
+        || die 4 "controller digest output is invalid or mismatched"
 }
 
 transaction_release() {
@@ -546,6 +547,50 @@ safe_directory_state() {
     esac
 }
 
+capture_tool_output() {
+    local destination="$1"
+    shift
+    local captured marker status captured_output
+    captured="$("$@" 2>/dev/null; status=$?; printf '\036%s' "$status")" || return 2
+    marker="${captured##*$'\036'}"
+    [[ "$marker" =~ ^[0-9]+$ ]] || return 2
+    captured_output="${captured%$'\036'*}"
+    (( marker == 0 )) || return 2
+    printf -v "$destination" '%s' "$captured_output"
+}
+
+exact_directory_state() {
+    local directory="$1" expected_mode="$2" owner mode resolved
+    [[ -e "$directory" || -L "$directory" ]] || return 1
+    [[ -d "$directory" && ! -L "$directory" ]] || return 1
+    capture_tool_output owner stat -c '%u:%g' "$directory" || return 2
+    [[ "$owner" == $'0:0\n' ]] || {
+        [[ "$owner" =~ ^[0-9]+:[0-9]+$'\n'$ ]] || return 2
+        return 1
+    }
+    capture_tool_output mode stat -c '%a' "$directory" || return 2
+    [[ "$mode" =~ ^[0-7]{3,4}$'\n'$ ]] || return 2
+    mode="${mode%$'\n'}"
+    (( 8#$mode == expected_mode )) || return 1
+    capture_tool_output resolved realpath "$directory" || return 2
+    [[ "$resolved" == "$directory"$'\n' ]] || return 1
+}
+
+classifier_release_paths_state() {
+    local release="$1" state
+    exact_directory_state "$LAB_ROOT" 0755 || { state="$?"; return "$state"; }
+    exact_directory_state "$RELEASES_DIR" 0755 || { state="$?"; return "$state"; }
+    exact_directory_state "$release" 0755 || { state="$?"; return "$state"; }
+}
+
+classifier_capability_paths_state() {
+    local sha="$1" state
+    classifier_release_paths_state "$RELEASES_DIR/$sha" || { state="$?"; return "$state"; }
+    exact_directory_state "$DEPLOY_STATE_DIR" 0755 || { state="$?"; return "$state"; }
+    exact_directory_state "$ARTIFACT_RECORDS_DIR" 0755 || { state="$?"; return "$state"; }
+    exact_directory_state "$ACCEPTED_DIR" 0755 || { state="$?"; return "$state"; }
+}
+
 ensure_safe_directory() {
     local directory="$1" mode="$2" owner="$3" group="$4"
     case "$directory" in
@@ -604,38 +649,27 @@ safe_record_state() {
         return 1
     fi
     [[ -f "$record" && ! -L "$record" ]] || return 1
-    if ! owner="$(stat -c '%u:%g' "$record" 2>/dev/null)"; then
-        return 2
-    fi
-    [[ "$owner" =~ ^[0-9]+:[0-9]+$ ]] || return 2
-    [[ "$owner" == "0:0" ]] || return 1
-    if ! mode="$(stat -c '%a' "$record" 2>/dev/null)"; then
-        return 2
-    fi
-    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 2
+    capture_tool_output owner stat -c '%u:%g' "$record" || return 2
+    [[ "$owner" =~ ^[0-9]+:[0-9]+$'\n'$ ]] || return 2
+    [[ "$owner" == $'0:0\n' ]] || return 1
+    capture_tool_output mode stat -c '%a' "$record" || return 2
+    [[ "$mode" =~ ^[0-7]{3,4}$'\n'$ ]] || return 2
+    mode="${mode%$'\n'}"
     (( 8#$mode == 0644 )) || return 1
-    if ! lab_real="$(realpath "$LAB_ROOT" 2>/dev/null)"; then
-        return 2
-    fi
-    if ! record_real="$(realpath "$record" 2>/dev/null)"; then
-        return 2
-    fi
-    case "$record_real" in
-        "$lab_real"/*) return 0 ;;
-        *) return 1 ;;
-    esac
+    capture_tool_output lab_real realpath "$LAB_ROOT" || return 2
+    [[ "$lab_real" == "$LAB_ROOT"$'\n' ]] || return 1
+    capture_tool_output record_real realpath "$record" || return 2
+    [[ "$record_real" == "$record"$'\n' ]] || return 1
 }
 
 read_file_content() {
-    local source="$1" destination="$2" content
-    if ! content="$(<"$source")"; then
-        return 2
-    fi
-    printf -v "$destination" '%s' "$content"
+    local source="$1" destination="$2"
+    capture_tool_output "$destination" cat -- "$source"
 }
 
 read_artifact_record() {
-    local sha="$1" record="$ARTIFACT_RECORDS_DIR/$sha" line key value count=0
+    local sha="$1"
+    local record="$ARTIFACT_RECORDS_DIR/$sha"
     local record_state record_content
     artifact_archive_digest=""
     artifact_controller_digest=""
@@ -646,28 +680,19 @@ read_artifact_record() {
     if safe_directory_state "$ARTIFACT_RECORDS_DIR"; then :; else record_state="$?"; return "$record_state"; fi
     if safe_record_state "$record"; then :; else record_state="$?"; return "$record_state"; fi
     read_file_content "$record" record_content || return 2
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        count=$((count + 1))
-        key="${line%%=*}"
-        value="${line#*=}"
-        [[ "$key" != "$line" && -n "$value" ]] || return 1
-        case "$key" in
-            schema) [[ -z "$artifact_record_schema" ]] || return 1; artifact_record_schema="$value" ;;
-            git_sha) [[ -z "$artifact_record_sha" ]] || return 1; artifact_record_sha="$value" ;;
-            archive_sha256) [[ -z "$artifact_archive_digest" ]] || return 1; artifact_archive_digest="$value" ;;
-            controller_sha256) [[ -z "$artifact_controller_digest" ]] || return 1; artifact_controller_digest="$value" ;;
-            allowlist_sha256) [[ -z "$artifact_allowlist_digest" ]] || return 1; artifact_allowlist_digest="$value" ;;
-            *) return 1 ;;
-        esac
-    done <<< "$record_content"
-    [[ "$count" -eq 5 && "$artifact_record_schema" == "1" && "$artifact_record_sha" == "$sha" \
-        && "$artifact_archive_digest" =~ ^[0-9a-f]{64}$ \
-        && "$artifact_controller_digest" =~ ^[0-9a-f]{64}$ \
+    [[ "$record_content" =~ ^schema=1$'\n'git_sha=([0-9a-f]{40})$'\n'archive_sha256=([0-9a-f]{64})$'\n'controller_sha256=([0-9a-f]{64})$'\n'allowlist_sha256=([0-9a-f]{64})$'\n'$ ]] || return 1
+    artifact_record_schema="1"
+    artifact_record_sha="${BASH_REMATCH[1]}"
+    artifact_archive_digest="${BASH_REMATCH[2]}"
+    artifact_controller_digest="${BASH_REMATCH[3]}"
+    artifact_allowlist_digest="${BASH_REMATCH[4]}"
+    [[ "$artifact_record_sha" == "$sha" \
         && "$artifact_allowlist_digest" == "$REMOTE_ALLOWLIST_SHA256" ]]
 }
 
 read_acceptance_marker() {
-    local sha="$1" marker="$ACCEPTED_DIR/$sha" line key value count=0
+    local sha="$1"
+    local marker="$ACCEPTED_DIR/$sha"
     local marker_state marker_content
     marker_schema=""
     marker_archive_digest=""
@@ -677,35 +702,23 @@ read_acceptance_marker() {
     if safe_directory_state "$ACCEPTED_DIR"; then :; else marker_state="$?"; return "$marker_state"; fi
     if safe_record_state "$marker"; then :; else marker_state="$?"; return "$marker_state"; fi
     read_file_content "$marker" marker_content || return 2
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        count=$((count + 1))
-        key="${line%%=*}"
-        value="${line#*=}"
-        [[ "$key" != "$line" && -n "$value" ]] || return 1
-        case "$key" in
-            schema) [[ -z "$marker_schema" ]] || return 1; marker_schema="$value" ;;
-            archive_sha256) [[ -z "$marker_archive_digest" ]] || return 1; marker_archive_digest="$value" ;;
-            runtime_image_id) [[ -z "$marker_runtime_image_id" ]] || return 1; marker_runtime_image_id="$value" ;;
-            acceptance_image_id) [[ -z "$marker_acceptance_image_id" ]] || return 1; marker_acceptance_image_id="$value" ;;
-            *) return 1 ;;
-        esac
-    done <<< "$marker_content"
-    [[ "$count" -eq 4 && "$marker_schema" == "1" \
-        && "$marker_archive_digest" =~ ^[0-9a-f]{64}$ \
-        && "$marker_runtime_image_id" =~ ^sha256:[0-9a-f]{64}$ \
-        && "$marker_acceptance_image_id" =~ ^sha256:[0-9a-f]{64}$ ]]
+    [[ "$marker_content" =~ ^schema=1$'\n'archive_sha256=([0-9a-f]{64})$'\n'runtime_image_id=(sha256:[0-9a-f]{64})$'\n'acceptance_image_id=(sha256:[0-9a-f]{64})$'\n'$ ]] || return 1
+    marker_schema="1"
+    marker_archive_digest="${BASH_REMATCH[1]}"
+    marker_runtime_image_id="${BASH_REMATCH[2]}"
+    marker_acceptance_image_id="${BASH_REMATCH[3]}"
 }
 
 docker_image_id() {
     local image="$1" image_id
-    image_id="$(docker_command 15 image inspect --format '{{.Id}}' "$image" 2>/dev/null)" || return 2
-    [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]] || return 2
-    printf '%s\n' "$image_id"
+    capture_tool_output image_id docker_command 15 image inspect --format '{{.Id}}' "$image" || return 2
+    [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$'\n'$ ]] || return 2
+    printf '%s' "$image_id"
 }
 
 image_reference_state() {
     local image="$1" listed image_id
-    if ! listed="$(docker_command 15 image ls --quiet --no-trunc "$image" 2>/dev/null)"; then
+    if ! capture_tool_output listed docker_command 15 image ls --quiet --no-trunc "$image"; then
         printf 'probe_error\n'
         return 0
     fi
@@ -713,15 +726,19 @@ image_reference_state() {
         printf 'absent\n'
         return 0
     fi
-    if ! image_id="$(docker_command 15 image inspect --format '{{.Id}}' "$image" 2>/dev/null)"; then
+    [[ "$listed" =~ ^sha256:[0-9a-f]{64}$'\n'$ ]] || {
+        printf 'probe_error\n'
+        return 0
+    }
+    if ! capture_tool_output image_id docker_command 15 image inspect --format '{{.Id}}' "$image"; then
         printf 'probe_error\n'
         return 0
     fi
-    if [[ ! "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    if [[ ! "$image_id" =~ ^sha256:[0-9a-f]{64}$'\n'$ ]]; then
         printf 'probe_error\n'
         return 0
     fi
-    printf 'present:%s\n' "$image_id"
+    printf 'present:%s' "$image_id"
 }
 
 release_contract_state() {
@@ -740,56 +757,93 @@ release_contract_state() {
     esac
 }
 
-grep_contract_state() {
-    local pattern="$1" file="$2" grep_status
-    if grep -Eq "$pattern" "$file" 2>/dev/null; then
-        return 0
-    else
-        grep_status="$?"
-    fi
-    (( grep_status == 1 )) && return 1
-    return 2
+release_json_state() {
+    local file="$1" sha="$2" output
+    local parser='import json,sys
+class DuplicateKey(ValueError): pass
+def unique(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result: raise DuplicateKey(key)
+        result[key] = value
+    return result
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as source:
+        value = json.load(source, object_pairs_hook=unique)
+    allowed = {"schema", "git_sha", "built_at", "platform", "artifacts"}
+    valid = isinstance(value, dict) and set(value) <= allowed
+    valid = valid and value.get("schema") == 1 and not isinstance(value.get("schema"), bool)
+    valid = valid and value.get("git_sha") == sys.argv[2]
+    valid = valid and value.get("platform") == "linux/amd64"
+    if "built_at" in value:
+        valid = valid and isinstance(value["built_at"], str) and bool(value["built_at"])
+    if "artifacts" in value:
+        artifacts = value["artifacts"]
+        valid = valid and isinstance(artifacts, dict)
+        valid = valid and set(artifacts) == {"miloco", "cli", "miot", "models"}
+        valid = valid and all(isinstance(item, str) and item for item in artifacts.values())
+    print("valid" if valid else "invalid")
+except (OSError, UnicodeError):
+    raise
+except (json.JSONDecodeError, DuplicateKey, TypeError, ValueError):
+    print("invalid")'
+    capture_tool_output output python3 -c "$parser" "$file" "$sha" || return 2
+    case "$output" in
+        $'valid\n') return 0 ;;
+        $'invalid\n') return 1 ;;
+        *) return 2 ;;
+    esac
 }
 
 classify_release_tree() {
     local release="$1" sha="$2" state query_output entry owner mode expected_mode
     local line digest path file relative hash_output actual_digest checksum_content
-    local checksum_match checksummed_path
-    local -a checksummed_paths=()
+    local checksum_match checksummed_path listing_remaining listing_line listing_count root_count
+    local duplicate actual_match listed_count=0 checksummed_count=0 actual_count=0 index listed_path actual_file
+    local -a checksummed_paths=() listed_paths=() actual_files=()
 
-    if safe_directory_state "$release"; then :; else state="$?"; return "$state"; fi
+    if classifier_release_paths_state "$release"; then :; else state="$?"; return "$state"; fi
 
-    if ! query_output="$(find "$release" -xdev -type l -print -quit 2>/dev/null)"; then
-        return 2
-    fi
+    capture_tool_output query_output find "$release" -xdev -type l -print -quit || return 2
     if [[ -n "$query_output" ]]; then
-        [[ "$query_output" == "$release"/* ]] || return 2
+        [[ "$query_output" == "$release"/*$'\n' && "$query_output" != *$'\n'*$'\n'* ]] || return 2
         return 1
     fi
-    if ! query_output="$(find "$release" -xdev ! -type d ! -type f -print -quit 2>/dev/null)"; then
-        return 2
-    fi
+    capture_tool_output query_output find "$release" -xdev ! -type d ! -type f -print -quit || return 2
     if [[ -n "$query_output" ]]; then
-        [[ "$query_output" == "$release"/* ]] || return 2
+        [[ "$query_output" == "$release"/*$'\n' && "$query_output" != *$'\n'*$'\n'* ]] || return 2
         return 1
     fi
-    if ! query_output="$(find "$release" -xdev -print 2>/dev/null)"; then
-        return 2
-    fi
-    while IFS= read -r entry || [[ -n "$entry" ]]; do
+    capture_tool_output query_output find "$release" -xdev -print || return 2
+    [[ -n "$query_output" && "$query_output" == *$'\n' ]] || return 2
+    listing_remaining="$query_output"
+    listing_count=0
+    root_count=0
+    while [[ -n "$listing_remaining" ]]; do
+        listing_line="${listing_remaining%%$'\n'*}"
+        listing_remaining="${listing_remaining#*$'\n'}"
+        [[ -n "$listing_line" ]] || return 2
+        entry="$listing_line"
         [[ "$entry" == "$release" || "$entry" == "$release"/* ]] || return 2
-        if ! owner="$(stat -c '%u:%g' "$entry" 2>/dev/null)"; then
-            return 2
-        fi
-        [[ "$owner" =~ ^[0-9]+:[0-9]+$ ]] || return 2
-        [[ "$owner" == "0:0" ]] || return 1
-        if ! mode="$(stat -c '%a' "$entry" 2>/dev/null)"; then
-            return 2
-        fi
-        [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 2
+        duplicate=0
+        for (( index=0; index < listed_count; index++ )); do
+            [[ "${listed_paths[$index]}" != "$entry" ]] || duplicate=1
+        done
+        (( duplicate == 0 )) || return 2
+        listed_paths[$listed_count]="$entry"
+        listed_count=$((listed_count + 1))
+        listing_count=$((listing_count + 1))
+        [[ "$entry" != "$release" ]] || root_count=$((root_count + 1))
+        capture_tool_output owner stat -c '%u:%g' "$entry" || return 2
+        [[ "$owner" =~ ^[0-9]+:[0-9]+$'\n'$ ]] || return 2
+        [[ "$owner" == $'0:0\n' ]] || return 1
+        capture_tool_output mode stat -c '%a' "$entry" || return 2
+        [[ "$mode" =~ ^[0-7]{3,4}$'\n'$ ]] || return 2
+        mode="${mode%$'\n'}"
         if [[ -d "$entry" ]]; then
             expected_mode=0755
         else
+            [[ -f "$entry" && ! -L "$entry" ]] || return 2
             relative="${entry#"$release"/}"
             case "$relative" in
                 container-entrypoint.sh|remote-release.sh|acceptance/scripts/*.sh) expected_mode=0555 ;;
@@ -797,7 +851,8 @@ classify_release_tree() {
             esac
         fi
         (( 8#$mode == expected_mode )) || return 1
-    done <<< "$query_output"
+    done
+    (( listing_count > 0 && root_count == 1 )) || return 2
 
     for file in "$release/release.json" "$release/SHA256SUMS"; do
         if [[ ! -e "$file" && ! -L "$file" ]]; then
@@ -805,62 +860,84 @@ classify_release_tree() {
         fi
         [[ -f "$file" && ! -L "$file" ]] || return 1
     done
-    if grep_contract_state '"schema"[[:space:]]*:[[:space:]]*1([,[:space:]]|$)' "$release/release.json"; then
-        :
-    else
-        state="$?"; return "$state"
-    fi
-    if grep_contract_state "\"git_sha\"[[:space:]]*:[[:space:]]*\"$sha\"" "$release/release.json"; then
-        :
-    else
-        state="$?"; return "$state"
-    fi
-    if grep_contract_state '"platform"[[:space:]]*:[[:space:]]*"linux/amd64"' "$release/release.json"; then
-        :
-    else
-        state="$?"; return "$state"
-    fi
+    if release_json_state "$release/release.json" "$sha"; then :; else state="$?"; return "$state"; fi
 
     read_file_content "$release/SHA256SUMS" checksum_content || return 2
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        digest="${line%% *}"
-        path="${line#*  }"
-        [[ "$digest" =~ ^[0-9a-f]{64}$ && "$path" != "$line" ]] || return 1
+    [[ -n "$checksum_content" && "$checksum_content" == *$'\n' ]] || return 1
+    listing_remaining="$checksum_content"
+    while [[ -n "$listing_remaining" ]]; do
+        line="${listing_remaining%%$'\n'*}"
+        listing_remaining="${listing_remaining#*$'\n'}"
+        [[ "$line" =~ ^([0-9a-f]{64})\ \ ([A-Za-z0-9._/+:-]+)$ ]] || return 1
+        digest="${BASH_REMATCH[1]}"
+        path="${BASH_REMATCH[2]}"
         case "$path" in
             /*|../*|*/../*|*/..|.|..|*\\*) return 1 ;;
         esac
+        duplicate=0
+        for (( index=0; index < checksummed_count; index++ )); do
+            [[ "${checksummed_paths[$index]}" != "$path" ]] || duplicate=1
+        done
+        (( duplicate == 0 )) || return 1
         file="$release/$path"
         if [[ ! -e "$file" && ! -L "$file" ]]; then
             return 1
         fi
         [[ -f "$file" && ! -L "$file" ]] || return 1
-        if ! hash_output="$(sha256sum -- "$file" 2>/dev/null)"; then
-            return 2
-        fi
-        actual_digest="${hash_output%% *}"
-        [[ "$actual_digest" =~ ^[0-9a-f]{64}$ ]] || return 2
+        capture_tool_output hash_output sha256sum -- "$file" || return 2
+        [[ "$hash_output" =~ ^([0-9a-f]{64})\ \ (.+)$'\n'$ ]] || return 2
+        actual_digest="${BASH_REMATCH[1]}"
+        [[ "${BASH_REMATCH[2]}" == "$file" ]] || return 2
         [[ "$actual_digest" == "$digest" ]] || return 1
-        checksummed_paths+=("$path")
-    done <<< "$checksum_content"
-    (( ${#checksummed_paths[@]} > 0 )) || return 1
+        checksummed_paths[$checksummed_count]="$path"
+        checksummed_count=$((checksummed_count + 1))
+    done
+    (( checksummed_count > 0 )) || return 1
 
-    if ! query_output="$(find "$release" -xdev -type f -print 2>/dev/null)"; then
-        return 2
-    fi
-    while IFS= read -r file || [[ -n "$file" ]]; do
+    capture_tool_output query_output find "$release" -xdev -type f -print || return 2
+    [[ -n "$query_output" && "$query_output" == *$'\n' ]] || return 2
+    listing_remaining="$query_output"
+    while [[ -n "$listing_remaining" ]]; do
+        file="${listing_remaining%%$'\n'*}"
+        listing_remaining="${listing_remaining#*$'\n'}"
+        [[ -n "$file" ]] || return 2
         relative="${file#"$release"/}"
         [[ "$relative" != "$file" ]] || return 2
         [[ "$relative" == "SHA256SUMS" ]] && continue
+        duplicate=0
+        for (( index=0; index < actual_count; index++ )); do
+            [[ "${actual_files[$index]}" != "$relative" ]] || duplicate=1
+        done
+        (( duplicate == 0 )) || return 2
+        actual_files[$actual_count]="$relative"
+        actual_count=$((actual_count + 1))
         remote_path_is_allowlisted "$relative" || return 1
         checksum_match=0
-        for checksummed_path in "${checksummed_paths[@]}"; do
-            if [[ "$checksummed_path" == "$relative" ]]; then
+        for (( index=0; index < checksummed_count; index++ )); do
+            if [[ "${checksummed_paths[$index]}" == "$relative" ]]; then
                 checksum_match=1
                 break
             fi
         done
         (( checksum_match == 1 )) || return 1
-    done <<< "$query_output"
+    done
+    (( actual_count == checksummed_count )) || return 2
+    for (( index=0; index < checksummed_count; index++ )); do
+        checksummed_path="${checksummed_paths[$index]}"
+        actual_match=0
+        for (( listed_count=0; listed_count < actual_count; listed_count++ )); do
+            [[ "${actual_files[$listed_count]}" != "$checksummed_path" ]] || actual_match=1
+        done
+        (( actual_match == 1 )) || return 2
+    done
+    for (( index=0; index < actual_count; index++ )); do
+        file="$release/${actual_files[$index]}"
+        actual_match=0
+        for (( listed_count=0; listed_count < listing_count; listed_count++ )); do
+            [[ "${listed_paths[$listed_count]}" != "$file" ]] || actual_match=1
+        done
+        (( actual_match == 1 )) || return 2
+    done
     return 0
 }
 
@@ -975,8 +1052,9 @@ abort_candidate_build() {
 }
 
 release_capability() {
-    local sha="$1" contract_state runtime_state acceptance_state runtime_id acceptance_id record_state
+    local sha="$1" contract_state runtime_state acceptance_state runtime_id acceptance_id record_state path_state
     validate_sha "$sha"
+    if classifier_capability_paths_state "$sha"; then :; else path_state="$?"; [[ "$path_state" -eq 1 ]] && printf 'definitively_invalid\n' || printf 'probe_error\n'; return 0; fi
     if read_artifact_record "$sha"; then :; else record_state="$?"; [[ "$record_state" -eq 1 ]] && printf 'definitively_invalid\n' || printf 'probe_error\n'; return 0; fi
     if read_acceptance_marker "$sha"; then :; else record_state="$?"; [[ "$record_state" -eq 1 ]] && printf 'definitively_invalid\n' || printf 'probe_error\n'; return 0; fi
     if [[ "$marker_archive_digest" != "$artifact_archive_digest" ]]; then
@@ -1308,9 +1386,15 @@ verify_running() {
 }
 
 status_release() {
-    local host="$1"
+    local host="$1" path_state
     require_root
     validate_host "$host"
+    if [[ -e "$LAB_ROOT" || -L "$LAB_ROOT" ]]; then
+        if exact_directory_state "$LAB_ROOT" 0755; then :; else path_state="$?"; die 4 "lab root is unsafe for status (state=$path_state)"; fi
+        if [[ -e "$DEPLOY_STATE_DIR" || -L "$DEPLOY_STATE_DIR" ]]; then
+            if exact_directory_state "$DEPLOY_STATE_DIR" 0755; then :; else path_state="$?"; die 4 "deploy-state parent is unsafe for status (state=$path_state)"; fi
+        fi
+    fi
     [[ ! -L "$CURRENT_FILE" ]] || die 4 "current state record is unsafe"
     if [[ ! -f "$CURRENT_FILE" ]]; then
         printf 'not_deployed host=%s\n' "$host"

@@ -1102,6 +1102,7 @@ def test_rollback_requires_artifact_bound_acceptance_marker_before_images(tmp_pa
         source
         + "\nverify_release() { return 0; }\n"
         + "release_contract_state() { printf 'valid\\n'; }\n"
+        + "classifier_capability_paths_state() { return 0; }\n"
         + "require_safe_directory() { return 0; }\n"
         + "require_safe_record() { return 0; }\n"
         + "safe_directory_state() { [[ -d \"$1\" && ! -L \"$1\" ]] || return 1; return 0; }\n"
@@ -1194,6 +1195,7 @@ def test_release_capability_distinguishes_invalid_debris_from_probe_uncertainty(
     harness.write_text(
         source
         + "\nrequire_safe_directory() { return 0; }\n"
+        + "classifier_capability_paths_state() { return 0; }\n"
         + "require_safe_record() { return 0; }\n"
         + "safe_directory_state() { [[ -d \"$1\" && ! -L \"$1\" ]] || return 1; return 0; }\n"
         + "safe_record_state() { [[ -f \"$1\" && ! -L \"$1\" ]] || return 1; return 0; }\n"
@@ -1237,6 +1239,7 @@ def test_failed_acceptance_invalidates_old_marker_and_cleans_rebuilt_tags(tmp_pa
     harness.write_text(
         source
         + "\nrequire_safe_directory() { return 0; }\n"
+        + "release_capability() { printf 'definitively_invalid\\n'; }\n"
         + "require_safe_record() { return 0; }\n"
         + "safe_directory_state() { [[ -d \"$1\" && ! -L \"$1\" ]] || return 1; return 0; }\n"
         + "safe_record_state() { [[ -f \"$1\" && ! -L \"$1\" ]] || return 1; return 0; }\n"
@@ -1371,7 +1374,7 @@ def test_same_sha_retry_classifies_non_pointer_history_before_any_mutation(
         ("stat_error", "probe_error"),
         ("stat_mode_malformed", "probe_error"),
         ("unsafe_mode", "definitively_invalid"),
-        ("grep_error", "probe_error"),
+        ("python_error", "probe_error"),
         ("contract_mismatch", "definitively_invalid"),
     ],
 )
@@ -1426,8 +1429,8 @@ def test_release_contract_classifier_separates_mismatch_from_tool_or_io_uncertai
         overrides.append("find() { return 74; }")
     if probe_case == "find_malformed_output":
         overrides.append("find() { printf '/outside-release\\n'; }")
-    if probe_case == "grep_error":
-        overrides.append("grep() { return 2; }")
+    if probe_case == "python_error":
+        overrides.append("python3() { return 74; }")
     if probe_case == "sha256sum_absent":
         overrides.append("sha256sum() { return 127; }")
     if probe_case == "sha256sum_io_error":
@@ -1447,6 +1450,297 @@ def test_release_contract_classifier_separates_mismatch_from_tool_or_io_uncertai
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == expected_state
+
+
+def _write_valid_classifier_release(lab_root: Path, sha: str) -> Path:
+    release = lab_root / "releases" / sha
+    release.mkdir(parents=True)
+    release_json = release / "release.json"
+    release_json.write_text(
+        '{"schema":1,"git_sha":"'
+        + sha
+        + '","built_at":"2026-08-28T00:00:00Z","platform":"linux/amd64",'
+        + '"artifacts":{"miloco":"miloco.whl","cli":"cli.whl",'
+        + '"miot":"miot.whl","models":"models.tar.gz"}}\n',
+        encoding="utf-8",
+    )
+    payload = release / "remote-release.sh"
+    payload.write_text("payload\n", encoding="utf-8")
+    payload.chmod(0o555)
+    (release / "SHA256SUMS").write_text(
+        f"{hashlib.sha256(release_json.read_bytes()).hexdigest()}  release.json\n"
+        f"{hashlib.sha256(payload.read_bytes()).hexdigest()}  remote-release.sh\n",
+        encoding="utf-8",
+    )
+    return release
+
+
+def _run_release_classifier(
+    tmp_path: Path,
+    lab_root: Path,
+    sha: str,
+    *,
+    shell_override: str = "",
+    invocation: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    source = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8").rsplit(
+        '\nmain "$@"', maxsplit=1
+    )[0]
+    source = source.replace('readonly LAB_ROOT="/opt/miloco-lab"', f'readonly LAB_ROOT="{lab_root}"')
+    stat_override = (
+        "stat() { case \"$2\" in '%u:%g') printf '0:0\\n' ;; '%a') "
+        "case \"$3\" in */remote-release.sh|*/container-entrypoint.sh|*/acceptance/scripts/*.sh) "
+        "printf '555\\n' ;; *) [[ -d \"$3\" ]] && printf '755\\n' || printf '644\\n' ;; "
+        "esac ;; *) return 74 ;; esac; }"
+    )
+    harness = tmp_path / ("strict-classifier-" + hashlib.sha256(shell_override.encode()).hexdigest()[:8] + ".sh")
+    harness.write_text(
+        source
+        + "\n"
+        + stat_override
+        + "\n"
+        + shell_override
+        + "\n"
+        + (invocation or f'release_contract_state "{sha}"')
+        + "\n",
+        encoding="utf-8",
+    )
+    harness.chmod(0o755)
+    return subprocess.run(
+        [str(harness)], text=True, capture_output=True, check=False, timeout=5
+    )
+
+
+@pytest.mark.parametrize("find_case", ["empty", "partial", "duplicate"])
+def test_release_classifier_treats_successful_incomplete_find_output_as_uncertain(
+    tmp_path: Path, find_case: str
+) -> None:
+    """Catches a successful but non-bijective enumeration being called valid."""
+    sha = "a" * 40
+    lab_root = tmp_path / "miloco-lab"
+    release = _write_valid_classifier_release(lab_root, sha)
+    if find_case == "empty":
+        replacement = "printf ''"
+    elif find_case == "partial":
+        replacement = f"printf '%s\\n' '{release}' '{release / 'release.json'}'"
+    else:
+        replacement = f"printf '%s\\n' '{release}' '{release}' '{release / 'release.json'}' '{release / 'SHA256SUMS'}' '{release / 'remote-release.sh'}'"
+    override = (
+        "find() { case \"$*\" in "
+        "*'-type l'*|*'! -type d ! -type f'*) command find \"$@\" ;; "
+        f"*'-xdev -print'*) {replacement} ;; "
+        "*) command find \"$@\" ;; esac; }"
+    )
+    result = _run_release_classifier(tmp_path, lab_root, sha, shell_override=override)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "probe_error"
+
+
+@pytest.mark.parametrize("hash_case", ["extra_line", "wrong_filename"])
+def test_release_classifier_requires_exact_single_file_hash_output(
+    tmp_path: Path, hash_case: str
+) -> None:
+    """Catches a digest prefix being accepted from malformed successful hash output."""
+    sha = "b" * 40
+    lab_root = tmp_path / "miloco-lab"
+    _write_valid_classifier_release(lab_root, sha)
+    if hash_case == "extra_line":
+        suffix = "printf '%064d  extra\\n' 0"
+    else:
+        suffix = "printf '%064d  wrong-name\\n' 0"
+    override = "sha256sum() { command sha256sum \"$@\"; " + suffix + "; }"
+    result = _run_release_classifier(tmp_path, lab_root, sha, shell_override=override)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "probe_error"
+
+
+@pytest.mark.parametrize("checksum_case", ["duplicate_path", "trailing_blank"])
+def test_release_classifier_rejects_noncanonical_checksum_records(
+    tmp_path: Path, checksum_case: str
+) -> None:
+    """Catches ambiguous checksum manifests being accepted as release proof."""
+    sha = "c" * 40
+    lab_root = tmp_path / "miloco-lab"
+    release = _write_valid_classifier_release(lab_root, sha)
+    checksum_file = release / "SHA256SUMS"
+    content = checksum_file.read_text(encoding="utf-8")
+    if checksum_case == "duplicate_path":
+        content += content.splitlines(keepends=True)[0]
+    else:
+        content += "\n"
+    checksum_file.write_text(content, encoding="utf-8")
+    result = _run_release_classifier(tmp_path, lab_root, sha)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "definitively_invalid"
+
+
+@pytest.mark.parametrize(
+    "release_json",
+    [
+        '{"schema":1,"git_sha":"{sha}","platform":"linux/amd64"} trailing\n',
+        '{"schema":1,"schema":1,"git_sha":"{sha}","platform":"linux/amd64"}\n',
+        '{"schema":1,"git_sha":"{sha}","platform":"linux/amd64","platform":"other"}\n',
+        '[{"schema":1,"git_sha":"{sha}","platform":"linux/amd64"}]\n',
+    ],
+)
+def test_release_classifier_uses_strict_json_semantics(
+    tmp_path: Path, release_json: str
+) -> None:
+    """Catches grep-compatible but invalid, duplicate, conflicting, or wrapped metadata."""
+    sha = "d" * 40
+    lab_root = tmp_path / "miloco-lab"
+    release = _write_valid_classifier_release(lab_root, sha)
+    metadata = release / "release.json"
+    metadata.write_text(release_json.replace("{sha}", sha), encoding="utf-8")
+    checksum_file = release / "SHA256SUMS"
+    payload = release / "remote-release.sh"
+    checksum_file.write_text(
+        f"{hashlib.sha256(metadata.read_bytes()).hexdigest()}  release.json\n"
+        f"{hashlib.sha256(payload.read_bytes()).hexdigest()}  remote-release.sh\n",
+        encoding="utf-8",
+    )
+    result = _run_release_classifier(tmp_path, lab_root, sha)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "definitively_invalid"
+
+
+@pytest.mark.parametrize(
+    "path_case",
+    ["lab_root", "releases_parent", "deploy_state", "records_parent", "accepted_parent"],
+)
+def test_release_classifier_never_calls_symlinked_ancestor_paths_capable(
+    tmp_path: Path, path_case: str
+) -> None:
+    """Catches resolved-path-only validation that skips a raw ancestor symlink."""
+    sha = "e" * 40
+    visible_root = tmp_path / "miloco-lab"
+    if path_case == "lab_root":
+        actual_root = tmp_path / "actual-root"
+        _write_valid_classifier_release(actual_root, sha)
+        visible_root.symlink_to(actual_root, target_is_directory=True)
+        lab_root = visible_root
+    else:
+        lab_root = visible_root
+        _write_valid_classifier_release(lab_root, sha)
+        if path_case == "releases_parent":
+            actual_releases = tmp_path / "actual-releases"
+            (lab_root / "releases").rename(actual_releases)
+            (lab_root / "releases").symlink_to(actual_releases, target_is_directory=True)
+        elif path_case == "deploy_state":
+            actual_state = tmp_path / "actual-deploy-state"
+            actual_state.mkdir()
+            (lab_root / "deploy-state").symlink_to(actual_state, target_is_directory=True)
+        else:
+            deploy_state = lab_root / "deploy-state"
+            deploy_state.mkdir()
+            directory_name = "artifacts" if path_case == "records_parent" else "accepted"
+            actual_records = deploy_state / f"actual-{directory_name}"
+            actual_records.mkdir()
+            (deploy_state / directory_name).symlink_to(actual_records, target_is_directory=True)
+            other_name = "accepted" if directory_name == "artifacts" else "artifacts"
+            (deploy_state / other_name).mkdir()
+    invocation = None
+    if path_case in {"deploy_state", "records_parent", "accepted_parent"}:
+        invocation = (
+            f'if classifier_capability_paths_state "{sha}"; then printf valid; '
+            "else status=$?; [[ $status -eq 1 ]] && printf definitively_invalid "
+            "|| printf probe_error; fi"
+        )
+    result = _run_release_classifier(tmp_path, lab_root, sha, invocation=invocation)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() != "valid"
+
+
+@pytest.mark.parametrize("record_kind", ["artifact", "acceptance"])
+def test_fixed_records_reject_a_trailing_blank_record(
+    tmp_path: Path, record_kind: str
+) -> None:
+    """Catches command-substitution newline stripping that hides an extra record."""
+    sha = "f" * 40
+    lab_root = tmp_path / "miloco-lab"
+    artifacts = lab_root / "deploy-state" / "artifacts"
+    accepted = lab_root / "deploy-state" / "accepted"
+    artifacts.mkdir(parents=True)
+    accepted.mkdir()
+    if record_kind == "artifact":
+        (artifacts / sha).write_text(
+            "schema=1\n"
+            f"git_sha={sha}\n"
+            f"archive_sha256={'1' * 64}\n"
+            f"controller_sha256={'2' * 64}\n"
+            f"allowlist_sha256={hashlib.sha256(ALLOWLIST.read_bytes()).hexdigest()}\n\n",
+            encoding="utf-8",
+        )
+        reader = "read_artifact_record"
+    else:
+        (accepted / sha).write_text(
+            "schema=1\n"
+            f"archive_sha256={'1' * 64}\n"
+            f"runtime_image_id=sha256:{'2' * 64}\n"
+            f"acceptance_image_id=sha256:{'3' * 64}\n\n",
+            encoding="utf-8",
+        )
+        reader = "read_acceptance_marker"
+    source = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8").rsplit(
+        '\nmain "$@"', maxsplit=1
+    )[0]
+    source = source.replace('readonly LAB_ROOT="/opt/miloco-lab"', f'readonly LAB_ROOT="{lab_root}"')
+    harness = tmp_path / "strict-record.sh"
+    harness.write_text(
+        source
+        + "\nstat() { case \"$2\" in '%u:%g') printf '0:0\\n' ;; '%a') "
+        + "[[ -d \"$3\" ]] && printf '755\\n' || printf '644\\n' ;; esac; }\n"
+        + f'if {reader} "{sha}"; then printf valid; else printf invalid; fi\n',
+        encoding="utf-8",
+    )
+    harness.chmod(0o755)
+    result = subprocess.run(
+        [str(harness)], text=True, capture_output=True, check=False, timeout=5
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "invalid"
+
+
+def test_exact_valid_classifier_path_and_metadata_remain_capable(tmp_path: Path) -> None:
+    """Catches strict parsing that rejects the canonical release and proof records."""
+    sha = "1" * 40
+    archive_digest = "2" * 64
+    runtime_id = "sha256:" + "3" * 64
+    acceptance_id = "sha256:" + "4" * 64
+    lab_root = tmp_path / "miloco-lab"
+    _write_valid_classifier_release(lab_root, sha)
+    artifacts = lab_root / "deploy-state" / "artifacts"
+    accepted = lab_root / "deploy-state" / "accepted"
+    artifacts.mkdir(parents=True)
+    accepted.mkdir()
+    (artifacts / sha).write_text(
+        "schema=1\n"
+        f"git_sha={sha}\n"
+        f"archive_sha256={archive_digest}\n"
+        f"controller_sha256={'5' * 64}\n"
+        f"allowlist_sha256={hashlib.sha256(ALLOWLIST.read_bytes()).hexdigest()}\n",
+        encoding="utf-8",
+    )
+    (accepted / sha).write_text(
+        "schema=1\n"
+        f"archive_sha256={archive_digest}\n"
+        f"runtime_image_id={runtime_id}\n"
+        f"acceptance_image_id={acceptance_id}\n",
+        encoding="utf-8",
+    )
+    image_override = (
+        "image_reference_state() { case \"$1\" in miloco-lab-acceptance:*) "
+        f"printf 'present:{acceptance_id}\\n' ;; *) printf 'present:{runtime_id}\\n' ;; esac; }}"
+    )
+    result = _run_release_classifier(
+        tmp_path,
+        lab_root,
+        sha,
+        shell_override=image_override,
+        invocation=f'release_capability "{sha}"',
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "capable"
 
 
 @pytest.mark.parametrize(
@@ -1498,6 +1792,7 @@ def test_release_capability_propagates_record_semantics_and_read_uncertainty(
         source
         + "\n"
         + "\n".join(overrides)
+        + "\nclassifier_capability_paths_state() { return 0; }"
         + "\n"
         + f'release_capability "{sha}"\n',
         encoding="utf-8",
@@ -1892,6 +2187,39 @@ def test_status_rejects_current_record_symlink_without_docker(tmp_path: Path) ->
     )
     assert result.returncode == 4
     assert "unsafe" in result.stderr
+    assert not docker_log.exists()
+
+
+def test_status_rejects_raw_lab_root_symlink_without_docker(tmp_path: Path) -> None:
+    """Catches read-only status resolving through an attacker-repointable lab root."""
+    actual_root = tmp_path / "actual-root"
+    actual_root.mkdir()
+    lab_root = tmp_path / "miloco-lab"
+    lab_root.symlink_to(actual_root, target_is_directory=True)
+    source = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8").rsplit(
+        '\nmain "$@"', maxsplit=1
+    )[0].replace(
+        'readonly LAB_ROOT="/opt/miloco-lab"', f'readonly LAB_ROOT="{lab_root}"'
+    )
+    docker_log = tmp_path / "status-root-symlink-docker.log"
+    harness = tmp_path / "status-root-symlink.sh"
+    harness.write_text(
+        source
+        + "\nid() { printf '0\\n'; }\n"
+        + f"docker() {{ printf called >> '{docker_log}'; return 99; }}\n"
+        + 'main "$@"\n',
+        encoding="utf-8",
+    )
+    harness.chmod(0o755)
+    result = subprocess.run(
+        [str(harness), "status", "ai-lab01.esxi"],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+    assert result.returncode == 4
+    assert "unsafe" in result.stderr or "symlink" in result.stderr
     assert not docker_log.exists()
 
 

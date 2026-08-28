@@ -86,8 +86,11 @@ after a failed acceptance run without extracting over the existing release.
 
 The deployment root and every control, incoming, release, artifact, acceptance,
 state, and lock parent or record are required to be non-symlinks, root-owned,
-and resolved beneath `/opt/miloco-lab` before use. Atomic writes validate both
-their parent and final record.
+at their exact canonical path, and resolved beneath `/opt/miloco-lab` before
+use. The classifier checks the raw root and every named ancestor before the
+resolved leaf, including read-only status paths; resolving through a parent
+symlink is never accepted. Atomic writes validate both their parent and final
+record.
 
 If the requested SHA already has an intact release, marker, and exact image-ID
 pair, it is reused without any marker, tag, or build mutation whether it is
@@ -124,9 +127,15 @@ contract/checksum-invalid release, or an explicit marker/image-ID mismatch is
 definitively invalid. Contract verification distinguishes a successfully
 computed checksum or metadata mismatch from uncertainty: missing tools,
 unexpected exit codes or output, and filesystem, read, `find`, `stat`, `grep`,
-or checksum I/O failures are probe errors. Docker daemon/query failures and
-unexpected image output are probe errors as well. Probe errors stop cleanup
-without deleting anything. Invalid debris does not consume a historical slot.
+or checksum I/O failures are probe errors. `release.json` is parsed as JSON by
+`python3`, with duplicate keys rejected and the schema, full Git SHA, platform,
+and allowed build fields checked semantically. `SHA256SUMS`, artifact receipts,
+acceptance markers, file enumeration, per-file hash output, image listings, and
+image inspection results must have one exact, non-duplicated structure; partial,
+extra, empty, or malformed successful output is a probe error unless it proves a
+contract mismatch. Docker daemon/query failures and unexpected image output are
+probe errors as well. Probe errors stop cleanup without deleting anything.
+Invalid debris does not consume a historical slot.
 The current release plus two rollback-capable historical pairs are kept, and
 `previous` consumes one historical slot.
 Removal protects `current` and `previous`, removes and verifies both image tags
