@@ -458,12 +458,11 @@ class GeminiAdapter(OmniProviderAdapter):
 
 
 class OpenAIResponsesAdapter(OmniProviderAdapter):
-    """Responses protocol placeholder.
+    """OpenAI Responses JSON protocol adapter.
 
-    Task 1 makes protocol selection explicit. Payload construction and HTTP
-    normalization are intentionally implemented by the following plan tasks;
-    every method fails locally in the meantime so Responses can never silently
-    fall back to Chat Completions.
+    Miloco keeps an OpenAI-shaped messages IR internally. This adapter converts
+    the bounded text/JPEG subset to Responses input blocks and normalizes the
+    non-streaming response before downstream usage, trace, and parser consumers.
     """
 
     media_mode: OmniMediaMode = "image_sequence"
@@ -473,11 +472,60 @@ class OpenAIResponsesAdapter(OmniProviderAdapter):
     def _not_implemented() -> Never:
         raise NotImplementedError("OpenAI Responses adapter is not implemented yet")
 
-    def build_video_block(self, video_base64: str, media: LocalMediaInfo) -> dict[str, Any]:
-        self._not_implemented()
+    def build_video_block(
+        self, video_base64: str, media: LocalMediaInfo
+    ) -> dict[str, Any]:
+        raise ValueError("unsupported Responses content block: video_url")
 
-    def build_audio_block(self, audio_base64: str, media: LocalMediaInfo) -> dict[str, Any]:
-        self._not_implemented()
+    def build_audio_block(
+        self, audio_base64: str, media: LocalMediaInfo
+    ) -> dict[str, Any]:
+        raise ValueError("unsupported Responses content block: input_audio")
+
+    @staticmethod
+    def _text_content(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            raise ValueError("unsupported Responses message content")
+        texts: list[str] = []
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "text":
+                raise ValueError("unsupported Responses system content block")
+            text = block.get("text")
+            if not isinstance(text, str):
+                raise ValueError("malformed Responses text content block")
+            texts.append(text)
+        return "".join(texts)
+
+    @staticmethod
+    def _user_content(content: Any) -> list[dict[str, Any]]:
+        if isinstance(content, str):
+            return [{"type": "input_text", "text": content}]
+        if not isinstance(content, list):
+            raise ValueError("unsupported Responses message content")
+
+        converted: list[dict[str, Any]] = []
+        for block in content:
+            if not isinstance(block, dict):
+                raise ValueError("unsupported Responses content block: malformed")
+            block_type = block.get("type")
+            if block_type == "text":
+                text = block.get("text")
+                if not isinstance(text, str):
+                    raise ValueError("malformed Responses text content block")
+                converted.append({"type": "input_text", "text": text})
+            elif block_type == "image_url":
+                image = block.get("image_url")
+                image_url = image.get("url") if isinstance(image, dict) else None
+                if not isinstance(image_url, str) or not image_url.startswith(
+                    "data:image/"
+                ):
+                    raise ValueError("malformed Responses input_image content block")
+                converted.append({"type": "input_image", "image_url": image_url})
+            else:
+                raise ValueError("unsupported Responses content block")
+        return converted
 
     def build_request_body(
         self,
@@ -489,16 +537,86 @@ class OpenAIResponsesAdapter(OmniProviderAdapter):
         top_p: float,
         stream: bool = False,
     ) -> dict[str, Any]:
-        self._not_implemented()
+        system_parts: list[str] = []
+        user_parts: list[dict[str, Any]] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                raise ValueError("malformed Responses message")
+            role = message.get("role")
+            if role == "system":
+                system_parts.append(self._text_content(message.get("content", "")))
+            elif role == "user":
+                user_parts.extend(self._user_content(message.get("content", "")))
+            else:
+                raise ValueError("unsupported Responses message role")
+
+        return {
+            "model": model,
+            "instructions": "\n\n".join(part for part in system_parts if part),
+            "input": [{"role": "user", "content": user_parts}],
+            "max_output_tokens": max_tokens,
+            "stream": stream,
+        }
 
     def endpoint(self, base_url: str, model: str, *, stream: bool) -> str:
-        self._not_implemented()
+        return f"{base_url.rstrip('/')}/responses"
 
     def auth_headers(self, api_key: str) -> dict[str, str]:
-        self._not_implemented()
+        return {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
     def parse_response(self, raw: dict[str, Any]) -> dict[str, Any]:
-        self._not_implemented()
+        if not isinstance(raw, dict):
+            raise ValueError("Responses output contains no output_text")
+        output = raw.get("output")
+        if not isinstance(output, list):
+            raise ValueError("Responses output contains no output_text")
+
+        text_parts: list[str] = []
+        for item in output:
+            if not isinstance(item, dict):
+                raise ValueError("Responses output contains no output_text")
+            content = item.get("content")
+            if content is None:
+                continue
+            if not isinstance(content, list):
+                raise ValueError("Responses output contains no output_text")
+            for part in content:
+                if not isinstance(part, dict):
+                    raise ValueError("Responses output contains no output_text")
+                if part.get("type") != "output_text":
+                    continue
+                text = part.get("text")
+                if not isinstance(text, str):
+                    raise ValueError("Responses output contains no output_text")
+                text_parts.append(text)
+
+        text = "".join(text_parts)
+        if not text.strip():
+            raise ValueError("Responses output contains no output_text")
+
+        usage_in = raw.get("usage") or {}
+        if not isinstance(usage_in, dict):
+            raise ValueError("Responses usage is malformed")
+        input_details = usage_in.get("input_tokens_details") or {}
+        if not isinstance(input_details, dict):
+            raise ValueError("Responses usage is malformed")
+        try:
+            prompt_tokens = int(usage_in.get("input_tokens") or 0)
+            completion_tokens = int(usage_in.get("output_tokens") or 0)
+            total_tokens = int(usage_in.get("total_tokens") or 0)
+            cached_tokens = int(input_details.get("cached_tokens") or 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Responses usage is malformed") from exc
+
+        return {
+            "choices": [{"message": {"content": text}}],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+                "prompt_tokens_details": {"cached_tokens": cached_tokens},
+            },
+        }
 
     def parse_stream_chunk(
         self, chunk: dict[str, Any]

@@ -299,14 +299,14 @@ async def _call_omni_messages(
     text 字符串，再由 ``_build_messages`` 拼接 video/crops；本函数允许调用方完全自定义
     messages（含 image_url / video_url 等多模态块）。
     """
+    if adapter is None:
+        adapter = get_adapter(config.api_protocol, config.model)
     api_key = resolve_api_key(config)
-    if not api_key:
+    if adapter.auth_required and not api_key:
         raise ValueError(
             "MILOCO_MODEL__OMNI__API_KEY is not set; cannot call fused omni"
         )
 
-    if adapter is None:
-        adapter = get_adapter(config.api_protocol, config.model)
     body = adapter.build_request_body(
         messages,
         model=config.model,
@@ -338,9 +338,7 @@ async def _call_omni_messages(
             if classified is not None:
                 await cb.record_failure(classified)
                 logger.error(
-                    "[omni] omni API 调用失败，错误码=%d | %s",
-                    resp.status_code,
-                    resp.text[:500],
+                    "[omni] omni API 调用失败，错误码=%d", resp.status_code
                 )
                 if resp.status_code == 400:
                     logger.error(
@@ -364,16 +362,15 @@ async def _call_omni_messages(
                 if classified is not None:
                     await cb.record_failure(classified)
                     logger.error(
-                        "[omni] omni API 调用失败(stream)，错误码=%d | %s",
+                        "[omni] omni API 调用失败(stream)，错误码=%d",
                         e.response.status_code,
-                        e.response.text[:500],
                     )
                 raise
-        # 服务端在 fused 大 payload 下偶发返回非 dict body (~1.5%);此处校验
-        # 形态并 dump 截断后的原始响应,便于事后定位服务端返回了什么。
+        # 服务端在 fused 大 payload 下偶发返回非 dict body (~1.5%);只记录稳定的
+        # status/type 元数据，原始响应可能包含用户内容，不得写入普通日志。
         if not isinstance(raw, dict):
             raw_cls = raw.__class__.__name__
-            detail = f"type={raw_cls} body={str(raw)[:1000]}"
+            detail = f"non-dict type={raw_cls}"
             if not forced_stream:
                 detail = f"status={resp.status_code} {detail}"
             logger.error("[omni-fused] unexpected response shape | %s", detail)

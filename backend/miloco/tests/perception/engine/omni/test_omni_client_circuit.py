@@ -334,6 +334,8 @@ async def test_call_omni_forced_stream_401_records_failure(monkeypatch):
     orig_adapter = provider.get_adapter(None, "m")
 
     class _StreamAdapter:
+        auth_required = True
+
         def build_request_body(self, messages, **kw):
             kw["stream"] = True  # 关键:忽略调用方传的 stream=False
             return orig_adapter.build_request_body(messages, **kw)
@@ -372,6 +374,8 @@ async def test_call_omni_forced_stream_500_records_failure(monkeypatch):
     orig_adapter = provider.get_adapter(None, "m")
 
     class _StreamAdapter:
+        auth_required = True
+
         def build_request_body(self, messages, **kw):
             kw["stream"] = True
             return orig_adapter.build_request_body(messages, **kw)

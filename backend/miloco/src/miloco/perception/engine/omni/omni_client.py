@@ -9,7 +9,7 @@ import os
 import time
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import httpx
 
@@ -27,6 +27,7 @@ from miloco.perception.engine.omni.error_classifier import (
     classify_response,
 )
 from miloco.perception.engine.omni.provider import (
+    LocalMediaInfo,
     OmniProviderAdapter,
     get_adapter,
     resolve_api_protocol,
@@ -198,13 +199,13 @@ async def call_omni(
     `type` is either ``"realtime"`` (perception-loop driven, default) or
     ``"on_demand"`` (user-initiated query).
     """
+    adapter = get_adapter(config.api_protocol, config.model)
     api_key = resolve_api_key(config)
-    if not api_key:
+    if adapter.auth_required and not api_key:
         raise ValueError(
             f"{_ENV_KEY} is not set. Provide it via config or environment variable."
         )
 
-    adapter = get_adapter(config.api_protocol, config.model)
     messages = _build_messages(payload, adapter)
 
     body = adapter.build_request_body(
@@ -237,9 +238,7 @@ async def call_omni(
                 classified = classify_response(resp)
                 if classified is not None:
                     await cb.record_failure(classified)
-                    logger.error(
-                        "Omni API error %d: %s", resp.status_code, resp.text[:500]
-                    )
+                    logger.error("Omni API error %d", resp.status_code)
                     resp.raise_for_status()
                 raw = adapter.parse_response(resp.json())
             else:
@@ -257,9 +256,7 @@ async def call_omni(
                     if classified is not None:
                         await cb.record_failure(classified)
                         logger.error(
-                            "Omni API error %d (stream): %s",
-                            e.response.status_code,
-                            e.response.text[:500],
+                            "Omni API error %d (stream)", e.response.status_code
                         )
                     raise
             if not isinstance(raw, dict):
@@ -342,7 +339,7 @@ async def _collect_stream_response(
     ) as resp:
         if resp.status_code != 200:
             await resp.aread()
-            logger.error("Omni stream error %d: %s", resp.status_code, resp.text[:500])
+            logger.error("Omni stream error %d", resp.status_code)
             if resp.status_code == 400:
                 from miloco.perception.engine.omni.omni import (
                     _summarize_multimodal_payload,
@@ -369,7 +366,7 @@ def _build_messages(payload: dict, adapter: OmniProviderAdapter) -> list[dict]:
 
     content: list[dict] = [{"type": "text", "text": payload["user_content"]}]
 
-    media_info = payload.get("media_info")
+    media_info = cast(LocalMediaInfo, payload.get("media_info"))
 
     if payload.get("video_base64"):
         content.append(adapter.build_video_block(payload["video_base64"], media_info))
@@ -383,6 +380,18 @@ def _build_messages(payload: dict, adapter: OmniProviderAdapter) -> list[dict]:
                 "type": "image_url",
                 "image_url": {
                     "url": f"data:{crop['media_type']};base64,{crop['data']}"
+                },
+            }
+        )
+
+    # Responses image-sequence payloads use the same internal image_url IR as
+    # existing tracker crops. They are converted to input_image by the adapter.
+    for image in payload.get("images", []):
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{image['media_type']};base64,{image['data']}"
                 },
             }
         )
@@ -425,13 +434,13 @@ async def call_omni_stream(
                    会以 {input_tokens, output_tokens, cached_tokens} 写回到这个 dict。
         type: 给 ``fire_record`` 的调用类型标签，默认 ``"realtime"``，跟 ``call_omni`` 对齐。
     """
+    adapter = get_adapter(config.api_protocol, config.model)
     api_key = resolve_api_key(config)
-    if not api_key:
+    if adapter.auth_required and not api_key:
         raise ValueError(
             f"{_ENV_KEY} is not set. Provide it via config or environment variable."
         )
 
-    adapter = get_adapter(config.api_protocol, config.model)
     messages = _build_messages(payload, adapter)
 
     body = adapter.build_request_body(
@@ -472,9 +481,7 @@ async def call_omni_stream(
                 if classified is not None:
                     await resp.aread()
                     await cb.record_failure(classified)
-                    logger.error(
-                        "Omni stream error %d: %s", resp.status_code, resp.text[:500]
-                    )
+                    logger.error("Omni stream error %d", resp.status_code)
                     resp.raise_for_status()
                 async for chunk in _iter_sse_chunks(resp):
                     delta, chunk_usage = adapter.parse_stream_chunk(chunk)
