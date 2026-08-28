@@ -336,12 +336,6 @@ pack_models() {
 # wheel + miloco + cli wheel + openclaw tgz + 模型 tarball。打完算各归档 SHA/size 回填
 # manifest.bundles（install.py 下载前据此选包 + 整包校验）。
 pack_platform_bundles() {
-    local models_tar miloco_whl cli_whl tgz
-    models_tar=$(ls "$DIST_DIR"/miloco-models-*.tar.gz 2>/dev/null | head -1)
-    miloco_whl=$(ls "$DIST_DIR"/miloco-*.whl 2>/dev/null | grep -v miloco_miot | grep -v miloco_cli | head -1)
-    cli_whl=$(ls "$DIST_DIR"/miloco_cli-*.whl 2>/dev/null | head -1)
-    tgz=$(ls "$DIST_DIR"/miloco-openclaw-plugin-*.tgz 2>/dev/null | head -1)
-
     # 子集构建（--packages 只构建部分包）本就产不出完整平台归档：跳过而非硬失败，
     # 否则 sync-to-remote.sh --packages <子集> 这类 dev 工作流会被 set -e 中断。
     # 全量构建（默认 / CI）时缺文件仍走硬失败，暴露 CI 打包异常。
@@ -349,6 +343,12 @@ pack_platform_bundles() {
         log "子集构建（--packages=${PACKAGES}），跳过平台归档打包"
         return
     fi
+
+    local models_tar miloco_whl cli_whl tgz
+    models_tar=$(ls "$DIST_DIR"/miloco-models-*.tar.gz 2>/dev/null | head -1)
+    miloco_whl=$(ls "$DIST_DIR"/miloco-*.whl 2>/dev/null | grep -v miloco_miot | grep -v miloco_cli | head -1)
+    cli_whl=$(ls "$DIST_DIR"/miloco_cli-*.whl 2>/dev/null | head -1)
+    tgz=$(ls "$DIST_DIR"/miloco-openclaw-plugin-*.tgz 2>/dev/null | head -1)
 
     if [[ -z "$miloco_whl" || -z "$cli_whl" || -z "$tgz" || -z "$models_tar" ]]; then
         log "FATAL: 缺失文件 — miloco_whl=$miloco_whl cli_whl=$cli_whl tgz=$tgz models_tar=$models_tar"

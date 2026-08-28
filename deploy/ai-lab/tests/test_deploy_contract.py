@@ -210,6 +210,33 @@ def _run_staging_allowlist_validation(staging: Path) -> subprocess.CompletedProc
     )
 
 
+def _run_pack_platform_bundles(
+    dist_dir: Path, packages: str
+) -> subprocess.CompletedProcess[str]:
+    build_script = REPOSITORY_ROOT / "scripts" / "build.sh"
+    function = re.search(
+        r"(?ms)^pack_platform_bundles\(\) \{\n.*?^\}\n",
+        build_script.read_text(encoding="utf-8"),
+    )
+    assert function is not None, "scripts/build.sh must define pack_platform_bundles"
+    return subprocess.run(
+        ["bash"],
+        input=(
+            "set -euo pipefail\n"
+            f"DIST_DIR={shlex.quote(str(dist_dir))}\n"
+            f"PACKAGES={shlex.quote(packages)}\n"
+            'ALL_PACKAGES="miloco-miot,miloco,miloco-cli,openclaw,web,hermes"\n'
+            "log() { :; }\n"
+            f"{function.group()}\n"
+            "pack_platform_bundles\n"
+        ),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+
+
 def _compose_service() -> dict[str, object]:
     compose = yaml.safe_load(COMPOSE_FILE.read_text(encoding="utf-8"))
     assert set(compose["services"]) == {"miloco"}
@@ -963,6 +990,22 @@ def test_build_contract_is_content_addressed_locked_and_bounded() -> None:
         "MILOCO_RTSP_TEST_PASSWORD",
     ):
         assert f"-u {credential_name}" in controller
+
+
+def test_partial_build_returns_without_openclaw_bundle(tmp_path: Path) -> None:
+    """Catches full-bundle artifact lookups running before the partial-build return."""
+    result = _run_pack_platform_bundles(
+        tmp_path, "web,miloco-miot,miloco,miloco-cli"
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_pack_platform_bundles_fails_for_missing_full_build_artifacts(tmp_path: Path) -> None:
+    """Catches a full build silently skipping required platform bundle inputs."""
+    result = _run_pack_platform_bundles(
+        tmp_path, "miloco-miot,miloco,miloco-cli,openclaw,web,hermes"
+    )
+    assert result.returncode != 0
 
 
 def test_preflight_and_transfer_are_bounded_to_the_two_labs() -> None:
