@@ -683,9 +683,10 @@ class ProtocolScopedEnvSource(PydanticBaseSettingsSource):
     """Keep the generic Omni env key scoped to key-required protocols.
 
     ``MILOCO_MODEL__OMNI__API_KEY`` predates provider selection and therefore
-    belongs to the legacy authenticated Chat/Gemini path.  When the effective
-    source stack explicitly selects Responses, remove only that env field so a
-    persisted or init-provided Responses key can still win normally.
+    belongs to the legacy authenticated Chat/Gemini path.  When a non-env
+    source explicitly selects Responses, remove only that env field so a
+    persisted or init-provided Responses key can still win normally.  An env
+    source that explicitly selects Responses keeps its same-source key.
     """
 
     def __init__(
@@ -709,18 +710,20 @@ class ProtocolScopedEnvSource(PydanticBaseSettingsSource):
     def __call__(self) -> dict[str, Any]:  # type: ignore[override]
         env_data = self._env_source()
         effective_protocol = None
-        for source in (
-            self._init_source,
-            self._env_source,
-            self._json_source,
-            self._yaml_source,
+        protocol_source = None
+        for source_name, source in (
+            ("init", self._init_source),
+            ("env", self._env_source),
+            ("json", self._json_source),
+            ("yaml", self._yaml_source),
         ):
             found, protocol = _source_omni_protocol(source())
             if found:
                 effective_protocol = protocol
+                protocol_source = source_name
                 break
 
-        if effective_protocol != "openai_responses":
+        if effective_protocol != "openai_responses" or protocol_source == "env":
             return env_data
 
         model = env_data.get("model")

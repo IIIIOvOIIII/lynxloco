@@ -216,12 +216,13 @@ def test_legacy_active_json_profile_keeps_protocol_missing_until_resolution(
         ),
         ("openai_chat_completions", "cloud-chat", "", "OLD_CHAT_SENTINEL"),
         ("gemini_native", "gemini-3-flash", "", "OLD_CHAT_SENTINEL"),
+        (None, "legacy-model", "", "OLD_CHAT_SENTINEL"),
     ],
 )
 def test_generic_omni_env_key_is_protocol_scoped_during_json_reload(
     tmp_path: Path,
     monkeypatch,
-    api_protocol: str,
+    api_protocol: str | None,
     model: str,
     persisted_key: str,
     expected_key: str,
@@ -250,8 +251,34 @@ def test_generic_omni_env_key_is_protocol_scoped_during_json_reload(
     assert settings.perception.engine["omni"]["api_key"] == expected_key
 
 
+def test_explicit_responses_env_key_is_preserved(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "MILOCO_MODEL__OMNI__API_PROTOCOL",
+        "openai_responses",
+    )
+    monkeypatch.setenv("MILOCO_MODEL__OMNI__MODEL", "env-vlm")
+    monkeypatch.setenv(
+        "MILOCO_MODEL__OMNI__BASE_URL",
+        "http://127.0.0.1:8000/v1",
+    )
+    monkeypatch.setenv("MILOCO_MODEL__OMNI__API_KEY", "RESPONSES_ENV_KEY")
+    reset_settings()
+
+    settings = get_settings()
+
+    assert settings.model.omni.api_protocol == "openai_responses"
+    assert settings.model.omni.api_key == "RESPONSES_ENV_KEY"
+    assert settings.perception.engine["omni"]["api_key"] == "RESPONSES_ENV_KEY"
+
+
+@pytest.mark.parametrize(
+    ("init_key", "expected_key"),
+    [("", ""), ("RESPONSES_INIT_KEY", "RESPONSES_INIT_KEY")],
+)
 def test_generic_omni_env_key_does_not_override_direct_responses_init(
     monkeypatch,
+    init_key: str,
+    expected_key: str,
 ) -> None:
     monkeypatch.setenv("MILOCO_MODEL__OMNI__API_KEY", "OLD_CHAT_SENTINEL")
 
@@ -260,14 +287,14 @@ def test_generic_omni_env_key_does_not_override_direct_responses_init(
             omni=OmniModelSettings(
                 model="local-vlm",
                 base_url="http://127.0.0.1:8000/v1",
-                api_key="",
+                api_key=init_key,
                 api_protocol="openai_responses",
             )
         )
     )
 
-    assert settings.model.omni.api_key == ""
-    assert settings.perception.engine["omni"]["api_key"] == ""
+    assert settings.model.omni.api_key == expected_key
+    assert settings.perception.engine["omni"]["api_key"] == expected_key
 
 
 # SSL 已废弃：backend 永远 HTTP，跨网加密走反代。原 ssl_enabled / ssl_certfile /

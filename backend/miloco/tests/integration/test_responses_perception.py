@@ -295,6 +295,40 @@ async def test_persisted_keyless_responses_ignores_generic_env_across_all_paths(
     assert sentinel not in repr(fixture.requests)
 
 
+@pytest.mark.asyncio
+async def test_explicit_responses_env_key_reaches_http_as_bearer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with ResponsesFixtureServer(api_key="RESPONSES_ENV_KEY") as fixture:
+        monkeypatch.setenv(
+            "MILOCO_MODEL__OMNI__API_PROTOCOL",
+            "openai_responses",
+        )
+        monkeypatch.setenv("MILOCO_MODEL__OMNI__MODEL", "fixture-vlm")
+        monkeypatch.setenv("MILOCO_MODEL__OMNI__BASE_URL", fixture.base_url)
+        monkeypatch.setenv("MILOCO_MODEL__OMNI__API_KEY", "RESPONSES_ENV_KEY")
+        reset_settings()
+        active = get_settings().model.omni
+
+        raw = await call_omni(
+            _payload(),
+            OmniConfig(
+                model=active.model,
+                base_url=active.base_url,
+                api_key=active.api_key,
+                api_protocol=active.api_protocol,
+                timeout=2.0,
+            ),
+        )
+
+    assert active.api_key == "RESPONSES_ENV_KEY"
+    assert parse_omni_response(raw).caption[0].description == "fixture saw the room"
+    assert [(request.method, request.path) for request in fixture.requests] == [
+        ("POST", "/v1/responses")
+    ]
+    assert fixture.requests[0].auth_present is True
+
+
 def _minimal_jpeg_data_url() -> str:
     return _DATA_URL_PREFIX + base64.b64encode(b"\xff\xd8\xff\xd9").decode()
 
