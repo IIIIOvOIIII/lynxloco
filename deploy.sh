@@ -372,6 +372,14 @@ read_release_receipt() {
 build_release() (
     local sha="$clean_sha"
     local temp_root staging output_dir archive receipt temporary_archive temporary_receipt built_at
+    output_dir="$PROJECT_ROOT/dist/lab/$sha"
+    archive="$output_dir/miloco-lab-${sha}.tar.gz"
+    receipt="$output_dir/miloco-lab-${sha}.receipt"
+    if [[ -e "$output_dir" || -L "$output_dir" \
+        || -e "$archive" || -L "$archive" \
+        || -e "$receipt" || -L "$receipt" ]]; then
+        die 4 "immutable release already exists for Git SHA $sha"
+    fi
     temp_root="$(mktemp -d)"
     temporary_archive=""
     temporary_receipt=""
@@ -451,9 +459,6 @@ build_release() (
     generate_checksums "$staging"
     validate_staging_allowlist "$staging"
 
-    output_dir="$PROJECT_ROOT/dist/lab/$sha"
-    archive="$output_dir/miloco-lab-${sha}.tar.gz"
-    receipt="$output_dir/miloco-lab-${sha}.receipt"
     install -d -m 0755 "$output_dir"
     temporary_archive="$(mktemp "$output_dir/.miloco-lab-${sha}.tar.gz.XXXXXX")"
     COPYFILE_DISABLE=1 tar -czf "$temporary_archive" -C "$staging" -- .

@@ -1411,6 +1411,128 @@ def test_build_and_help_do_not_require_ssh_identity(
     assert "MILOCO_SSH_IDENTITY" not in build_result.stderr
 
 
+def test_build_rejects_same_sha_before_rebuilding_or_mutating_proof(tmp_path: Path) -> None:
+    """Catches a same-SHA guard removed or moved after the package build."""
+    sha = "0" * 40
+    repository = tmp_path / "same-sha-repo"
+    remote_dir = repository / "deploy" / "ai-lab"
+    acceptance_dir = remote_dir / "acceptance"
+    integration_dir = repository / "backend" / "miloco" / "tests" / "integration"
+    fixture_dir = repository / "backend" / "miloco" / "tests" / "fixtures" / "rtsp"
+    scripts_dir = repository / "scripts"
+    for directory in (
+        acceptance_dir,
+        integration_dir,
+        fixture_dir,
+        scripts_dir,
+        repository / "backend",
+        repository / "cli",
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    shutil.copy2(DEPLOY_SCRIPT, repository / "deploy.sh")
+    for source in (REMOTE_RELEASE_SCRIPT, ALLOWLIST, DOCKERFILE, COMPOSE_FILE, ENTRYPOINT):
+        shutil.copy2(source, remote_dir / source.name)
+    shutil.copy2(ACCEPTANCE_PYTEST, acceptance_dir / "pytest.ini")
+    for name in (
+        "test_rtsp_perception.py",
+        "test_rtsp_live_view.py",
+        "test_responses_perception.py",
+        "responses_fixture_server.py",
+    ):
+        (integration_dir / name).write_text("# test-only acceptance payload\n", encoding="utf-8")
+    for name in (
+        "h264_annexb_packets.bin",
+        "h264_avcc_packets.bin",
+        "h264_video_audio.mkv",
+        "h265_video_only.mkv",
+    ):
+        (fixture_dir / name).write_bytes(f"test-only {name}\n".encode())
+    for name in ("rtsp-view-smoke.sh", "responses-vlm-smoke.sh"):
+        (scripts_dir / name).write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+
+    build_count = repository / "build-count"
+    build_script = scripts_dir / "build.sh"
+    build_script.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "count=0\n"
+        f"[[ ! -f {shlex.quote(str(build_count))} ]] || read -r count < {shlex.quote(str(build_count))}\n"
+        "count=$((count + 1))\n"
+        f"printf '%s\\n' \"$count\" > {shlex.quote(str(build_count))}\n"
+        "mkdir -p dist\n"
+        "printf 'miloco build %s\\n' \"$count\" > dist/miloco-1.0.0-py3-none-any.whl\n"
+        "printf 'cli build %s\\n' \"$count\" > dist/miloco_cli-1.0.0-py3-none-any.whl\n"
+        "printf 'miot build %s\\n' \"$count\" > dist/miloco_miot-1.0.0-manylinux_2_28_x86_64.whl\n"
+        "printf 'models build %s\\n' \"$count\" > dist/miloco-models-1.0.0.tar.gz\n",
+        encoding="utf-8",
+    )
+    build_script.chmod(0o755)
+
+    bin_dir = tmp_path / "same-sha-bin"
+    bin_dir.mkdir()
+    git_stub = bin_dir / "git"
+    git_stub.write_text(
+        "#!/usr/bin/env bash\n"
+        "case \"$*\" in\n"
+        "  *status*|*ls-files*|*diff*) exit 0 ;;\n"
+        f"  *rev-parse*) printf '%s\\n' '{sha}' ;;\n"
+        "  *) exit 2 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    git_stub.chmod(0o755)
+    uv_stub = bin_dir / "uv"
+    uv_stub.write_text("#!/usr/bin/env bash\nprintf 'test-dependency==1.0\\n'\n", encoding="utf-8")
+    uv_stub.chmod(0o755)
+    environment = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+
+    first = subprocess.run(
+        [str(repository / "deploy.sh"), "build"],
+        cwd=repository,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=10,
+        env=environment,
+    )
+    assert first.returncode == 0, first.stderr
+    release_dir = repository / "dist" / "lab" / sha
+    archive = release_dir / f"miloco-lab-{sha}.tar.gz"
+    receipt = release_dir / f"miloco-lab-{sha}.receipt"
+    assert archive.is_file() and receipt.is_file()
+
+    fixed_mtime_ns = 946_684_800_000_000_000
+    os.utime(archive, ns=(fixed_mtime_ns, fixed_mtime_ns))
+    os.utime(receipt, ns=(fixed_mtime_ns, fixed_mtime_ns))
+
+    def proof_state(path: Path) -> tuple[bytes, str, int, int]:
+        metadata = path.stat()
+        contents = path.read_bytes()
+        return (
+            contents,
+            hashlib.sha256(contents).hexdigest(),
+            stat.S_IMODE(metadata.st_mode),
+            metadata.st_mtime_ns,
+        )
+
+    before = (proof_state(archive), proof_state(receipt))
+    second = subprocess.run(
+        [str(repository / "deploy.sh"), "build"],
+        cwd=repository,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=10,
+        env=environment,
+    )
+
+    assert second.returncode != 0
+    assert "immutable release" in second.stderr.lower()
+    assert build_count.read_text(encoding="utf-8") == "1\n"
+    assert (proof_state(archive), proof_state(receipt)) == before
+
+
 @pytest.mark.parametrize("replacement_target", ["archive", "controller"])
 def test_deploy_rejects_replacement_after_clean_build_receipt(
     tmp_path: Path, replacement_target: str
