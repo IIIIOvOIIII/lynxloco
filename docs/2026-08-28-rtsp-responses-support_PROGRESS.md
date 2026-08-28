@@ -125,3 +125,10 @@
 - Expected result: 公开协议必须严格为 Chat Completions、Responses、Gemini native；新默认显式 Chat，旧记录缺字段时保持 `None` 到 resolver；显式值覆盖模型名且 Base URL 不参与；Chat 内 MiMo/Qwen 特化和旧 Gemini 推断保持兼容；Responses 在后续 payload/HTTP 实现前必须本地 fail closed。
 - Result: Achieved。实现提交 `4246292`。TDD 初始 backend 29 failed/29 passed、CLI 5 failed/4 passed，并额外捕获旧 active Gemini 被 YAML Chat 默认覆盖的合并缺口；修复后实现者相关回归 backend 617 passed、CLI 199 passed。独立审查有界复跑 backend 89 passed、CLI 34 passed，确认双参数 adapter 签名、breaker 协议身份、全调用点迁移和 OpenClaw/Hermes 隔离，结论 CLEAN。Responses adapter 当前仅为 fail-closed 占位，不会协议回退或发出错误网络请求。
 - Next step: 执行 Responses Task 2，增加确定性图片序列生成、最多 6 张全景与 6 张优先 crop、总数不超过 12，并保持 Chat/Gemini 原有视频/音频 payload。
+
+## 2026-08-28 11:15 SGT
+
+- Current work: 完成 Responses Task 2 的图片序列构造、全部 Omni 入口接线和独立审查修复循环。
+- Expected result: Responses 只产生确定性、可解码、输入不可变的 JPEG 图片序列，最多 6 张全景与 6 张优先 crop、总数不超过 12；普通、batch、stream、fused 与按需查询都必须由同一 live 协议快照选择媒体模式；Chat/Gemini 保持既有 MP4/音频行为。
+- Result: Achieved。初始提交 `7792f8f` 的 16 个新契约和组合回归 212 passed；独立审查发现 `pipeline.py` 的按需查询仍使用默认 `video_audio`。生产入口级 RED 让 Responses/Chat/Gemini 三项精确失败；`5d4515f` 改为 prompt 前只解析一次 live config、显式传 `adapter.media_mode`，并将同一对象交给 `call_omni`。最终相关回归 226 passed，独立精确复审 3 passed，结论 CLEAN。Responses 普通/fused/text-only 均不含 video/audio，fused 不额外注入 gallery/pet 媒体；网络请求仍未实现。
+- Next step: 执行 Responses Task 3，实现标准 `/responses` 非流式 body、空 Key/可选 Bearer、输出与 usage 归一化，并让现有 breaker/trace/parser 无需协议分支。
