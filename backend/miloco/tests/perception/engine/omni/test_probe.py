@@ -6,6 +6,7 @@ import base64
 import io
 
 import httpx
+import pytest
 from miloco.perception.engine.omni import probe
 from PIL import Image
 
@@ -563,7 +564,7 @@ async def test_responses_visual_probe_models_not_supported_still_proves_vision(
             "AsyncClient",
             _fake_async_client(
                 get_resp=_FakeResp(status),
-                post_resp=_FakeResp(200, _responses_output("The image is red.")),
+                post_resp=_FakeResp(200, _responses_output("red.")),
                 calls=calls,
             ),
         )
@@ -579,13 +580,27 @@ async def test_responses_visual_probe_models_not_supported_still_proves_vision(
         assert [call[0] for call in calls] == ["GET", "POST"]
 
 
-async def test_responses_visual_probe_rejects_generic_text_only_ack(monkeypatch):
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "Request acknowledged.",
+        "The request was colored.",
+        "redacted",
+        "already done",
+        "red is the dominant color",
+        "the dominant color is red",
+    ],
+)
+async def test_responses_visual_probe_rejects_non_exact_color_answer(
+    monkeypatch,
+    answer,
+):
     monkeypatch.setattr(
         probe.httpx,
         "AsyncClient",
         _fake_async_client(
             get_resp=_FakeResp(404),
-            post_resp=_FakeResp(200, _responses_output("Request acknowledged.")),
+            post_resp=_FakeResp(200, _responses_output(answer)),
         ),
     )
 
@@ -598,7 +613,29 @@ async def test_responses_visual_probe_rejects_generic_text_only_ack(monkeypatch)
 
     assert result["ok"] is False
     assert result["code"] == "bad_response"
-    assert "acknowledged" not in result["message"].lower()
+    assert answer.casefold().strip() not in result["message"].casefold()
+
+
+@pytest.mark.parametrize("answer", ["red", "RED", "  red\n", "red.", " RED. "])
+async def test_responses_visual_probe_accepts_exact_red_answer(monkeypatch, answer):
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_async_client(
+            get_resp=_FakeResp(405),
+            post_resp=_FakeResp(200, _responses_output(answer)),
+        ),
+    )
+
+    result = await probe.probe_omni(
+        "local-vlm",
+        "https://vlm.example/v1",
+        "",
+        api_protocol="openai_responses",
+    )
+
+    assert result["ok"] is True
+    assert result["code"] == "ok"
 
 
 async def test_responses_visual_probe_rejects_missing_output_text(monkeypatch):

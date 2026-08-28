@@ -23,7 +23,8 @@ _TIMEOUT = httpx.Timeout(15.0, connect=10.0)
 _ALLOWED_SCHEMES = ("http", "https")
 _VISUAL_PROBE_IMAGE = Path(__file__).with_name("assets") / "visual_probe_red.jpg"
 _VISUAL_PROBE_PROMPT = (
-    "What is the dominant color of this image? Answer with the English color word only."
+    "What is the dominant color of this image? "
+    "Reply with exactly one English color word and no other text."
 )
 
 
@@ -510,7 +511,10 @@ async def _probe_responses(
         usage_warning = True
 
     output_text = normalized["choices"][0]["message"]["content"]
-    if not isinstance(output_text, str) or "red" not in output_text.casefold():
+    if not isinstance(output_text, str) or output_text.casefold().strip() not in {
+        "red",
+        "red.",
+    }:
         return {
             "ok": False,
             "code": "bad_response",
