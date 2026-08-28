@@ -62,3 +62,10 @@
 - Expected result: 单摄像机只保留一条输入会话；慢观看者不反压感知；H.265/不兼容 H.264 只在存在观看者时共享转码；浏览器能收到稳定关闭码，认证令牌不进入 URL query 或 Uvicorn access log；旧 MIoT 路由保持兼容。
 - Result: Achieved。Task 1–4 独立复审均 CLEAN。最终 Task 4 camera focused 83 passed、legacy MIoT 112 passed、完整 Web 321 passed/1 skipped，typecheck/build 与 scoped Ruff/ty 通过。真实 Uvicorn 验证未认证握手为 403、认证后业务状态为 4404/4403/1013，特殊字符令牌及其认证子协议不进入 access log；零等待 detach→reattach 与二次解析状态突变均有确定性回归覆盖。
 - Next step: 执行 Plan 2 Task 5，在现有摄像机界面增加 RTSP 新增、编辑、测试、启停、删除及统一观看入口；随后执行 fixture WebSocket E2E、smoke 测量和 Plan 2 批次审查。真实摄像机网络、CPU、fps、首帧延迟及并发容量继续保持 `not_measured`，直到实验室存在已持久化的实际来源。
+
+## 2026-08-28 08:54 SGT
+
+- Current work: 完成 RTSP Web 管理闭环与三轮独立审查，包括去敏 API 映射、添加/编辑/测试/启停/删除、来源状态、统一观看入口和父子页面同源内存认证。
+- Expected result: 长期 bearer 不进入 query、fragment 或浏览器存储；已启用来源的新连接配置必须在服务端探测成功后才替换运行连接；配置并发变化必须 fail closed；操作后页面必须取得 mutation 之后的新快照，短暂后台刷新失败不得卸载已有 MIoT/RTSP 播放器。
+- Result: Achieved。最终独立复审 CLEAN。后端使用完整来源基线和共享配置锁内精确比较实现乐观并发，冲突返回稳定 409 且零写入/零热同步；前端区分普通 single-flight 与 mutation trailing barrier，并采用 stale-while-error 与 2/5/10 秒有界恢复。最终 backend camera 157 passed、Web 368 passed/1 skipped，typecheck/build 与 scoped Ruff/format/ty/diff/leak 通过。Vite 主包约 503.58 KB 仅触发既有提示线，不作为本批次阻断。
+- Next step: 执行 Plan 2 Task 6：fixture RTSP session 到 perception/live hub/WebSocket 的 H.264 透传与 H.265 转码 E2E、单输入/有界队列/最后观看者资源释放、smoke 指标和设计状态更新；随后进行 Plan 2 整批独立审查。真实摄像机与浏览器长时间行为继续保持 `not_measured`，待实验室验收。
