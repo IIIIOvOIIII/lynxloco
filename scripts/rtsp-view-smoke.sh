@@ -34,16 +34,18 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import signal
 import ssl
+import stat
 import sys
 import time
+from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
-from miloco.config import get_settings
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
 from websockets.typing import Subprotocol
@@ -64,6 +66,57 @@ class SmokeFailure(RuntimeError):
 def _auth_protocol(token: str) -> Subprotocol:
     encoded = base64.urlsafe_b64encode(token.encode()).decode().rstrip("=")
     return Subprotocol(f"miloco.auth.{encoded}")
+
+
+def _load_persisted_server() -> tuple[str, bool]:
+    configured_home = os.environ.get("MILOCO_HOME")
+    home = (
+        Path(configured_home).expanduser()
+        if configured_home
+        else Path.home() / ".openclaw" / "miloco"
+    )
+    config_path = (home / "config.json").absolute()
+    try:
+        if config_path.resolve(strict=True) != config_path:
+            raise SmokeFailure(2, "persisted backend configuration is unavailable")
+        parent_stat = config_path.parent.stat()
+        if parent_stat.st_uid != os.geteuid() or stat.S_IMODE(parent_stat.st_mode) & 0o022:
+            raise SmokeFailure(2, "persisted backend configuration is unavailable")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(config_path, flags)
+        try:
+            config_stat = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(config_stat.st_mode)
+                or config_stat.st_uid != os.geteuid()
+                or stat.S_IMODE(config_stat.st_mode) & 0o077
+            ):
+                raise SmokeFailure(
+                    2, "persisted backend configuration is unavailable"
+                )
+            with os.fdopen(descriptor, encoding="utf-8") as config_file:
+                descriptor = -1
+                payload = json.load(config_file)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+    except SmokeFailure:
+        raise
+    except (OSError, json.JSONDecodeError, UnicodeError, TypeError, ValueError):
+        raise SmokeFailure(2, "persisted backend configuration is unavailable") from None
+
+    if not isinstance(payload, dict):
+        raise SmokeFailure(2, "persisted backend configuration is unavailable")
+    server = payload.get("server")
+    if not isinstance(server, dict):
+        raise SmokeFailure(2, "persisted backend configuration is unavailable")
+    token = server.get("token")
+    if not isinstance(token, str) or not token.strip():
+        raise SmokeFailure(2, "persisted backend configuration is unavailable")
+    verify_tls = server.get("tls_verify", True)
+    if not isinstance(verify_tls, bool):
+        raise SmokeFailure(2, "persisted backend configuration is unavailable")
+    return token, verify_tls
 
 
 def _http_json(path: str, token: str, *, verify_tls: bool) -> dict[str, Any]:
@@ -94,9 +147,7 @@ def _websocket_url(camera_path: str) -> str:
 
 
 async def _run() -> int:
-    settings = get_settings()
-    token = settings.server.token
-    verify_tls = settings.server.tls_verify
+    token, verify_tls = _load_persisted_server()
     encoded_camera_id = quote(CAMERA_ID, safe="")
     state_path = f"/api/cameras/{encoded_camera_id}/stream/state"
     resources_path = "/api/monitor/resources"
@@ -128,6 +179,7 @@ async def _run() -> int:
     first_frame_at: float | None = None
     frame_count = 0
     final_state: dict[str, Any] | None = None
+    measurement_ended: float | None = None
     try:
         async with connect(
             _websocket_url(ws_path),
@@ -148,12 +200,17 @@ async def _run() -> int:
                 except TimeoutError:
                     continue
                 except ConnectionClosed:
-                    break
+                    if signal_code:
+                        break
+                    raise SmokeFailure(
+                        4, "live WebSocket closed before measurement completed"
+                    ) from None
                 if not isinstance(chunk, bytes) or not chunk:
                     continue
                 frame_count += 1
                 if first_frame_at is None:
                     first_frame_at = time.monotonic()
+            measurement_ended = time.monotonic()
             if signal_code:
                 return signal_code
             final_state_payload = await asyncio.to_thread(
@@ -167,7 +224,8 @@ async def _run() -> int:
     except Exception:
         raise SmokeFailure(4, "live WebSocket measurement failed") from None
 
-    elapsed = time.monotonic() - started
+    assert measurement_ended is not None
+    elapsed = measurement_ended - started
     if first_frame_at is None or frame_count == 0:
         raise SmokeFailure(4, "live WebSocket produced no binary video frames")
     if final_state is None:
@@ -191,7 +249,7 @@ async def _run() -> int:
     output_fps = frame_count / elapsed
     cpu_delta = float(after_cpu) - float(before_cpu)
     print(f"first_frame_latency_ms={first_frame_ms}")
-    print(f"sample_seconds={DURATION_SEC} output_fps={output_fps:.2f}")
+    print(f"sample_seconds={elapsed:.2f} output_fps={output_fps:.2f}")
     print(f"process_cpu_pct_delta={cpu_delta:.1f}")
     print(
         "viewer_count={} mode={} queue_depth={} queue_drops={}".format(

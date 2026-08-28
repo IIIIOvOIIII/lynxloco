@@ -192,9 +192,15 @@ class _BlockingContainer(_Container):
 
 
 class _OverlapTrackingBlockingContainer(_Container):
-    def __init__(self, *, read_timeout: float = 0.1) -> None:
+    def __init__(
+        self,
+        *,
+        read_timeout: float = 0.1,
+        failure: BaseException | None = None,
+    ) -> None:
         super().__init__([], video_stream=_stream("video", "h264"))
         self._read_timeout = read_timeout
+        self._failure = failure
         self._inside_demux = False
         self._lock = threading.Lock()
         self.entered = threading.Event()
@@ -213,6 +219,8 @@ class _OverlapTrackingBlockingContainer(_Container):
         with self._lock:
             self._inside_demux = False
         self.exited.set()
+        if self._failure is not None:
+            raise self._failure
         return []
 
     def close(self) -> None:
@@ -890,6 +898,105 @@ async def test_external_session_cancellation_closes_and_joins_decode_worker(
     assert session.state().connected is False
     await session.stop()
     assert session._task is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "decode_failure",
+    [None, ConnectionResetError("decode failed during cancellation")],
+    ids=["clean-read-return", "read-exception"],
+)
+async def test_repeated_cancel_cannot_abandon_active_decode_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    decode_failure: BaseException | None,
+) -> None:
+    session_module = _rtsp_session()
+    container = _OverlapTrackingBlockingContainer(
+        read_timeout=2.0,
+        failure=decode_failure,
+    )
+    opener = _SequenceOpener(container, _terminal_error())
+    monkeypatch.setattr(session_module.av, "open", opener)
+    session = session_module.RtspSession(_source())
+
+    await session.start(_unused_video_cb, _unused_audio_cb)
+    assert await asyncio.to_thread(container.entered.wait, 0.5)
+    task = session._task
+    worker = session._decode_worker
+    assert task is not None
+    assert worker is not None
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    stopping = asyncio.create_task(session.stop())
+    restarting = asyncio.create_task(session.start(_unused_video_cb, _unused_audio_cb))
+    await asyncio.sleep(0.05)
+    premature = (
+        task.done(),
+        stopping.done(),
+        restarting.done(),
+        session._decode_worker is worker,
+        opener.calls,
+    )
+
+    container.read_return.set()
+    task_result = await asyncio.gather(task, return_exceptions=True)
+    await asyncio.wait_for(stopping, timeout=0.5)
+    await asyncio.wait_for(restarting, timeout=0.5)
+    await session.stop()
+
+    assert premature == (False, False, False, True, 1)
+    assert isinstance(task_result[0], asyncio.CancelledError)
+    assert worker.done()
+    assert container.exited.is_set()
+    assert container.close_calls == 1
+    assert container.close_overlaps == [False]
+    assert container.close_threads == [container.demux_thread]
+    assert opener.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancel_cannot_abandon_open_in_progress_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_module = _rtsp_session()
+    opener = _BlockingOpenSequence()
+    monkeypatch.setattr(session_module.av, "open", opener)
+    session = session_module.RtspSession(_source())
+
+    await session.start(_unused_video_cb, _unused_audio_cb)
+    assert await asyncio.to_thread(opener.started.wait, 0.5)
+    task = session._task
+    open_worker = session._open_worker
+    assert task is not None
+    assert open_worker is not None
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    stopping = asyncio.create_task(session.stop())
+    restarting = asyncio.create_task(session.start(_unused_video_cb, _unused_audio_cb))
+    await asyncio.sleep(0.05)
+    premature = (
+        task.done(),
+        stopping.done(),
+        restarting.done(),
+        session._open_worker is open_worker,
+        opener.second_started.is_set(),
+        opener.max_active,
+    )
+
+    opener.release.set()
+    task_result = await asyncio.gather(task, return_exceptions=True)
+    await asyncio.wait_for(stopping, timeout=0.5)
+    await asyncio.wait_for(restarting, timeout=0.5)
+    await _wait_until(lambda: opener.second_started.is_set())
+    await session.stop()
+
+    assert premature == (False, False, False, True, False, 1)
+    assert isinstance(task_result[0], asyncio.CancelledError)
+    assert open_worker.done()
+    assert opener.late_container.close_calls == 1
+    assert opener.max_active == 1
 
 
 @pytest.mark.asyncio

@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import json
 import logging
 import os
+import signal
 import socket
 import threading
 import time
@@ -167,6 +169,49 @@ async def _wait_for_more_video(
     await _wait_until(ready)
     assert result is not None
     return result
+
+
+async def _run_view_smoke(
+    *,
+    miloco_home: Path,
+    camera_id: str,
+    backend_url: str,
+    duration_sec: int,
+    environment_overrides: dict[str, str] | None = None,
+    timeout: float = 5.0,
+) -> tuple[int, str, str]:
+    environment = os.environ.copy()
+    environment.pop("MILOCO_CONFIG_SEARCH_PATH", None)
+    environment.pop("MILOCO_SERVER__TOKEN", None)
+    environment["MILOCO_HOME"] = str(miloco_home)
+    environment["MILOCO_RTSP_VIEW_SMOKE_DURATION_SEC"] = str(duration_sec)
+    if environment_overrides is not None:
+        environment.update(environment_overrides)
+    process = await asyncio.create_subprocess_exec(
+        str(_REPO_ROOT / "scripts" / "rtsp-view-smoke.sh"),
+        camera_id,
+        backend_url,
+        cwd=_REPO_ROOT,
+        env=environment,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout_bytes, stderr_bytes = await asyncio.wait_for(
+        process.communicate(), timeout=timeout
+    )
+    assert process.returncode is not None
+    return process.returncode, stdout_bytes.decode(), stderr_bytes.decode()
+
+
+def _write_smoke_config(home: Path, token: str, *, mode: int = 0o600) -> Path:
+    home.mkdir(mode=0o700, exist_ok=True)
+    config_path = home / "config.json"
+    config_path.write_text(
+        json.dumps({"server": {"token": token}}),
+        encoding="utf-8",
+    )
+    config_path.chmod(mode)
+    return config_path
 
 
 def _decode_h264(chunk: bytes) -> list[av.VideoFrame]:
@@ -425,17 +470,202 @@ async def test_view_smoke_measures_real_websocket_and_safe_state(
     server_task = asyncio.create_task(server.serve(sockets=[server_socket]))
     try:
         await _wait_until(lambda: server.started)
-        config_path = tmp_path / "config.json"
+        _write_smoke_config(tmp_path, token)
+        tmp_path.chmod(0o755)
+        returncode, stdout, stderr = await _run_view_smoke(
+            miloco_home=tmp_path,
+            camera_id=camera_id,
+            backend_url=f"http://127.0.0.1:{port}",
+            duration_sec=1,
+            environment_overrides={"MILOCO_SERVER__TOKEN": "ignored-env-secret"},
+        )
+    finally:
+        server.should_exit = True
+        await asyncio.wait_for(server_task, timeout=2)
+        server_socket.close()
+
+    assert returncode == 0, stderr
+    assert "first_frame_latency_ms=" in stdout
+    sample_field = next(
+        field for field in stdout.split() if field.startswith("sample_seconds=")
+    )
+    sample_seconds = float(sample_field.partition("=")[2])
+    assert 0.8 <= sample_seconds <= 1.5
+    assert "output_fps=" in stdout
+    assert "process_cpu_pct_delta=5.5" in stdout
+    assert "viewer_count=1" in stdout
+    assert "queue_depth=2" in stdout
+    assert "queue_drops=3" in stdout
+    assert token not in stdout + stderr
+    assert "ignored-env-secret" not in stdout + stderr
+    assert "fixture-password" not in stdout + stderr
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        "env_only",
+        "world_readable",
+        "symlink",
+        "unsafe_parent",
+        "invalid_json",
+        "invalid_schema",
+        "missing_token",
+        "wrong_owner",
+    ],
+)
+async def test_view_smoke_rejects_unsafe_or_missing_persisted_token(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    token = f"private-{case}-token"
+    home = tmp_path / "miloco-home"
+    home.mkdir(mode=0o700)
+    overrides: dict[str, str] | None = None
+    if case == "env_only":
+        overrides = {"MILOCO_SERVER__TOKEN": token}
+    elif case == "world_readable":
+        _write_smoke_config(home, token, mode=0o644)
+    elif case == "symlink":
+        target = tmp_path / "real-config.json"
+        target.write_text(json.dumps({"server": {"token": token}}), encoding="utf-8")
+        target.chmod(0o600)
+        (home / "config.json").symlink_to(target)
+    elif case == "unsafe_parent":
+        _write_smoke_config(home, token)
+        home.chmod(0o770)
+    elif case == "invalid_json":
+        config_path = home / "config.json"
+        config_path.write_text("{invalid", encoding="utf-8")
+        config_path.chmod(0o600)
+    elif case == "invalid_schema":
+        config_path = home / "config.json"
         config_path.write_text(
-            '{"server":{"token":"smoke /+?-secret"}}',
+            json.dumps({"server": {"token": token, "tls_verify": "false"}}),
             encoding="utf-8",
         )
         config_path.chmod(0o600)
+    elif case == "wrong_owner":
+        if os.geteuid() != 0:
+            pytest.skip("wrong-owner config requires root to simulate")
+        config_path = _write_smoke_config(home, token)
+        os.chown(config_path, 1, -1)
+    else:
+        config_path = home / "config.json"
+        config_path.write_text('{"server":{}}', encoding="utf-8")
+        config_path.chmod(0o600)
+
+    returncode, stdout, stderr = await _run_view_smoke(
+        miloco_home=home,
+        camera_id="rtsp:unsafe-config",
+        backend_url="http://127.0.0.1:1",
+        duration_sec=1,
+        environment_overrides=overrides,
+    )
+
+    assert returncode == 2
+    assert stdout == ""
+    assert stderr.strip() == "persisted backend configuration is unavailable"
+    assert token not in stdout + stderr
+    assert str(home) not in stdout + stderr
+
+
+@pytest.mark.asyncio
+async def test_view_smoke_fails_when_websocket_closes_after_first_frame(
+    tmp_path: Path,
+) -> None:
+    token = "early-close-secret"
+    camera_id = "rtsp:early-close"
+    app = FastAPI()
+
+    @app.get("/api/monitor/resources")
+    async def resources(authorization: str | None = Header(default=None)) -> dict:
+        assert authorization == f"Bearer {token}"
+        return {"cpu_pct": 10.0}
+
+    @app.websocket("/api/cameras/{requested_camera_id}/stream")
+    async def stream(websocket: WebSocket, requested_camera_id: str) -> None:
+        assert requested_camera_id == camera_id
+        await websocket.accept(subprotocol=_FIXED_PROTOCOL)
+        await websocket.send_bytes(b"\x00\x00\x00\x01\x65\x00")
+
+    server_socket = socket.socket()
+    server_socket.bind(("127.0.0.1", 0))
+    server_socket.listen(128)
+    server_socket.setblocking(False)
+    port = server_socket.getsockname()[1]
+    server = uvicorn.Server(
+        uvicorn.Config(app, log_config=None, access_log=False, lifespan="off")
+    )
+    server_task = asyncio.create_task(server.serve(sockets=[server_socket]))
+    try:
+        await _wait_until(lambda: server.started)
+        _write_smoke_config(tmp_path, token)
+        returncode, stdout, stderr = await _run_view_smoke(
+            miloco_home=tmp_path,
+            camera_id=camera_id,
+            backend_url=f"http://127.0.0.1:{port}",
+            duration_sec=30,
+        )
+    finally:
+        server.should_exit = True
+        await asyncio.wait_for(server_task, timeout=2)
+        server_socket.close()
+
+    assert returncode == 4
+    assert stdout == ""
+    assert stderr.strip() == "live WebSocket closed before measurement completed"
+    assert token not in stdout + stderr
+
+
+@pytest.mark.asyncio
+async def test_view_smoke_signal_exits_nonzero_and_closes_websocket(
+    tmp_path: Path,
+) -> None:
+    token = "signal-cleanup-secret"
+    camera_id = "rtsp:signal-cleanup"
+    websocket_active = False
+    app = FastAPI()
+
+    @app.get("/api/monitor/resources")
+    async def resources(authorization: str | None = Header(default=None)) -> dict:
+        assert authorization == f"Bearer {token}"
+        return {"cpu_pct": 10.0}
+
+    @app.websocket("/api/cameras/{requested_camera_id}/stream")
+    async def stream(websocket: WebSocket, requested_camera_id: str) -> None:
+        nonlocal websocket_active
+        assert requested_camera_id == camera_id
+        await websocket.accept(subprotocol=_FIXED_PROTOCOL)
+        websocket_active = True
+        try:
+            while True:
+                await websocket.send_bytes(b"\x00\x00\x00\x01\x65\x00")
+                await asyncio.sleep(0.05)
+        except Exception:
+            pass
+        finally:
+            websocket_active = False
+
+    server_socket = socket.socket()
+    server_socket.bind(("127.0.0.1", 0))
+    server_socket.listen(128)
+    server_socket.setblocking(False)
+    port = server_socket.getsockname()[1]
+    server = uvicorn.Server(
+        uvicorn.Config(app, log_config=None, access_log=False, lifespan="off")
+    )
+    server_task = asyncio.create_task(server.serve(sockets=[server_socket]))
+    process: asyncio.subprocess.Process | None = None
+    try:
+        await _wait_until(lambda: server.started)
+        _write_smoke_config(tmp_path, token)
         environment = os.environ.copy()
         environment.pop("MILOCO_CONFIG_SEARCH_PATH", None)
         environment.pop("MILOCO_SERVER__TOKEN", None)
         environment["MILOCO_HOME"] = str(tmp_path)
-        environment["MILOCO_RTSP_VIEW_SMOKE_DURATION_SEC"] = "1"
+        environment["MILOCO_RTSP_VIEW_SMOKE_DURATION_SEC"] = "30"
         process = await asyncio.create_subprocess_exec(
             str(_REPO_ROOT / "scripts" / "rtsp-view-smoke.sh"),
             camera_id,
@@ -445,23 +675,25 @@ async def test_view_smoke_measures_real_websocket_and_safe_state(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        await _wait_until(lambda: websocket_active)
+        process.send_signal(signal.SIGTERM)
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            process.communicate(), timeout=5
+            process.communicate(), timeout=3
         )
+        await _wait_until(lambda: not websocket_active)
     finally:
+        if process is not None and process.returncode is None:
+            process.kill()
+            await process.wait()
         server.should_exit = True
         await asyncio.wait_for(server_task, timeout=2)
         server_socket.close()
 
     stdout = stdout_bytes.decode()
     stderr = stderr_bytes.decode()
-    assert process.returncode == 0, stderr
-    assert "first_frame_latency_ms=" in stdout
-    assert "sample_seconds=1" in stdout
-    assert "output_fps=" in stdout
-    assert "process_cpu_pct_delta=5.5" in stdout
-    assert "viewer_count=1" in stdout
-    assert "queue_depth=2" in stdout
-    assert "queue_drops=3" in stdout
+    assert process is not None
+    assert process.returncode == 143
+    assert stdout == ""
+    assert "first_frame_latency_ms=" not in stdout
+    assert "output_fps=" not in stdout
     assert token not in stdout + stderr
-    assert "fixture-password" not in stdout + stderr

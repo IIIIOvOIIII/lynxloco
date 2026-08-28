@@ -10,7 +10,7 @@ from collections import deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
-from typing import Literal, Protocol, SupportsBytes, cast
+from typing import Literal, Protocol, SupportsBytes, TypeVar, cast
 
 import av
 import numpy as np
@@ -35,6 +35,7 @@ _AUDIO_SAMPLE_RATE = 16_000
 # stop that is waiting for the demux owner to leave native code to eight seconds.
 _IO_TIMEOUT_SEC = 8.0
 _JITTER_BOUND = 0.2
+_TaskResult = TypeVar("_TaskResult")
 
 
 def reconnect_delay(attempt: int, *, jitter: float) -> float:
@@ -146,10 +147,12 @@ class RtspSession:
             self._stop_thread.set()
             if self._stop_async is not None:
                 self._stop_async.set()
-            await asyncio.gather(task, return_exceptions=True)
+            _, _, cancellation = await self._await_task_uninterruptibly(task)
             if self._task is task:
                 self._task = None
             self._clear_ingress()
+            if cancellation is not None:
+                raise cancellation
 
     def state(self) -> CameraSourceState:
         with self._ingress_lock:
@@ -349,36 +352,63 @@ class RtspSession:
             done, _ = await asyncio.wait(
                 {opener, stopper}, return_when=asyncio.FIRST_COMPLETED
             )
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancellation:
             stopper.cancel()
-            await asyncio.gather(stopper, return_exceptions=True)
-            await self._reap_stopped_opener(opener)
-            raise
+            _, _, cancellation = await self._await_task_uninterruptibly(
+                stopper,
+                pending_cancel=cancellation,
+            )
+            await self._reap_stopped_opener(
+                opener,
+                pending_cancel=cancellation,
+            )
+            raise AssertionError("cancelled opener cleanup must re-raise")
         try:
             if stopper in done:
                 await self._reap_stopped_opener(opener)
                 return None
 
             stopper.cancel()
-            await asyncio.gather(stopper, return_exceptions=True)
-            return await opener
+            _, _, cancellation = await self._await_task_uninterruptibly(stopper)
+            if cancellation is not None:
+                await self._reap_stopped_opener(
+                    opener,
+                    pending_cancel=cancellation,
+                )
+                raise AssertionError("cancelled opener cleanup must re-raise")
+            return opener.result()
         finally:
             if self._open_worker is opener:
                 self._open_worker = None
 
     async def _reap_stopped_opener(
-        self, opener: asyncio.Task[av.container.InputContainer]
+        self,
+        opener: asyncio.Task[av.container.InputContainer],
+        *,
+        pending_cancel: asyncio.CancelledError | None = None,
     ) -> None:
-        container: av.container.InputContainer | None = None
+        container, _failure, cancellation = await self._await_task_uninterruptibly(
+            opener,
+            pending_cancel=pending_cancel,
+        )
         try:
-            container = await asyncio.shield(opener)
-        except BaseException:
-            pass
+            if container is not None:
+                closer = asyncio.create_task(
+                    asyncio.to_thread(self._close_container_sync, container)
+                )
+                (
+                    _,
+                    _close_failure,
+                    cancellation,
+                ) = await self._await_task_uninterruptibly(
+                    closer,
+                    pending_cancel=cancellation,
+                )
         finally:
             if self._open_worker is opener:
                 self._open_worker = None
-        if container is not None:
-            await asyncio.to_thread(self._close_container_sync, container)
+        if cancellation is not None:
+            raise cancellation
 
     async def _decode_until_stopped(
         self,
@@ -391,18 +421,43 @@ class RtspSession:
         self._decode_worker = worker
         try:
             return await asyncio.shield(worker)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancellation:
             self._stop_thread.set()
             if self._stop_async is not None:
                 self._stop_async.set()
-            try:
-                await asyncio.shield(worker)
-            except BaseException:
-                pass
-            raise
+            _, _failure, cancellation = await self._await_task_uninterruptibly(
+                worker,
+                pending_cancel=cancellation,
+            )
+            assert cancellation is not None
+            raise cancellation
         finally:
             if self._decode_worker is worker:
                 self._decode_worker = None
+
+    @staticmethod
+    async def _await_task_uninterruptibly(
+        task: asyncio.Task[_TaskResult],
+        *,
+        pending_cancel: asyncio.CancelledError | None = None,
+    ) -> tuple[_TaskResult | None, BaseException | None, asyncio.CancelledError | None]:
+        """Finish one owned task, deferring caller cancellation until cleanup."""
+        cancellation = pending_cancel
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as error:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    cancellation = cancellation or error
+                if task.done():
+                    break
+            except BaseException:
+                break
+        try:
+            return task.result(), None, cancellation
+        except BaseException as failure:
+            return None, failure, cancellation
 
     async def _wait_for_stop(self, delay: float) -> bool:
         assert self._stop_async is not None
