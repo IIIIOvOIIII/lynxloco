@@ -117,6 +117,94 @@ def test_config_show_unmasked(runner, isolated_config):
     assert data["server"]["token"] == "secret-token"
 
 
+def test_config_show_masks_nested_camera_and_profile_credentials(
+    runner, isolated_config
+):
+    from miloco_cli.config import atomic_write
+
+    rtsp_uri = "rtsp://redaction-camera.example/live"
+    rtsp_username = "redaction-camera-user"
+    rtsp_password = "redaction-camera-password"
+    profile_key = "redaction-profile-key"
+    atomic_write(
+        isolated_config,
+        {
+            "camera": {
+                "rtsp_sources": [
+                    {
+                        "id": "rtsp:redaction",
+                        "uri": rtsp_uri,
+                        "username": rtsp_username,
+                        "password": rtsp_password,
+                    },
+                    {"id": "rtsp:partial"},
+                ]
+            },
+            "model": {
+                "omni_profiles": [
+                    {"label": "responses", "api_key": profile_key},
+                    {"label": "no-key"},
+                ]
+            },
+        },
+    )
+
+    result = runner.invoke(cli, ["config", "show"])
+
+    assert result.exit_code == 0
+    assert rtsp_uri not in result.output
+    assert rtsp_username not in result.output
+    assert rtsp_password not in result.output
+    assert profile_key not in result.output
+
+    data = json.loads(result.output)
+    source = data["camera"]["rtsp_sources"][0]
+    assert source["uri"] == "***"
+    assert source["username"] == "***"
+    assert source["password"] == "***"
+    assert data["camera"]["rtsp_sources"][1] == {"id": "rtsp:partial"}
+    profile = data["model"]["omni_profiles"][0]
+    assert profile["api_key"] == "***"
+    assert data["model"]["omni_profiles"][1] == {"label": "no-key"}
+
+
+def test_config_show_unmasked_preserves_nested_camera_and_profile_credentials(
+    runner, isolated_config
+):
+    from miloco_cli.config import atomic_write
+
+    rtsp_uri = "rtsp://unmasked-camera.example/live"
+    rtsp_username = "unmasked-camera-user"
+    rtsp_password = "unmasked-camera-password"
+    profile_key = "unmasked-profile-key"
+    atomic_write(
+        isolated_config,
+        {
+            "camera": {
+                "rtsp_sources": [
+                    {
+                        "id": "rtsp:unmasked",
+                        "uri": rtsp_uri,
+                        "username": rtsp_username,
+                        "password": rtsp_password,
+                    }
+                ]
+            },
+            "model": {"omni_profiles": [{"label": "responses", "api_key": profile_key}]},
+        },
+    )
+
+    result = runner.invoke(cli, ["config", "show", "--unmasked"])
+
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    source = data["camera"]["rtsp_sources"][0]
+    assert source["uri"] == rtsp_uri
+    assert source["username"] == rtsp_username
+    assert source["password"] == rtsp_password
+    assert data["model"]["omni_profiles"][0]["api_key"] == profile_key
+
+
 def test_config_get_existing(runner):
     result = runner.invoke(cli, ["config", "get", "server.url"])
     assert result.exit_code == 0

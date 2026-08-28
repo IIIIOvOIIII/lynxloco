@@ -33,10 +33,24 @@ def _mask(data: dict) -> dict:
     server = masked.get("server") or {}
     if server.get("token"):
         server["token"] = "***"
+    camera = masked.get("camera") or {}
+    rtsp_sources = camera.get("rtsp_sources") or []
+    for source in rtsp_sources:
+        if not isinstance(source, dict):
+            continue
+        for field in ("uri", "username", "password"):
+            if source.get(field):
+                source[field] = "***"
     model = masked.get("model") or {}
     omni = model.get("omni") or {}
     if omni.get("api_key"):
         omni["api_key"] = "***"
+    omni_profiles = model.get("omni_profiles") or []
+    for profile in omni_profiles:
+        if not isinstance(profile, dict):
+            continue
+        if profile.get("api_key"):
+            profile["api_key"] = "***"
     return masked
 
 
