@@ -1,6 +1,6 @@
 # Miloco ai-lab Simplified Immutable Deployment Design
 
-**Status:** Pending written-spec review
+**Status:** Approved by user on 2026-08-28
 
 **Approved direction:** Disable automatic historical retention deletion and
 same-SHA in-place rebuilds. Continue toward sequential lab deployment only
@@ -253,4 +253,3 @@ The simplified deployment task is complete when:
 - executable deployment contracts pass;
 - independent review reports no open Critical or Important finding;
 - no real host access occurs before that approval.
-

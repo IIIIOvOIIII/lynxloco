@@ -209,3 +209,10 @@
 - Expected result: 只关闭完整树/file-only/checksum 三方集合证明、builder-compatible 完整 `release.json` artifact identity，以及 `status` 的全路径 Docker 前证明；完整契约通过且原审查人 `Approved` 后才允许进入 Task 4 或访问实验机。
 - Result: Not achieved，最终 fail closed。例外提交 `0ffc42d` 仅修改 remote release controller、deployment contract tests 和 README；本地完整 contract 为 134 passed，Ruff、shell syntax、diff 和 help 通过。原审查人确认 `status` 前置证明已 ADDRESSED，JSON schema/artifact identity 与三方集合主体均显著收紧，但仍保留 2 个 Important：两个 walk 同时漏掉一个已由 checksum 成功证明存在的文件时被误判 `definitively_invalid`；artifact `lstat` 的任意 `OSError`（包括 EIO/权限/临时 FS 错误）被误判为 contract invalid。两者都可能让 retention 在证据不确定时删除历史 release。无 Critical；未执行真实 build、Docker、SSH、status、transfer、deploy、verify 或 rollback，ai-lab01/02 仍未访问。
 - Next step: 例外修复授权已耗尽，停止继续修改和部署。建议重新批准更简单的实验室部署设计：默认禁用自动 retention 删除，将不确定和无效历史都只报告/保留，并把历史清理拆成独立、显式、另行审查的运维操作。未经用户新的设计授权，不访问实验机；真实 RTSP/VLM 继续为 `not_measured`。
+
+## 2026-08-28 20:22 SGT
+
+- Current work: 根据用户批准完成简化不可变部署设计，并将其转换为新的五任务实施计划；旧部署计划保留为历史证据但不再授权 retention、同 SHA 重建或后续主机操作。
+- Expected result: 规格必须明确发布证据只累积不自动删除、既有 SHA 只复用或失败、低于 5 GiB 只停止；实施计划必须提供精确 TDD、显式 SSH identity、安装 wheel 的 RTSP/Responses fixture 验收、lab01→相同 SHA lab02、回滚和最终门禁，且不存在占位符或跨任务接口矛盾。
+- Result: Achieved pending user plan review。批准规格保存于 `docs/superpowers/specs/2026-08-28-ai-lab-simplified-deployment-design.md`；新计划保存于 `docs/superpowers/plans/2026-08-28-ai-lab-simplified-deployment.md`，共 5 个任务。Task 1 先删除自动 retention/历史 pair removal 并建立 `published_sha_state -> new|existing|probe_error`；Task 2 精确包装 RTSP/Responses fixture；Task 3/4 使用 `/Users/nicholasliao/.ssh/id_co_openclaw` 明确身份顺序部署同一 clean SHA；Task 5 做回滚、全回归和交接。占位符、规格覆盖、接口名称、diff whitespace 自检通过；未修改控制器、未执行 Docker/SSH/host 操作。
+- Next step: 用户确认书面实施计划后，沿用已选择的当前会话 subagent-driven-development，从 Task 1 的 RED 测试开始；Task 1 独立复审无 Critical/Important 前不得进入 acceptance 或实验机。
