@@ -55,3 +55,10 @@
 - Expected result: 所有 Plan 1 Critical/Important finding 关闭；backend、CLI、OpenClaw 三类共享配置写入者统一锁内重读和 0600 权限；终止错误既不周期重试，也持续返回安全可操作状态；随后在不新增 RTSP 输入连接的前提下进入实时预览。
 - Result: Achieved。最终审查在 `0b9a908` 判定 clean：backend RTSP/camera 152 passed、CLI 633 passed、OpenClaw shared-config/security 33 passed。配置、临时文件和锁文件均收敛 0600；OpenClaw/CLI/backend 使用同一 flock 协议；fixture smoke 只接受本次 enable 后的新解码帧。真实摄像机网络、CPU、fps、启动与重连仍按边界为 `not_measured`。
 - Next step: 执行 Plan 2 Task 1，增加不持有凭据、不打开第二条 RTSP 连接的 source-neutral bounded live-stream hub；每任务继续 RED→GREEN、独立审查和有界修复。
+
+## 2026-08-28 08:04 SGT
+
+- Current work: 完成 RTSP 实时预览 Plan 2 Task 1–4，包括共享直播分发、H.264 保守透传、按观看者启动的单实例 H.264 转码、统一 WebSocket 与通用观看页；每项均经独立审查和有界修复。
+- Expected result: 单摄像机只保留一条输入会话；慢观看者不反压感知；H.265/不兼容 H.264 只在存在观看者时共享转码；浏览器能收到稳定关闭码，认证令牌不进入 URL query 或 Uvicorn access log；旧 MIoT 路由保持兼容。
+- Result: Achieved。Task 1–4 独立复审均 CLEAN。最终 Task 4 camera focused 83 passed、legacy MIoT 112 passed、完整 Web 321 passed/1 skipped，typecheck/build 与 scoped Ruff/ty 通过。真实 Uvicorn 验证未认证握手为 403、认证后业务状态为 4404/4403/1013，特殊字符令牌及其认证子协议不进入 access log；零等待 detach→reattach 与二次解析状态突变均有确定性回归覆盖。
+- Next step: 执行 Plan 2 Task 5，在现有摄像机界面增加 RTSP 新增、编辑、测试、启停、删除及统一观看入口；随后执行 fixture WebSocket E2E、smoke 测量和 Plan 2 批次审查。真实摄像机网络、CPU、fps、首帧延迟及并发容量继续保持 `not_measured`，直到实验室存在已持久化的实际来源。
