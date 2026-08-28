@@ -21,7 +21,18 @@ if [ -n "${MILOCO_SMOKE_PYTHON:-}" ]; then
     python_bin="$MILOCO_SMOKE_PYTHON"
 else
     python_bin="$repo_root/backend/.venv/bin/python"
-    [ -f "$python_bin" ] && [ ! -L "$python_bin" ] && [ -x "$python_bin" ] || exit 2
+    resolved_python_bin="$python_bin"
+    symlink_depth=0
+    while [ -L "$resolved_python_bin" ] && [ "$symlink_depth" -lt 16 ]; do
+        symlink_target=$(readlink "$resolved_python_bin") || exit 2
+        case "$symlink_target" in
+            /*) resolved_python_bin="$symlink_target" ;;
+            *) resolved_python_bin="$(dirname "$resolved_python_bin")/$symlink_target" ;;
+        esac
+        symlink_depth=$((symlink_depth + 1))
+    done
+    [ -f "$resolved_python_bin" ] && [ ! -L "$resolved_python_bin" ] \
+        && [ -x "$resolved_python_bin" ] || exit 2
     cd "$repo_root/backend"
 fi
 

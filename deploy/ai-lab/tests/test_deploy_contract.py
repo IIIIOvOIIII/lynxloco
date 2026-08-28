@@ -676,6 +676,45 @@ def test_smoke_python_override_is_direct_and_fails_closed(tmp_path: Path) -> Non
             assert override not in result.stdout + result.stderr
 
 
+def test_responses_smoke_resolves_repo_default_venv_python_symlink(tmp_path: Path) -> None:
+    """Catches source-layout Responses smoke rejecting a uv-style venv interpreter link."""
+    repo_root = tmp_path / "repo"
+    script = repo_root / "scripts" / "responses-vlm-smoke.sh"
+    script.parent.mkdir(parents=True)
+    shutil.copy2(REPOSITORY_ROOT / "scripts" / "responses-vlm-smoke.sh", script)
+
+    fake_python = tmp_path / "fake-python"
+    fake_python.write_text(
+        "#!/usr/bin/env bash\ncat >/dev/null\nprintf 'fake-interpreter-reached\\n'\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o700)
+    assert fake_python.stat().st_uid == os.getuid()
+
+    repo_python = repo_root / "backend" / ".venv" / "bin" / "python"
+    repo_python.parent.mkdir(parents=True)
+    repo_python.symlink_to(fake_python)
+
+    environment = {
+        **os.environ,
+        "MILOCO_RESPONSES_BASE_URL": "http://127.0.0.1:1",
+        "MILOCO_RESPONSES_MODEL": "fixture-vlm",
+    }
+    environment.pop("MILOCO_SMOKE_PYTHON", None)
+    result = subprocess.run(
+        [str(script)],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+        env=environment,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == "fake-interpreter-reached\n"
+    assert result.stderr == ""
+
+
 def test_acceptance_image_resets_runtime_entrypoint_before_fixture_command() -> None:
     """Catches inherited runtime entrypoints that wrap the acceptance pytest command."""
     effective_config = _docker_stage_effective_config()
