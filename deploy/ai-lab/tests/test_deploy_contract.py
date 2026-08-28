@@ -1377,7 +1377,12 @@ def _run_published_sha_state_harness(
     harness = tmp_path / "published-state.sh"
     harness.write_text(
         _remote_source_for_harness(lab_root)
+        + f"\nmutation_log='{mutation_log}'\n"
+        + "rm() { case \"$*\" in *'/releases/'*|*'/artifacts/'*|*'/accepted/'*) printf 'rm %s\\n' \"$*\" >> \"$mutation_log\"; return 99 ;; *) /bin/rm \"$@\" ;; esac; }\n"
+        + "mv() { printf 'mv %s\\n' \"$*\" >> \"$mutation_log\"; return 99; }\n"
+        + "atomic_write() { printf 'atomic-write %s\\n' \"$*\" >> \"$mutation_log\"; return 99; }\n"
         + "\ndocker_command() {\n"
+        + "  case \"$*\" in *' image ls '*|*' image inspect '*) ;; *) printf 'docker-mutation %s\\n' \"$*\" >> \"$mutation_log\"; return 99 ;; esac\n"
         + "  image=\"${*: -1}\"\n"
         + "  case \"$image\" in\n"
         + f"    miloco-lab:{sha}) state='{runtime_tag}' ;;\n"
@@ -1445,6 +1450,10 @@ def _run_existing_sha_transaction_harness(
     harness = tmp_path / f"existing-{capability}-{state_pointer}.sh"
     harness.write_text(
         _remote_source_for_harness(lab_root)
+        + f"\nmutation_log='{mutation_log}'\n"
+        + "rm() { case \"$*\" in *'/releases/'*|*'/artifacts/'*|*'/accepted/'*|*'miloco-lab:'*) printf 'rm %s\\n' \"$*\" >> \"$mutation_log\"; return 99 ;; *) /bin/rm \"$@\" ;; esac; }\n"
+        + "mv() { printf 'mv %s\\n' \"$*\" >> \"$mutation_log\"; return 99; }\n"
+        + "compose_command() { printf 'compose %s\\n' \"$*\" >> \"$mutation_log\"; return 99; }\n"
         + "\nrequire_root() { :; }\n"
         + "acquire_transition_lock() { :; }\n"
         + "verify_controller_self() { :; }\n"
@@ -1457,12 +1466,12 @@ def _run_existing_sha_transaction_harness(
         + f"read_artifact_record() {{ artifact_archive_digest='{digest}'; artifact_controller_digest='{digest}'; artifact_allowlist_digest='{hashlib.sha256(ALLOWLIST.read_bytes()).hexdigest()}'; }}\n"
         + f"\nrelease_capability() {{ printf '{capability}\\n'; }}\n"
         + f"build_and_activate_locked() {{ build_images_and_accept \"$1\" \"$2\" \"$3\" \"{lab_root}/releases/{sha}\"; }}\n"
-        + f"atomic_write() {{ printf 'atomic-write\\n' >> '{mutation_log}'; }}\n"
+        + f"atomic_write() {{ printf 'atomic-write %s\\n' \"$*\" >> '{mutation_log}'; return 99; }}\n"
         + f"mark_acceptance_success() {{ printf 'marker-write\\n' >> '{mutation_log}'; }}\n"
         + f"remove_candidate_image_tags() {{ printf 'candidate-tag-removal\\n' >> '{mutation_log}'; }}\n"
         + f"remove_image_tags() {{ printf 'canonical-tag-removal\\n' >> '{mutation_log}'; }}\n"
         + f"invalidate_acceptance() {{ printf 'marker-removal\\n' >> '{mutation_log}'; }}\n"
-        + f"docker_command() {{ printf 'docker-mutation\\n' >> '{mutation_log}'; }}\n"
+        + f"docker_command() {{ case \"$*\" in *' image ls '*|*' image inspect '*) return 99 ;; *) printf 'docker-mutation %s\\n' \"$*\" >> '{mutation_log}'; return 99 ;; esac; }}\n"
         + f'transaction_release "ai-lab01.esxi" "{sha}" "{digest}" "{digest}" "{hashlib.sha256(ALLOWLIST.read_bytes()).hexdigest()}"\n',
         encoding="utf-8",
     )
@@ -2278,6 +2287,62 @@ def test_activation_failure_preserves_published_proof(tmp_path: Path) -> None:
     assert result.returncode != 0
     after = [path.read_bytes() if path.is_file() else tuple(path.iterdir()) for path in proof_paths]
     assert after == before
+
+
+@pytest.mark.parametrize("activation_result", ["success", "failure"])
+def test_activation_preserves_canonical_image_ids(
+    tmp_path: Path, activation_result: str
+) -> None:
+    """The real image-reference parser must observe identical canonical IDs across activation."""
+    previous, candidate = (character * 40 for character in "45")
+    runtime_id = "sha256:" + "6" * 64
+    acceptance_id = "sha256:" + "7" * 64
+    lab_root = tmp_path / "miloco-lab"
+    state = lab_root / "deploy-state"
+    state.mkdir(parents=True)
+    (state / "current").write_text(f"{previous}\n", encoding="utf-8")
+    observation_log = tmp_path / f"activation-{activation_result}-mutations.log"
+    before = tmp_path / f"activation-{activation_result}-before.txt"
+    after = tmp_path / f"activation-{activation_result}-after.txt"
+    harness = tmp_path / f"activation-{activation_result}-images.sh"
+    compose_result = "return 0" if activation_result == "success" else "return 1"
+    harness.write_text(
+        _remote_source_for_harness(lab_root)
+        + f"\nmutation_log='{observation_log}'\n"
+        + "release_capability() { printf 'capable\\n'; }\n"
+        + "install() { :; }\n"
+        + "require_safe_record() { :; }\n"
+        + "atomic_write() { :; }\n"
+        + f"compose_up() {{ {compose_result}; }}\n"
+        + f"wait_for_health() {{ {compose_result}; }}\n"
+        + "collect_failure_evidence() { :; }\n"
+        + "restore_previous() { :; }\n"
+        + "docker_command() {\n"
+        + "  image=\"${*: -1}\"\n"
+        + "  case \"$*\" in\n"
+        + f"    *' image ls '*miloco-lab:{candidate}) printf '%s\\n' '{runtime_id}' ;;\n"
+        + f"    *' image inspect '*miloco-lab:{candidate}) printf '%s\\n' '{runtime_id}' ;;\n"
+        + f"    *' image ls '*miloco-lab-acceptance:{candidate}) printf '%s\\n' '{acceptance_id}' ;;\n"
+        + f"    *' image inspect '*miloco-lab-acceptance:{candidate}) printf '%s\\n' '{acceptance_id}' ;;\n"
+        + "    *) printf 'docker-mutation %s\\n' \"$*\" >> \"$mutation_log\"; return 99 ;;\n"
+        + "  esac\n"
+        + "}\n"
+        + f"observe() {{ image_reference_state 'miloco-lab:{candidate}'; image_reference_state 'miloco-lab-acceptance:{candidate}'; }}\n"
+        + f"observe > '{before}'\n"
+        + "set +e\n"
+        + f'activate_release "ai-lab01.esxi" "{candidate}"\n'
+        + "status=$?\nset -e\n"
+        + f"observe > '{after}'\n"
+        + "exit \"$status\"\n",
+        encoding="utf-8",
+    )
+    harness.chmod(0o755)
+    result = subprocess.run([str(harness)], text=True, capture_output=True, check=False, timeout=5)
+    assert (result.returncode == 0) is (activation_result == "success")
+    expected = f"present:{runtime_id}\npresent:{acceptance_id}\n"
+    assert before.read_text(encoding="utf-8") == expected
+    assert after.read_text(encoding="utf-8") == expected
+    assert not observation_log.exists()
 
 
 def test_receipt_write_failure_preserves_newly_published_release(tmp_path: Path) -> None:
