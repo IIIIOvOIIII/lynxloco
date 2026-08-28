@@ -1,0 +1,144 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import {
+  realCreateRtspCamera,
+  realDeleteCamera,
+  realDisableCamera,
+  realEditRtspCamera,
+  realEnableCamera,
+  realListCameraSummaries,
+  realTestRtspCamera,
+} from "@/api/real";
+import type { RtspSourceInput } from "@/lib/types";
+
+const originalFetch = globalThis.fetch;
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  globalThis.fetch = originalFetch;
+});
+
+const input: RtspSourceInput = {
+  name: "Front door",
+  room_name: "Entry",
+  uri: "rtsps://camera.example.test:7441/live",
+  username: "viewer",
+  password: "secret",
+  transport: "tcp",
+  audio_enabled: true,
+};
+
+function summary(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "rtsp:source/1",
+    source_type: "rtsp",
+    name: "Front door",
+    room_name: "Entry",
+    enabled: false,
+    connected: false,
+    video_codec: "h264",
+    audio_codec: null,
+    last_frame_unix_ms: null,
+    has_password: true,
+    error_code: null,
+    error_message: null,
+    ...overrides,
+  };
+}
+
+function mockNormal(data: unknown) {
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  globalThis.fetch = vi.fn(async (request: RequestInfo | URL, init?: RequestInit) => {
+    calls.push({ url: request.toString(), init });
+    return new Response(JSON.stringify({ code: 0, message: "ok", data }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }) as unknown as typeof fetch;
+  return calls;
+}
+
+describe("generic camera API", () => {
+  it("lists the redacted public camera shape from GET /api/cameras", async () => {
+    const raw = summary({
+      uri: "rtsp://should-not-map/live",
+      username: "should-not-map",
+      password: "should-not-map",
+    });
+    const calls = mockNormal([raw]);
+
+    const cameras = await realListCameraSummaries();
+
+    expect(calls[0]).toMatchObject({ url: "/api/cameras" });
+    expect(calls[0].init?.method).toBeUndefined();
+    expect(cameras).toEqual([
+      {
+        id: "rtsp:source/1",
+        sourceType: "rtsp",
+        name: "Front door",
+        roomName: "Entry",
+        enabled: false,
+        connected: false,
+        videoCodec: "h264",
+        audioCodec: null,
+        lastFrameUnixMs: null,
+        hasPassword: true,
+        errorCode: null,
+        errorMessage: null,
+      },
+    ]);
+    expect(cameras[0]).not.toHaveProperty("uri");
+    expect(cameras[0]).not.toHaveProperty("username");
+    expect(cameras[0]).not.toHaveProperty("password");
+  });
+
+  it("tests an unsaved source at the exact test path", async () => {
+    const calls = mockNormal({ video_codec: "h264", width: 1280, height: 720 });
+
+    await realTestRtspCamera(input);
+
+    expect(calls[0].url).toBe("/api/cameras/rtsp/test");
+    expect(calls[0].init?.method).toBe("POST");
+    expect(JSON.parse(String(calls[0].init?.body))).toEqual(input);
+  });
+
+  it("creates a disabled source without an enabled field", async () => {
+    const calls = mockNormal(summary());
+
+    const created = await realCreateRtspCamera(input);
+
+    expect(calls[0].url).toBe("/api/cameras/rtsp");
+    expect(calls[0].init?.method).toBe("POST");
+    expect(JSON.parse(String(calls[0].init?.body))).toEqual(input);
+    expect(JSON.parse(String(calls[0].init?.body))).not.toHaveProperty("enabled");
+    expect(created.enabled).toBe(false);
+  });
+
+  it("edits with an encoded camera id and preserves a blank password", async () => {
+    const calls = mockNormal(summary());
+    const edit = { ...input, password: "" };
+
+    await realEditRtspCamera("rtsp:source/1", edit);
+
+    expect(calls[0].url).toBe("/api/cameras/rtsp/rtsp%3Asource%2F1");
+    expect(calls[0].init?.method).toBe("PUT");
+    expect(JSON.parse(String(calls[0].init?.body)).password).toBe("");
+  });
+
+  it.each([
+    ["enable", realEnableCamera, "POST"],
+    ["disable", realDisableCamera, "POST"],
+  ] as const)("uses the exact %s path", async (action, fn, method) => {
+    const calls = mockNormal(summary());
+    await fn("rtsp:source/1");
+    expect(calls[0].url).toBe(`/api/cameras/rtsp%3Asource%2F1/${action}`);
+    expect(calls[0].init?.method).toBe(method);
+  });
+
+  it("deletes with DELETE and an encoded camera id", async () => {
+    const calls = mockNormal(null);
+    await realDeleteCamera("rtsp:source/1");
+    expect(calls[0].url).toBe("/api/cameras/rtsp%3Asource%2F1");
+    expect(calls[0].init?.method).toBe("DELETE");
+  });
+});

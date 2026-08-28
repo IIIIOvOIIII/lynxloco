@@ -20,11 +20,25 @@ describe("bundled camera viewer", () => {
     expect(page).toContain("new WebSocket(url, [CAMERA_PROTOCOL, authProtocol(token)])");
   });
 
-  it("uses an ephemeral URL fragment and clears it before network access", () => {
-    expect(page).toContain('new URLSearchParams(location.hash.slice(1))');
-    expect(page).toContain("history.replaceState(null, \"\", location.pathname + location.search)");
+  it("requests an in-memory token from the exact same-origin parent before boot", () => {
+    expect(page).toContain('const AUTH_REQUEST = "miloco.camera.auth.request"');
+    expect(page).toContain('const AUTH_RESPONSE = "miloco.camera.auth.response"');
+    expect(page).toContain("event.origin !== location.origin");
+    expect(page).toContain("event.source !== window.parent");
+    expect(page).toContain("window.parent === window");
+    expect(page).toContain("await requestParentToken()");
+    expect(page).toContain("window.parent.postMessage(");
+    expect(page).toContain("location.origin,");
+    expect(page).not.toContain("location.hash");
     expect(page).not.toContain('params.get("token")');
     expect(page).not.toContain('localStorage.getItem("miloco_token")');
+    expect(page).not.toContain('sessionStorage.getItem("miloco_token")');
+  });
+
+  it("fails closed when neither legacy injection nor parent auth is available", () => {
+    expect(page).toContain("if (!token) {");
+    expect(page).toContain('setState(t("missingToken"), true)');
+    expect(page).toContain("return;");
   });
 
   it("contains no legacy MIoT stream path", () => {

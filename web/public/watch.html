@@ -68,11 +68,6 @@
 <script type="module">
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
-const fragmentParams = new URLSearchParams(location.hash.slice(1));
-const FRAGMENT_TOKEN = fragmentParams.get("token") || "";
-if (location.hash) {
-  history.replaceState(null, "", location.pathname + location.search);
-}
 if (params.get("embedded") === "1") document.body.classList.add("embedded");
 
 // 语言:读主应用同源写入的 localStorage key,只识别显式 "en",其余一律中文。
@@ -91,7 +86,7 @@ const I18N = {
     foundCams: (n) => `已找到 ${n} 个可观看的摄像头`,
     noCams: "当前没有可观看的摄像头",
     pickCamFirst: "请先选择摄像头",
-    missingToken: "缺少 token：请从 Miloco 家庭面板打开，或使用临时安全链接",
+    missingToken: "缺少授权：请从 Miloco 家庭面板打开",
     connecting: "连接中…",
     connectingCam: "正在连接摄像头…",
     disconnected: (code) => `已断开 (${code})`,
@@ -129,7 +124,7 @@ const I18N = {
     foundCams: (n) => `Found ${n} viewable camera(s)`,
     noCams: "No viewable cameras right now",
     pickCamFirst: "Please pick a camera first",
-    missingToken: "Missing token: open this page from Miloco, or use an ephemeral secure link",
+    missingToken: "Missing authorization: open this page from Miloco",
     connecting: "Connecting…",
     connectingCam: "Connecting to camera…",
     disconnected: (code) => `Disconnected (${code})`,
@@ -165,9 +160,9 @@ $("refresh").title = t("refreshTitle");
 $("loading").textContent = t("loading");
 $("state").textContent = t("ready");
 
-// The compatibility watch handler may substitute this placeholder. The generic
-// camera watch route serves the asset unchanged. Its optional fragment token
-// is removed from the address bar before any network request is made.
+// The compatibility MIoT handler may substitute this placeholder. The generic
+// route serves the asset unchanged and receives auth from its same-origin SPA
+// parent over a source-checked postMessage handshake.
 const INJECTED_TOKEN = "__MILOCO_TOKEN__";
 // **不能**用 `!== "__MILOCO_TOKEN__"` 这种严格相等比较 — backend 是全文 replace,
 // 比较右侧的 "__MILOCO_TOKEN__" 字符串字面量也会被替换成真 token,导致条件
@@ -175,11 +170,49 @@ const INJECTED_TOKEN = "__MILOCO_TOKEN__";
 // **不含完整占位** `__MILOCO_TOKEN__`,replace 不动它,继续工作。
 const TOKEN_INJECTED = INJECTED_TOKEN && !INJECTED_TOKEN.startsWith("__MILOCO_");
 
-// Token resolution priority: the legacy handler's in-memory injection, then
-// the one-shot URL fragment. Never read credentials from query/localStorage.
+const AUTH_REQUEST = "miloco.camera.auth.request";
+const AUTH_RESPONSE = "miloco.camera.auth.response";
+let PARENT_TOKEN = "";
+
+// Token resolution priority: legacy handler injection, then the same-origin
+// parent's in-memory response. Never read credentials from URL or storage.
 function resolveToken() {
   if (TOKEN_INJECTED) return INJECTED_TOKEN;
-  return FRAGMENT_TOKEN;
+  return PARENT_TOKEN;
+}
+
+function requestParentToken() {
+  if (TOKEN_INJECTED) return Promise.resolve(INJECTED_TOKEN);
+  if (window.parent === window) return Promise.resolve("");
+  return new Promise((resolve) => {
+    let settled = false;
+    let timeout;
+    let requestTimer;
+    const finish = (token) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      clearInterval(requestTimer);
+      window.removeEventListener("message", onMessage);
+      PARENT_TOKEN = token;
+      resolve(token);
+    };
+    const onMessage = (event) => {
+      if (event.origin !== location.origin) return;
+      if (event.source !== window.parent) return;
+      if (event.data?.type !== AUTH_RESPONSE || event.data?.version !== 1) return;
+      if (typeof event.data.token !== "string" || !event.data.token) return;
+      finish(event.data.token);
+    };
+    const request = () => window.parent.postMessage(
+      { type: AUTH_REQUEST, version: 1 },
+      location.origin,
+    );
+    timeout = setTimeout(() => finish(""), 3000);
+    requestTimer = setInterval(request, 250);
+    window.addEventListener("message", onMessage);
+    request();
+  });
 }
 
 const CAMERA_PROTOCOL = "miloco.camera.v1";
@@ -815,7 +848,8 @@ setInterval(() => {
 
 // Page boot: load camera list, then auto-connect if a camera is selected.
 (async () => {
-  if (!resolveToken()) {
+  const token = resolveToken() || await requestParentToken();
+  if (!token) {
     setState(t("missingToken"), true);
     return;
   }

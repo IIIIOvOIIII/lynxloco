@@ -264,6 +264,47 @@ export interface PerceptionCamera {
   roomName?: string;
 }
 
+// ── 通用摄像头管理（MIoT + 手工 RTSP）──────────────────────
+// GET /api/cameras 的去敏展示模型。传输地址、用户名、密码不属于此类型，避免
+// 列表数据被组件、日志或浏览器持久化意外带出。
+export type CameraSourceType = "miot" | "rtsp";
+
+export interface CameraSummary {
+  id: string;
+  sourceType: CameraSourceType;
+  name: string;
+  roomName: string;
+  enabled: boolean;
+  connected: boolean;
+  videoCodec: string | null;
+  audioCodec: string | null;
+  lastFrameUnixMs: number | null;
+  hasPassword: boolean;
+  errorCode: string | null;
+  errorMessage: string | null;
+}
+
+/** POST/PUT /api/cameras/rtsp payload；enabled 由独立端点管理。 */
+export interface RtspSourceInput {
+  name: string;
+  room_name: string;
+  uri: string;
+  username: string;
+  password: string;
+  transport: "tcp" | "udp";
+  audio_enabled: boolean;
+}
+
+export interface RtspProbeResult {
+  videoCodec: "h264" | "hevc";
+  width: number;
+  height: number;
+  fps: number;
+  timeBase: string;
+  audioCodec: string | null;
+  audioSampleRate: number | null;
+}
+
 // ── 米家 scope 摄像头（含禁用 / 离线，控件配置用） ─────────────
 // 来源：GET /api/miot/scope/cameras（in_use=false 即停用该摄像头的感知）。
 // PerceptionCamera 是「当前 perception 在订阅」的子集（did 为合成 did，通道号已编码其中，

@@ -8,6 +8,7 @@
 import type {
   Person,
   Pet,
+  CameraSummary,
   ScopeCamera,
   UsageStats,
 } from "@/lib/types";
@@ -27,7 +28,7 @@ import {
   feedDid as synthFeedDid,
   lensLabelKey,
 } from "@/lib/cameraChannel";
-import { IconRefresh, IconPencil } from "@/lib/icons";
+import { IconPlus, IconRefresh, IconPencil, IconTrash } from "@/lib/icons";
 
 // 每摄像头「感知须知」prompt 长度上限（与 backend MAX_CAMERA_PROMPT_LEN 对齐）。
 const CAMERA_PROMPT_MAX_LEN = 500;
@@ -62,6 +63,8 @@ interface Props {
   /** 米家全集（含被禁用 / 离线），用于渲染所有摄像头卡片 + Switch。多通道相机每条
    *  通道一条记录（did 相同、channel 区分），channel 直接带在每条上供播放 / 分行。 */
   scopeCameras: ScopeCamera[];
+  /** 通用列表中的 RTSP 来源；不含任何 URI 或凭据。 */
+  cameraSummaries?: CameraSummary[];
   /** miot 上是否有 camera 类设备——区分两种空态 */
   miotHasCamera: boolean;
   /** 最多投喂给 miloco 的摄像头数(后端 MAX_ENABLED_CAMERAS，经 /api/miot/status 下发)。
@@ -84,6 +87,10 @@ interface Props {
   onClearCameraPrompt: (did: string) => void | Promise<void>;
   /** 手动刷新未感知设备状态（force 刷新相机在线 / 镜头 + await 列表重拉落地）。 */
   onRefresh?: () => void | Promise<void>;
+  onAddRtsp?: () => void;
+  onEditRtsp?: (camera: CameraSummary) => void;
+  onToggleRtsp?: (camera: CameraSummary, enabled: boolean) => void | Promise<void>;
+  onDeleteRtsp?: (camera: CameraSummary) => void | Promise<void>;
 }
 
 // 排序:已认识在前,未认识统一靠后
@@ -102,6 +109,7 @@ export function HeroNow({
   pets,
   petsEnabled = false,
   scopeCameras,
+  cameraSummaries = [],
   miotHasCamera,
   maxStreamCams,
   onPersonClick,
@@ -111,6 +119,10 @@ export function HeroNow({
   onSetCameraPrompt,
   onClearCameraPrompt,
   onRefresh,
+  onAddRtsp,
+  onEditRtsp,
+  onToggleRtsp,
+  onDeleteRtsp,
 }: Props) {
   const { t } = useTranslation();
   const sorted = sortPersons(persons);
@@ -221,8 +233,206 @@ export function HeroNow({
         onSetCameraPrompt={onSetCameraPrompt}
         onClearCameraPrompt={onClearCameraPrompt}
         onRefresh={onRefresh}
+        showEmpty={!cameraSummaries.some((camera) => camera.sourceType === "rtsp")}
+      />
+      <RtspCameraSection
+        cameras={cameraSummaries.filter((camera) => camera.sourceType === "rtsp")}
+        onAdd={onAddRtsp}
+        onEdit={onEditRtsp}
+        onToggle={onToggleRtsp}
+        onDelete={onDeleteRtsp}
       />
     </section>
+  );
+}
+
+function RtspCameraSection({
+  cameras,
+  onAdd,
+  onEdit,
+  onToggle,
+  onDelete,
+}: {
+  cameras: CameraSummary[];
+  onAdd?: () => void;
+  onEdit?: (camera: CameraSummary) => void;
+  onToggle?: (camera: CameraSummary, enabled: boolean) => void | Promise<void>;
+  onDelete?: (camera: CameraSummary) => void | Promise<void>;
+}) {
+  const { t } = useTranslation();
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<CameraSummary | null>(null);
+
+  const runToggle = async (camera: CameraSummary) => {
+    if (!onToggle || busyId) return;
+    setBusyId(camera.id);
+    try {
+      await onToggle(camera, !camera.enabled);
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const confirmDelete = async () => {
+    if (!deleteTarget || !onDelete || busyId) return;
+    setBusyId(deleteTarget.id);
+    try {
+      await onDelete(deleteTarget);
+      setDeleteTarget(null);
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  return (
+    <div className="mt-6 border-t border-border pt-5">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <SectionLabel>{t("rtspCamera.title")}</SectionLabel>
+        {onAdd && (
+          <button
+            type="button"
+            onClick={onAdd}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-border px-2.5 py-1.5 text-caption text-text-secondary hover:border-border-strong hover:text-text-primary"
+          >
+            <IconPlus width={14} height={14} />
+            {t("rtspCamera.add")}
+          </button>
+        )}
+      </div>
+
+      {cameras.length === 0 ? (
+        <div className="rounded-lg border border-dashed border-border px-4 py-5 text-center text-body text-text-secondary">
+          {t("rtspCamera.add")}
+        </div>
+      ) : (
+        <div className="grid gap-3 md:grid-cols-2">
+          {cameras.map((camera) => {
+            const busy = busyId === camera.id;
+            const state = camera.connected
+              ? t("rtspCamera.connected")
+              : camera.enabled && camera.errorCode
+                ? t("rtspCamera.reconnecting")
+                : camera.enabled
+                  ? t("rtspCamera.offline")
+                  : t("rtspCamera.disabled");
+            const codec = camera.videoCodec
+              ? t("rtspCamera.codec", {
+                  video: camera.videoCodec.toUpperCase(),
+                  audio: camera.audioCodec?.toUpperCase() ?? "—",
+                })
+              : t("rtspCamera.noCodec");
+            return (
+              <article key={camera.id} className="rounded-xl border border-border bg-bg-primary p-3">
+                {camera.connected ? (
+                  <LivePlayerPlaceholder
+                    cameraName={camera.name}
+                    roomName={camera.roomName || undefined}
+                    cameraId={camera.id}
+                    className="mb-3"
+                    dimmed={camera.videoCodec === "hevc"}
+                    dimmedMessage={
+                      camera.videoCodec === "hevc" ? t("rtspCamera.liveTranscode") : undefined
+                    }
+                  />
+                ) : (
+                  <div className="mb-3 flex aspect-video items-center justify-center rounded-xl border border-border bg-black/90 text-caption text-white/60">
+                    {state}
+                  </div>
+                )}
+                <div className="flex items-start gap-2">
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <span className="truncate text-body text-text-primary">{camera.name}</span>
+                      <span className="rounded border border-border px-1.5 py-0.5 text-caption text-text-tertiary">
+                        {t("rtspCamera.sourceRtsp")}
+                      </span>
+                      {camera.roomName && (
+                        <span className="text-caption text-text-tertiary">{camera.roomName}</span>
+                      )}
+                    </div>
+                    <div className="mt-1 text-caption text-text-secondary">
+                      {state} · {codec}
+                    </div>
+                    {camera.errorMessage && (
+                      <div className="mt-1 text-caption text-warning" role="status">
+                        {camera.errorMessage}
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex shrink-0 items-center gap-1">
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => onEdit?.(camera)}
+                      aria-label={t("rtspCamera.edit")}
+                      className="rounded-md border border-border p-1.5 text-text-secondary hover:text-text-primary disabled:opacity-50"
+                    >
+                      <IconPencil width={14} height={14} />
+                    </button>
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => setDeleteTarget(camera)}
+                      aria-label={t("rtspCamera.delete")}
+                      className="rounded-md border border-border p-1.5 text-text-secondary hover:text-error disabled:opacity-50"
+                    >
+                      <IconTrash width={14} height={14} />
+                    </button>
+                    <button
+                      type="button"
+                      disabled={busy || !onToggle}
+                      onClick={() => void runToggle(camera)}
+                      className="rounded-md border border-border px-2 py-1.5 text-caption text-text-primary hover:border-border-strong disabled:opacity-50"
+                    >
+                      {busy && !camera.enabled
+                        ? t("rtspCamera.enableTesting")
+                        : t(camera.enabled ? "rtspCamera.disable" : "rtspCamera.enable")}
+                    </button>
+                  </div>
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      )}
+
+      {deleteTarget && (
+        <div
+          className="fixed inset-0 z-[70] flex items-center justify-center bg-black/45 p-4"
+          onClick={busyId ? undefined : () => setDeleteTarget(null)}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            className="w-full max-w-md rounded-xl border border-border bg-bg-secondary p-5 shadow-sm"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <h2 className="text-title text-text-primary">
+              {t("rtspCamera.deleteTitle", { name: deleteTarget.name })}
+            </h2>
+            <p className="mt-2 text-body text-text-secondary">{t("rtspCamera.deleteBody")}</p>
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                disabled={!!busyId}
+                onClick={() => setDeleteTarget(null)}
+                className="rounded-lg border border-border px-3 py-2 text-body text-text-secondary disabled:opacity-50"
+              >
+                {t("rtspCamera.cancel")}
+              </button>
+              <button
+                type="button"
+                disabled={!!busyId}
+                onClick={() => void confirmDelete()}
+                className="rounded-lg bg-error px-3 py-2 text-body text-white disabled:opacity-50"
+              >
+                {t("rtspCamera.confirmDelete")}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -240,6 +450,7 @@ interface CameraSectionProps {
   onSetCameraPrompt: (did: string, text: string) => void | Promise<void>;
   onClearCameraPrompt: (did: string) => void | Promise<void>;
   onRefresh?: () => void | Promise<void>;
+  showEmpty: boolean;
 }
 
 function CameraSection({
@@ -253,6 +464,7 @@ function CameraSection({
   onSetCameraPrompt,
   onClearCameraPrompt,
   onRefresh,
+  showEmpty,
 }: CameraSectionProps) {
   const { t } = useTranslation();
   // 手动刷新未感知设备状态:in-flight 期间转圈 + disable 防连点(force 刷新本身绕过 8s 节流)。
@@ -430,7 +642,7 @@ function CameraSection({
           </div>
         )}
       </div>
-      {total === 0 ? (
+      {total === 0 ? showEmpty ? (
         <div className="text-body rounded-lg bg-bg-primary border border-dashed border-border-strong text-text-secondary py-8 px-5 text-center">
           {miotHasCamera ? (
             <>
@@ -445,7 +657,7 @@ function CameraSection({
             <>{t("hero.cameraEmpty")}</>
           )}
         </div>
-      ) : (
+      ) : null : (
         <>
           {/* 上区:最多 4 路「带实时流」的相机,按物理 did 分组——每台一张卡(卡内每通道
               一个小窗),整台一套开关。卡 key=物理 did,稳定排序,toggle 某台时其余卡
@@ -923,18 +1135,19 @@ function CamCardWithToggle({
   hasPrompt,
   onEditPrompt,
 }: CamCardProps) {
+  const { t } = useTranslation();
   return (
     <div className="snap-start shrink-0 w-[min(280px,85vw)]">
       <div className="relative">
         <LivePlayerPlaceholder
           cameraName={cam.name}
           roomName={cam.roomName}
-          cameraDid={cam.did}
-          channel={cam.channel}
+          cameraId={synthFeedDid(cam.did, cam.channel, cam.channelCount > 1)}
         />
         {/* 画面左上角标相机名(单/多摄一致都显示);多摄再后缀镜头标签(移动/固定画面)区分同台两路。 */}
         <span className="absolute top-2 left-2 max-w-[calc(100%-1rem)] truncate px-1.5 py-0.5 rounded-md bg-black/50 text-white text-caption pointer-events-none z-10">
           {channelLabel ? `${cam.name} · ${channelLabel}` : cam.name}
+          {` · ${t("rtspCamera.sourceMiot")}`}
         </span>
         {/* 全拆后每路一个独立开关 → 拾音 + 投喂开关回到画面内右上角(不再放画面外的卡头)。
             拾音仅有 mic 的通道(球机/ch0)显示。 */}
@@ -990,6 +1203,7 @@ function BenchCamItem({
   hasPrompt: boolean;
   onEditPrompt: () => void;
 }) {
+  const { t } = useTranslation();
   const available = cameraAvailable(cam);
   return (
     <li className="px-4 py-3 flex items-center justify-between gap-3 hover:bg-bg-tertiary transition-colors">
@@ -1014,6 +1228,9 @@ function BenchCamItem({
               {cam.roomName}
             </span>
           )}
+          <span className="shrink-0 rounded border border-border px-1.5 py-0.5 text-caption leading-none text-text-tertiary">
+            {t("rtspCamera.sourceMiot")}
+          </span>
         </div>
         {/* 该路自己的三态灯（各路镜头 / 连通可能不同）。 */}
         <ChannelStateDots cam={cam} />

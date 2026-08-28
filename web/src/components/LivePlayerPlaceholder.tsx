@@ -11,12 +11,12 @@ import { useTranslation } from "react-i18next";
 import { createPortal } from "react-dom";
 import { IconCamera, IconX } from "@/lib/icons";
 import { useEscClose } from "@/hooks/useEscClose";
+import { resolveToken } from "@/api/client";
 
 interface Props {
   cameraName: string;
   roomName?: string;
-  cameraDid: string;
-  channel: number;
+  cameraId: string;
   className?: string;
   disabled?: boolean;
   disabledMessage?: string;
@@ -27,8 +27,7 @@ interface Props {
 export function LivePlayerPlaceholder({
   cameraName,
   roomName,
-  cameraDid,
-  channel,
+  cameraId,
   className,
   disabled = false,
   disabledMessage,
@@ -39,6 +38,7 @@ export function LivePlayerPlaceholder({
   const [expanded, setExpanded] = useState(false);
   const [smallLoaded, setSmallLoaded] = useState(false);
   const modalSlotRef = useRef<HTMLDivElement>(null);
+  const iframeRef = useRef<HTMLIFrameElement>(null);
   const [rect, setRect] = useState<{
     top: number;
     left: number;
@@ -50,18 +50,37 @@ export function LivePlayerPlaceholder({
 
   // (did, channel) 变才重算 src,平时稳定。useMemo 比 render 阶段写 ref 更标准,
   // concurrent mode 重跑 render 时也安全(useMemo 自动跟 deps 一致)。
-  const refKey = `${cameraDid}|${channel}`;
-  const src = useMemo(
-    () =>
-      `/api/miot/watch?camera_id=${encodeURIComponent(cameraDid)}&channel=${channel}&embedded=1`,
-    [cameraDid, channel],
-  );
+  const refKey = cameraId;
+  const src = useMemo(() => cameraWatchUrl(cameraId), [cameraId]);
 
   // refKey 变(cam 或 channel 切换)时重置 loading mask,让"拉流中…"再显一次盖
   // 旧画面到新首帧之间的空隙。避免 React 复用 LivePlayer 实例换 cam 时 mask 不出。
   useEffect(() => {
     setSmallLoaded(false);
   }, [refKey]);
+
+  // The generic watch asset is public but its list/stream calls are not. Give
+  // only this exact same-origin child window the SPA's already injected token,
+  // in memory, after the child explicitly asks. No URL or browser storage is used.
+  useLayoutEffect(() => {
+    const onAuthRequest = (event: MessageEvent) => {
+      if (
+        !isCameraAuthRequest(
+          event,
+          window.location.origin,
+          iframeRef.current?.contentWindow ?? null,
+        )
+      ) return;
+      const token = resolveToken();
+      if (!token || !iframeRef.current?.contentWindow) return;
+      iframeRef.current.contentWindow.postMessage(
+        { type: "miloco.camera.auth.response", version: 1, token },
+        window.location.origin,
+      );
+    };
+    window.addEventListener("message", onAuthRequest);
+    return () => window.removeEventListener("message", onAuthRequest);
+  }, []);
 
   // expanded=true 时同步 modal 占位 div 的 boundingRect → iframe 用 fixed +
   // inline rect 浮上去。ResizeObserver 监听占位尺寸/位置变化(dimmedMessage chip
@@ -163,6 +182,7 @@ export function LivePlayerPlaceholder({
         ) : (
           <>
             <iframe
+              ref={iframeRef}
               src={src}
               title={t("devices.liveView", { name: cameraName })}
               aria-hidden={useFixed ? undefined : "true"}
@@ -244,4 +264,19 @@ export function LivePlayerPlaceholder({
         )}
     </>
   );
+}
+
+export function cameraWatchUrl(cameraId: string): string {
+  return `/api/cameras/${encodeURIComponent(cameraId)}/watch?embedded=1`;
+}
+
+export function isCameraAuthRequest(
+  event: Pick<MessageEvent, "data" | "origin" | "source">,
+  expectedOrigin: string,
+  expectedSource: MessageEventSource | null,
+): boolean {
+  if (expectedSource === null) return false;
+  if (event.origin !== expectedOrigin) return false;
+  if (event.source !== expectedSource) return false;
+  return event.data?.type === "miloco.camera.auth.request" && event.data?.version === 1;
 }

@@ -27,6 +27,9 @@ import type {
   Scene,
   ScopeCamera,
   ScopeHome,
+  CameraSummary,
+  RtspProbeResult,
+  RtspSourceInput,
   Task,
   TokenBreakdown,
   UsageCallType,
@@ -49,6 +52,60 @@ interface Normal<T> {
   code: number;
   message: string;
   data: T;
+}
+
+interface BackendCameraSummary {
+  id: string;
+  source_type: "miot" | "rtsp";
+  name: string;
+  room_name: string;
+  enabled: boolean;
+  connected: boolean;
+  video_codec: string | null;
+  audio_codec: string | null;
+  last_frame_unix_ms?: number | null;
+  has_password?: boolean;
+  error_code?: string | null;
+  error_message?: string | null;
+}
+
+interface BackendRtspProbeResult {
+  video_codec: "h264" | "hevc";
+  width: number;
+  height: number;
+  fps: number;
+  time_base: string;
+  audio_codec: string | null;
+  audio_sample_rate: number | null;
+}
+
+function mapCameraSummary(camera: BackendCameraSummary): CameraSummary {
+  return {
+    id: camera.id,
+    sourceType: camera.source_type,
+    name: camera.name,
+    roomName: camera.room_name,
+    enabled: camera.enabled,
+    connected: camera.connected,
+    videoCodec: camera.video_codec,
+    audioCodec: camera.audio_codec,
+    lastFrameUnixMs: camera.last_frame_unix_ms ?? null,
+    hasPassword: camera.has_password ?? false,
+    errorCode: camera.error_code ?? null,
+    errorMessage: camera.error_message ?? null,
+  };
+}
+
+function mapRtspProbe(result: BackendRtspProbeResult): RtspProbeResult {
+  return {
+    videoCodec: result.video_codec,
+    width: result.width,
+    height: result.height,
+    fps: result.fps,
+    timeBase: result.time_base,
+    audioCodec: result.audio_codec,
+    audioSampleRate: result.audio_sample_rate,
+  };
 }
 
 // ── 米家绑定状态 ───────────────────────────────────────────
@@ -1133,6 +1190,69 @@ export async function realListCameras(): Promise<PerceptionCamera[]> {
       name: c.name,
       roomName: c.room_name,
     }));
+}
+
+/** Credential-safe MIoT + RTSP camera management list. */
+export async function realListCameraSummaries(): Promise<CameraSummary[]> {
+  const response = await apiFetch<Normal<BackendCameraSummary[]>>("/api/cameras");
+  return response.data.map(mapCameraSummary);
+}
+
+export async function realTestRtspCamera(
+  input: RtspSourceInput,
+): Promise<RtspProbeResult> {
+  const response = await apiFetch<Normal<BackendRtspProbeResult>>(
+    "/api/cameras/rtsp/test",
+    { method: "POST", body: JSON.stringify(input) },
+  );
+  return mapRtspProbe(response.data);
+}
+
+export async function realCreateRtspCamera(
+  input: RtspSourceInput,
+): Promise<CameraSummary> {
+  const response = await apiFetch<Normal<BackendCameraSummary>>("/api/cameras/rtsp", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+  return mapCameraSummary(response.data);
+}
+
+export async function realEditRtspCamera(
+  cameraId: string,
+  input: RtspSourceInput,
+): Promise<CameraSummary> {
+  const response = await apiFetch<Normal<BackendCameraSummary>>(
+    `/api/cameras/rtsp/${encodeURIComponent(cameraId)}`,
+    { method: "PUT", body: JSON.stringify(input) },
+  );
+  return mapCameraSummary(response.data);
+}
+
+async function realSetCameraEnabled(
+  cameraId: string,
+  enabled: boolean,
+): Promise<CameraSummary> {
+  const action = enabled ? "enable" : "disable";
+  const response = await apiFetch<Normal<BackendCameraSummary>>(
+    `/api/cameras/${encodeURIComponent(cameraId)}/${action}`,
+    { method: "POST" },
+  );
+  return mapCameraSummary(response.data);
+}
+
+export function realEnableCamera(cameraId: string): Promise<CameraSummary> {
+  return realSetCameraEnabled(cameraId, true);
+}
+
+export function realDisableCamera(cameraId: string): Promise<CameraSummary> {
+  return realSetCameraEnabled(cameraId, false);
+}
+
+export async function realDeleteCamera(cameraId: string): Promise<void> {
+  await apiFetch<Normal<null>>(`/api/cameras/${encodeURIComponent(cameraId)}`, {
+    method: "DELETE",
+  });
 }
 
 // ── 米家账号绑定 OAuth ────────────────────────────────────

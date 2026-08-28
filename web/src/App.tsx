@@ -28,7 +28,13 @@ import {
   switchScopeHome,
 } from "./api";
 import { useAsync } from "./hooks/useAsync";
-import type { Pet, Person } from "./lib/types";
+import type { CameraSummary, Pet, Person } from "./lib/types";
+import {
+  realDeleteCamera,
+  realDisableCamera,
+  realEnableCamera,
+  realListCameraSummaries,
+} from "./api/real";
 import { Sidebar, MobileTabBar, type TabKey } from "./components/Sidebar";
 import { SettingsDrawer } from "./components/SettingsDrawer";
 import { HomeSwitcher } from "./components/HomeSwitcher";
@@ -47,6 +53,7 @@ import { HomeKnowledgePanel } from "./components/HomeKnowledgePanel";
 import { TasksPage } from "./components/TasksPage";
 import { CandidateReviewPanel } from "./components/CandidateReviewPanel";
 import { MiotBindDialog } from "./components/MiotBindDialog";
+import { RtspCameraDialog } from "./components/RtspCameraDialog";
 import { ToastHost, toast } from "./components/Toast";
 import { UsagePage } from "./components/UsagePage";
 import type { HomeId } from "./lib/types";
@@ -134,6 +141,9 @@ function MainApp() {
   const cameras = useAsync(() => listCameras(homeId), [homeId], {
     errorLabel: t("app.loadCamerasFail"),
   });
+  const cameraSummaries = useAsync(() => realListCameraSummaries(), [], {
+    errorLabel: t("app.loadCamerasFail"),
+  });
   // 加载相机列表前先轻量刷新在线状态(/refresh_camera_online,只更新缓存元数据、
   // 不碰解码/流,故不卡流)——否则相机重新上线后 list_cameras_with_state 只读旧缓存,
   // 页面一直显"已离线"。节流 + 失败静默,不阻断列表。
@@ -198,6 +208,7 @@ function MainApp() {
   const [selectedPetId, setSelectedPetId] = useState<string | null>(null);
   const [editingPet, setEditingPet] = useState<Pet | null | undefined>(undefined);
   const [miotBindOpen, setMiotBindOpen] = useState(false);
+  const [editingRtsp, setEditingRtsp] = useState<CameraSummary | null | undefined>(undefined);
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   // 米家家庭名直接走 backend `/api/miot/home::home_name`，米家给啥前端就显啥；
@@ -216,7 +227,7 @@ function MainApp() {
         // devices 也纳入聚合:HeroNow 用 devices 推 miotHasCamera,devices 拉
         // 失败时 `(devices.data ?? []).some(...)` 会兜底成 false → 米家上明明有
         // 摄像头但 hero 显"家里还没有摄像头",住户被误导去米家 app 加而非排查网络。
-        const err = persons.error ?? cameras.error ?? scopeCameras.error ?? devices.error;
+        const err = persons.error ?? cameras.error ?? cameraSummaries.error ?? scopeCameras.error ?? devices.error;
         if (err) {
           return (
             <TabPanelError
@@ -224,13 +235,14 @@ function MainApp() {
               onRetry={() => {
                 persons.reload();
                 cameras.reload();
+                cameraSummaries.reload();
                 scopeCameras.reload();
                 devices.reload();
               }}
             />
           );
         }
-        if (!persons.data || !cameras.data || !scopeCameras.data || !devices.data) {
+        if (!persons.data || !cameras.data || !cameraSummaries.data || !scopeCameras.data || !devices.data) {
           return <TabPanelLoading text={t("app.tabHomeLoading")} />;
         }
         return (
@@ -240,6 +252,7 @@ function MainApp() {
               pets={pets.data}
               petsEnabled={features.data?.petRecognition ?? false}
               scopeCameras={scopeCameras.data}
+              cameraSummaries={cameraSummaries.data}
               miotHasCamera={devices.data.some(
                 (d) => d.category === "camera",
               )}
@@ -250,6 +263,36 @@ function MainApp() {
                  不传 onPersonClick → PersonChip 降级成 div（无 hover/点击反馈）,
                  防住户看到可点 button 形态点了无反馈以为系统坏。 */
               onJumpUsage={() => setActiveTab("usage")}
+              onAddRtsp={() => setEditingRtsp(null)}
+              onEditRtsp={(camera) => setEditingRtsp(camera)}
+              onToggleRtsp={async (camera, enabled) => {
+                try {
+                  // The backend enable transaction probes the persisted source
+                  // (including its preserved password) before flipping enabled.
+                  if (enabled) await realEnableCamera(camera.id);
+                  else await realDisableCamera(camera.id);
+                  await cameraSummaries.reload();
+                } catch (error) {
+                  toast(
+                    error instanceof Error ? error.message : t("rtspCamera.operationFailed"),
+                    "warn",
+                  );
+                  throw error;
+                }
+              }}
+              onDeleteRtsp={async (camera) => {
+                try {
+                  await realDeleteCamera(camera.id);
+                  await cameraSummaries.reload();
+                  toast(t("rtspCamera.deleted"), "ok");
+                } catch (error) {
+                  toast(
+                    error instanceof Error ? error.message : t("rtspCamera.operationFailed"),
+                    "warn",
+                  );
+                  throw error;
+                }
+              }}
               onToggleCameras={async (dids, inUse) => {
                 try {
                   await toggleScopeCamera(dids, inUse);
@@ -301,7 +344,7 @@ function MainApp() {
                 // reload() 的 Promise 在 listScopeCameras settle 后 resolve,故 onRefresh 完成
                 // = 列表已更新到位,刷新按钮转圈据此精确覆盖全程(不被其他 reload 借用)。
                 await refreshCameraOnline(homeId, true).catch(() => {});
-                await scopeCameras.reload();
+                await Promise.all([scopeCameras.reload(), cameraSummaries.reload()]);
               }}
             />
           </div>
@@ -657,6 +700,13 @@ function MainApp() {
           }
           window.location.reload();
         }}
+      />
+
+      <RtspCameraDialog
+        open={editingRtsp !== undefined}
+        camera={editingRtsp ?? null}
+        onClose={() => setEditingRtsp(undefined)}
+        onSaved={() => cameraSummaries.reload()}
       />
 
       <SettingsDrawer open={settingsOpen} onClose={() => setSettingsOpen(false)} />
