@@ -2,6 +2,7 @@
   "rtspCamera": {
     "title": "RTSP cameras",
     "add": "Add RTSP camera",
+    "refresh": "Refresh RTSP camera status",
     "edit": "Edit RTSP camera",
     "name": "Camera name",
     "url": "RTSP URL",
@@ -31,6 +32,7 @@
     "offline": "Offline",
     "disabled": "Disabled",
     "reconnecting": "Reconnecting",
+    "attentionRequired": "Configuration needs attention",
     "liveTranscode": "Live view is transcoding to H.264",
     "codec": "Video {{video}} · Audio {{audio}}",
     "noCodec": "Codec pending",

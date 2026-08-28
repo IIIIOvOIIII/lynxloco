@@ -23,9 +23,31 @@ export class ApiError extends Error {
   constructor(
     public status: number,
     message: string,
+    public code?: string,
   ) {
     super(message);
   }
+}
+
+function parseErrorBody(
+  body: unknown,
+  fallback: string,
+): { message: string; code?: string } {
+  if (!body || typeof body !== "object") return { message: fallback };
+  const envelope = body as Record<string, unknown>;
+  const detail = envelope.detail;
+  if (detail && typeof detail === "object") {
+    const structured = detail as Record<string, unknown>;
+    const message = typeof structured.message === "string" ? structured.message : fallback;
+    const code = typeof structured.code === "string" ? structured.code : undefined;
+    return { message, code };
+  }
+  if (typeof detail === "string") {
+    return { message: detail };
+  }
+  const message = typeof envelope.message === "string" ? envelope.message : fallback;
+  const code = typeof envelope.code === "string" ? envelope.code : undefined;
+  return { message, code };
 }
 
 export async function apiFetch<T>(
@@ -41,14 +63,15 @@ export async function apiFetch<T>(
 
   const resp = await fetch(path, { ...init, headers });
   if (!resp.ok) {
-    let msg = `HTTP ${resp.status}`;
+    const fallback = `HTTP ${resp.status}`;
+    let parsed: { message: string; code?: string } = { message: fallback };
     try {
       const body = await resp.json();
-      msg = body.message ?? body.detail ?? msg;
+      parsed = parseErrorBody(body, fallback);
     } catch {
       // ignore
     }
-    throw new ApiError(resp.status, msg);
+    throw new ApiError(resp.status, parsed.message, parsed.code);
   }
   // backend NormalResponse 业务错(HTTP 200 但 body.code != 0)也当错处理。
   // 当前 backend 全走 HTTPException → handle_exception → 4xx,没用 200+code != 0
@@ -66,7 +89,11 @@ export async function apiFetch<T>(
   if (typeof body.code === "number" && body.code !== 0) {
     // `||` 而非 `??`：?? 只挡 null/undefined,空串 "" 也是合法 message,但住户看到
     // "" 跟"无错误"无法区分,需要用 ?code? 兜底让住户至少看到 code 编码。
-    throw new ApiError(resp.status, body.message || i18n.t("api.bizError", { code: body.code }));
+    throw new ApiError(
+      resp.status,
+      body.message || i18n.t("api.bizError", { code: body.code }),
+      String(body.code),
+    );
   }
   return body as T;
 }

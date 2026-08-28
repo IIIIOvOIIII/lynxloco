@@ -157,16 +157,23 @@ class CameraService:
 
     async def edit_rtsp(self, camera_id: str, body: RtspSourceUpsert) -> CameraSummary:
         async with self._write_lock:
+            current_sources = await asyncio.to_thread(self._load_sources_safely)
+            _index, current = self._locate(current_sources, camera_id)
+            password = body.password if body.password else current.password
+            candidate = self._source_from_upsert(
+                current.id,
+                body,
+                enabled=current.enabled,
+                password=password,
+            )
+            if current.enabled:
+                await self._probe(candidate)
 
             def edit(raw_sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 sources = self._validate_sources(raw_sources)
-                index, current = self._locate(sources, camera_id)
-                password = body.password if body.password else current.password
-                sources[index] = self._source_from_upsert(
-                    current.id,
-                    body,
-                    enabled=current.enabled,
-                    password=password,
+                index, persisted = self._locate(sources, camera_id)
+                sources[index] = candidate.model_copy(
+                    update={"enabled": persisted.enabled}
                 )
                 return [source.model_dump() for source in sources]
 

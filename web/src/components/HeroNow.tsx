@@ -29,6 +29,7 @@ import {
   lensLabelKey,
 } from "@/lib/cameraChannel";
 import { IconPlus, IconRefresh, IconPencil, IconTrash } from "@/lib/icons";
+import { isRtspLiveReady, isTerminalRtspError } from "@/lib/rtspPolling";
 
 // 每摄像头「感知须知」prompt 长度上限（与 backend MAX_CAMERA_PROMPT_LEN 对齐）。
 const CAMERA_PROMPT_MAX_LEN = 500;
@@ -89,6 +90,7 @@ interface Props {
   onRefresh?: () => void | Promise<void>;
   onAddRtsp?: () => void;
   onEditRtsp?: (camera: CameraSummary) => void;
+  onRefreshRtsp?: () => void | Promise<void>;
   onToggleRtsp?: (camera: CameraSummary, enabled: boolean) => void | Promise<void>;
   onDeleteRtsp?: (camera: CameraSummary) => void | Promise<void>;
 }
@@ -121,6 +123,7 @@ export function HeroNow({
   onRefresh,
   onAddRtsp,
   onEditRtsp,
+  onRefreshRtsp,
   onToggleRtsp,
   onDeleteRtsp,
 }: Props) {
@@ -239,6 +242,7 @@ export function HeroNow({
         cameras={cameraSummaries.filter((camera) => camera.sourceType === "rtsp")}
         onAdd={onAddRtsp}
         onEdit={onEditRtsp}
+        onRefresh={onRefreshRtsp}
         onToggle={onToggleRtsp}
         onDelete={onDeleteRtsp}
       />
@@ -250,18 +254,31 @@ function RtspCameraSection({
   cameras,
   onAdd,
   onEdit,
+  onRefresh,
   onToggle,
   onDelete,
 }: {
   cameras: CameraSummary[];
   onAdd?: () => void;
   onEdit?: (camera: CameraSummary) => void;
+  onRefresh?: () => void | Promise<void>;
   onToggle?: (camera: CameraSummary, enabled: boolean) => void | Promise<void>;
   onDelete?: (camera: CameraSummary) => void | Promise<void>;
 }) {
   const { t } = useTranslation();
   const [busyId, setBusyId] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<CameraSummary | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+
+  const refresh = async () => {
+    if (!onRefresh || refreshing) return;
+    setRefreshing(true);
+    try {
+      await onRefresh();
+    } finally {
+      setRefreshing(false);
+    }
+  };
 
   const runToggle = async (camera: CameraSummary) => {
     if (!onToggle || busyId) return;
@@ -288,16 +305,33 @@ function RtspCameraSection({
     <div className="mt-6 border-t border-border pt-5">
       <div className="mb-3 flex items-center justify-between gap-3">
         <SectionLabel>{t("rtspCamera.title")}</SectionLabel>
-        {onAdd && (
-          <button
-            type="button"
-            onClick={onAdd}
-            className="inline-flex items-center gap-1.5 rounded-lg border border-border px-2.5 py-1.5 text-caption text-text-secondary hover:border-border-strong hover:text-text-primary"
-          >
-            <IconPlus width={14} height={14} />
-            {t("rtspCamera.add")}
-          </button>
-        )}
+        <div className="flex items-center gap-2">
+          {onRefresh && (
+            <button
+              type="button"
+              onClick={() => void refresh()}
+              disabled={refreshing}
+              aria-label={t("rtspCamera.refresh")}
+              className="rounded-lg border border-border p-1.5 text-text-secondary hover:text-text-primary disabled:opacity-50"
+            >
+              <IconRefresh
+                width={14}
+                height={14}
+                className={refreshing ? "animate-spin" : undefined}
+              />
+            </button>
+          )}
+          {onAdd && (
+            <button
+              type="button"
+              onClick={onAdd}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-border px-2.5 py-1.5 text-caption text-text-secondary hover:border-border-strong hover:text-text-primary"
+            >
+              <IconPlus width={14} height={14} />
+              {t("rtspCamera.add")}
+            </button>
+          )}
+        </div>
       </div>
 
       {cameras.length === 0 ? (
@@ -310,6 +344,8 @@ function RtspCameraSection({
             const busy = busyId === camera.id;
             const state = camera.connected
               ? t("rtspCamera.connected")
+              : camera.enabled && isTerminalRtspError(camera.errorCode)
+                ? t("rtspCamera.attentionRequired")
               : camera.enabled && camera.errorCode
                 ? t("rtspCamera.reconnecting")
                 : camera.enabled
@@ -323,7 +359,7 @@ function RtspCameraSection({
               : t("rtspCamera.noCodec");
             return (
               <article key={camera.id} className="rounded-xl border border-border bg-bg-primary p-3">
-                {camera.connected ? (
+                {isRtspLiveReady(camera) ? (
                   <LivePlayerPlaceholder
                     cameraName={camera.name}
                     roomName={camera.roomName || undefined}

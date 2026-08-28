@@ -2,6 +2,7 @@
   "rtspCamera": {
     "title": "RTSP 摄像头",
     "add": "添加 RTSP 摄像头",
+    "refresh": "刷新 RTSP 摄像头状态",
     "edit": "编辑 RTSP 摄像头",
     "name": "摄像头名称",
     "url": "RTSP 地址",
@@ -31,6 +32,7 @@
     "offline": "离线",
     "disabled": "已停用",
     "reconnecting": "正在重连",
+    "attentionRequired": "配置需要处理",
     "liveTranscode": "实时画面正转码为 H.264",
     "codec": "视频 {{video}} · 音频 {{audio}}",
     "noCodec": "编码信息待获取",

@@ -2,7 +2,7 @@
  * 主框架：左 Sidebar + 主区按 tab 切换。mobile 下 Sidebar 折叠为底部 nav。
  */
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   getFeatures,
   getHomeStatus,
@@ -62,6 +62,11 @@ import { IconMoon, IconSun } from "./lib/icons";
 import { useTheme } from "./hooks/useTheme";
 import { useTranslation } from "react-i18next";
 import { LanguageSwitcher } from "./components/LanguageSwitcher";
+import {
+  isTerminalRtspError,
+  rtspPollingPlan,
+  runSingleFlight,
+} from "./lib/rtspPolling";
 
 /** URL hash 是 #perf 时,App 整屏渲染性能调试视图,跳过主框架。 */
 function usePerfMode(): boolean {
@@ -210,6 +215,60 @@ function MainApp() {
   const [miotBindOpen, setMiotBindOpen] = useState(false);
   const [editingRtsp, setEditingRtsp] = useState<CameraSummary | null | undefined>(undefined);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [pageVisible, setPageVisible] = useState(
+    () => typeof document === "undefined" || document.visibilityState === "visible",
+  );
+  const [rtspPollRevision, setRtspPollRevision] = useState(0);
+  const rtspFastAttempts = useRef<Record<string, number>>({});
+  const rtspRefreshPromise = useRef<Promise<void> | null>(null);
+
+  const refreshRtspSummaries = (): Promise<void> => {
+    return runSingleFlight(rtspRefreshPromise, cameraSummaries.reload);
+  };
+
+  const resetRtspFastPoll = (cameraId: string) => {
+    rtspFastAttempts.current[cameraId] = 0;
+    setRtspPollRevision((revision) => revision + 1);
+  };
+
+  useEffect(() => {
+    const onVisibility = () => setPageVisible(document.visibilityState === "visible");
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, []);
+
+  useEffect(() => {
+    for (const camera of cameraSummaries.data ?? []) {
+      if (
+        camera.sourceType === "rtsp" &&
+        (!camera.enabled || camera.connected || isTerminalRtspError(camera.errorCode))
+      ) {
+        delete rtspFastAttempts.current[camera.id];
+      }
+    }
+  }, [cameraSummaries.data]);
+
+  useEffect(() => {
+    if (cameraSummaries.loading) return;
+    const plan = rtspPollingPlan(
+      cameraSummaries.data ?? [],
+      rtspFastAttempts.current,
+      pageVisible,
+    );
+    if (!plan) return;
+    const timer = window.setTimeout(() => {
+      if (plan.mode === "fast") {
+        for (const cameraId of plan.cameraIds) {
+          rtspFastAttempts.current[cameraId] =
+            (rtspFastAttempts.current[cameraId] ?? 0) + 1;
+        }
+      }
+      void refreshRtspSummaries();
+    }, plan.delayMs);
+    return () => window.clearTimeout(timer);
+    // reload is stable; revision explicitly re-plans after an edit/enable.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cameraSummaries.data, cameraSummaries.loading, pageVisible, rtspPollRevision]);
 
   // 米家家庭名直接走 backend `/api/miot/home::home_name`，米家给啥前端就显啥；
   // 未绑或 backend 没返时**不渲染** HomeSwitcher（未登录提示由头像 button 承担，
@@ -235,7 +294,7 @@ function MainApp() {
               onRetry={() => {
                 persons.reload();
                 cameras.reload();
-                cameraSummaries.reload();
+                void refreshRtspSummaries();
                 scopeCameras.reload();
                 devices.reload();
               }}
@@ -265,13 +324,24 @@ function MainApp() {
               onJumpUsage={() => setActiveTab("usage")}
               onAddRtsp={() => setEditingRtsp(null)}
               onEditRtsp={(camera) => setEditingRtsp(camera)}
+              onRefreshRtsp={async () => {
+                for (const camera of cameraSummaries.data ?? []) {
+                  if (camera.sourceType === "rtsp" && camera.enabled && !camera.connected) {
+                    rtspFastAttempts.current[camera.id] = 0;
+                  }
+                }
+                setRtspPollRevision((revision) => revision + 1);
+                await refreshRtspSummaries();
+              }}
               onToggleRtsp={async (camera, enabled) => {
                 try {
                   // The backend enable transaction probes the persisted source
                   // (including its preserved password) before flipping enabled.
                   if (enabled) await realEnableCamera(camera.id);
                   else await realDisableCamera(camera.id);
-                  await cameraSummaries.reload();
+                  if (enabled) resetRtspFastPoll(camera.id);
+                  else delete rtspFastAttempts.current[camera.id];
+                  await refreshRtspSummaries();
                 } catch (error) {
                   toast(
                     error instanceof Error ? error.message : t("rtspCamera.operationFailed"),
@@ -283,7 +353,8 @@ function MainApp() {
               onDeleteRtsp={async (camera) => {
                 try {
                   await realDeleteCamera(camera.id);
-                  await cameraSummaries.reload();
+                  delete rtspFastAttempts.current[camera.id];
+                  await refreshRtspSummaries();
                   toast(t("rtspCamera.deleted"), "ok");
                 } catch (error) {
                   toast(
@@ -344,7 +415,7 @@ function MainApp() {
                 // reload() 的 Promise 在 listScopeCameras settle 后 resolve,故 onRefresh 完成
                 // = 列表已更新到位,刷新按钮转圈据此精确覆盖全程(不被其他 reload 借用)。
                 await refreshCameraOnline(homeId, true).catch(() => {});
-                await Promise.all([scopeCameras.reload(), cameraSummaries.reload()]);
+                await Promise.all([scopeCameras.reload(), refreshRtspSummaries()]);
               }}
             />
           </div>
@@ -706,7 +777,10 @@ function MainApp() {
         open={editingRtsp !== undefined}
         camera={editingRtsp ?? null}
         onClose={() => setEditingRtsp(undefined)}
-        onSaved={() => cameraSummaries.reload()}
+        onSaved={async () => {
+          if (editingRtsp) resetRtspFastPoll(editingRtsp.id);
+          await refreshRtspSummaries();
+        }}
       />
 
       <SettingsDrawer open={settingsOpen} onClose={() => setSettingsOpen(false)} />

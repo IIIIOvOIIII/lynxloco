@@ -362,6 +362,104 @@ async def test_edit_replaces_password_only_when_non_empty() -> None:
 
 
 @pytest.mark.asyncio
+async def test_edit_enabled_source_probes_complete_candidate_before_persist_and_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _ConfigStore([_source(enabled=True)])
+    perception = _Perception()
+    events: list[str] = []
+    seen: list[RtspSourceSettings] = []
+
+    async def probe(candidate: RtspSourceSettings) -> RtspProbeResult:
+        events.append("probe")
+        seen.append(candidate)
+        return _probe_result()
+
+    original_mutate = store.mutate
+
+    def mutate(mutation):
+        events.append("persist")
+        return original_mutate(mutation)
+
+    async def sync() -> bool:
+        events.append("sync")
+        perception.sync_count += 1
+        return True
+
+    monkeypatch.setattr(store, "mutate", mutate)
+    monkeypatch.setattr(perception, "sync_camera_sources", sync)
+
+    edited = await _service(store, perception, probe=probe).edit_rtsp(
+        SOURCE_ID,
+        _upsert(name="Renamed", uri="rtsps://new-camera.local/live", password=""),
+    )
+
+    assert events == ["probe", "persist", "sync"]
+    assert seen == [store.sources[0]]
+    assert seen[0].enabled is True
+    assert seen[0].password == "stored-secret"
+    assert edited.enabled is True
+
+
+@pytest.mark.asyncio
+async def test_edit_enabled_probe_failure_preserves_persisted_and_runtime_source() -> (
+    None
+):
+    original = _source(enabled=True)
+    store = _ConfigStore([original])
+    perception = _Perception()
+    old_runtime = perception._rtsp_camera_source
+    seen: list[RtspSourceSettings] = []
+
+    async def probe(candidate: RtspSourceSettings) -> RtspProbeResult:
+        seen.append(candidate)
+        raise RtspSourceError(
+            "authentication_failed", "RTSP authentication failed", recoverable=False
+        )
+
+    with pytest.raises(RtspSourceError) as caught:
+        await _service(store, perception, probe=probe).edit_rtsp(
+            SOURCE_ID,
+            _upsert(
+                name="New private name",
+                uri="rtsps://private-new.example/secret-path",
+                password="",
+            ),
+        )
+
+    assert seen[0].password == "stored-secret"
+    assert seen[0].enabled is True
+    assert store.write_count == 0
+    assert store.sources == [original]
+    assert perception.sync_count == 0
+    assert perception._rtsp_camera_source is old_runtime
+    assert caught.value.code == "authentication_failed"
+    assert str(caught.value) == "RTSP authentication failed"
+    assert "secret-path" not in repr(caught.value)
+    assert "stored-secret" not in repr(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_edit_disabled_source_still_allows_offline_save_without_probe() -> None:
+    store = _ConfigStore([_source(enabled=False)])
+    perception = _Perception()
+
+    async def forbidden_probe(_candidate: RtspSourceSettings) -> RtspProbeResult:
+        raise AssertionError("disabled edit must not probe")
+
+    edited = await _service(store, perception, probe=forbidden_probe).edit_rtsp(
+        SOURCE_ID,
+        _upsert(uri="rtsp://offline-camera.local/live", password=""),
+    )
+
+    assert edited.enabled is False
+    assert store.sources[0].uri == "rtsp://offline-camera.local/live"
+    assert store.sources[0].password == "stored-secret"
+    assert store.write_count == 1
+    assert perception.sync_count == 1
+
+
+@pytest.mark.asyncio
 async def test_test_source_does_not_write_or_hot_apply() -> None:
     store = _ConfigStore([_source()])
     perception = _Perception()
