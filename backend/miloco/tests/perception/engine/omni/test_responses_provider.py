@@ -64,6 +64,31 @@ def _responses_payload() -> dict[str, Any]:
     }
 
 
+def _live_settings(
+    *,
+    model: str,
+    base_url: str,
+    api_key: str,
+    api_protocol: str | None,
+):
+    class _Omni:
+        pass
+
+    current = _Omni()
+    current.model = model
+    current.base_url = base_url
+    current.api_key = api_key
+    current.api_protocol = api_protocol
+
+    class _Model:
+        omni = current
+
+    class _Settings:
+        model = _Model()
+
+    return _Settings()
+
+
 class _Response:
     status_code = 200
     headers: dict[str, str] = {}
@@ -435,6 +460,148 @@ async def test_existing_chat_protocol_still_requires_a_key(monkeypatch) -> None:
         await omni_client.call_omni(
             {"system_prompt": "system", "user_content": "user"}, config
         )
+
+
+@pytest.mark.asyncio
+async def test_live_switch_to_keyless_responses_never_sends_old_cloud_key(
+    monkeypatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+    old_snapshot = OmniConfig(
+        model="cloud-chat",
+        base_url="https://cloud.example/v1",
+        api_key="OLD_CLOUD_SECRET",
+        api_protocol="openai_chat_completions",
+    )
+    monkeypatch.setattr(
+        "miloco.config.get_settings",
+        lambda: _live_settings(
+            model="local-vlm",
+            base_url="http://127.0.0.1:8000/v1/",
+            api_key="",
+            api_protocol="openai_responses",
+        ),
+    )
+    monkeypatch.delenv("MILOCO_MODEL__OMNI__API_KEY", raising=False)
+    monkeypatch.setattr(
+        omni_client.httpx,
+        "AsyncClient",
+        _capturing_client(
+            {"output": [{"content": [{"type": "output_text", "text": "local"}]}]},
+            calls,
+        ),
+    )
+
+    resolved = omni_client.resolve_live_omni_config(old_snapshot)
+    result = await omni_client.call_omni(_responses_payload(), resolved)
+
+    assert resolved.api_key == ""
+    assert result["choices"][0]["message"]["content"] == "local"
+    assert calls[0]["url"] == "http://127.0.0.1:8000/v1/responses"
+    assert "Authorization" not in calls[0]["headers"]
+    assert "OLD_CLOUD_SECRET" not in repr(calls)
+    assert omni_client._maybe_reset_breaker_on_config_change._last_triple == (
+        "openai_responses",
+        "local-vlm",
+        "http://127.0.0.1:8000/v1/",
+        "",
+    )
+
+
+@pytest.mark.parametrize(
+    ("current_protocol", "current_model", "current_base_url"),
+    [
+        ("openai_responses", "same-model", "https://same.example/v1"),
+        ("openai_chat_completions", "different-model", "https://same.example/v1"),
+        ("openai_chat_completions", "same-model", "https://other.example/v1"),
+    ],
+)
+def test_live_identity_change_never_inherits_snapshot_key(
+    monkeypatch,
+    current_protocol: str,
+    current_model: str,
+    current_base_url: str,
+) -> None:
+    base = OmniConfig(
+        model="same-model",
+        base_url="https://same.example/v1",
+        api_key="OLD_ENDPOINT_SECRET",
+        api_protocol="openai_chat_completions",
+    )
+    monkeypatch.setattr(
+        "miloco.config.get_settings",
+        lambda: _live_settings(
+            model=current_model,
+            base_url=current_base_url,
+            api_key="",
+            api_protocol=current_protocol,
+        ),
+    )
+
+    resolved = omni_client.resolve_live_omni_config(base)
+
+    assert resolved.api_key == ""
+
+
+@pytest.mark.parametrize(
+    ("base_protocol", "current_protocol", "current_base_url"),
+    [
+        (
+            "openai_chat_completions",
+            "openai_chat_completions",
+            "https://same.example/v1",
+        ),
+        (None, "openai_chat_completions", "https://same.example/v1"),
+        ("openai_chat_completions", None, "https://same.example/v1/"),
+    ],
+)
+def test_same_effective_identity_preserves_snapshot_key_when_current_key_empty(
+    monkeypatch,
+    base_protocol: str | None,
+    current_protocol: str | None,
+    current_base_url: str,
+) -> None:
+    base = OmniConfig(
+        model="same-model",
+        base_url="https://same.example/v1",
+        api_key="SNAPSHOT_KEY",
+        api_protocol=base_protocol,
+    )
+    monkeypatch.setattr(
+        "miloco.config.get_settings",
+        lambda: _live_settings(
+            model="same-model",
+            base_url=current_base_url,
+            api_key="",
+            api_protocol=current_protocol,
+        ),
+    )
+
+    resolved = omni_client.resolve_live_omni_config(base)
+
+    assert resolved.api_key == "SNAPSHOT_KEY"
+
+
+def test_explicit_current_key_always_overrides_snapshot_key(monkeypatch) -> None:
+    base = OmniConfig(
+        model="old-model",
+        base_url="https://old.example/v1",
+        api_key="OLD_KEY",
+        api_protocol="openai_chat_completions",
+    )
+    monkeypatch.setattr(
+        "miloco.config.get_settings",
+        lambda: _live_settings(
+            model="new-model",
+            base_url="https://new.example/v1",
+            api_key="NEW_KEY",
+            api_protocol="openai_responses",
+        ),
+    )
+
+    resolved = omni_client.resolve_live_omni_config(base)
+
+    assert resolved.api_key == "NEW_KEY"
 
 
 @pytest.mark.asyncio

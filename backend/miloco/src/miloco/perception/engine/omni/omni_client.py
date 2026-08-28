@@ -147,7 +147,9 @@ def resolve_live_omni_config(base: OmniConfig) -> OmniConfig:
     感知引擎启动时把 OmniConfig 当快照持有,故 web 改配置默认要重启才生效。
     在每次 omni 调用前用本函数取一次当前 settings(``update_shared_config`` 写完已
     ``reset_settings()`` 清缓存),即可让新模型在**下一个推理周期**自动生效,无需重启
-    进程、不重建引擎。api_key 为空时退回快照值,最终调用点 ``resolve_api_key`` 仍会兜底环境变量。
+    进程、不重建引擎。只有调用身份（有效协议、model、规范化 base_url）未变化时，
+    当前空 api_key 才退回快照值；切换身份时空 key 是有效选择，不能把旧端点凭据带到新端点。
+    最终调用点 ``resolve_api_key`` 仍会兜底环境变量。
 
     副作用:调用身份 (resolved protocol, model, base_url, resolved key) 变化时清熔断状态
     到 CLOSED。覆盖所有配置源
@@ -158,11 +160,18 @@ def resolve_live_omni_config(base: OmniConfig) -> OmniConfig:
     from miloco.config import get_settings
 
     o = get_settings().model.omni
+    same_identity = (
+        resolve_api_protocol(base.api_protocol, base.model)
+        == resolve_api_protocol(o.api_protocol, o.model)
+        and base.model == o.model
+        and base.base_url.rstrip("/") == o.base_url.rstrip("/")
+    )
+    api_key = (o.api_key or base.api_key) if same_identity else o.api_key
     resolved = replace(
         base,
         model=o.model,
         base_url=o.base_url,
-        api_key=o.api_key or base.api_key,
+        api_key=api_key,
         api_protocol=o.api_protocol,
     )
     _maybe_reset_breaker_on_config_change(resolved)
