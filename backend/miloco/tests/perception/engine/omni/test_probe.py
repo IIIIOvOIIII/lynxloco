@@ -4,11 +4,67 @@ from __future__ import annotations
 
 import base64
 import io
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
 import pytest
 from miloco.perception.engine.omni import probe
 from PIL import Image
+
+
+@pytest.fixture
+def recording_http_server():
+    requests: list[dict] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def _record(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length) if length else b""
+            requests.append(
+                {
+                    "method": self.command,
+                    "path": self.path,
+                    "headers": dict(self.headers),
+                    "body": json.loads(body) if body else None,
+                }
+            )
+
+        def _json(self, payload: dict, status: int = 200):
+            raw = json.dumps(payload).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_GET(self):  # noqa: N802
+            self._record()
+            if self.path == "/v1/models":
+                self._json({"data": [{"id": "gemini-named-local-model"}]})
+            else:
+                self._json({}, 404)
+
+        def do_POST(self):  # noqa: N802
+            self._record()
+            if self.path == "/v1/chat/completions":
+                self._json({"choices": []})
+            else:
+                self._json({}, 404)
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}/v1", requests
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
 
 
 class _FakeResp:
@@ -910,3 +966,25 @@ async def test_explicit_gemini_probe_protocol_overrides_model_name(monkeypatch):
     ]
     assert calls[0][2]["headers"]["x-goog-api-key"] == "gemini-key"
     assert "Authorization" not in calls[0][2]["headers"]
+
+
+async def test_explicit_chat_protocol_survives_real_http_probe_for_gemini_named_model(
+    recording_http_server,
+):
+    base_url, requests = recording_http_server
+
+    result = await probe.probe_omni(
+        "gemini-named-local-model",
+        base_url,
+        "chat-key",
+        api_protocol="openai_chat_completions",
+    )
+
+    assert result["ok"] is True
+    assert [(request["method"], request["path"]) for request in requests] == [
+        ("GET", "/v1/models"),
+        ("POST", "/v1/chat/completions"),
+    ]
+    for request in requests:
+        assert request["headers"]["Authorization"] == "Bearer chat-key"
+        assert "x-goog-api-key" not in request["headers"]

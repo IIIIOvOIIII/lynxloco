@@ -865,11 +865,13 @@ def _key_by_label(
     *,
     base_url: str | None = None,
     api_protocol: OmniApiProtocol | None = None,
+    model: str | None = None,
 ) -> str:
     """provided 非空用它;否则取该 label 档案(或当前生效配置)已存的 key。
 
-    base_url 非 None 时,还要求档案里存的 base_url 与传入一致,否则不沿用 key
-    (返 "" 让调用方走 no_key 分支)。这是防"跨 URL 复用凭证"—— 攻击者拿到
+    base_url / api_protocol / model 非 None 时,还要求档案 identity 与传入一致,否则不沿用 key
+    (返 "" 让调用方走 no_key 分支)。model 为 None 的模型发现路径只比较 URL+协议。
+    这是防"跨 identity 复用凭证"—— 攻击者拿到
     admin token 后可以:
       - upsert:改档案 base_url 但 api_key 留空 → 沿用旧 key(可能是云 provider 真 key)
       - test / list_models:传新 base_url + 已存档案 label → 后端拿档案里的 key 送到新 URL
@@ -899,7 +901,8 @@ def _key_by_label(
             api_protocol is None
             or resolve_api_protocol(stored_protocol, stored_model) == api_protocol
         )
-        return url_matches and protocol_matches
+        model_matches = model is None or stored_model == model
+        return url_matches and protocol_matches and model_matches
 
     # 命中当前生效配置(含 label 为空、按展示 label 合成的「当前生效行」)→ 回退其 key。
     if m.omni.api_key and label in (m.omni.label, _active_display_label()):
@@ -1004,7 +1007,7 @@ class OmniConfigBody(BaseModel):
     base_url: str
     model: str
     api_protocol: OmniApiProtocol
-    api_key: str | None = None  # 留空 = 沿用该档案原 key(不被打码值覆盖)
+    api_key: str | None = None  # 留空 = 仅同 URL+协议+model identity 沿用旧 key
     original_label: str | None = None  # 正在编辑的档案原名(支持改名/定位);None=新增
     activate: bool = True  # True=同时设为当前生效;False=只入列表(激活由 /activate 负责)
 
@@ -1057,12 +1060,13 @@ async def put_omni_config(
     clash = next((p for p in profiles if p["label"] == label and p is not target), None)
     if clash:
         raise HTTPException(status_code=409, detail=f"档案名「{label}」已存在")
-    # 传 base_url 让 _key_by_label 校验"URL 未变才沿用旧 key",防跨 URL 复用凭证。
+    # PUT 有完整 target identity；URL、协议、model 均不变时才允许沿用旧 key。
     key = _key_by_label(
         orig or label,
         body.api_key,
         base_url=base_url,
         api_protocol=body.api_protocol,
+        model=model,
     )
     entry = {
         "label": label,
@@ -1235,13 +1239,13 @@ async def test_omni_config(
     omni = get_settings().model.omni
     model = (body.model or omni.model).strip()
     base_url = (body.base_url or omni.base_url).strip()
-    # base_url 传入 _key_by_label:test 端点不写盘,是隐蔽性最高的钓鱼跳板——攻击者
-    # 只需一次调用就能让后端把已存的真 key 送到攻击者的 base_url。校验 URL 一致才沿用。
+    # test 端点不写盘,是隐蔽性最高的凭据跳板；完整 identity 一致才沿用旧 key。
     api_key = _key_by_label(
         (body.label or omni.label or "").strip(),
         body.api_key,
         base_url=base_url,
         api_protocol=body.api_protocol,
+        model=model,
     )
     if not api_key and body.api_protocol != "openai_responses":
         return NormalResponse(

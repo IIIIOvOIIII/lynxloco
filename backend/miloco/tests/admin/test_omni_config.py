@@ -322,6 +322,20 @@ def test_edit_legacy_gemini_profile_reuses_key_only_for_resolved_protocol(
             "gemini_native",
         )
     ]
+    changed = client.put(
+        "/api/admin/omni-config",
+        json={
+            "label": "legacy-gemini",
+            "original_label": "legacy-gemini",
+            "model": "gemini-vision-v2",
+            "base_url": "https://gemini.example/v1",
+            "api_protocol": "gemini_native",
+            "activate": True,
+        },
+    )
+    assert changed.status_code == 400
+    assert changed.json()["detail"]["code"] == "no_key"
+    assert len(calls) == 1
 
 
 # ─── GET / PUT / 档案(label=id) ────────────────────────────────────────────
@@ -451,7 +465,7 @@ def test_second_profile_has_independent_key(client):
     assert yi["has_key"] is False
 
 
-def test_update_same_label_blank_key_keeps_it(client):
+def test_update_same_identity_blank_key_keeps_it(client):
     client.put(
         "/api/admin/omni-config",
         json={
@@ -462,20 +476,122 @@ def test_update_same_label_blank_key_keeps_it(client):
             "api_key": "sk-keyforjia12",
         },
     )
-    # 同名再存、不传 key、改了 model → key 沿用
+    # 归一化 URL、协议、model 都相同，同名再存且不传 key → key 沿用。
     out = client.put(
         "/api/admin/omni-config",
         json={
             "label": "甲",
-            "model": "m2",
-            "base_url": "https://x/v1",
+            "model": "m1",
+            "base_url": "https://x/v1/",
             "api_protocol": "openai_chat_completions",
             "original_label": "甲",
         },
     ).json()["data"]
-    assert out["active"]["model"] == "m2"
+    assert out["active"]["model"] == "m1"
     assert out["active"]["has_key"] is True
     assert len(out["profiles"]) == 1  # 同名 = 同一档案,未新增
+
+
+def test_update_changed_model_with_explicit_new_key_succeeds(client, monkeypatch):
+    client.put(
+        "/api/admin/omni-config",
+        json={
+            "label": "甲",
+            "model": "m1",
+            "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
+            "api_key": "old-key",
+            "activate": False,
+        },
+    )
+    calls = []
+
+    async def _probe(model, base_url, api_key, api_protocol):
+        calls.append((model, base_url, api_key, api_protocol))
+        return {"ok": True, "code": "ok", "message": "连接正常"}
+
+    monkeypatch.setattr("miloco.admin.router._probe.probe_omni", _probe)
+    response = client.put(
+        "/api/admin/omni-config",
+        json={
+            "label": "甲",
+            "original_label": "甲",
+            "model": "m2",
+            "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
+            "api_key": "new-key",
+            "activate": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert calls == [("m2", "https://x/v1", "new-key", "openai_chat_completions")]
+
+
+def test_update_responses_changed_model_blank_key_drops_old_key(client):
+    client.put(
+        "/api/admin/omni-config",
+        json={
+            "label": "local",
+            "model": "vision-v1",
+            "base_url": "http://127.0.0.1:8000/v1",
+            "api_protocol": "openai_responses",
+            "api_key": "optional-old-key",
+            "activate": False,
+        },
+    )
+    response = client.put(
+        "/api/admin/omni-config",
+        json={
+            "label": "local",
+            "original_label": "local",
+            "model": "vision-v2",
+            "base_url": "http://127.0.0.1:8000/v1/",
+            "api_protocol": "openai_responses",
+            "activate": False,
+        },
+    )
+
+    assert response.status_code == 200
+    profile = response.json()["data"]["profiles"][0]
+    assert profile["model"] == "vision-v2"
+    assert profile["has_key"] is False
+
+
+def test_test_changed_model_blank_key_does_not_probe_with_saved_key(
+    client, monkeypatch
+):
+    client.put(
+        "/api/admin/omni-config",
+        json={
+            "label": "saved",
+            "model": "vision-v1",
+            "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
+            "api_key": "saved-key",
+            "activate": False,
+        },
+    )
+    calls = []
+
+    async def _probe(*args):
+        calls.append(args)
+        return {"ok": True, "code": "ok", "message": "连接正常"}
+
+    monkeypatch.setattr("miloco.admin.router._probe.probe_omni", _probe)
+    response = client.post(
+        "/api/admin/omni-config/test",
+        json={
+            "label": "saved",
+            "model": "vision-v2",
+            "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"]["code"] == "no_key"
+    assert calls == []
 
 
 def test_rename_via_original_label(client):
@@ -542,6 +658,7 @@ def test_put_activate_false_editing_active_still_syncs(client):
             "model": "m2",
             "base_url": "https://x/v1",
             "api_protocol": "openai_chat_completions",
+            "api_key": "sk-k222222222",
             "original_label": "甲",
             "activate": False,
         },
@@ -796,7 +913,7 @@ def test_edit_synthesized_active_empty_label_syncs_active(client):
     s.model.omni.api_key = "sk-adhoc999999"
     synth_label = _get(client)["profiles"][0]["label"]
 
-    # 用合成 label 作 original_label 编辑(改 model、key 留空沿用),activate=false
+    # 用合成 label 作 original_label 编辑；改 model 时显式给新 key，activate=false。
     out = client.put(
         "/api/admin/omni-config",
         json={
@@ -804,12 +921,13 @@ def test_edit_synthesized_active_empty_label_syncs_active(client):
             "model": "ad-hoc-v2",
             "base_url": "https://adhoc/v1",
             "api_protocol": "openai_chat_completions",
+            "api_key": "sk-adhoc-v2-999999",
             "original_label": synth_label,
             "activate": False,
         },
     ).json()["data"]
     assert out["active"]["model"] == "ad-hoc-v2"  # 当前生效那套即时同步
-    assert out["active"]["has_key"] is True  # key 留空 → 沿用原 key
+    assert out["active"]["has_key"] is True
     assert any(
         p["label"] == synth_label and p["model"] == "ad-hoc-v2" for p in out["profiles"]
     )

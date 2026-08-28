@@ -694,9 +694,8 @@ def test_upsert_rejects_cross_url_key_reuse(client, mock_probe):
     assert r.json()["detail"]["code"] == "no_key"
 
 
-def test_upsert_same_url_blank_key_still_reuses(client, mock_probe):
-    """回归防护:仅在 base_url 变时不沿用;URL 不变、只改 model 时保留 key 沿用能力
-    (原 test_update_same_label_blank_key_keeps_it 语义,防误伤)。"""
+def test_upsert_same_url_changed_model_blank_key_is_rejected(client, mock_probe):
+    """URL 与协议相同但 model 改变时，空 Key 不得沿用旧模型凭据。"""
     client.put(
         "/api/admin/omni-config",
         json={
@@ -718,9 +717,8 @@ def test_upsert_same_url_blank_key_still_reuses(client, mock_probe):
             "original_label": "甲",
         },
     )
-    data = r.json()["data"]
-    assert data["active"]["model"] == "m2"
-    assert data["active"]["has_key"] is True  # key 仍沿用
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "no_key"
 
 
 # ─── PUT / activate 成功后立即 reset 熔断状态 (review #2 回归) ────────────
