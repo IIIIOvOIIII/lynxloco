@@ -43,6 +43,7 @@ import type {
   Task,
   UsagePeriod,
   UsageStats,
+  OmniApiProtocol,
   OmniConfigState,
   OmniConfigUpdate,
   OmniHealth,
@@ -551,6 +552,7 @@ export async function deactivateOmniConfig(
 
 export async function listOmniModels(input: {
   base_url: string;
+  api_protocol: OmniApiProtocol;
   api_key?: string;
   label?: string;
 }): Promise<OmniModelsResult> {

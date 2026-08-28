@@ -117,7 +117,7 @@ async def test_fetch_models_ok(monkeypatch):
         "AsyncClient",
         _fake_async_client(resp=_FakeResp(200, {"data": [{"id": "m1"}, {"id": "m2"}]})),
     )
-    r = await probe.fetch_models("https://ok/v1", "sk-x")
+    r = await probe.fetch_models("https://ok/v1", "sk-x", "openai_chat_completions")
     assert r == {"ok": True, "models": ["m1", "m2"]}
 
 
@@ -125,7 +125,7 @@ async def test_fetch_models_bad_key_on_401(monkeypatch):
     monkeypatch.setattr(
         probe.httpx, "AsyncClient", _fake_async_client(resp=_FakeResp(401))
     )
-    r = await probe.fetch_models("https://ok/v1", "sk-x")
+    r = await probe.fetch_models("https://ok/v1", "sk-x", "openai_chat_completions")
     assert r["ok"] is False and r["code"] == "bad_key"
 
 
@@ -133,8 +133,98 @@ async def test_fetch_models_unreachable_on_exception(monkeypatch):
     monkeypatch.setattr(
         probe.httpx, "AsyncClient", _fake_async_client(exc=httpx.ConnectError("nope"))
     )
-    r = await probe.fetch_models("https://ok/v1", "sk-x")
+    r = await probe.fetch_models("https://ok/v1", "sk-x", "openai_chat_completions")
     assert r["ok"] is False and r["code"] == "unreachable"
+
+
+async def test_fetch_models_chat_protocol_overrides_gemini_hostname(monkeypatch):
+    """显式 Chat 协议必须决定鉴权和解析，URL 主机名不得覆盖它。"""
+    calls: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_async_client(
+            resp=_FakeResp(200, {"data": [{"id": "openai-shape"}]}),
+            calls=calls,
+        ),
+    )
+
+    result = await probe.fetch_models(
+        "https://generativelanguage.googleapis.com/v1beta",
+        "chat-key",
+        "openai_chat_completions",
+    )
+
+    assert result == {"ok": True, "models": ["openai-shape"]}
+    headers = calls[0][2]["headers"]
+    assert headers == {"Authorization": "Bearer chat-key"}
+
+
+async def test_fetch_models_gemini_protocol_overrides_arbitrary_hostname(monkeypatch):
+    """显式 Gemini 协议在任意代理 URL 上仍使用 Gemini 鉴权和响应形状。"""
+    calls: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_async_client(
+            resp=_FakeResp(200, {"models": [{"name": "models/gemini-proxy"}]}),
+            calls=calls,
+        ),
+    )
+
+    result = await probe.fetch_models(
+        "https://proxy.example/v1beta",
+        "gemini-key",
+        "gemini_native",
+    )
+
+    assert result == {"ok": True, "models": ["gemini-proxy"]}
+    headers = calls[0][2]["headers"]
+    assert headers == {"x-goog-api-key": "gemini-key"}
+
+
+@pytest.mark.parametrize("status", [404, 405])
+async def test_fetch_models_responses_treats_missing_endpoint_as_unsupported(
+    monkeypatch, status
+):
+    """Responses 可没有 /models；稳定返回空发现结果，让用户继续手填并做视觉预检。"""
+    calls: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_async_client(resp=_FakeResp(status), calls=calls),
+    )
+
+    result = await probe.fetch_models(
+        "https://responses.example/v1",
+        "",
+        "openai_responses",
+    )
+
+    assert result == {
+        "ok": True,
+        "code": "unsupported",
+        "models": [],
+        "message": "该协议不支持模型发现，请手动填写模型",
+    }
+    assert calls[0][2]["headers"] == {}
+
+
+async def test_fetch_models_responses_adds_bearer_only_when_key_present(monkeypatch):
+    calls: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_async_client(resp=_FakeResp(200, {"data": []}), calls=calls),
+    )
+
+    await probe.fetch_models(
+        "https://responses.example/v1",
+        "responses-key",
+        "openai_responses",
+    )
+
+    assert calls[0][2]["headers"] == {"Authorization": "Bearer responses-key"}
 
 
 # ─── probe_chat ─────────────────────────────────────────────────────────────
@@ -256,7 +346,7 @@ async def test_probe_omni_rejects_file_scheme():
 
 
 async def test_fetch_models_rejects_ftp_scheme():
-    r = await probe.fetch_models("ftp://x/y", "sk-x")
+    r = await probe.fetch_models("ftp://x/y", "sk-x", "openai_chat_completions")
     assert r["ok"] is False and r["code"] == "unreachable" and r["models"] == []
 
 

@@ -76,28 +76,27 @@ async def probe_reachable(base_url: str) -> dict | None:
     return {"code": "http_error", "message": f"服务返回异常（HTTP {r.status_code}）"}
 
 
-async def fetch_models(base_url: str, api_key: str) -> dict[str, Any]:
+async def fetch_models(
+    base_url: str,
+    api_key: str,
+    api_protocol: OmniApiProtocol,
+) -> dict[str, Any]:
     """拉取 provider 模型列表(GET /models)。
 
-    模型下拉在「选定 model 之前」拉取,没有 model 可路由 adapter,故按 base_url 判 provider:
-    Gemini 原生根(generativelanguage)用 ``x-goog-api-key`` 鉴权、响应形态 ``{models:[{name}]}``
-    (需剥 "models/" 前缀);其余按 OpenAI 兼容 ``{data:[{id}]}`` + ``Bearer`` 解析。
-    (经代理转发的 Gemini 不含该域名时,仍走 OpenAI 兼容分支——用户可手填 model 名兜底。)
+    协议由调用方显式传入,Base URL 只负责寻址,绝不参与 provider 推断。Gemini 原生
+    使用 ``x-goog-api-key`` 和 ``{models:[{name}]}``;Chat/Responses 使用 OpenAI
+    ``{data:[{id}]}`` 形状。Responses 的 Key 可空,非空时才发送 Bearer。
     """
     base, err = _normalize_base_url(base_url)
     if err is not None:
         return {"ok": False, "code": "unreachable", "models": [], "message": err}
-    # 解析出主机名精确匹配,不用子串判断(``"…" in base_url`` 会被
-    # ``https://evil.com/generativelanguage.googleapis.com`` 之类绕过——CodeQL 报的
-    # incomplete URL substring sanitization)。
-    is_gemini = (
-        urlparse(base).hostname or ""
-    ).lower() == "generativelanguage.googleapis.com"
-    headers = (
-        {"x-goog-api-key": api_key}
-        if is_gemini
-        else {"Authorization": f"Bearer {api_key}"}
-    )
+    is_gemini = api_protocol == "gemini_native"
+    if is_gemini:
+        headers = {"x-goog-api-key": api_key}
+    elif api_key:
+        headers = {"Authorization": f"Bearer {api_key}"}
+    else:
+        headers = {}
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             r = await client.get(f"{base}/models", headers=headers)
@@ -121,6 +120,13 @@ async def fetch_models(base_url: str, api_key: str) -> dict[str, Any]:
         except Exception:  # noqa: BLE001
             ids = []
         return {"ok": True, "models": sorted(i for i in ids if i)}
+    if api_protocol == "openai_responses" and r.status_code in (404, 405):
+        return {
+            "ok": True,
+            "code": "unsupported",
+            "models": [],
+            "message": "该协议不支持模型发现，请手动填写模型",
+        }
     if r.status_code in (401, 403):
         return {
             "ok": False,

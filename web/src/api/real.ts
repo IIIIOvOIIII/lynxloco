@@ -39,6 +39,7 @@ import type {
   UsageStats,
   OmniConfigState,
   OmniConfigUpdate,
+  OmniApiProtocol,
   OmniHealth,
   OmniProfileRef,
   OmniTestResult,
@@ -2043,10 +2044,14 @@ export async function realDismissUpgrade(version: string): Promise<void> {
 // 拉取某 Base URL 下可用模型列表（供模型下拉）。api_key 留空则用同 base_url 已存 key。
 export async function realListOmniModels(input: {
   base_url: string;
+  api_protocol: OmniApiProtocol;
   api_key?: string;
   label?: string;
 }): Promise<OmniModelsResult> {
-  const body: Record<string, string> = { base_url: input.base_url };
+  const body: Record<string, string> = {
+    base_url: input.base_url,
+    api_protocol: input.api_protocol,
+  };
   if (input.api_key) body.api_key = input.api_key;
   if (input.label) body.label = input.label;
   const r = await apiFetch<Normal<OmniModelsResult>>(

@@ -1,11 +1,12 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  omniDiscoveryRequest,
   omniProfileIdentity,
+  omniProtocolSelection,
   omniProtocolFormPolicy,
 } from "@/components/UsageOmniConfig";
 import { hasConfiguredOmni } from "@/components/PetAutoGenFlow";
-
 
 describe("Omni protocol form policy", () => {
   it("makes Responses key optional and presents image-only visual preflight", () => {
@@ -41,7 +42,6 @@ describe("Omni protocol form policy", () => {
   });
 });
 
-
 describe("Responses without an API key", () => {
   it("remains configured for Pet auto-generation preflight", () => {
     expect(
@@ -56,5 +56,34 @@ describe("Responses without an API key", () => {
         has_key: false,
       }),
     ).toBe(false);
+  });
+});
+
+describe("Omni protocol model discovery", () => {
+  it("clears candidates and discovery status when protocol changes", () => {
+    expect(omniProtocolSelection("gemini_native")).toEqual({
+      apiProtocol: "gemini_native",
+      models: [],
+      modelsMsg: null,
+      modelsErr: false,
+      modelsErrCode: null,
+      testResult: null,
+    });
+  });
+
+  it("builds the next explicit discovery with the selected protocol", () => {
+    expect(
+      omniDiscoveryRequest(
+        "gemini_native",
+        " https://proxy.example/v1beta/ ",
+        " gemini-key ",
+        "legacy-gemini",
+      ),
+    ).toEqual({
+      api_protocol: "gemini_native",
+      base_url: "https://proxy.example/v1beta/",
+      api_key: "gemini-key",
+      label: "legacy-gemini",
+    });
   });
 });

@@ -543,15 +543,29 @@ describe("omni 配置契约 — 多档案", () => {
     expect(cap.body).toEqual({ label: "配置2" });
   });
 
-  it("listModels：返回 {ok, models}", async () => {
-    mockFetchByUrl({
-      "/api/admin/omni-config/models": {
-        code: 0,
-        message: "ok",
-        data: { ok: true, models: ["a", "b"] },
-      },
+  it("listModels：显式序列化协议并返回 {ok, models}", async () => {
+    let body: unknown = null;
+    globalThis.fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      body = init?.body ? JSON.parse(init.body as string) : null;
+      return new Response(
+        JSON.stringify({
+          code: 0,
+          message: "ok",
+          data: { ok: true, models: ["a", "b"] },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }) as unknown as typeof fetch;
+    const res = await realListOmniModels({
+      base_url: "https://p/v1",
+      api_protocol: "openai_responses",
+      api_key: "sk-x",
     });
-    const res = await realListOmniModels({ base_url: "https://p/v1", api_key: "sk-x" });
+    expect(body).toEqual({
+      base_url: "https://p/v1",
+      api_protocol: "openai_responses",
+      api_key: "sk-x",
+    });
     expect(res.ok).toBe(true);
     expect(res.models).toEqual(["a", "b"]);
   });

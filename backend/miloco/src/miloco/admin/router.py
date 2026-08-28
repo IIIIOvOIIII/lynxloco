@@ -1279,6 +1279,7 @@ class OmniModelsBody(BaseModel):
     base_url: str
     api_key: str | None = None
     label: str | None = None
+    api_protocol: OmniApiProtocol
 
 
 @router.post(
@@ -1292,8 +1293,13 @@ async def list_omni_models(
     """用 base_url + key(留空则按 label 取该档案已存 key)请求 GET /models,返回模型 id 列表。"""
     base_url = body.base_url.strip()
     # 同 test 端点:传 base_url 校验 URL 一致才沿用旧 key,防用已存 key 拉取攻击者 URL 的 /models。
-    api_key = _key_by_label((body.label or "").strip(), body.api_key, base_url=base_url)
-    if not api_key:
+    api_key = _key_by_label(
+        (body.label or "").strip(),
+        body.api_key,
+        base_url=base_url,
+        api_protocol=body.api_protocol,
+    )
+    if not api_key and body.api_protocol != "openai_responses":
         # URL 本身错优先于「缺 key」暴露:无 key 时先探可达性,连不上→报 URL 错;能连上才报缺 key。
         reach = await _probe.probe_reachable(base_url)
         if reach is not None:
@@ -1318,7 +1324,9 @@ async def list_omni_models(
             },
         )
     return NormalResponse(
-        code=0, message="ok", data=await _probe.fetch_models(base_url, api_key)
+        code=0,
+        message="ok",
+        data=await _probe.fetch_models(base_url, api_key, body.api_protocol),
     )
 
 

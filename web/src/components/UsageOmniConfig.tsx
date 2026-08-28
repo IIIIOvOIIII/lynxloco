@@ -55,6 +55,31 @@ export function omniProtocolFormPolicy(protocol: OmniApiProtocol) {
   } as const;
 }
 
+export function omniProtocolSelection(apiProtocol: OmniApiProtocol) {
+  return {
+    apiProtocol,
+    models: [] as string[],
+    modelsMsg: null,
+    modelsErr: false,
+    modelsErrCode: null,
+    testResult: null,
+  } as const;
+}
+
+export function omniDiscoveryRequest(
+  apiProtocol: OmniApiProtocol,
+  baseUrl: string,
+  apiKey: string,
+  label?: string | null,
+) {
+  return {
+    api_protocol: apiProtocol,
+    base_url: baseUrl.trim(),
+    ...(apiKey.trim() ? { api_key: apiKey.trim() } : {}),
+    ...(label ? { label } : {}),
+  };
+}
+
 // omni 测试 / 模型列表的后端机器码 → i18n key;命中走前端本地化,
 // 未命中(如 http_error,含动态 HTTP 细节)回退后端 message。
 // 与 error_classifier.CODES 保持一致(10 个 code):测试路径撞 429 会返 rate_limited、
@@ -215,6 +240,7 @@ export function UsageOmniConfig() {
   const [modelsMsg, setModelsMsg] = useState<string | null>(null);
   const [modelsErr, setModelsErr] = useState(false); // modelsMsg 是否为错误(决定红色突出)
   const [modelsErrCode, setModelsErrCode] = useState<string | null>(null); // 错误机器码(决定就近显示在哪个字段)
+  const discoveryGeneration = useRef(0);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<OmniTestResult | null>(null);
@@ -289,23 +315,28 @@ export function UsageOmniConfig() {
     setModelsErr(false);
     setModelsErrCode(null);
     setTestResult(null);
-    void fetchModels(p.base_url, "", p.label);
+    void fetchModels(p.base_url, "", p.label, p.api_protocol);
   }
 
   // label 非空时:编辑态下未填新 key 也能让后端用该档案存档 key 拉模型(否则需 key 的厂商
   // 会回 bad_key,一打开编辑就误报红错)。
-  async function fetchModels(bu: string, key: string, label?: string | null) {
+  async function fetchModels(
+    bu: string,
+    key: string,
+    label?: string | null,
+    protocol: OmniApiProtocol = apiProtocol,
+  ) {
     if (!bu.trim()) return;
+    const generation = ++discoveryGeneration.current;
     setModelsLoading(true);
     setModelsMsg(null);
     setModelsErr(false);
     setModelsErrCode(null);
     try {
-      const res = await listOmniModels({
-        base_url: bu.trim(),
-        api_key: key.trim() || undefined,
-        label: label || undefined,
-      });
+      const res = await listOmniModels(
+        omniDiscoveryRequest(protocol, bu, key, label),
+      );
+      if (generation !== discoveryGeneration.current) return;
       if (res.ok) {
         setModels(res.models);
         if (!res.models.length) setModelsMsg(t("usage.modelsEmptyResult"));
@@ -317,12 +348,13 @@ export function UsageOmniConfig() {
         setModelsErrCode(res.code ?? null);
       }
     } catch (e) {
+      if (generation !== discoveryGeneration.current) return;
       setModels([]);
       setModelsMsg(e instanceof Error ? e.message : t("usage.modelsFetchFailed"));
       setModelsErr(true);
       setModelsErrCode("unreachable"); // 网络/解析异常归为 Base URL 不可达
     } finally {
-      setModelsLoading(false);
+      if (generation === discoveryGeneration.current) setModelsLoading(false);
     }
   }
 
@@ -722,8 +754,17 @@ export function UsageOmniConfig() {
                     <select
                       value={apiProtocol}
                       onChange={(e) => {
-                        setApiProtocol(e.target.value as OmniApiProtocol);
-                        setTestResult(null);
+                        const next = omniProtocolSelection(
+                          e.target.value as OmniApiProtocol,
+                        );
+                        discoveryGeneration.current += 1;
+                        setApiProtocol(next.apiProtocol);
+                        setModels(next.models);
+                        setModelsMsg(next.modelsMsg);
+                        setModelsErr(next.modelsErr);
+                        setModelsErrCode(next.modelsErrCode);
+                        setTestResult(next.testResult);
+                        setModelsLoading(false);
                       }}
                       className={INPUT_CLS}
                     >

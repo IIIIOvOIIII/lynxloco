@@ -134,6 +134,114 @@ def test_put_rejects_invalid_protocol_without_writing(client, tmp_path):
     assert (tmp_path / "config.json").read_bytes() == before
 
 
+def test_list_models_requires_explicit_protocol_without_writing(client, tmp_path):
+    """模型发现也必须显式选择协议；缺失时在请求验证层拒绝且不改配置。"""
+    before = (tmp_path / "config.json").read_bytes()
+
+    response = client.post(
+        "/api/admin/omni-config/models",
+        json={"base_url": "https://models.example/v1", "api_key": "sk-x"},
+    )
+
+    assert response.status_code == 422
+    assert (tmp_path / "config.json").read_bytes() == before
+
+
+def test_list_models_same_url_cross_protocol_does_not_reuse_key(client, monkeypatch):
+    """相同 URL 也不能把 Chat 档案的 Key 带入 Responses 模型发现。"""
+    client.put(
+        "/api/admin/omni-config",
+        json={
+            "label": "shared-url",
+            "model": "vision",
+            "base_url": "https://models.example/v1",
+            "api_protocol": "openai_chat_completions",
+            "api_key": "chat-secret",
+            "activate": False,
+        },
+    )
+    calls = []
+
+    async def _fetch(base_url, api_key, api_protocol):
+        calls.append((base_url, api_key, api_protocol))
+        return {"ok": True, "code": "unsupported", "models": []}
+
+    monkeypatch.setattr("miloco.admin.router._probe.fetch_models", _fetch)
+
+    response = client.post(
+        "/api/admin/omni-config/models",
+        json={
+            "label": "shared-url",
+            "base_url": "https://models.example/v1",
+            "api_protocol": "openai_responses",
+        },
+    )
+
+    assert response.status_code == 200
+    assert calls == [("https://models.example/v1", "", "openai_responses")]
+
+
+def test_list_models_legacy_gemini_reuses_key_only_for_resolved_identity(
+    client, monkeypatch
+):
+    """旧 Gemini 的 None 协议只可按解析后的 Gemini identity 沿用 Key。"""
+    from miloco.config.settings import OmniModelSettings, get_settings
+
+    get_settings().model.omni_profiles = [
+        OmniModelSettings(
+            label="legacy-gemini",
+            model="gemini-vision",
+            base_url="https://proxy.example/v1beta",
+            api_key="gemini-secret",
+            api_protocol=None,
+        )
+    ]
+    calls = []
+
+    async def _fetch(base_url, api_key, api_protocol):
+        calls.append((base_url, api_key, api_protocol))
+        return {"ok": True, "models": []}
+
+    async def _reachable(_base_url):
+        return None
+
+    monkeypatch.setattr("miloco.admin.router._probe.fetch_models", _fetch)
+    monkeypatch.setattr("miloco.admin.router._probe.probe_reachable", _reachable)
+
+    gemini = client.post(
+        "/api/admin/omni-config/models",
+        json={
+            "label": "legacy-gemini",
+            "base_url": "https://proxy.example/v1beta",
+            "api_protocol": "gemini_native",
+        },
+    )
+    chat = client.post(
+        "/api/admin/omni-config/models",
+        json={
+            "label": "legacy-gemini",
+            "base_url": "https://proxy.example/v1beta",
+            "api_protocol": "openai_chat_completions",
+        },
+    )
+    responses = client.post(
+        "/api/admin/omni-config/models",
+        json={
+            "label": "legacy-gemini",
+            "base_url": "https://proxy.example/v1beta",
+            "api_protocol": "openai_responses",
+        },
+    )
+
+    assert gemini.status_code == 200
+    assert chat.json()["data"]["code"] == "no_key"
+    assert responses.status_code == 200
+    assert calls == [
+        ("https://proxy.example/v1beta", "gemini-secret", "gemini_native"),
+        ("https://proxy.example/v1beta", "", "openai_responses"),
+    ]
+
+
 def test_put_responses_allows_blank_key_and_persists_protocol(client, monkeypatch):
     """Responses 本地端点可以无 Key，但 probe 和持久化必须收到显式协议。"""
     calls = []
@@ -1012,7 +1120,11 @@ def test_list_models_no_key(client, monkeypatch):
         probe.httpx, "AsyncClient", _fake_async_client(resp=_FakeResp(401))
     )
     data = client.post(
-        "/api/admin/omni-config/models", json={"base_url": "https://x/v1"}
+        "/api/admin/omni-config/models",
+        json={
+            "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
+        },
     ).json()["data"]
     assert data["ok"] is False
     assert data["code"] == "no_key"
@@ -1028,7 +1140,11 @@ def test_list_models_no_key_unreachable_url_reports_url_first(client, monkeypatc
         probe.httpx, "AsyncClient", _fake_async_client(exc=httpx.ConnectError("boom"))
     )
     data = client.post(
-        "/api/admin/omni-config/models", json={"base_url": "https://nope.invalid/v1"}
+        "/api/admin/omni-config/models",
+        json={
+            "base_url": "https://nope.invalid/v1",
+            "api_protocol": "openai_chat_completions",
+        },
     ).json()["data"]
     assert data["ok"] is False
     assert data["code"] == "unreachable"  # URL 错优先于缺 key
@@ -1045,7 +1161,11 @@ def test_list_models_no_key_bad_url_404_reports_url_first(client, monkeypatch):
         _fake_async_client(resp=_FakeResp(404, text="<html>404 openresty</html>")),
     )
     data = client.post(
-        "/api/admin/omni-config/models", json={"base_url": "https://wrong.example/v1"}
+        "/api/admin/omni-config/models",
+        json={
+            "base_url": "https://wrong.example/v1",
+            "api_protocol": "openai_chat_completions",
+        },
     ).json()["data"]
     assert data["ok"] is False
     assert data["code"] == "http_error"  # 地址错优先于缺 key,且不泄漏原始 HTML
@@ -1124,7 +1244,7 @@ def test_fetch_models_gemini_parses_name_and_goog_key(client, monkeypatch):
         "/api/admin/omni-config/models",
         json={
             "base_url": "https://generativelanguage.googleapis.com/v1beta",
-            "api_protocol": "openai_chat_completions",
+            "api_protocol": "gemini_native",
             "api_key": "k",
         },
     ).json()["data"]

@@ -651,7 +651,11 @@ def test_list_models_rejects_cross_url_key_reuse(client, mock_probe):
     )
     r = client.post(
         "/api/admin/omni-config/models",
-        json={"label": "甲", "base_url": "https://api.evil.com/v1"},
+        json={
+            "label": "甲",
+            "base_url": "https://api.evil.com/v1",
+            "api_protocol": "openai_chat_completions",
+        },
     )
     data = r.json()["data"]
     assert data["ok"] is False
