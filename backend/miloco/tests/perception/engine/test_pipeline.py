@@ -6,8 +6,9 @@ from unittest.mock import AsyncMock, patch
 
 import numpy as np
 import pytest
+from miloco.config.settings import OmniApiProtocol
 from miloco.perception.engine.api import PerceptionEngine
-from miloco.perception.engine.config import PerceptionConfig
+from miloco.perception.engine.config import OmniConfig, PerceptionConfig
 from miloco.perception.engine.gate.visual_gate import _preprocess
 from miloco.perception.engine.identity.tracking_service import (
     MockTrackingService,
@@ -570,6 +571,73 @@ async def test_query_rooms_run_concurrently():
     assert max_concurrent == 2, f"on_demand 未并发, max={max_concurrent}"
     assert results["study-room"].answer == "有人在"
     assert results["kitchen"].answer == "有人在"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("protocol", "model", "expected_media_mode"),
+    [
+        ("openai_responses", "local-vlm", "image_sequence"),
+        ("openai_chat_completions", "mimo-v2.5", "video_audio"),
+        ("gemini_native", "gemini-3-flash", "video_audio"),
+    ],
+)
+async def test_query_uses_one_live_protocol_snapshot_for_prompt_and_call(
+    protocol: OmniApiProtocol,
+    model: str,
+    expected_media_mode: str,
+):
+    """Query prompt media and HTTP call must share one live protocol snapshot."""
+    frames = [_solid(80, 80, 80), _solid(160, 160, 160)] * 3
+    snapshot = _make_snapshot(
+        "study-room", "cam-query", frames, np.zeros(16000, dtype=np.int16)
+    )
+    batch = BatchedSnapshot(snapshots=[snapshot])
+    config = PerceptionConfig()
+    config.omni.api_key = "snapshot-key"
+    live = OmniConfig(
+        model=model,
+        api_protocol=protocol,
+        api_key="snapshot-key",
+    )
+    tracking = MockTrackingService(create_default_mock_response())
+    captured: dict[str, object] = {}
+
+    def capture_prompt(*, media_mode, **kwargs):
+        captured["media_mode"] = media_mode
+        return {"system_prompt": "system", "user_content": "query", "images": []}
+
+    with (
+        patch(
+            "miloco.perception.engine.pipeline.resolve_live_omni_config",
+            return_value=live,
+        ) as resolve_live,
+        patch(
+            "miloco.perception.engine.omni.prompt_builder.build_query_prompt",
+            side_effect=capture_prompt,
+        ),
+        patch(
+            "miloco.perception.engine.omni.omni_client.call_omni",
+            new_callable=AsyncMock,
+            return_value=MOCK_OMNI_RESPONSE,
+        ) as call,
+        patch(
+            "miloco.perception.engine.omni.response_parser.parse_query_response",
+            return_value="ok",
+        ),
+    ):
+        results = await run_query_pipeline(
+            batch,
+            "书房现在什么情况",
+            config,
+            get_tracking_service=lambda did, room: tracking,
+        )
+
+    assert results["study-room"].answer == "ok"
+    assert captured["media_mode"] == expected_media_mode
+    resolve_live.assert_called_once_with(config.omni)
+    assert call.await_args is not None
+    assert call.await_args.args[1] is live
 
 
 # =============================================================================

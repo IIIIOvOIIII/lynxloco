@@ -32,6 +32,7 @@ from miloco.perception.engine.omni.omni_client import (
     OmniError,
     resolve_live_omni_config,
 )
+from miloco.perception.engine.omni.provider import get_adapter
 
 if TYPE_CHECKING:
     import numpy as np
@@ -869,6 +870,11 @@ async def run_query_pipeline(
         )
         primary_did = snapshots[primary_idx].device.did if snapshots else "unknown"
 
+        live_omni_config = resolve_live_omni_config(config.omni)
+        adapter = get_adapter(
+            live_omni_config.api_protocol, live_omni_config.model
+        )
+
         # Set device context before build_query_prompt — push_clip_bytes is
         # called during video encoding inside build_query_prompt, and
         # push_omni_trace is called inside call_omni's finally block.
@@ -882,9 +888,10 @@ async def run_query_pipeline(
                 identity_packets=room_identity_packets,
                 query=query,
                 last_caption=captions.get(room_name),
+                media_mode=adapter.media_mode,
             )
             raw_response = await call_omni(
-                payload, resolve_live_omni_config(config.omni), type="on_demand"
+                payload, live_omni_config, type="on_demand"
             )
         finally:
             reset_device_context(device_ctx_token)
