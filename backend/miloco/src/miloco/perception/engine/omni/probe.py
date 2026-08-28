@@ -8,14 +8,23 @@
 
 from __future__ import annotations
 
+import base64
 import time
-from typing import Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 import httpx
 
+if TYPE_CHECKING:
+    from miloco.config.settings import OmniApiProtocol
+
 _TIMEOUT = httpx.Timeout(15.0, connect=10.0)
 _ALLOWED_SCHEMES = ("http", "https")
+_VISUAL_PROBE_IMAGE = Path(__file__).with_name("assets") / "visual_probe_red.jpg"
+_VISUAL_PROBE_PROMPT = (
+    "What is the dominant color of this image? Answer with the English color word only."
+)
 
 
 def _normalize_base_url(base_url: str) -> tuple[str | None, str | None]:
@@ -81,8 +90,8 @@ async def fetch_models(base_url: str, api_key: str) -> dict[str, Any]:
     # ``https://evil.com/generativelanguage.googleapis.com`` 之类绕过——CodeQL 报的
     # incomplete URL substring sanitization)。
     is_gemini = (
-        (urlparse(base).hostname or "").lower() == "generativelanguage.googleapis.com"
-    )
+        urlparse(base).hostname or ""
+    ).lower() == "generativelanguage.googleapis.com"
     headers = (
         {"x-goog-api-key": api_key}
         if is_gemini
@@ -138,7 +147,9 @@ class _FakeStatusResp:
     大小写不敏感 hit 行为不一致,Qwen 撞 429 时会丢掉 server 明示的 Retry-After。
     """
 
-    def __init__(self, status_code: int, json_body: dict, text: str, headers: dict | None = None):
+    def __init__(
+        self, status_code: int, json_body: dict, text: str, headers: dict | None = None
+    ):
         self.status_code = status_code
         self._json = json_body
         self.text = text
@@ -160,7 +171,10 @@ async def _probe_stream_chat(
     headers,让上层 429 分支能读 Retry-After —— 否则 forced-stream provider (Qwen)
     撞 429 时熔断退避会丢掉 server 明示的等待时长,与非流式路径 (MiMo) 行为不一致。"""
     async with client.stream(
-        "POST", url, headers=headers, json=body,
+        "POST",
+        url,
+        headers=headers,
+        json=body,
     ) as resp:
         if resp.status_code != 200:
             await resp.aread()  # 允许连接释放
@@ -179,7 +193,12 @@ async def _probe_stream_chat(
         return 500, 0, False, {}
 
 
-async def probe_chat(model: str, base_url: str, api_key: str) -> dict[str, Any]:
+async def probe_chat(
+    model: str,
+    base_url: str,
+    api_key: str,
+    api_protocol: OmniApiProtocol | None = None,
+) -> dict[str, Any]:
     """极简 chat 探测(max_tokens=1)真校验模型是否可用。
 
     走 provider adapter 生成 body,兼容不同 provider 的强制要求(Qwen 强制
@@ -189,11 +208,12 @@ async def probe_chat(model: str, base_url: str, api_key: str) -> dict[str, Any]:
     base, err = _normalize_base_url(base_url)
     if err is not None:
         return {"ok": False, "code": "unreachable", "message": err}
+    assert base is not None
     # 延迟 import 避免 probe 被 wire 时循环拉起 provider (provider 只依赖标准库,
     # 但保险起见延后到函数内)。
     from miloco.perception.engine.omni.provider import get_adapter
 
-    adapter = get_adapter(None, model)
+    adapter = get_adapter(api_protocol, model)
     body = adapter.build_request_body(
         [{"role": "user", "content": "ping"}],
         model=model,
@@ -330,28 +350,216 @@ async def probe_chat(model: str, base_url: str, api_key: str) -> dict[str, Any]:
     }
 
 
-async def probe_omni(model: str, base_url: str, api_key: str) -> dict[str, Any]:
-    """两阶段探测:GET /models 预检 → 极简 chat 真校验。
+def _retry_after_seconds(response: Any) -> float | None:
+    retry_after = response.headers.get("Retry-After")
+    if not retry_after:
+        return None
+    try:
+        return float(retry_after)
+    except ValueError:
+        return None
 
-    - GET /models 网络错 → unreachable
-    - GET /models 401/403 → bad_key
-    - GET /models 5xx → http_error
-    - 其他(含 200 / 404 等) → 回退到 chat,以其结论为准
 
-    非 OpenAI 兼容族(Gemini 等原生协议)没有等价的 GET /models 预检语义,直接走
-    adapter 化的 chat 探测(``probe_chat`` 已按 provider 取 endpoint / 鉴权)。
+def _probe_http_failure(response: Any, latency_ms: int) -> dict[str, Any]:
+    status = response.status_code
+    if status in (401, 403):
+        return {
+            "ok": False,
+            "code": "bad_key",
+            "status": status,
+            "latency_ms": latency_ms,
+            "message": "API Key 无效或无权限",
+        }
+    if status == 404:
+        return {
+            "ok": False,
+            "code": "not_found",
+            "status": status,
+            "latency_ms": latency_ms,
+            "message": "模型或地址不存在",
+        }
+    if status in (400, 422):
+        return {
+            "ok": False,
+            "code": "rejected_authed",
+            "status": status,
+            "latency_ms": latency_ms,
+            "message": "已连接，但请求被拒绝（模型名或 API Key 可能有误）",
+        }
+    if status == 429:
+        result: dict[str, Any] = {
+            "ok": False,
+            "code": "rate_limited",
+            "status": status,
+            "latency_ms": latency_ms,
+            "message": "被 provider 限流",
+        }
+        retry_after = _retry_after_seconds(response)
+        if retry_after is not None:
+            result["retry_after_seconds"] = retry_after
+        return result
+    return {
+        "ok": False,
+        "code": "http_error",
+        "status": status,
+        "latency_ms": latency_ms,
+        "message": f"服务返回异常（HTTP {status}）",
+    }
+
+
+def _responses_visual_messages() -> list[dict[str, Any]]:
+    image_data = base64.b64encode(_VISUAL_PROBE_IMAGE.read_bytes()).decode("ascii")
+    return [
+        {
+            "role": "system",
+            "content": "Answer with one short visual fact only.",
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": _VISUAL_PROBE_PROMPT},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/jpeg;base64,{image_data}",
+                    },
+                },
+            ],
+        },
+    ]
+
+
+async def _probe_responses(
+    model: str,
+    base: str,
+    api_key: str,
+) -> dict[str, Any]:
+    from miloco.perception.engine.omni.provider import OpenAIResponsesAdapter
+
+    adapter = OpenAIResponsesAdapter()
+    auth_headers = adapter.auth_headers(api_key)
+    t0 = time.monotonic()
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            models_response = await client.get(
+                f"{base}/models",
+                headers=auth_headers,
+            )
+            if not (
+                200 <= models_response.status_code < 300
+                or models_response.status_code in (404, 405)
+            ):
+                return _probe_http_failure(
+                    models_response,
+                    round((time.monotonic() - t0) * 1000),
+                )
+
+            body = adapter.build_request_body(
+                _responses_visual_messages(),
+                model=model,
+                max_tokens=16,
+                temperature=0.0,
+                top_p=1.0,
+                stream=False,
+            )
+            response = await client.post(
+                adapter.endpoint(base, model, stream=False),
+                headers={**auth_headers, "Content-Type": "application/json"},
+                json=body,
+            )
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "code": "unreachable",
+            "message": f"无法连接 Base URL（{type(exc).__name__}）",
+        }
+
+    latency_ms = round((time.monotonic() - t0) * 1000)
+    if response.status_code != 200:
+        return _probe_http_failure(response, latency_ms)
+
+    try:
+        raw = response.json()
+    except Exception:  # noqa: BLE001
+        raw = None
+    if not isinstance(raw, dict):
+        return {
+            "ok": False,
+            "code": "bad_response",
+            "status": 200,
+            "latency_ms": latency_ms,
+            "message": "Responses 视觉预检响应格式异常",
+        }
+
+    usage_warning = raw.get("usage") is None
+    try:
+        normalized = adapter.parse_response(raw)
+    except ValueError:
+        without_usage = dict(raw)
+        without_usage["usage"] = None
+        try:
+            normalized = adapter.parse_response(without_usage)
+        except ValueError:
+            return {
+                "ok": False,
+                "code": "bad_response",
+                "status": 200,
+                "latency_ms": latency_ms,
+                "message": "Responses 视觉预检响应格式异常",
+            }
+        usage_warning = True
+
+    output_text = normalized["choices"][0]["message"]["content"]
+    if not isinstance(output_text, str) or "red" not in output_text.casefold():
+        return {
+            "ok": False,
+            "code": "bad_response",
+            "status": 200,
+            "latency_ms": latency_ms,
+            "message": "Responses 服务未通过图片颜色验证",
+        }
+
+    result: dict[str, Any] = {
+        "ok": True,
+        "code": "ok",
+        "status": 200,
+        "latency_ms": latency_ms,
+        "message": "视觉预检通过",
+    }
+    if usage_warning:
+        result["warning"] = "usage_unavailable"
+    return result
+
+
+async def probe_omni(
+    model: str,
+    base_url: str,
+    api_key: str,
+    api_protocol: OmniApiProtocol | None = None,
+) -> dict[str, Any]:
+    """协议定向探测，显式 Responses 使用真实图片验证视觉能力。
+
+    Responses 先把 GET /models 当可选发现（仅 404/405 可忽略），再使用运行时
+    OpenAIResponsesAdapter 将确定性红色 JPEG 发往 /responses，并要求 output_text
+    包含 red。Chat/Gemini 保留原有两阶段/原生探测行为，不做协议回退。
+
+    缺省 api_protocol 仅用于兼容 Task6 前仍以三参数调用的现有 admin/runtime 路径。
     """
     base, err = _normalize_base_url(base_url)
     if err is not None:
         return {"ok": False, "code": "unreachable", "message": err}
+    assert base is not None
     # 延迟 import 避免顶层循环依赖。
     from miloco.perception.engine.omni.provider import (
         OpenAICompatAdapter,
         get_adapter,
     )
 
-    if not isinstance(get_adapter(None, model), OpenAICompatAdapter):
-        return await probe_chat(model, base, api_key)
+    adapter = get_adapter(api_protocol, model)
+    if api_protocol == "openai_responses":
+        return await _probe_responses(model, base, api_key)
+    if not isinstance(adapter, OpenAICompatAdapter):
+        return await probe_chat(model, base, api_key, api_protocol)
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             r = await client.get(

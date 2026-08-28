@@ -2,26 +2,40 @@
 
 from __future__ import annotations
 
+import base64
+import io
+
 import httpx
 from miloco.perception.engine.omni import probe
+from PIL import Image
 
 
 class _FakeResp:
-    def __init__(self, status_code: int, json_data: object | None = None, text: str = ""):
+    def __init__(
+        self,
+        status_code: int,
+        json_data: object | None = None,
+        text: str = "",
+        headers: dict[str, str] | None = None,
+    ):
         self.status_code = status_code
         self._json: object = json_data if json_data is not None else {}
         self.text = text
+        self.headers = httpx.Headers(headers or {})
 
     def json(self):
         return self._json
 
 
 def _fake_async_client(
-    resp: _FakeResp | None = None,
+    resp: object | None = None,
     *,
     exc: Exception | None = None,
+    get_exc: Exception | None = None,
+    post_exc: Exception | None = None,
     get_resp: _FakeResp | None = None,
     post_resp: _FakeResp | None = None,
+    calls: list[tuple[str, str, dict]] | None = None,
 ):
     g = get_resp if get_resp is not None else resp
     p = post_resp if post_resp is not None else resp
@@ -37,13 +51,19 @@ def _fake_async_client(
             return False
 
         async def get(self, *a, **k):
-            if exc:
-                raise exc
+            if calls is not None:
+                calls.append(("GET", a[0], k))
+            raised = get_exc if get_exc is not None else exc
+            if raised is not None:
+                raise raised
             return g
 
         async def post(self, *a, **k):
-            if exc:
-                raise exc
+            if calls is not None:
+                calls.append(("POST", a[0], k))
+            raised = post_exc if post_exc is not None else exc
+            if raised is not None:
+                raise raised
             return p
 
     return _C
@@ -187,9 +207,7 @@ async def test_probe_chat_bad_response_on_json_decode_error(monkeypatch):
         def json(self):
             raise _json.JSONDecodeError("Expecting value", "", 0)
 
-    monkeypatch.setattr(
-        probe.httpx, "AsyncClient", _fake_async_client(resp=_Bad200())
-    )
+    monkeypatch.setattr(probe.httpx, "AsyncClient", _fake_async_client(resp=_Bad200()))
     r = await probe.probe_chat("m1", "https://ok/v1", "sk-x")
     assert r["ok"] is False
     assert r["code"] == "bad_response"
@@ -380,7 +398,9 @@ async def test_probe_chat_uses_adapter_body_for_qwen(monkeypatch):
     monkeypatch.setattr(
         probe.httpx,
         "AsyncClient",
-        _fake_stream_client(_FakeResp(200, {"data": [{"id": "qwen-omni"}]}), stream_resp),
+        _fake_stream_client(
+            _FakeResp(200, {"data": [{"id": "qwen-omni"}]}), stream_resp
+        ),
     )
     r = await probe.probe_omni("qwen3.5-omni-plus", "https://qwen.example/v1", "sk-x")
     assert r["ok"] is True
@@ -422,10 +442,344 @@ async def test_probe_chat_stream_429_preserves_retry_after(monkeypatch):
     monkeypatch.setattr(
         probe.httpx,
         "AsyncClient",
-        _fake_stream_client(_FakeResp(200, {"data": [{"id": "qwen-omni"}]}), stream_resp),
+        _fake_stream_client(
+            _FakeResp(200, {"data": [{"id": "qwen-omni"}]}), stream_resp
+        ),
     )
     r = await probe.probe_omni("qwen3.5-omni-plus", "https://qwen.example/v1", "sk-x")
     assert r["ok"] is False
     assert r["code"] == "rate_limited"
     # 关键:Retry-After 被解析出来传给上层 _grow_backoff_locked
     assert r["retry_after_seconds"] == 45.0
+
+
+# ─── OpenAI Responses visual preflight ─────────────────────────────────────
+
+
+def _responses_output(text: str, usage: object = ...):
+    payload: dict[str, object] = {
+        "output": [
+            {
+                "type": "message",
+                "content": [{"type": "output_text", "text": text}],
+            }
+        ]
+    }
+    if usage is ...:
+        payload["usage"] = {
+            "input_tokens": 12,
+            "output_tokens": 1,
+            "total_tokens": 13,
+            "input_tokens_details": {"cached_tokens": 0},
+        }
+    elif usage is not None:
+        payload["usage"] = usage
+    return payload
+
+
+async def test_responses_visual_probe_without_key_sends_valid_red_jpeg(monkeypatch):
+    """缺失 Responses 视觉分支会让显式协议无法调用 /responses。"""
+    calls: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_async_client(
+            get_resp=_FakeResp(200, {"data": [{"id": "local-vlm"}]}),
+            post_resp=_FakeResp(200, _responses_output("RED")),
+            calls=calls,
+        ),
+    )
+
+    result = await probe.probe_omni(
+        "local-vlm",
+        "http://127.0.0.1:8000/v1",
+        "",
+        api_protocol="openai_responses",
+    )
+
+    assert result["ok"] is True
+    assert result["code"] == "ok"
+    assert "warning" not in result
+    assert [call[:2] for call in calls] == [
+        ("GET", "http://127.0.0.1:8000/v1/models"),
+        ("POST", "http://127.0.0.1:8000/v1/responses"),
+    ]
+    assert "Authorization" not in calls[0][2]["headers"]
+    assert "Authorization" not in calls[1][2]["headers"]
+
+    body = calls[1][2]["json"]
+    assert body["model"] == "local-vlm"
+    assert body["max_output_tokens"] == 16
+    assert body["stream"] is False
+    assert "temperature" not in body
+    assert "top_p" not in body
+    content = body["input"][0]["content"]
+    assert [block["type"] for block in content] == ["input_text", "input_image"]
+    assert "dominant color" in content[0]["text"].lower()
+    data_url = content[1]["image_url"]
+    assert data_url.startswith("data:image/jpeg;base64,")
+    image_bytes = base64.b64decode(data_url.partition(",")[2], validate=True)
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        image.load()
+        assert image.format == "JPEG"
+        assert image.size == (32, 32)
+        pixel = image.convert("RGB").resize((1, 1)).getpixel((0, 0))
+        assert isinstance(pixel, tuple)
+        red, green, blue = pixel
+    assert red > 240 and green < 20 and blue < 20
+
+
+async def test_responses_visual_probe_sends_bearer_key(monkeypatch):
+    calls: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_async_client(
+            get_resp=_FakeResp(200, {"data": []}),
+            post_resp=_FakeResp(200, _responses_output("red")),
+            calls=calls,
+        ),
+    )
+
+    result = await probe.probe_omni(
+        "local-vlm",
+        "https://vlm.example/v1",
+        "sk-secret",
+        api_protocol="openai_responses",
+    )
+
+    assert result["ok"] is True
+    assert calls[0][2]["headers"]["Authorization"] == "Bearer sk-secret"
+    assert calls[1][2]["headers"]["Authorization"] == "Bearer sk-secret"
+
+
+async def test_responses_visual_probe_models_not_supported_still_proves_vision(
+    monkeypatch,
+):
+    for status in (404, 405):
+        calls: list[tuple[str, str, dict]] = []
+        monkeypatch.setattr(
+            probe.httpx,
+            "AsyncClient",
+            _fake_async_client(
+                get_resp=_FakeResp(status),
+                post_resp=_FakeResp(200, _responses_output("The image is red.")),
+                calls=calls,
+            ),
+        )
+
+        result = await probe.probe_omni(
+            "local-vlm",
+            "https://vlm.example/v1",
+            "",
+            api_protocol="openai_responses",
+        )
+
+        assert result["ok"] is True
+        assert [call[0] for call in calls] == ["GET", "POST"]
+
+
+async def test_responses_visual_probe_rejects_generic_text_only_ack(monkeypatch):
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_async_client(
+            get_resp=_FakeResp(404),
+            post_resp=_FakeResp(200, _responses_output("Request acknowledged.")),
+        ),
+    )
+
+    result = await probe.probe_omni(
+        "local-vlm",
+        "https://vlm.example/v1",
+        "",
+        api_protocol="openai_responses",
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "bad_response"
+    assert "acknowledged" not in result["message"].lower()
+
+
+async def test_responses_visual_probe_rejects_missing_output_text(monkeypatch):
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_async_client(
+            get_resp=_FakeResp(404),
+            post_resp=_FakeResp(
+                200,
+                {"output": [{"content": [{"type": "refusal", "text": "red"}]}]},
+            ),
+        ),
+    )
+
+    result = await probe.probe_omni(
+        "local-vlm",
+        "https://vlm.example/v1",
+        "",
+        api_protocol="openai_responses",
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "bad_response"
+
+
+async def test_responses_visual_probe_warns_when_usage_is_missing(monkeypatch):
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_async_client(
+            get_resp=_FakeResp(404),
+            post_resp=_FakeResp(200, _responses_output("red", usage=None)),
+        ),
+    )
+
+    result = await probe.probe_omni(
+        "local-vlm",
+        "https://vlm.example/v1",
+        "",
+        api_protocol="openai_responses",
+    )
+
+    assert result["ok"] is True
+    assert result["warning"] == "usage_unavailable"
+
+
+async def test_responses_visual_probe_warns_when_usage_is_malformed(monkeypatch):
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_async_client(
+            get_resp=_FakeResp(404),
+            post_resp=_FakeResp(200, _responses_output("red", usage="not-an-object")),
+        ),
+    )
+
+    result = await probe.probe_omni(
+        "local-vlm",
+        "https://vlm.example/v1",
+        "",
+        api_protocol="openai_responses",
+    )
+
+    assert result["ok"] is True
+    assert result["warning"] == "usage_unavailable"
+
+
+async def test_responses_visual_probe_classifies_response_auth_failure(monkeypatch):
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_async_client(get_resp=_FakeResp(404), post_resp=_FakeResp(403)),
+    )
+
+    result = await probe.probe_omni(
+        "local-vlm",
+        "https://vlm.example/v1",
+        "bad-key",
+        api_protocol="openai_responses",
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "bad_key"
+    assert result["status"] == 403
+
+
+async def test_responses_visual_probe_classifies_response_timeout(monkeypatch):
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_async_client(
+            get_resp=_FakeResp(404),
+            post_exc=httpx.ReadTimeout("slow"),
+        ),
+    )
+
+    result = await probe.probe_omni(
+        "local-vlm",
+        "https://vlm.example/v1",
+        "",
+        api_protocol="openai_responses",
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "unreachable"
+    assert "slow" not in result["message"]
+
+
+async def test_responses_visual_probe_preserves_rate_limit_retry_after(monkeypatch):
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_async_client(
+            get_resp=_FakeResp(404),
+            post_resp=_FakeResp(429, headers={"Retry-After": "17"}),
+        ),
+    )
+
+    result = await probe.probe_omni(
+        "local-vlm",
+        "https://vlm.example/v1",
+        "",
+        api_protocol="openai_responses",
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "rate_limited"
+    assert result["retry_after_seconds"] == 17.0
+
+
+async def test_explicit_responses_protocol_never_falls_back_by_model_name(monkeypatch):
+    for model in ("qwen3.5-omni-plus", "gemini-vision"):
+        calls: list[tuple[str, str, dict]] = []
+        monkeypatch.setattr(
+            probe.httpx,
+            "AsyncClient",
+            _fake_async_client(
+                get_resp=_FakeResp(404),
+                post_resp=_FakeResp(200, _responses_output("red")),
+                calls=calls,
+            ),
+        )
+
+        result = await probe.probe_omni(
+            model,
+            "https://vlm.example/v1",
+            "",
+            api_protocol="openai_responses",
+        )
+
+        assert result["ok"] is True
+        assert calls[1][1] == "https://vlm.example/v1/responses"
+        assert calls[1][2]["json"]["stream"] is False
+
+
+async def test_explicit_gemini_probe_protocol_overrides_model_name(monkeypatch):
+    calls: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_async_client(
+            post_resp=_FakeResp(200, {"candidates": [{"content": {"parts": []}}]}),
+            calls=calls,
+        ),
+    )
+
+    result = await probe.probe_omni(
+        "plain-model-name",
+        "https://generativelanguage.googleapis.com/v1beta",
+        "gemini-key",
+        api_protocol="gemini_native",
+    )
+
+    assert result["ok"] is True
+    assert [call[:2] for call in calls] == [
+        (
+            "POST",
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            "plain-model-name:generateContent",
+        )
+    ]
+    assert calls[0][2]["headers"]["x-goog-api-key"] == "gemini-key"
+    assert "Authorization" not in calls[0][2]["headers"]
