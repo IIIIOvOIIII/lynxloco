@@ -118,3 +118,10 @@
 - Expected result: Plan 2 的单输入会话、H.264/H.265、转码资源、有界慢消费者、WebSocket 鉴权/关闭、MIoT 兼容、Web 管理并发、smoke 与 native cleanup 均不得存在 Critical/Important；设计文档必须与最终门禁事实一致，随后才能开始 Responses 生产代码。
 - Result: Achieved。整批代码审查未发现 Critical/Important；审查有界复跑 backend camera/Task6/session 为 215 passed、1 skipped，Web 为 368 passed、1 skipped，typecheck/build 与 scoped Ruff/ty 通过。唯一 Important 是设计文档 §18/§19 残留历史 `Partial` 表述；已在 `399e6b9` 修正并由同一审查人复核 CLEAN。Responses 账本已固定显式协议、旧档案兼容、Chat 内 MiMo/Qwen 特化、12 图硬上限、统一 normalization、视觉 preflight、管理面与 fixture/真实端点证据边界。
 - Next step: 执行 Responses Task 1，以 TDD 增加显式 `api_protocol`、旧档案解析和所有 Omni 调用点的协议感知 adapter 选择；不修改 OpenClaw/Hermes Agent 模型路径。
+
+## 2026-08-28 10:55 SGT
+
+- Current work: 完成 Responses Task 1 的显式协议配置、旧档案兼容、所有 Omni 调用点迁移及独立审查。
+- Expected result: 公开协议必须严格为 Chat Completions、Responses、Gemini native；新默认显式 Chat，旧记录缺字段时保持 `None` 到 resolver；显式值覆盖模型名且 Base URL 不参与；Chat 内 MiMo/Qwen 特化和旧 Gemini 推断保持兼容；Responses 在后续 payload/HTTP 实现前必须本地 fail closed。
+- Result: Achieved。实现提交 `4246292`。TDD 初始 backend 29 failed/29 passed、CLI 5 failed/4 passed，并额外捕获旧 active Gemini 被 YAML Chat 默认覆盖的合并缺口；修复后实现者相关回归 backend 617 passed、CLI 199 passed。独立审查有界复跑 backend 89 passed、CLI 34 passed，确认双参数 adapter 签名、breaker 协议身份、全调用点迁移和 OpenClaw/Hermes 隔离，结论 CLEAN。Responses adapter 当前仅为 fail-closed 占位，不会协议回退或发出错误网络请求。
+- Next step: 执行 Responses Task 2，增加确定性图片序列生成、最多 6 张全景与 6 张优先 crop、总数不超过 12，并保持 Chat/Gemini 原有视频/音频 payload。
