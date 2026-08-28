@@ -188,3 +188,10 @@
 - Expected result: no-key Responses 必须能在真实 proxy 中 READY；旧 Chat/Gemini 通用环境 Key 不得进入显式 Responses；env 同源显式 Responses Key 必须正常发送 Bearer；协议、模型、规范化 URL 与最终 Key 必须共同决定 admin/runtime identity；测试成功后只清理当前 active breaker。
 - Result: Achieved。首轮整批审查发现 2 Critical/2 Important；`ab99c3e`、`006d137`、`9a87c34`、`e090af2` 依次关闭 proxy readiness、协议感知凭据隔离、显式协议/模型身份、env source 归属和 admin breaker 恢复。最终原审查人复核 CLEAN，无 Critical/Important；生产聚焦矩阵 259 passed，strict localhost HTTP integration 25 passed，真实 Bearer 与 no-Authorization 两类路径均经 HTTP fixture 证明。随后当前 HEAD 的 `./scripts/local-ci.sh --tests` 6/6 通过，Hermes 185 passed/2 skipped，backend 仅保留脚本既有的 3 项 macOS node-monitor/smaps 排除。真实本地 VLM 服务版本、视觉效果、延迟、usage 与具体 SSE 方言继续为 `not_measured`。
 - Next step: 完成全分支只读静态检查、凭据泄漏扫描和独立发布前审查；通过后编写并审查 ai-lab01/02 可回滚部署计划，再分别部署和验收。
+
+## 2026-08-28 14:24 SGT
+
+- Current work: 完成 ai-lab01/02 双机部署实施计划和自检，固定构建产物、隔离运行、验收与回滚边界。
+- Expected result: 不复制仓库或本机配置，只从 exact clean Git SHA 构建 Web、Linux x86_64 wheels、锁定依赖和模型归档；经 SHA-256 校验后按 lab01→lab02 顺序部署，任一主机激活失败自动恢复该主机上一镜像；两机使用同一 runtime SHA。
+- Result: Achieved。计划保存于 `docs/superpowers/plans/2026-08-28-ai-lab-deployment.md`，共 7 个任务、474 行。运行方式固定为非 root Docker、host network、owner-only 持久状态、只读根文件系统；lab01 限制 3 CPU/3072m，lab02 限制 1.25 CPU/1536m。验收镜像从已安装 wheel 运行 RTSP perception/live 与 Responses JSON/SSE/no-key/Bearer fixture；真实摄像机/VLM 只有存在实际端点才执行，否则保持 `not_measured`。占位符、接口和 `git diff --check` 自检通过。
+- Next step: 提交部署计划；沿用用户已选择的当前会话 subagent-driven-development，按 TDD 实现 artifact allowlist、容器、deploy.sh、验收打包与回滚，再先部署 lab01。
