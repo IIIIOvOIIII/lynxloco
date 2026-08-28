@@ -11,24 +11,25 @@ configuration, or credentials.
 
 ## Operator commands
 
-Run these six commands from the repository root after `deploy.sh` is supplied:
+Run the canonical controller from the repository root:
 
 ```bash
-./deploy/ai-lab/deploy.sh build
-./deploy/ai-lab/deploy.sh preflight --host ai-lab01.esxi
-./deploy/ai-lab/deploy.sh deploy --host ai-lab01.esxi
-./deploy/ai-lab/deploy.sh verify --host ai-lab01.esxi
-./deploy/ai-lab/deploy.sh status --host ai-lab01.esxi
-./deploy/ai-lab/deploy.sh rollback --host ai-lab01.esxi
+./deploy.sh build
+./deploy.sh preflight ai-lab01.esxi
+./deploy.sh deploy ai-lab01.esxi
+./deploy.sh verify ai-lab01.esxi
+./deploy.sh status ai-lab01.esxi
+./deploy.sh rollback ai-lab01.esxi <full-40-character-sha>
 ```
 
-Use the same command shape with `--host ai-lab02.esxi` for the second
-permitted host. `build` refuses a dirty worktree. `preflight` validates the
+Use the same positional command shape with `ai-lab02.esxi` (or the equivalent
+`--host ai-lab02.esxi` form) for the second permitted host. `build` refuses a
+dirty worktree. `preflight` validates the
 selected host and release before any remote change. `deploy` automatically
 rolls back to the last known-good release when its post-deploy verification
 fails; an operator can also run the explicit `rollback` command.
 
-`./deploy/ai-lab/deploy.sh --help` provides one machine-readable authoritative
+`./deploy.sh --help` provides one machine-readable authoritative
 line: `Operations: build preflight deploy verify status rollback`. Its prose
 may describe those operations in any layout, but it must not declare a second
 operations list or advertise a concrete operation in `Usage:`.
@@ -44,8 +45,12 @@ it never skips or runs the deployment CLI without isolation.
 
 ## Runtime boundary
 
-Remote release state, including the active and last-known-good revisions, is
-kept in `/var/lib/miloco-ai-lab`. The service is exposed on port `1810` only.
+Persistent application state is kept at `/opt/miloco-lab/state`. Deployment
+state is kept separately in `/opt/miloco-lab/deploy-state/current` and
+`/opt/miloco-lab/deploy-state/previous`; status never creates either path.
+Immutable releases are kept under `/opt/miloco-lab/releases/<sha>`. The service
+is exposed on port `1810` only. `ai-lab01.esxi` uses 3.0 CPUs and 3072m;
+`ai-lab02.esxi` uses 1.25 CPUs and 1536m.
 `compose.yaml` is required to declare CPU, memory, and process-count resource
 limits; the release validation checks that those limits survive the rendered
 Compose configuration.

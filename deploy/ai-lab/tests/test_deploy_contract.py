@@ -20,7 +20,8 @@ import yaml
 
 DEPLOY_DIR = Path(__file__).resolve().parents[1]
 REPOSITORY_ROOT = DEPLOY_DIR.parents[1]
-DEPLOY_SCRIPT = DEPLOY_DIR / "deploy.sh"
+DEPLOY_SCRIPT = REPOSITORY_ROOT / "deploy.sh"
+REMOTE_RELEASE_SCRIPT = DEPLOY_DIR / "remote-release.sh"
 ALLOWLIST = DEPLOY_DIR / "artifact-files.txt"
 DOCKERFILE = DEPLOY_DIR / "Dockerfile"
 COMPOSE_FILE = DEPLOY_DIR / "compose.yaml"
@@ -238,24 +239,40 @@ def _require_deploy_script() -> None:
         pytest.skip("deploy.sh is supplied by the following deployment task")
 
 
-def _assert_deferred_cli_is_safe_to_execute(script: str | None = None) -> None:
-    """Reject execution forms that can evade the isolated test harness."""
-    if script is None:
-        script = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+def _assert_pre_guard_block_is_safe(script: str, guard_marker: str) -> None:
+    """Reject execution indirection only in the pre-validation block.
+
+    Approved build and remote paths necessarily occur after the host or clean
+    worktree guard.  The executable sandbox tests below prove that failing
+    guards exit before those paths can run.
+    """
+    assert script.count(guard_marker) == 1
+    guarded_block = script.split(guard_marker, maxsplit=1)[0]
     unsafe_forms = re.findall(
         r"(?m)(?:^|[;&]\s*|\b(?:if|then|do|elif|else|while|until)\s+)"
         r"(?:source\s+|\.\s+|(?:export\s+)?PATH\s*=|(?:eval|exec|command|env|xargs|sh|bash|zsh|dash)\b|\$\{?[A-Za-z_])",
-        script,
+        guarded_block,
     )
     direct_executables = re.findall(
         r"(?m)(?:^|[;&|]\s*|\b(?:if|then|elif|do|while|until)\s+|\$\(\s*)"
         r"(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*((?:/|\./|\.\./)[^\s;|&]+)",
-        script,
+        guarded_block,
     )
     assert not unsafe_forms and not direct_executables, (
         "deferred deploy CLI tests refuse source/PATH/indirection or direct executable paths "
         f"that evade the isolated harness: {unsafe_forms + direct_executables}"
     )
+
+
+def _assert_deferred_cli_is_safe_to_execute(script: str | None = None) -> None:
+    """Require explicit host/build guard boundaries without banning approved paths."""
+    if script is None:
+        script = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    main = script.split("# DISPATCH_START", maxsplit=1)[1]
+    host_branch = main.split("# HOST_GUARD_START", maxsplit=1)[1]
+    _assert_pre_guard_block_is_safe(host_branch, "# HOST_VALIDATION_COMPLETE")
+    build_branch = main.split("# BUILD_GUARD_START", maxsplit=1)[1]
+    _assert_pre_guard_block_is_safe(build_branch, "# CLEAN_WORKTREE_VALIDATION_COMPLETE")
 
 
 def _help_operations(help_text: str) -> set[str]:
@@ -525,16 +542,6 @@ def test_help_exposes_only_the_release_operations(
 def test_unknown_host_exits_two_before_ssh(command_stubs: tuple[Path, Path]) -> None:
     """Catches host validation that occurs after a remote connection attempt."""
     _require_deploy_script()
-    for bypass in (
-        "source helper.sh\n",
-        "PATH=/usr/bin\n",
-        "eval \"ssh target\"\n",
-        "bash helper.sh\n",
-        "tool=/usr/bin/ssh\n$tool target\n",
-        "$(/usr/bin/tar -cf release.tar release)\n",
-    ):
-        with pytest.raises(AssertionError):
-            _assert_deferred_cli_is_safe_to_execute(bypass)
     command_log, sandbox_dir = command_stubs
     result = _run_deploy("preflight", "--host", "outside-ai-lab.esxi", sandbox_dir=sandbox_dir)
     assert result.returncode == 2
@@ -557,6 +564,276 @@ def test_dirty_worktree_exits_three_before_build_or_transfer(
     )
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
     command_log, sandbox_dir = command_stubs
-    result = _run_deploy("build", "--host", "ai-lab01.esxi", sandbox_dir=sandbox_dir)
+    result = _run_deploy("build", sandbox_dir=sandbox_dir)
     assert result.returncode == 3
     assert not command_log.exists(), "a dirty tree must stop before tar, SSH, or the build command"
+
+
+def test_guard_scope_allows_only_post_validation_approved_paths() -> None:
+    """Catches both pre-guard indirection and a guard that bans required build paths."""
+    marker = "# VALIDATION_COMPLETE"
+    for bypass in (
+        "source helper.sh\n",
+        "PATH=/usr/bin\n",
+        "eval \"ssh target\"\n",
+        "bash helper.sh\n",
+        "tool=/usr/bin/ssh\n$tool target\n",
+        "$(/usr/bin/tar -cf release.tar release)\n",
+    ):
+        with pytest.raises(AssertionError):
+            _assert_pre_guard_block_is_safe(f"{bypass}{marker}\n", marker)
+    _assert_pre_guard_block_is_safe(
+        f"validate_host \"$host\"\n{marker}\n./scripts/build.sh\n",
+        marker,
+    )
+
+
+def test_controller_and_readme_use_the_canonical_root_interface() -> None:
+    """Catches reintroduction of the deprecated deploy/ai-lab controller path."""
+    _require_deploy_script()
+    readme = (DEPLOY_DIR / "README.md").read_text(encoding="utf-8")
+    assert "./deploy.sh build" in readme
+    assert "./deploy.sh preflight ai-lab01.esxi" in readme
+    assert "./deploy/ai-lab/deploy.sh" not in readme
+    assert "/opt/miloco-lab/state" in readme
+    assert "/opt/miloco-lab/deploy-state/current" in readme
+    assert "/opt/miloco-lab/deploy-state/previous" in readme
+    assert "/var/lib/miloco-ai-lab" not in readme
+
+
+def test_build_contract_is_content_addressed_locked_and_bounded() -> None:
+    """Catches non-reproducible dependency export or broad source staging."""
+    _require_deploy_script()
+    controller = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    assert "./scripts/build.sh --packages web,miloco-miot,miloco,miloco-cli" in controller
+    assert controller.count("uv export --locked --no-dev --no-emit-workspace") >= 2
+    assert "uv export --locked --no-emit-workspace" in controller
+    for path in (
+        "backend/miloco/tests/integration/test_rtsp_perception.py",
+        "backend/miloco/tests/integration/test_rtsp_live_view.py",
+        "backend/miloco/tests/integration/test_responses_perception.py",
+        "backend/miloco/tests/integration/responses_fixture_server.py",
+        "backend/miloco/tests/fixtures/rtsp",
+        "scripts/rtsp-smoke.sh",
+        "scripts/rtsp-view-smoke.sh",
+        "scripts/responses-vlm-smoke.sh",
+    ):
+        assert path in controller
+    assert "mktemp -d" in controller
+    assert "artifact-files.txt" in controller
+    assert 'find "$staging" -mindepth 1 -print0' in controller
+    assert '[[ ! -L "$path" ]]' in controller
+    assert "release.json" in controller
+    assert "SHA256SUMS" in controller
+    assert "miloco-lab-${sha}.tar.gz" in controller
+    assert "tar -czf -" not in controller
+    assert not re.search(r"tar\b[^\n]*-C\s+\"?\$?PROJECT_ROOT", controller)
+    for credential_name in (
+        "MILOCO_MODEL__OMNI__API_KEY",
+        "MILOCO_RESPONSES_API_KEY",
+        "MILOCO_RTSP_TEST_URL",
+        "MILOCO_RTSP_TEST_USERNAME",
+        "MILOCO_RTSP_TEST_PASSWORD",
+    ):
+        assert f"-u {credential_name}" in controller
+
+
+def test_preflight_and_transfer_are_bounded_to_the_two_labs() -> None:
+    """Catches weak host/platform checks or repository-wide transfer methods."""
+    _require_deploy_script()
+    controller = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    remote = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8")
+    assert set(re.findall(r"ai-lab0[12]\.esxi", controller)) == ALLOWED_HOSTS
+    assert "Docker >= 26" in remote
+    assert "Compose >= 2.26" in remote
+    assert "linux/amd64" in remote
+    assert "1810" in remote
+    assert str(5 * 1024 * 1024) in remote
+    assert 'LAB_ROOT="/opt/miloco-lab"' in remote
+    assert re.search(r"\[\[?\s+!?\s*-L\s+\"\$LAB_ROOT\"", remote)
+    assert 'docker top "$container_id" -eo pid' in remote
+    assert "listener_pid" in remote
+    assert 'remote_release="${REMOTE_RELEASES}/${sha}"' in controller
+    assert "tar -xzf -" in controller
+    assert "remote-release.sh" in controller
+    assert not re.search(r"\b(?:scp|sftp|rclone|oras|skopeo)\b", controller)
+    assert not re.search(r"rsync\b[^\n]*\s\.\s", controller)
+    assert not re.search(r"tar\b[^\n]*-C\s+\"?\$?PROJECT_ROOT", controller)
+
+
+def test_remote_checksum_and_acceptance_precede_activation() -> None:
+    """Catches building or switching from an unverified/unaccepted release."""
+    remote = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8")
+    verify_body = remote.split("verify_release()", maxsplit=1)[1].split("\n}", maxsplit=1)[0]
+    build_body = remote.split("build_and_activate()", maxsplit=1)[1].split("\n}", maxsplit=1)[0]
+    assert 'sha256sum -c "SHA256SUMS"' in verify_body
+    assert build_body.index("verify_release") < build_body.index("--target runtime")
+    assert build_body.index("--target runtime") < build_body.index("--target acceptance")
+    assert build_body.index("--target acceptance") < build_body.index("miloco-lab-acceptance:$sha")
+    assert build_body.index("miloco-lab-acceptance:$sha") < build_body.index("activate_release")
+    assert "--platform linux/amd64" in remote
+    assert 'install -d -o 10001 -g 10001 -m 0700 "$STATE_DIR"' in remote
+    assert 'ai-lab01.esxi) cpu_limit="3.0"; memory_limit="3072m"' in remote
+    assert 'ai-lab02.esxi) cpu_limit="1.25"; memory_limit="1536m"' in remote
+
+
+def test_activation_and_health_failure_preserve_rollback_state() -> None:
+    """Catches current-before-previous writes and failed health without restoration."""
+    remote = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8")
+    activate_body = remote.split("activate_release()", maxsplit=1)[1].split("\n}", maxsplit=1)[0]
+    previous_write = activate_body.index('atomic_write "$PREVIOUS_FILE"')
+    current_write = activate_body.index('atomic_write "$CURRENT_FILE"')
+    assert previous_write < activate_body.index("compose_up") < current_write
+    assert "HEALTH_TIMEOUT_SECONDS=120" in remote
+    assert "State.Health.Status" in remote
+    assert "http://127.0.0.1:1810/health" in remote
+    assert "restore_previous" in remote
+    assert re.search(
+        r"if ! compose_up\b[\s\S]*restore_previous[\s\S]*return 1",
+        activate_body,
+    )
+    assert "logs --tail" in remote
+    assert "sanitize_logs" in remote
+
+
+def test_explicit_rollback_requires_verified_release_and_image_without_state_delete() -> None:
+    """Catches rollback to an unknown SHA or destructive state cleanup."""
+    remote = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8")
+    rollback = remote.split("rollback_release()", maxsplit=1)[1]
+    assert "verify_release" in rollback
+    assert "docker image inspect" in rollback
+    assert "activate_release" in rollback
+    assert not re.search(r"rm\s+(?:-[A-Za-z]*r[A-Za-z]*f?|--recursive)[^\n]*\$STATE_DIR", remote)
+    assert not re.search(r"rm\s+[^\n]*\$CURRENT_FILE|rm\s+[^\n]*\$PREVIOUS_FILE", remote)
+
+
+def test_status_path_is_read_only_and_does_not_create_state() -> None:
+    """Catches status implementations that mutate an undeployed host."""
+    remote = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8")
+    status_body = remote.split("status_release()", maxsplit=1)[1].split("\n}", maxsplit=1)[0]
+    assert "not_deployed" in status_body
+    assert not re.search(r"\b(?:mkdir|install|touch|mv|rm|docker compose .* up)\b", status_body)
+
+
+def test_success_retains_current_and_two_prior_releases_and_images() -> None:
+    """Catches unbounded release growth or cleanup that removes rollback capacity."""
+    remote = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8")
+    assert "retain_rollback_history" in remote
+    retention_body = remote.split("retain_rollback_history()", maxsplit=1)[1].split(
+        "\n}", maxsplit=1
+    )[0]
+    assert "historical_kept=0" in retention_body
+    assert "historical_kept < 2" in retention_body
+    assert "PREVIOUS_FILE" in retention_body
+    assert "docker image rm" in retention_body
+    activate_body = remote.split("activate_release()", maxsplit=1)[1].split("\n}", maxsplit=1)[0]
+    assert activate_body.index('atomic_write "$CURRENT_FILE"') < activate_body.index(
+        "retain_rollback_history"
+    )
+
+
+def test_deploy_streams_one_archive_through_stubbed_ssh(tmp_path: Path) -> None:
+    """Catches transfer drift to broad copies or non-content-addressed remote paths."""
+    sha = "0123456789abcdef0123456789abcdef01234567"
+    repository = tmp_path / "repo"
+    controller = repository / "deploy.sh"
+    remote_dir = repository / "deploy" / "ai-lab"
+    remote_dir.mkdir(parents=True)
+    shutil.copy2(DEPLOY_SCRIPT, controller)
+    shutil.copy2(REMOTE_RELEASE_SCRIPT, remote_dir / "remote-release.sh")
+    archive = repository / "dist" / "lab" / sha / f"miloco-lab-{sha}.tar.gz"
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"stubbed-release-archive")
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    git_stub = bin_dir / "git"
+    git_stub.write_text(
+        "#!/usr/bin/env bash\n"
+        "case \"$*\" in\n"
+        "  *status*) exit 0 ;;\n"
+        f"  *rev-parse*) printf '%s\\n' '{sha}' ;;\n"
+        "  *) exit 2 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    git_stub.chmod(0o755)
+    ssh_stub = bin_dir / "ssh"
+    ssh_stub.write_text(
+        "#!/usr/bin/env bash\n"
+        f"counter='{tmp_path / 'ssh-count'}'\n"
+        "count=0\n"
+        "if [[ -f \"$counter\" ]]; then read -r count < \"$counter\"; fi\n"
+        "count=$((count + 1))\n"
+        "printf '%s\\n' \"$count\" > \"$counter\"\n"
+        f"printf '%s\\n' \"$*\" > '{tmp_path}/ssh-args-'\"$count\"\n"
+        f"/bin/cat > '{tmp_path}/ssh-stdin-'\"$count\"\n",
+        encoding="utf-8",
+    )
+    ssh_stub.chmod(0o755)
+    result = subprocess.run(
+        [str(controller), "deploy", "ai-lab01.esxi"],
+        cwd=repository,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+        env={**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "ssh-count").read_text(encoding="utf-8").strip() == "3"
+    transfer_args = (tmp_path / "ssh-args-2").read_text(encoding="utf-8")
+    assert f"/opt/miloco-lab/releases/{sha}" in transfer_args
+    assert "tar -xzf -" in transfer_args
+    assert (tmp_path / "ssh-stdin-2").read_bytes() == archive.read_bytes()
+    activation_args = (tmp_path / "ssh-args-3").read_text(encoding="utf-8")
+    assert f"bash -s -- activate ai-lab01.esxi {sha}" in activation_args
+
+
+def test_remote_status_and_unknown_rollback_are_safe_under_stubs(tmp_path: Path) -> None:
+    """Catches state creation by status and Docker access before rollback release proof."""
+    lab_root = tmp_path / "miloco-lab"
+    remote_copy = tmp_path / "remote-release.sh"
+    remote_copy.write_text(
+        REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8").replace(
+            'readonly LAB_ROOT="/opt/miloco-lab"',
+            f'readonly LAB_ROOT="{lab_root}"',
+        ).replace(
+            '"/opt/miloco-lab/releases/$sha"',
+            f'"{lab_root}/releases/$sha"',
+        ),
+        encoding="utf-8",
+    )
+    remote_copy.chmod(0o755)
+    bin_dir = tmp_path / "remote-bin"
+    bin_dir.mkdir()
+    external_log = tmp_path / "remote-external.log"
+    _write_stub(bin_dir, "id", external_log, 'if [ "$1" = "-u" ]; then printf "0\\n"; fi')
+    _write_stub(bin_dir, "docker", external_log, "exit 99")
+    environment = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+
+    status = subprocess.run(
+        [str(remote_copy), "status", "ai-lab01.esxi"],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+        env=environment,
+    )
+    assert status.returncode == 0, status.stderr
+    assert "not_deployed" in status.stdout
+    assert not lab_root.exists()
+    assert "docker" not in external_log.read_text(encoding="utf-8")
+
+    external_log.unlink()
+    rollback = subprocess.run(
+        [str(remote_copy), "rollback", "ai-lab01.esxi", "0" * 40],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+        env=environment,
+    )
+    assert rollback.returncode == 4
+    assert "unknown release" in rollback.stderr
+    assert "docker" not in external_log.read_text(encoding="utf-8")
