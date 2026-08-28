@@ -610,7 +610,7 @@ async def get_token_usage(
 
 @router.get(
     "/token-usage/daily",
-    summary="Token Usage (daily rollup by date / model / type)",
+    summary="Token Usage (daily rollup by date / model / base_url / type)",
     response_model=NormalResponse,
 )
 async def get_token_usage_daily(
@@ -618,14 +618,17 @@ async def get_token_usage_daily(
     until: str | None = None,
     current_user: str = Depends(verify_token),
 ):
-    """Daily rollup rows (date / model / type) combining historical + today's live."""
+    """Daily rollup rows (date / model / base_url / type) combining historical + today's live.
+
+    模型身份是「模型名 + base_url」：同一个模型名挂在两个 endpoint 上会各返回一行。
+    """
     rows = get_token_usage_repo().aggregate_daily(since, until)
     return NormalResponse(code=0, message="ok", data={"rows": rows, "total": len(rows)})
 
 
 @router.get(
     "/token-usage/buckets",
-    summary="Token Usage (today, server-side bucketed by time / model / type)",
+    summary="Token Usage (today, bucketed by time / model / base_url / type)",
     response_model=NormalResponse,
 )
 async def get_token_usage_buckets(
@@ -644,14 +647,60 @@ async def get_token_usage_buckets(
     return NormalResponse(code=0, message="ok", data={"rows": rows, "total": len(rows)})
 
 
+class ClearTokenUsageBody(BaseModel):
+    """清空范围。四个字段都省略 = 全清。
+
+    ``model`` 与 ``base_url`` 必须同时给或同时不给——模型的唯一身份是这两者的组合，
+    只给模型名会跨掉它的所有 endpoint，那不是任何界面入口的语义。
+    ``base_url=""`` 是有意义的取值（schema v3 之前的老数据，来源未记录）。
+
+    ``from_date``（YYYY-MM-DD）是界面**已经显示给用户**的那个「连带删除哪一天」。
+    日表的 date 按本机时区写入，而界面那句话是浏览器按它自己的时区算的，两者能差
+    一天；给了它就以界面说的那天为准，做到「说了哪天就删哪天」。只接受与 since_ms
+    推算相差不超过一天的日期。
+    """
+
+    since_ms: int | None = None
+    model: str | None = None
+    base_url: str | None = None
+    from_date: str | None = None
+
+
 @router.post(
     "/token-usage/clear",
-    summary="清空全部 Token 用量(实时表 + 日聚合，不可恢复)",
+    summary="清空 Token 用量(实时表 + 日聚合，不可恢复；可限时间范围)",
     response_model=NormalResponse,
 )
-def clear_token_usage(current_user: str = Depends(verify_token)):
-    """删除 token_usage + token_usage_daily 全部行，返回各表删除条数。供重置统计用。"""
-    deleted = get_token_usage_repo().clear_all()
+def clear_token_usage(
+    body: ClearTokenUsageBody | None = None,
+    current_user: str = Depends(verify_token),
+):
+    """删除 token_usage + token_usage_daily 中符合条件的行（条件间为 AND）。
+
+    body 省略、或四个字段都为 null 时才是全清——**保持与老客户端的兼容**:此前这个
+    端点不收 body，旧前端发的空 POST 仍然表示「全清」，语义不变。``since_ms=null``
+    本身只表示不限时间；若同时给了 model + base_url，删的仍然只是这一个
+    「模型名 + endpoint」。
+
+    给 ``model`` + ``base_url`` 则只删这一个「模型名 + endpoint」的记录，其他模型与
+    同名模型的另一个 endpoint 都不受影响。
+
+    返回值里的 ``daily_from_date`` 说明日聚合表实际是从哪一天起被删的:日表只有
+    天粒度，跨天范围会连带删掉 since 之前、同一天里的记录（详见 repo 的说明）。
+    给了 ``from_date`` 时它就等于界面显示的那一天。
+    """
+    since_ms = body.since_ms if body else None
+    model = body.model if body else None
+    base_url = body.base_url if body else None
+    from_date = body.from_date if body else None
+    try:
+        deleted = get_token_usage_repo().clear_since(
+            since_ms, model, base_url, from_date
+        )
+    except ValueError as e:
+        # 只给一半的定点条件、或对不上的 from_date = 调用方 bug。
+        # 返回 400 而不是按「不限 endpoint」多删、或按自己的时区改删别的一天。
+        raise HTTPException(status_code=400, detail=str(e)) from e
     return NormalResponse(code=0, message="ok", data={"deleted": deleted})
 
 

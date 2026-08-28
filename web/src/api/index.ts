@@ -515,9 +515,17 @@ export async function getUsageStats(
   return impl.realGetUsageStats(period, binMinutes);
 }
 
-// 清空全部用量数据（实时表 + 日聚合，不可恢复）
-export async function clearUsageData(): Promise<void> {
-  return impl.realClearUsageData();
+// 清除用量数据（实时表 + 日聚合，不可恢复）。范围由 opts 决定，都不给才是全清。
+export async function clearUsageData(
+  opts: {
+    sinceMs?: number | null;
+    model?: string;
+    baseUrl?: string;
+    /** 界面显示的「连带删除哪一天」，让后端按界面说的那天删，见 real 层说明。 */
+    fromDate?: string | null;
+  } = {},
+): Promise<void> {
+  return impl.realClearUsageData(opts);
 }
 
 // ── omni 模型配置（「模型」页内读/写，多档案切换）────────────────
