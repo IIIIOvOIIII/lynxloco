@@ -297,6 +297,8 @@ async def camera_stream_websocket(
         pass
     except asyncio.CancelledError:
         raise
+    except CameraServiceError as error:
+        close_code, close_reason = _stream_close_for_error(error)
     except Exception as error:  # noqa: BLE001
         logger.warning("Camera live stream failed (%s)", type(error).__name__)
         close_code, close_reason = _runtime_stream_close(

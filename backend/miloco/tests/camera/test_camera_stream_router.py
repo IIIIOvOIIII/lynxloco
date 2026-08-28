@@ -18,6 +18,7 @@ from starlette.exceptions import StarletteDeprecationWarning
 from starlette.websockets import WebSocketDisconnect
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosedError, InvalidStatus
+from websockets.typing import Subprotocol
 
 with warnings.catch_warnings():
     warnings.filterwarnings(
@@ -35,26 +36,29 @@ from miloco.camera.router import (
     router,
 )
 from miloco.camera.service import CameraConflictError, CameraNotFoundError
-from miloco.camera.stream import LiveStreamSource, LiveStreamState
+from miloco.camera.stream import LiveStreamHub, LiveStreamSource, LiveStreamState
 from miloco.middleware.exception_handler import handle_exception
 
-_FIXED_PROTOCOL = "miloco.camera.v1"
+_FIXED_PROTOCOL = Subprotocol("miloco.camera.v1")
 
 
-def _auth_protocol(token: str) -> str:
+def _auth_protocol(token: str) -> Subprotocol:
     encoded = base64.urlsafe_b64encode(token.encode()).decode().rstrip("=")
-    return f"miloco.auth.{encoded}"
+    return Subprotocol(f"miloco.auth.{encoded}")
 
 
 class _Service:
     def __init__(self, source_type: Literal["miot", "rtsp"] = "rtsp") -> None:
         self.source_type = source_type
         self.error: BaseException | None = None
+        self.error_on_call: int | None = None
         self.resolved: list[str] = []
 
     async def resolve_live_stream(self, camera_id: str) -> LiveStreamSource:
         self.resolved.append(camera_id)
-        if self.error is not None:
+        if self.error is not None and (
+            self.error_on_call is None or len(self.resolved) == self.error_on_call
+        ):
             raise self.error
         return LiveStreamSource(
             camera_id=camera_id.split(":ch", 1)[0],
@@ -311,6 +315,48 @@ def test_resolution_failures_close_with_stable_safe_codes(
     assert raised.value.reason == reason
     assert "secret" not in raised.value.reason
     assert "rtsp://" not in raised.value.reason
+
+
+@pytest.mark.parametrize(
+    ("error", "code", "reason"),
+    [
+        (CameraNotFoundError(), 4404, "camera_not_found"),
+        (
+            CameraConflictError("camera_disabled", "Camera is disabled"),
+            4403,
+            "camera_disabled",
+        ),
+        (
+            CameraConflictError("camera_unavailable", "private rtsp://secret"),
+            1013,
+            "camera_unavailable",
+        ),
+    ],
+)
+def test_second_hub_resolve_failure_uses_stable_camera_close(
+    client: TestClient,
+    service: _Service,
+    error: BaseException,
+    code: int,
+    reason: str,
+) -> None:
+    service.error = error
+    service.error_on_call = 2
+    client.app.dependency_overrides[_get_live_stream_hub] = lambda: LiveStreamHub(
+        service.resolve_live_stream
+    )
+
+    with pytest.raises(WebSocketDisconnect) as raised:
+        with client.websocket_connect(
+            "/api/cameras/rtsp%3Acamera/stream",
+            headers={"Authorization": "Bearer service-token"},
+        ) as websocket:
+            websocket.receive_bytes()
+
+    assert service.resolved == ["rtsp:camera", "rtsp:camera"]
+    assert raised.value.code == code
+    assert raised.value.reason == reason
+    assert "secret" not in raised.value.reason
 
 
 @pytest.mark.parametrize(
@@ -700,6 +746,40 @@ async def test_miot_backend_reattaches_while_active_connection_is_closing() -> N
 
 
 @pytest.mark.asyncio
+async def test_miot_backend_sync_reattach_before_close_task_runs() -> None:
+    from miloco.manager import _MiotLiveStreamBackend
+
+    class _LegacyManager:
+        def __init__(self) -> None:
+            self.starts = 0
+            self.second_started = asyncio.Event()
+
+        async def new_connection(self, **_kwargs) -> str:
+            self.starts += 1
+            if self.starts == 2:
+                self.second_started.set()
+            return f"connection-{self.starts}"
+
+        async def close_connection(self, **_kwargs) -> None:
+            return
+
+    legacy = _LegacyManager()
+    backend = _MiotLiveStreamBackend(legacy, "miot-camera", 0)
+    first_detach = backend.add_packet_listener(lambda _packet: None)
+    await asyncio.sleep(0)
+    assert backend._connection_id == "connection-1"
+
+    first_detach()
+    second_detach = backend.add_packet_listener(lambda _packet: None)
+
+    await asyncio.wait_for(legacy.second_started.wait(), timeout=0.2)
+    assert backend._connection_id == "connection-2"
+
+    second_detach()
+    await asyncio.wait_for(backend.aclose(), timeout=0.2)
+
+
+@pytest.mark.asyncio
 async def test_miot_backend_shutdown_cancels_hanging_start_and_is_bounded() -> None:
     from miloco.manager import _MiotLiveStreamBackend
 
@@ -711,7 +791,8 @@ async def test_miot_backend_shutdown_cancels_hanging_start_and_is_bounded() -> N
         async def new_connection(self, **_kwargs) -> str:
             self.started.set()
             try:
-                await asyncio.Event().wait()
+                never: asyncio.Future[str] = asyncio.Future()
+                return await never
             finally:
                 self.cancelled.set()
 

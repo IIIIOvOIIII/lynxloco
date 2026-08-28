@@ -69,6 +69,7 @@ class _MiotLiveStreamBackend:
         self._next_listener_id = 0
         self._connection_id: str | None = None
         self._start_task: asyncio.Task[None] | None = None
+        self._start_generation: int | None = None
         self._start_tasks: set[asyncio.Task[None]] = set()
         self._close_task: asyncio.Task[None] | None = None
         self._generation = 0
@@ -88,8 +89,13 @@ class _MiotLiveStreamBackend:
             self._generation += 1
         close_task = self._close_task
         close_pending = close_task is not None and not close_task.done()
-        should_start = self._connection_id is None and (
-            close_pending or self._start_task is None or self._start_task.done()
+        start_for_generation = (
+            self._start_task is not None
+            and not self._start_task.done()
+            and self._start_generation == self._generation
+        )
+        should_start = not start_for_generation and (
+            close_pending or self._connection_id is None
         )
         if should_start:
             self._create_start(
@@ -146,6 +152,7 @@ class _MiotLiveStreamBackend:
             self._start(generation=generation, preceding_close=preceding_close)
         )
         self._start_task = task
+        self._start_generation = generation
         self._start_tasks.add(task)
         task.add_done_callback(self._start_tasks.discard)
 
@@ -249,6 +256,7 @@ class _MiotLiveStreamBackend:
                 detach_task.cancel()
                 logger.warning("MIoT live stream detach timed out during shutdown")
         self._start_task = None
+        self._start_generation = None
         self._close_task = None
         await self._websocket.close()
 
