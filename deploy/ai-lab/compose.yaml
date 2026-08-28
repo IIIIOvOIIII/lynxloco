@@ -1,0 +1,23 @@
+services:
+  miloco:
+    image: miloco-lab:${MILOCO_RELEASE_SHA}
+    user: "10001:10001"
+    network_mode: host
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      MILOCO_HOME: /var/lib/miloco
+      MILOCO_DIRECTORIES__MODELS: /opt/miloco/models
+      MILOCO_SERVER__HOST: 0.0.0.0
+      MILOCO_SERVER__PORT: "1810"
+      MILOCO_SERVER__URL: http://127.0.0.1:1810
+    volumes:
+      - /opt/miloco-lab/state:/var/lib/miloco
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    cpus: ${MILOCO_CPU_LIMIT}
+    mem_limit: ${MILOCO_MEMORY_LIMIT}

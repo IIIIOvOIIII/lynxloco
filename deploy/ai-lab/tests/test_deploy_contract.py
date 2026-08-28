@@ -15,12 +15,29 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 
 DEPLOY_DIR = Path(__file__).resolve().parents[1]
 REPOSITORY_ROOT = DEPLOY_DIR.parents[1]
 DEPLOY_SCRIPT = DEPLOY_DIR / "deploy.sh"
 ALLOWLIST = DEPLOY_DIR / "artifact-files.txt"
+DOCKERFILE = DEPLOY_DIR / "Dockerfile"
+COMPOSE_FILE = DEPLOY_DIR / "compose.yaml"
+ENTRYPOINT = DEPLOY_DIR / "container-entrypoint.sh"
+ACCEPTANCE_PYTEST = DEPLOY_DIR / "acceptance" / "pytest.ini"
+
+RUNTIME_BASE = (
+    "python:3.12-slim-bookworm@"
+    "sha256:0f5b26b9518d002b6173fd61daad821fa340635ebfec5bba471013f9ca114579"
+)
+EXPECTED_RUNTIME_ENV = {
+    "MILOCO_HOME": "/var/lib/miloco",
+    "MILOCO_DIRECTORIES__MODELS": "/opt/miloco/models",
+    "MILOCO_SERVER__HOST": "0.0.0.0",
+    "MILOCO_SERVER__PORT": "1810",
+    "MILOCO_SERVER__URL": "http://127.0.0.1:1810",
+}
 
 EXPECTED_COMMANDS = {"build", "preflight", "deploy", "verify", "status", "rollback"}
 ALLOWED_HOSTS = {"ai-lab01.esxi", "ai-lab02.esxi"}
@@ -67,6 +84,32 @@ def _allowlist_entries() -> set[str]:
         for line in ALLOWLIST.read_text(encoding="utf-8").splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     }
+
+
+def _docker_stages() -> dict[str, str]:
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    stages: dict[str, str] = {}
+    stage_name = ""
+    stage_lines: list[str] = []
+    for line in dockerfile.splitlines():
+        from_match = re.match(r"FROM\s+\S+(?:\s+AS\s+([A-Za-z0-9_-]+))?", line)
+        if from_match:
+            if stage_name:
+                stages[stage_name] = "\n".join(stage_lines)
+            stage_name = from_match.group(1) or f"stage-{len(stages)}"
+            stage_lines = [line]
+            continue
+        if stage_name:
+            stage_lines.append(line)
+    if stage_name:
+        stages[stage_name] = "\n".join(stage_lines)
+    return stages
+
+
+def _compose_service() -> dict[str, object]:
+    compose = yaml.safe_load(COMPOSE_FILE.read_text(encoding="utf-8"))
+    assert set(compose["services"]) == {"miloco"}
+    return compose["services"]["miloco"]
 
 
 def _write_stub(path: Path, name: str, log: Path, body: str = "exit 0") -> None:
@@ -230,6 +273,76 @@ def test_artifact_manifest_never_admits_forbidden_path_components() -> None:
         if FORBIDDEN_PARTS.intersection(Path(entry.rstrip("/")).parts)
     }
     assert forbidden_entries == set()
+
+
+def test_runtime_image_is_non_root_and_excludes_acceptance_payload() -> None:
+    """Catches runtime images that run as root or carry test-only assets."""
+    stages = _docker_stages()
+    runtime = stages["runtime"]
+    assert f"FROM {RUNTIME_BASE} AS runtime" in runtime
+    assert "USER 10001:10001" in runtime
+    assert "acceptance/" not in runtime
+    assert "requirements/acceptance.txt" not in runtime
+    assert re.search(r"pip\s+install\b[^\n]*--require-hashes", runtime)
+    assert re.search(r"pip\s+install\b[^\n]*--no-deps\b[^\n]*wheels/miloco_miot-", runtime)
+    assert re.search(r"pip\s+install\b[^\n]*--no-deps\b[^\n]*wheels/miloco-", runtime)
+    assert re.search(r"pip\s+install\b[^\n]*--no-deps\b[^\n]*wheels/miloco_cli-", runtime)
+    for name, value in EXPECTED_RUNTIME_ENV.items():
+        assert f"{name}={value}" in runtime
+    assert "urllib.request.urlopen('http://127.0.0.1:1810/health'" in runtime
+    assert "container-entrypoint.sh" in runtime
+    assert "ENTRYPOINT" in runtime
+
+
+def test_acceptance_image_is_the_only_stage_with_acceptance_payload() -> None:
+    """Catches acceptance dependencies leaking into the production runtime."""
+    stages = _docker_stages()
+    acceptance = stages["acceptance"]
+    assert "FROM runtime AS acceptance" in acceptance
+    assert "requirements/acceptance.txt" in acceptance
+    assert "acceptance/" in acceptance
+    assert re.search(r"pip\s+install\b[^\n]*--require-hashes", acceptance)
+    assert "ai_lab_fixture" in acceptance
+    assert ACCEPTANCE_PYTEST.read_text(encoding="utf-8").count("ai_lab_fixture") == 1
+
+
+def test_docker_and_compose_do_not_define_secrets() -> None:
+    """Catches API key, token, or secret injection through image or Compose config."""
+    deploy_config = DOCKERFILE.read_text(encoding="utf-8") + "\n" + COMPOSE_FILE.read_text(
+        encoding="utf-8"
+    )
+    assert not re.search(r"(?i)(api[_-]?key|token|secret|password|credential)", deploy_config)
+    assert "secrets:" not in deploy_config
+
+
+def test_compose_runs_host_network_read_only_with_one_persistent_state_path() -> None:
+    """Catches runtime Compose configs that open extra writable or persistent paths."""
+    service = _compose_service()
+    assert service["image"] == "miloco-lab:${MILOCO_RELEASE_SHA}"
+    assert service["user"] == "10001:10001"
+    assert service["network_mode"] == "host"
+    assert service["restart"] == "unless-stopped"
+    assert service["read_only"] is True
+    assert service["security_opt"] == ["no-new-privileges:true"]
+    assert service["cap_drop"] == ["ALL"]
+    assert service["environment"] == EXPECTED_RUNTIME_ENV
+    assert service["volumes"] == ["/opt/miloco-lab/state:/var/lib/miloco"]
+    assert service["tmpfs"] == ["/tmp:size=256m,mode=1777"]
+    assert service["cpus"] == "${MILOCO_CPU_LIMIT}"
+    assert service["mem_limit"] == "${MILOCO_MEMORY_LIMIT}"
+    assert "build" not in service
+
+
+def test_entrypoint_refuses_unsafe_state_directory_before_starting_backend() -> None:
+    """Catches backends starting with unwritable or non-owner-only persistent state."""
+    entrypoint = ENTRYPOINT.read_text(encoding="utf-8")
+    assert "umask 077" in entrypoint
+    assert "[ -w \"$state_dir\" ]" in entrypoint
+    assert "stat -c '%u:%g'" in entrypoint
+    assert "id -u" in entrypoint and "id -g" in entrypoint
+    assert "stat -c '%a'" in entrypoint
+    assert 'exec miloco-backend "$@"' in entrypoint
+    assert not re.search(r"(?m)^\s*(?:env|printenv|set)\s*(?:$|[|;&>])", entrypoint)
 
 
 def test_existing_deploy_script_without_os_sandbox_fails_contract(
