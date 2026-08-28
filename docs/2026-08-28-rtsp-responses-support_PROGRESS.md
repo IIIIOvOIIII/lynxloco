@@ -146,3 +146,10 @@
 - Expected result: 任意传输分片、CRLF/comment/blank/multiline/EOF 均正确组帧；delta 与 completed usage 保持现有 consumer 契约；failed/incomplete/error、malformed、截断、空文本、重复完成和事件类型冲突必须 fail closed 并进入 breaker；Chat/Gemini 流式行为不变，raw event 不进日志。
 - Result: Achieved。初始 `9e07e5b` 的整个 Omni 回归 506 passed；独立审查发现无 completed/无非空文本仍可成功，以及通用 `event: message` 会掩盖标准 JSON `type`。`b8d6fa1` 增加每个 consumer 独立的 terminal/text 状态：仅恰好一次 completed、累计非空文本且完成后无新事件才成功；recognized JSON/event 冲突稳定 bad_response，通用/未知 envelope 不再吞标准事件。最终 Omni 519 passed，独立精确复审 Responses+collect 32 passed，结论 CLEAN。真实本地 VLM SSE 方言仍为 `not_measured`。
 - Next step: 执行 Responses Task 5，以确定性红色 JPEG 做真实视觉 preflight；Responses 的 `/models` 仅为可选发现，404/405 后仍必须用同一 runtime adapter 验证 `/responses` 图片能力。
+
+## 2026-08-28 12:13 SGT
+
+- Current work: 完成 Responses Task 5 的真实图片视觉 preflight、可选 `/models`、显式协议隔离和独立审查修复。
+- Expected result: 随包确定性有效 JPEG 必须经 Task 3 同一 adapter 发送到 `/responses`；404/405 的 `/models` 不得阻断视觉调用，其他 auth/rate/network 错误保持分类；只有真实颜色证明通过，generic/text-only/missing output 必须拒绝；无 Key/Bearer、显式协议和日志去敏保持正确。
+- Result: Achieved。`bcaaf47` 加入 32×32 红色 JPEG（wheel 已确认包含）及视觉 probe，Omni+admin preflight+tick 回归 562 passed；自审同时修复显式 Gemini 被模型名二次解析。独立审查发现 substring `red` 会让 `colored`/`redacted` 误通过；`ce25514` 收紧为规范化后仅精确接受 `red` 或 `red.`，拒绝额外单词和子串。独立 probe/admin/tick 复审 84 passed，结论 CLEAN。真实本地 VLM 视觉能力仍为 `not_measured`。
+- Next step: 执行 Responses Task 6，在 admin API、CLI 和 Web 中持久化/展示显式协议，所有 save/activate/test/retry 路径传入协议；Responses Key 可空，Chat/Gemini 保持既有 Key 门禁和跨 URL 凭据隔离。
