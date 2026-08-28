@@ -195,3 +195,10 @@
 - Expected result: 不复制仓库或本机配置，只从 exact clean Git SHA 构建 Web、Linux x86_64 wheels、锁定依赖和模型归档；经 SHA-256 校验后按 lab01→lab02 顺序部署，任一主机激活失败自动恢复该主机上一镜像；两机使用同一 runtime SHA。
 - Result: Achieved。计划保存于 `docs/superpowers/plans/2026-08-28-ai-lab-deployment.md`，共 7 个任务、474 行。运行方式固定为非 root Docker、host network、owner-only 持久状态、只读根文件系统；lab01 限制 3 CPU/3072m，lab02 限制 1.25 CPU/1536m。验收镜像从已安装 wheel 运行 RTSP perception/live 与 Responses JSON/SSE/no-key/Bearer fixture；真实摄像机/VLM 只有存在实际端点才执行，否则保持 `not_measured`。占位符、接口和 `git diff --check` 自检通过。
 - Next step: 提交部署计划；沿用用户已选择的当前会话 subagent-driven-development，按 TDD 实现 artifact allowlist、容器、deploy.sh、验收打包与回滚，再先部署 lab01。
+
+## 2026-08-28 19:05 SGT
+
+- Current work: 完成 ai-lab 部署计划 Task 1/2，并对 Task 3 的 content-addressed 构建、单事务传输、验收、激活、回滚与 retention 控制器执行五轮独立修复复审。
+- Expected result: 在任何真实 Docker、SSH 或实验机访问前，控制器必须证明 exact clean SHA/receipt/controller/allowlist 绑定、单次 SSH/单锁事务、隔离候选镜像、image-ID-bound acceptance、current/previous/历史回滚 proof 保护、signal cleanup、严格 120 秒健康期限、fail-closed 三态 retention、完整 path/symlink/owner/mode 边界和无凭据失败证据；五轮上限内独立审查必须批准。
+- Result: Not achieved，已 fail closed 停止外部动作。Task 1/2 独立审查 CLEAN；Task 3 当前提交 `38b6a12` 的本地 contract 为 105 passed，shell syntax、Ruff、diff 和 help 检查通过，且已关闭 controller race、split transaction、marker/image identity、protected same-SHA retry、signal cleanup、retention uncertainty 和多数精确输出/路径检查。但最终 round 5 复审仍有 3 个 Important：完整树/file-only/checksum 文件集尚未三方严格相等，`release.json` 尚未强制 builder 的完整必需 artifact identity，read-only `status` 尚未在首次 Docker 查询前验证全部 release/artifact/accepted parent/proof chain。没有 Critical；未执行真实 build、Docker、SSH、status、transfer、deploy、verify 或 rollback，ai-lab01/02 均未访问。
+- Next step: 因同一失败类已达到五轮修复预算，等待用户明确选择：额外授权一次只限上述三项的定点修复与原审查人复核，或重新批准一个更简单的部署设计。未经新授权不得访问实验机；真实 RTSP 摄像机与真实 Responses VLM 继续为 `not_measured`。
