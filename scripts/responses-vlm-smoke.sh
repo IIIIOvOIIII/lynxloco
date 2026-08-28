@@ -14,16 +14,36 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(dirname -- "$script_dir")
 cd "$repo_root/backend"
 
-uv run --quiet python - 2>/dev/null <<'PY'
+python_bin="$repo_root/backend/.venv/bin/python"
+if [ ! -x "$python_bin" ]; then
+    exit 2
+fi
+
+# Responses empty-key mode is explicit. Never let the generic Omni fallback key
+# cross into the independently selected Responses endpoint.
+unset MILOCO_MODEL__OMNI__API_KEY
+
+exec "$python_bin" - 2>/dev/null <<'PY'
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
 import re
+import signal
 import sys
 import time
 from urllib.parse import urlsplit
+
+
+def exit_for_signal(signum: int, _frame: object) -> None:
+    raise SystemExit(128 + signum)
+
+
+signal.signal(signal.SIGHUP, exit_for_signal)
+signal.signal(signal.SIGINT, exit_for_signal)
+signal.signal(signal.SIGTERM, exit_for_signal)
+os.environ.pop("MILOCO_MODEL__OMNI__API_KEY", None)
 
 import numpy as np
 

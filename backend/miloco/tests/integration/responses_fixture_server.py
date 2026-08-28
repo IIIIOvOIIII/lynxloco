@@ -35,6 +35,7 @@ class ResponsesFixtureServer:
         models_status: int = 200,
         responses_status: int = 200,
         malformed_response: bool = False,
+        hang_perception: bool = False,
     ) -> None:
         if models_status not in {200, 404, 405}:
             raise ValueError("models_status must be 200, 404, or 405")
@@ -42,6 +43,9 @@ class ResponsesFixtureServer:
         self.models_status = models_status
         self.responses_status = responses_status
         self.malformed_response = malformed_response
+        self.hang_perception = hang_perception
+        self.perception_hang_started = threading.Event()
+        self._release_perception_hang = threading.Event()
         self.requests: list[RecordedRequest] = []
         self._requests_lock = threading.Lock()
         owner = self
@@ -67,6 +71,7 @@ class ResponsesFixtureServer:
         return self
 
     def __exit__(self, *_args: object) -> None:
+        self._release_perception_hang.set()
         self._server.shutdown()
         self._server.server_close()
         self._thread.join(timeout=2)
@@ -132,6 +137,10 @@ class _ResponsesHandler(BaseHTTPRequestHandler):
             return
         if self.fixture.malformed_response:
             self._json_response(200, {"id": "resp_malformed", "output": []})
+            return
+        if self.fixture.hang_perception and body.get("max_output_tokens") != 16:
+            self.fixture.perception_hang_started.set()
+            self.fixture._release_perception_hang.wait(timeout=60)
             return
 
         output_text = (

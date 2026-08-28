@@ -6,7 +6,9 @@ import base64
 import json
 import logging
 import os
+import signal
 import subprocess
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -433,6 +435,97 @@ def test_smoke_runs_visual_preflight_then_synthetic_perception_without_leaks() -
         ("POST", "/v1/responses"),
         ("POST", "/v1/responses"),
     ]
+
+
+def test_smoke_does_not_inherit_generic_omni_key_for_no_key_responses() -> None:
+    repo_root = Path(__file__).resolve().parents[4]
+    script = repo_root / "scripts" / "responses-vlm-smoke.sh"
+    inherited_key = "old-generic-key-that-must-not-cross-endpoints"
+
+    with ResponsesFixtureServer(models_status=404) as fixture:
+        completed = subprocess.run(
+            [str(script)],
+            cwd=repo_root,
+            env={
+                "PATH": os.environ["PATH"],
+                "MILOCO_RESPONSES_BASE_URL": fixture.base_url,
+                "MILOCO_RESPONSES_MODEL": "fixture-vlm",
+                "MILOCO_MODEL__OMNI__API_KEY": inherited_key,
+            },
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+
+    assert completed.returncode == 0
+    assert inherited_key not in completed.stdout
+    assert completed.stderr == ""
+    assert [(request.method, request.path) for request in fixture.requests] == [
+        ("GET", "/v1/models"),
+        ("POST", "/v1/responses"),
+        ("POST", "/v1/responses"),
+    ]
+    assert all(request.auth_present is False for request in fixture.requests)
+
+
+def _process_group_python_or_uv_members(process_group: int) -> list[int]:
+    completed = subprocess.run(
+        ["ps", "-axo", "pid=,pgid=,command="],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=True,
+    )
+    members: list[int] = []
+    for line in completed.stdout.splitlines():
+        fields = line.strip().split(maxsplit=2)
+        if len(fields) != 3:
+            continue
+        pid_text, pgid_text, command = fields
+        if int(pgid_text) == process_group and (
+            "python" in command.casefold() or "uv" in command.casefold()
+        ):
+            members.append(int(pid_text))
+    return members
+
+
+def test_smoke_sigterm_exits_143_without_residual_uv_or_python_child() -> None:
+    repo_root = Path(__file__).resolve().parents[4]
+    script = repo_root / "scripts" / "responses-vlm-smoke.sh"
+
+    with ResponsesFixtureServer(hang_perception=True) as fixture:
+        process = subprocess.Popen(
+            [str(script)],
+            cwd=repo_root,
+            env={
+                "PATH": os.environ["PATH"],
+                "MILOCO_RESPONSES_BASE_URL": fixture.base_url,
+                "MILOCO_RESPONSES_MODEL": "fixture-vlm",
+            },
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            assert fixture.perception_hang_started.wait(timeout=10)
+            os.kill(process.pid, signal.SIGTERM)
+            stdout, stderr = process.communicate(timeout=3)
+        except BaseException:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+            raise
+
+    assert process.returncode == 143
+    assert stdout == ""
+    assert stderr == ""
+    deadline = time.monotonic() + 1.0
+    remaining = _process_group_python_or_uv_members(process.pid)
+    while remaining and time.monotonic() < deadline:
+        time.sleep(0.02)
+        remaining = _process_group_python_or_uv_members(process.pid)
+    assert remaining == []
 
 
 @pytest.mark.parametrize(
