@@ -23,10 +23,10 @@ DEPLOY_SCRIPT = DEPLOY_DIR / "deploy.sh"
 ALLOWLIST = DEPLOY_DIR / "artifact-files.txt"
 
 EXPECTED_COMMANDS = {"build", "preflight", "deploy", "verify", "status", "rollback"}
-EXPECTED_COMMAND_ORDER = ("build", "preflight", "deploy", "verify", "status", "rollback")
 ALLOWED_HOSTS = {"ai-lab01.esxi", "ai-lab02.esxi"}
 FORBIDDEN_PARTS = {".git", ".env", "config.json", ".venv", "node_modules", "__pycache__"}
 EXTERNAL_COMMANDS = (
+    "git",
     "ssh",
     "scp",
     "sftp",
@@ -48,6 +48,16 @@ EXTERNAL_COMMANDS = (
     "rclone",
     "oras",
     "skopeo",
+    "cp",
+    "mv",
+    "rm",
+    "mkdir",
+    "install",
+    "tee",
+    "gzip",
+    "sha256sum",
+    "shasum",
+    "find",
 )
 
 
@@ -73,7 +83,7 @@ def _write_stub(path: Path, name: str, log: Path, body: str = "exit 0") -> None:
 
 
 @pytest.fixture
-def command_stubs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def command_stubs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
     """Record external command names without ever recording environment data."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -81,19 +91,31 @@ def command_stubs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     for command in EXTERNAL_COMMANDS:
         _write_stub(bin_dir, command, call_log)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
-    return call_log
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    return call_log, tmp_path
 
 
-def _run_deploy(*arguments: str) -> subprocess.CompletedProcess[str]:
+def _run_deploy(*arguments: str, sandbox_dir: Path | None = None) -> subprocess.CompletedProcess[str]:
     _assert_deferred_cli_is_safe_to_execute()
+    command = [str(DEPLOY_SCRIPT), *arguments]
     sandbox_exec = shutil.which("sandbox-exec")
-    assert sandbox_exec, "refusing to run deferred deploy CLI tests without a network-denying sandbox"
+    if sandbox_exec and sandbox_dir:
+        sandbox_profile = (
+            "(version 1) "
+            "(deny default) "
+            "(allow file-read*) "
+            "(allow process*) "
+            f'(allow file-write* (subpath "{sandbox_dir}")) '
+            "(deny network*)"
+        )
+        command = [sandbox_exec, "-p", sandbox_profile, *command]
     return subprocess.run(
-        [sandbox_exec, "-p", "(version 1) (allow default) (deny network*)", str(DEPLOY_SCRIPT), *arguments],
+        command,
         cwd=REPOSITORY_ROOT,
         text=True,
         capture_output=True,
         check=False,
+        timeout=5,
         env={
             **os.environ,
             "DOCKER_HOST": "unix:///dev/null",
@@ -108,35 +130,40 @@ def _require_deploy_script() -> None:
         pytest.skip("deploy.sh is supplied by the following deployment task")
 
 
-def _assert_deferred_cli_is_safe_to_execute() -> None:
-    """Reject tool paths that would evade the temporary-PATH command stubs."""
-    script = DEPLOY_SCRIPT.read_text(encoding="utf-8")
-    command_pattern = "|".join(re.escape(command) for command in EXTERNAL_COMMANDS)
-    direct_paths = re.findall(
-        rf"(?<![A-Za-z0-9_.-])/(?:[A-Za-z0-9_.-]+/)*(?:{command_pattern})(?![A-Za-z0-9_.-])",
+def _assert_deferred_cli_is_safe_to_execute(script: str | None = None) -> None:
+    """Reject execution forms that can evade the isolated test harness."""
+    if script is None:
+        script = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    unsafe_forms = re.findall(
+        r"(?m)(?:^|[;&]\s*|\b(?:if|then|do|elif|else|while|until)\s+)"
+        r"(?:source\s+|\.\s+|(?:export\s+)?PATH\s*=|(?:eval|exec|command|env|xargs|sh|bash|zsh|dash)\b|\$\{?[A-Za-z_])",
         script,
     )
-    virtualenv_paths = re.findall(
-        rf"(?<![A-Za-z0-9_.-])(?:\./)?(?:[A-Za-z0-9_.-]+/)*\.venv/bin/(?:{command_pattern})(?![A-Za-z0-9_.-])",
+    direct_executables = re.findall(
+        r"(?m)(?:^|[;&|]\s*|\b(?:if|then|elif|do|while|until)\s+|\$\(\s*)"
+        r"(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*((?:/|\./|\.\./)[^\s;|&]+)",
         script,
     )
-    assert not direct_paths and not virtualenv_paths, (
-        "deferred deploy CLI tests refuse direct tool paths that evade the isolated PATH: "
-        f"{direct_paths + virtualenv_paths}"
+    assert not unsafe_forms and not direct_executables, (
+        "deferred deploy CLI tests refuse source/PATH/indirection or direct executable paths "
+        f"that evade the isolated harness: {unsafe_forms + direct_executables}"
     )
 
 
 def _help_operations(help_text: str) -> set[str]:
-    expected_help = [
-        "Usage: deploy.sh <operation> [--host HOST]",
-        "",
-        "Operations:",
-        *(f"  {command}" for command in EXPECTED_COMMAND_ORDER),
-    ]
-    assert help_text.splitlines() == expected_help, (
-        "--help must use the authoritative complete command list without extra advertised operations"
+    operation_lines = [line for line in help_text.splitlines() if line.startswith("Operations:")]
+    assert len(operation_lines) == 1, "--help must contain one authoritative Operations declaration"
+    advertised_operations = operation_lines[0].removeprefix("Operations:").split()
+    assert set(advertised_operations) == EXPECTED_COMMANDS and len(advertised_operations) == len(
+        EXPECTED_COMMANDS
+    ), "Operations must advertise exactly the six release operations"
+    usage_lines = [line for line in help_text.splitlines() if line.startswith("Usage:")]
+    assert len(usage_lines) == 1 and re.fullmatch(
+        r"Usage:\s+deploy\.sh\s+<operation>(?:\s+\[--host\s+HOST\])?", usage_lines[0]
+    ), (
+        "Usage must refer to the generic <operation> placeholder, not advertise a separate command"
     )
-    return set(EXPECTED_COMMAND_ORDER)
+    return set(advertised_operations)
 
 
 def test_artifact_manifest_is_the_exact_release_allowlist() -> None:
@@ -175,20 +202,43 @@ def test_help_exposes_only_the_release_operations() -> None:
     result = _run_deploy("--help")
     assert result.returncode == 0, result.stderr
     assert _help_operations(result.stdout) == EXPECTED_COMMANDS
+    assert _help_operations(
+        "Usage: deploy.sh <operation> [--host HOST]\n"
+        "Operations: rollback deploy status build verify preflight\n\n"
+        "build creates an immutable local artifact.\n"
+        "The descriptions may use arbitrary layout and wording.\n"
+    ) == EXPECTED_COMMANDS
     with pytest.raises(AssertionError):
-        _help_operations(result.stdout + "\nUsage: deploy.sh destroy\n")
+        _help_operations("Usage: deploy.sh destroy\nOperations: build preflight deploy verify status rollback\n")
+    with pytest.raises(AssertionError):
+        _help_operations(
+            "Usage: deploy.sh <operation>\n"
+            "Operations: build preflight deploy verify status rollback\n"
+            "Operations: destroy\n"
+        )
 
 
-def test_unknown_host_exits_two_before_ssh(command_stubs: Path) -> None:
+def test_unknown_host_exits_two_before_ssh(command_stubs: tuple[Path, Path]) -> None:
     """Catches host validation that occurs after a remote connection attempt."""
     _require_deploy_script()
-    result = _run_deploy("preflight", "--host", "outside-ai-lab.esxi")
+    for bypass in (
+        "source helper.sh\n",
+        "PATH=/usr/bin\n",
+        "eval \"ssh target\"\n",
+        "bash helper.sh\n",
+        "tool=/usr/bin/ssh\n$tool target\n",
+        "$(/usr/bin/tar -cf release.tar release)\n",
+    ):
+        with pytest.raises(AssertionError):
+            _assert_deferred_cli_is_safe_to_execute(bypass)
+    command_log, sandbox_dir = command_stubs
+    result = _run_deploy("preflight", "--host", "outside-ai-lab.esxi", sandbox_dir=sandbox_dir)
     assert result.returncode == 2
-    assert not command_stubs.exists(), "unknown hosts must not invoke SSH, tar, or a build command"
+    assert not command_log.exists(), "unknown hosts must not invoke SSH, tar, or a build command"
 
 
 def test_dirty_worktree_exits_three_before_build_or_transfer(
-    tmp_path: Path, command_stubs: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, command_stubs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Catches artifact creation or transfer before the dirty-tree safety gate."""
     _require_deploy_script()
@@ -202,6 +252,7 @@ def test_dirty_worktree_exits_three_before_build_or_transfer(
         "case \"$*\" in *status*) printf ' M deploy/ai-lab/deploy.sh\\n' ;; *diff*) exit 1 ;; *--show-toplevel*) printf '%s\\n' \"$PWD\" ;; *rev-parse*) printf '0123456789abcdef0123456789abcdef01234567\\n' ;; esac",
     )
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
-    result = _run_deploy("build", "--host", "ai-lab01.esxi")
+    command_log, sandbox_dir = command_stubs
+    result = _run_deploy("build", "--host", "ai-lab01.esxi", sandbox_dir=sandbox_dir)
     assert result.returncode == 3
-    assert not command_stubs.exists(), "a dirty tree must stop before tar, SSH, or the build command"
+    assert not command_log.exists(), "a dirty tree must stop before tar, SSH, or the build command"

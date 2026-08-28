@@ -28,9 +28,10 @@ selected host and release before any remote change. `deploy` automatically
 rolls back to the last known-good release when its post-deploy verification
 fails; an operator can also run the explicit `rollback` command.
 
-`./deploy/ai-lab/deploy.sh --help` is an authoritative complete command list:
-it shows exactly the six operations above and does not advertise aliases or
-additional operations.
+`./deploy/ai-lab/deploy.sh --help` provides one machine-readable authoritative
+line: `Operations: build preflight deploy verify status rollback`. Its prose
+may describe those operations in any layout, but it must not declare a second
+operations list or advertise a concrete operation in `Usage:`.
 
 ## Runtime boundary
 
