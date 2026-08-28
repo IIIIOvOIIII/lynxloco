@@ -10,9 +10,11 @@ from __future__ import annotations
 import os
 import hashlib
 import re
+import shlex
 import shutil
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -135,6 +137,30 @@ def _docker_stage_effective_config() -> dict[str, dict[str, str]]:
     if current_stage:
         stage_config[current_stage] = current_config
     return stage_config
+
+
+def _stage_acceptance_payload(staging: Path) -> None:
+    """Exercise the deploy script's real bounded staging helper in a temp tree."""
+    controller = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    function = re.search(
+        r"(?ms)^copy_acceptance_payload\(\) \{\n.*?^\}\n",
+        controller,
+    )
+    assert function is not None, "deploy.sh must define copy_acceptance_payload"
+    result = subprocess.run(
+        ["bash"],
+        input=(
+            "set -euo pipefail\n"
+            f"PROJECT_ROOT={shlex.quote(str(REPOSITORY_ROOT))}\n"
+            f"{function.group()}\n"
+            f"copy_acceptance_payload {shlex.quote(str(staging))}\n"
+        ),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def _compose_service() -> dict[str, object]:
@@ -358,7 +384,7 @@ def test_runtime_image_is_non_root_and_excludes_acceptance_payload() -> None:
     assert "ENTRYPOINT" in runtime
 
 
-def test_acceptance_image_is_the_only_stage_with_acceptance_payload() -> None:
+def test_acceptance_command_uses_only_installed_wheel_fixture_dependencies() -> None:
     """Catches acceptance dependencies leaking into the production runtime."""
     stages = _docker_stages()
     acceptance = stages["acceptance"]
@@ -366,8 +392,107 @@ def test_acceptance_image_is_the_only_stage_with_acceptance_payload() -> None:
     assert "requirements/acceptance.txt" in acceptance
     assert "acceptance/" in acceptance
     assert re.search(r"pip\s+install\b[^\n]*--require-hashes", acceptance)
-    assert "ai_lab_fixture" in acceptance
-    assert ACCEPTANCE_PYTEST.read_text(encoding="utf-8").count("ai_lab_fixture") == 1
+    assert "MILOCO_SMOKE_PYTHON=/usr/local/bin/python" in acceptance
+    assert "COPY acceptance/ /acceptance/" in acceptance
+    for environment in (
+        "PYTHONPATH=/acceptance/integration",
+        "MILOCO_CONFIG_SEARCH_PATH=/tmp/miloco-acceptance-config",
+        "MILOCO_MODEL__OMNI__API_KEY=",
+        "MILOCO_RESPONSES_API_KEY=",
+    ):
+        assert environment in acceptance
+
+
+def test_acceptance_tree_contains_only_the_explicit_fixture_contract(tmp_path: Path) -> None:
+    """Catches broad test copies, local state, and mode drift in release acceptance."""
+    staging = tmp_path / "release"
+    _stage_acceptance_payload(staging)
+
+    acceptance = staging / "acceptance"
+    fixture_root = REPOSITORY_ROOT / "backend" / "miloco" / "tests" / "fixtures" / "rtsp"
+    expected_files = {
+        Path("pytest.ini"),
+        Path("integration/test_rtsp_perception.py"),
+        Path("integration/test_rtsp_live_view.py"),
+        Path("integration/test_responses_perception.py"),
+        Path("integration/responses_fixture_server.py"),
+        Path("scripts/rtsp-view-smoke.sh"),
+        Path("scripts/responses-vlm-smoke.sh"),
+        *(
+            Path("fixtures/rtsp") / path.relative_to(fixture_root)
+            for path in fixture_root.rglob("*")
+            if path.is_file()
+        ),
+    }
+    actual_files = {path.relative_to(acceptance) for path in acceptance.rglob("*") if path.is_file()}
+    assert actual_files == expected_files
+
+    forbidden_parts = {".git", ".env", "config.json", ".venv", "__pycache__", "conftest.py"}
+    assert all(not forbidden_parts.intersection(path.parts) for path in actual_files)
+    assert all(not path.is_symlink() for path in acceptance.rglob("*"))
+    for path in acceptance.rglob("*"):
+        if path.is_dir():
+            assert stat.S_IMODE(path.stat().st_mode) == 0o755
+        elif path.name.endswith(".sh"):
+            assert stat.S_IMODE(path.stat().st_mode) == 0o555
+        else:
+            assert stat.S_IMODE(path.stat().st_mode) == 0o644
+
+
+def test_smoke_python_override_is_direct_and_fails_closed(tmp_path: Path) -> None:
+    """Catches release smoke scripts falling back to a repository interpreter in images."""
+    rtsp = (REPOSITORY_ROOT / "scripts" / "rtsp-view-smoke.sh").read_text(encoding="utf-8")
+    responses = (REPOSITORY_ROOT / "scripts" / "responses-vlm-smoke.sh").read_text(
+        encoding="utf-8"
+    )
+    for script in (rtsp, responses):
+        assert "MILOCO_SMOKE_PYTHON" in script
+        assert "eval" not in script
+        assert 'echo "$MILOCO_SMOKE_PYTHON"' not in script
+        assert 'exec "$MILOCO_SMOKE_PYTHON"' in script or 'python_bin="$MILOCO_SMOKE_PYTHON"' in script
+        assert "! -L" in script
+        assert "-x" in script
+
+    assert 'exec "$MILOCO_SMOKE_PYTHON" - "$CAMERA_ID" "$BACKEND_URL" "$DURATION_SEC"' in rtsp
+    assert 'python_bin="$MILOCO_SMOKE_PYTHON"' in responses
+    assert 'exec "$python_bin" - 2>/dev/null' in responses
+
+    non_executable = tmp_path / "not-executable"
+    non_executable.write_text("fixture\n", encoding="utf-8")
+    symlink = tmp_path / "python-link"
+    symlink.symlink_to(sys.executable)
+    invalid_values = (
+        "relative-python",
+        str(tmp_path / "missing-python"),
+        str(non_executable),
+        str(symlink),
+        f"{sys.executable} -I",
+    )
+    for override in invalid_values:
+        rtsp_result = subprocess.run(
+            [str(REPOSITORY_ROOT / "scripts" / "rtsp-view-smoke.sh"), "camera", "http://127.0.0.1:1"],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=5,
+            env={**os.environ, "MILOCO_SMOKE_PYTHON": override},
+        )
+        responses_result = subprocess.run(
+            [str(REPOSITORY_ROOT / "scripts" / "responses-vlm-smoke.sh")],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=5,
+            env={
+                **os.environ,
+                "MILOCO_SMOKE_PYTHON": override,
+                "MILOCO_RESPONSES_BASE_URL": "http://127.0.0.1:1",
+                "MILOCO_RESPONSES_MODEL": "fixture-vlm",
+            },
+        )
+        for result in (rtsp_result, responses_result):
+            assert result.returncode == 2
+            assert override not in result.stdout + result.stderr
 
 
 def test_acceptance_image_resets_runtime_entrypoint_before_fixture_command() -> None:
@@ -376,15 +501,16 @@ def test_acceptance_image_resets_runtime_entrypoint_before_fixture_command() -> 
     assert effective_config["runtime"]["ENTRYPOINT"] == '["container-entrypoint.sh"]'
     assert effective_config["acceptance"]["ENTRYPOINT"] == "[]"
     assert effective_config["acceptance"]["CMD"] == (
-        '["python", "-m", "pytest", "-q", "-m", "ai_lab_fixture"]'
+        '["python", "-m", "pytest", "-q", '
+        '"/acceptance/integration/test_rtsp_perception.py", '
+        '"/acceptance/integration/test_rtsp_live_view.py::test_fixture_perception_and_uvicorn_live_view_share_one_rtsp_session", '
+        '"/acceptance/integration/test_responses_perception.py", "-k", "not smoke"]'
     )
 
 
 def test_docker_and_compose_do_not_define_secrets() -> None:
     """Catches API key, token, or secret injection through image or Compose config."""
-    deploy_config = DOCKERFILE.read_text(encoding="utf-8") + "\n" + COMPOSE_FILE.read_text(
-        encoding="utf-8"
-    )
+    deploy_config = _docker_stages()["runtime"] + "\n" + COMPOSE_FILE.read_text(encoding="utf-8")
     forbidden_names = (
         r"api[_-]?key|token|secret|password|credential|"
         r"rtsp[_-]?(?:url|uri|user(?:name)?|pass(?:word)?)|"
@@ -691,7 +817,6 @@ def test_build_contract_is_content_addressed_locked_and_bounded() -> None:
         "backend/miloco/tests/integration/test_responses_perception.py",
         "backend/miloco/tests/integration/responses_fixture_server.py",
         "backend/miloco/tests/fixtures/rtsp",
-        "scripts/rtsp-smoke.sh",
         "scripts/rtsp-view-smoke.sh",
         "scripts/responses-vlm-smoke.sh",
     ):

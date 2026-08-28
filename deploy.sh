@@ -166,21 +166,29 @@ select_one() {
 }
 
 copy_acceptance_payload() {
-    local staging="$1"
+    local staging="$1" fixture_root fixture relative destination
     install -d -m 0755 \
+        "$staging/acceptance" \
         "$staging/acceptance/integration" \
+        "$staging/acceptance/fixtures" \
         "$staging/acceptance/fixtures/rtsp" \
         "$staging/acceptance/scripts"
-    cp -- "$PROJECT_ROOT/deploy/ai-lab/acceptance/pytest.ini" "$staging/acceptance/pytest.ini"
-    cp -- \
+    install -m 0644 "$PROJECT_ROOT/deploy/ai-lab/acceptance/pytest.ini" "$staging/acceptance/pytest.ini"
+    install -m 0644 \
         "$PROJECT_ROOT/backend/miloco/tests/integration/test_rtsp_perception.py" \
         "$PROJECT_ROOT/backend/miloco/tests/integration/test_rtsp_live_view.py" \
         "$PROJECT_ROOT/backend/miloco/tests/integration/test_responses_perception.py" \
         "$PROJECT_ROOT/backend/miloco/tests/integration/responses_fixture_server.py" \
         "$staging/acceptance/integration/"
-    cp -- "$PROJECT_ROOT/backend/miloco/tests/fixtures/rtsp/"* "$staging/acceptance/fixtures/rtsp/"
-    cp -- \
-        "$PROJECT_ROOT/scripts/rtsp-smoke.sh" \
+    fixture_root="$PROJECT_ROOT/backend/miloco/tests/fixtures/rtsp"
+    [[ -z "$(find "$fixture_root" -type l -print -quit)" ]] || die 4 "RTSP fixture symlinks are forbidden"
+    while IFS= read -r -d '' fixture; do
+        relative="${fixture#"$fixture_root"/}"
+        destination="$staging/acceptance/fixtures/rtsp/$relative"
+        install -d -m 0755 "$(dirname "$destination")"
+        install -m 0644 "$fixture" "$destination"
+    done < <(find "$fixture_root" -type f -print0)
+    install -m 0555 \
         "$PROJECT_ROOT/scripts/rtsp-view-smoke.sh" \
         "$PROJECT_ROOT/scripts/responses-vlm-smoke.sh" \
         "$staging/acceptance/scripts/"
@@ -389,6 +397,7 @@ build_release() (
         "$PROJECT_ROOT/deploy/ai-lab/remote-release.sh" \
         "$staging/"
     copy_acceptance_payload "$staging"
+    validate_staging_allowlist "$staging"
 
     (
         cd "$PROJECT_ROOT/backend"

@@ -52,10 +52,16 @@ COPY requirements/acceptance.txt /tmp/requirements/acceptance.txt
 RUN python -m pip install --no-cache-dir --require-hashes -r /tmp/requirements/acceptance.txt \
     && rm -rf /tmp/requirements
 
-COPY acceptance/ /opt/miloco/acceptance/
-RUN chown -R 10001:10001 /opt/miloco/acceptance
+COPY acceptance/ /acceptance/
+RUN chown -R 10001:10001 /acceptance
+
+ENV PYTHONPATH=/acceptance/integration \
+    MILOCO_CONFIG_SEARCH_PATH=/tmp/miloco-acceptance-config \
+    MILOCO_SMOKE_PYTHON=/usr/local/bin/python \
+    MILOCO_MODEL__OMNI__API_KEY= \
+    MILOCO_RESPONSES_API_KEY=
 
 USER 10001:10001
-WORKDIR /opt/miloco/acceptance
+WORKDIR /acceptance
 ENTRYPOINT []
-CMD ["python", "-m", "pytest", "-q", "-m", "ai_lab_fixture"]
+CMD ["python", "-m", "pytest", "-q", "/acceptance/integration/test_rtsp_perception.py", "/acceptance/integration/test_rtsp_live_view.py::test_fixture_perception_and_uvicorn_live_view_share_one_rtsp_session", "/acceptance/integration/test_responses_perception.py", "-k", "not smoke"]

@@ -22,13 +22,16 @@ if [[ ! "$DURATION_SEC" =~ ^[1-9][0-9]*$ ]]; then
     echo "MILOCO_RTSP_VIEW_SMOKE_DURATION_SEC must be a positive integer" >&2
     exit 2
 fi
-if ! command -v uv >/dev/null 2>&1; then
-    echo "uv is required" >&2
-    exit 2
-fi
-
-cd "$REPO_ROOT/backend"
-exec uv run python - "$CAMERA_ID" "$BACKEND_URL" "$DURATION_SEC" <<'PY'
+if [[ -n "${MILOCO_SMOKE_PYTHON:-}" ]]; then
+    [[ "$MILOCO_SMOKE_PYTHON" == /* && -f "$MILOCO_SMOKE_PYTHON" \
+        && ! -L "$MILOCO_SMOKE_PYTHON" && -x "$MILOCO_SMOKE_PYTHON" ]] \
+        || exit 2
+    exec "$MILOCO_SMOKE_PYTHON" - "$CAMERA_ID" "$BACKEND_URL" "$DURATION_SEC"
+else
+    command -v uv >/dev/null 2>&1 || exit 2
+    cd "$REPO_ROOT/backend"
+    exec uv run python - "$CAMERA_ID" "$BACKEND_URL" "$DURATION_SEC"
+fi <<'PY'
 from __future__ import annotations
 
 import asyncio

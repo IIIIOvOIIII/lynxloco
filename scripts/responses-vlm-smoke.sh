@@ -12,11 +12,17 @@ trap 'exit 143' TERM
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(dirname -- "$script_dir")
-cd "$repo_root/backend"
 
-python_bin="$repo_root/backend/.venv/bin/python"
-if [ ! -x "$python_bin" ]; then
-    exit 2
+if [ -n "${MILOCO_SMOKE_PYTHON:-}" ]; then
+    [ "${MILOCO_SMOKE_PYTHON#/}" != "$MILOCO_SMOKE_PYTHON" ] \
+        && [ -f "$MILOCO_SMOKE_PYTHON" ] \
+        && [ ! -L "$MILOCO_SMOKE_PYTHON" ] \
+        && [ -x "$MILOCO_SMOKE_PYTHON" ] || exit 2
+    python_bin="$MILOCO_SMOKE_PYTHON"
+else
+    python_bin="$repo_root/backend/.venv/bin/python"
+    [ -f "$python_bin" ] && [ ! -L "$python_bin" ] && [ -x "$python_bin" ] || exit 2
+    cd "$repo_root/backend"
 fi
 
 # Responses empty-key mode is explicit. Never let the generic Omni fallback key
