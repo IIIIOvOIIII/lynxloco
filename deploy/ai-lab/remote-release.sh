@@ -758,8 +758,8 @@ release_contract_state() {
 }
 
 release_json_state() {
-    local file="$1" sha="$2" output
-    local parser='import json,sys
+    local file="$1" sha="$2" release="$3" output
+    local parser='import datetime,json,os,re,stat,sys
 class DuplicateKey(ValueError): pass
 def unique(pairs):
     result = {}
@@ -770,24 +770,47 @@ def unique(pairs):
 try:
     with open(sys.argv[1], "r", encoding="utf-8") as source:
         value = json.load(source, object_pairs_hook=unique)
-    allowed = {"schema", "git_sha", "built_at", "platform", "artifacts"}
-    valid = isinstance(value, dict) and set(value) <= allowed
+    required = {"schema", "git_sha", "built_at", "platform", "artifacts"}
+    valid = isinstance(value, dict) and set(value) == required
     valid = valid and value.get("schema") == 1 and not isinstance(value.get("schema"), bool)
     valid = valid and value.get("git_sha") == sys.argv[2]
     valid = valid and value.get("platform") == "linux/amd64"
-    if "built_at" in value:
-        valid = valid and isinstance(value["built_at"], str) and bool(value["built_at"])
-    if "artifacts" in value:
+    built_at = value.get("built_at") if isinstance(value, dict) else None
+    valid = valid and isinstance(built_at, str) and bool(re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", built_at))
+    if valid:
+        try:
+            datetime.datetime.strptime(built_at, "%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            valid = False
+    if valid:
         artifacts = value["artifacts"]
         valid = valid and isinstance(artifacts, dict)
         valid = valid and set(artifacts) == {"miloco", "cli", "miot", "models"}
-        valid = valid and all(isinstance(item, str) and item for item in artifacts.values())
+        patterns = {
+            "miloco": r"miloco-[A-Za-z0-9_.+-]+[.]whl",
+            "cli": r"miloco_cli-[A-Za-z0-9_.+-]+[.]whl",
+            "miot": r"miloco_miot-[A-Za-z0-9_.+-]*manylinux_2_28_x86_64[.]whl",
+            "models": r"miloco-models-[A-Za-z0-9_.+-]+[.]tar[.]gz",
+        }
+        parents = {"miloco": "wheels", "cli": "wheels", "miot": "wheels", "models": "models"}
+        for key in ("miloco", "cli", "miot", "models"):
+            name = artifacts.get(key)
+            valid = valid and isinstance(name, str) and bool(re.fullmatch(patterns[key], name or ""))
+            if not valid:
+                break
+            artifact_path = os.path.join(sys.argv[3], parents[key], name)
+            try:
+                artifact_stat = os.lstat(artifact_path)
+            except OSError:
+                valid = False
+                break
+            valid = stat.S_ISREG(artifact_stat.st_mode)
     print("valid" if valid else "invalid")
 except (OSError, UnicodeError):
     raise
 except (json.JSONDecodeError, DuplicateKey, TypeError, ValueError):
     print("invalid")'
-    capture_tool_output output python3 -c "$parser" "$file" "$sha" || return 2
+    capture_tool_output output python3 -c "$parser" "$file" "$sha" "$release" || return 2
     case "$output" in
         $'valid\n') return 0 ;;
         $'invalid\n') return 1 ;;
@@ -800,7 +823,8 @@ classify_release_tree() {
     local line digest path file relative hash_output actual_digest checksum_content
     local checksum_match checksummed_path listing_remaining listing_line listing_count root_count
     local duplicate actual_match listed_count=0 checksummed_count=0 actual_count=0 index listed_path actual_file
-    local -a checksummed_paths=() listed_paths=() actual_files=()
+    local full_file_count=0 full_checksum_count=0 file_checksum_count=0 file_only_count=0
+    local -a checksummed_paths=() listed_paths=() actual_files=() full_files=() file_only_files=()
 
     if classifier_release_paths_state "$release"; then :; else state="$?"; return "$state"; fi
 
@@ -845,6 +869,10 @@ classify_release_tree() {
         else
             [[ -f "$entry" && ! -L "$entry" ]] || return 2
             relative="${entry#"$release"/}"
+            [[ "$relative" != "$entry" && -n "$relative" ]] || return 2
+            full_files[$full_file_count]="$relative"
+            full_file_count=$((full_file_count + 1))
+            [[ "$relative" != "SHA256SUMS" ]] || full_checksum_count=$((full_checksum_count + 1))
             case "$relative" in
                 container-entrypoint.sh|remote-release.sh|acceptance/scripts/*.sh) expected_mode=0555 ;;
                 *) expected_mode=0644 ;;
@@ -853,6 +881,7 @@ classify_release_tree() {
         (( 8#$mode == expected_mode )) || return 1
     done
     (( listing_count > 0 && root_count == 1 )) || return 2
+    (( full_file_count > 0 && full_checksum_count == 1 )) || return 2
 
     for file in "$release/release.json" "$release/SHA256SUMS"; do
         if [[ ! -e "$file" && ! -L "$file" ]]; then
@@ -860,7 +889,7 @@ classify_release_tree() {
         fi
         [[ -f "$file" && ! -L "$file" ]] || return 1
     done
-    if release_json_state "$release/release.json" "$sha"; then :; else state="$?"; return "$state"; fi
+    if release_json_state "$release/release.json" "$sha" "$release"; then :; else state="$?"; return "$state"; fi
 
     read_file_content "$release/SHA256SUMS" checksum_content || return 2
     [[ -n "$checksum_content" && "$checksum_content" == *$'\n' ]] || return 1
@@ -874,6 +903,7 @@ classify_release_tree() {
         case "$path" in
             /*|../*|*/../*|*/..|.|..|*\\*) return 1 ;;
         esac
+        [[ "$path" != "SHA256SUMS" ]] || return 1
         duplicate=0
         for (( index=0; index < checksummed_count; index++ )); do
             [[ "${checksummed_paths[$index]}" != "$path" ]] || duplicate=1
@@ -903,12 +933,17 @@ classify_release_tree() {
         [[ -n "$file" ]] || return 2
         relative="${file#"$release"/}"
         [[ "$relative" != "$file" ]] || return 2
-        [[ "$relative" == "SHA256SUMS" ]] && continue
         duplicate=0
-        for (( index=0; index < actual_count; index++ )); do
-            [[ "${actual_files[$index]}" != "$relative" ]] || duplicate=1
+        for (( index=0; index < file_only_count; index++ )); do
+            [[ "${file_only_files[$index]}" != "$relative" ]] || duplicate=1
         done
         (( duplicate == 0 )) || return 2
+        file_only_files[$file_only_count]="$relative"
+        file_only_count=$((file_only_count + 1))
+        if [[ "$relative" == "SHA256SUMS" ]]; then
+            file_checksum_count=$((file_checksum_count + 1))
+            continue
+        fi
         actual_files[$actual_count]="$relative"
         actual_count=$((actual_count + 1))
         remote_path_is_allowlisted "$relative" || return 1
@@ -919,16 +954,24 @@ classify_release_tree() {
                 break
             fi
         done
-        (( checksum_match == 1 )) || return 1
     done
-    (( actual_count == checksummed_count )) || return 2
+    (( file_only_count > 0 && file_checksum_count == 1 )) || return 2
+    (( full_file_count == file_only_count )) || return 2
+    for (( index=0; index < full_file_count; index++ )); do
+        actual_match=0
+        for (( listed_count=0; listed_count < file_only_count; listed_count++ )); do
+            [[ "${file_only_files[$listed_count]}" != "${full_files[$index]}" ]] || actual_match=1
+        done
+        (( actual_match == 1 )) || return 2
+    done
+    (( actual_count == checksummed_count )) || return 1
     for (( index=0; index < checksummed_count; index++ )); do
         checksummed_path="${checksummed_paths[$index]}"
         actual_match=0
         for (( listed_count=0; listed_count < actual_count; listed_count++ )); do
             [[ "${actual_files[$listed_count]}" != "$checksummed_path" ]] || actual_match=1
         done
-        (( actual_match == 1 )) || return 2
+        (( actual_match == 1 )) || return 1
     done
     for (( index=0; index < actual_count; index++ )); do
         file="$release/${actual_files[$index]}"
@@ -1051,21 +1094,31 @@ abort_candidate_build() {
     return 1
 }
 
-release_capability() {
-    local sha="$1" contract_state runtime_state acceptance_state runtime_id acceptance_id record_state path_state
+release_filesystem_proof_state() {
+    local sha="$1" contract_state record_state path_state
     validate_sha "$sha"
-    if classifier_capability_paths_state "$sha"; then :; else path_state="$?"; [[ "$path_state" -eq 1 ]] && printf 'definitively_invalid\n' || printf 'probe_error\n'; return 0; fi
-    if read_artifact_record "$sha"; then :; else record_state="$?"; [[ "$record_state" -eq 1 ]] && printf 'definitively_invalid\n' || printf 'probe_error\n'; return 0; fi
-    if read_acceptance_marker "$sha"; then :; else record_state="$?"; [[ "$record_state" -eq 1 ]] && printf 'definitively_invalid\n' || printf 'probe_error\n'; return 0; fi
-    if [[ "$marker_archive_digest" != "$artifact_archive_digest" ]]; then
-        printf 'definitively_invalid\n'
+    if classifier_capability_paths_state "$sha"; then :; else path_state="$?"; return "$path_state"; fi
+    if read_artifact_record "$sha"; then :; else record_state="$?"; return "$record_state"; fi
+    if read_acceptance_marker "$sha"; then :; else record_state="$?"; return "$record_state"; fi
+    [[ "$marker_archive_digest" == "$artifact_archive_digest" ]] || return 1
+    contract_state="$(release_contract_state "$sha")"
+    case "$contract_state" in
+        valid) return 0 ;;
+        definitively_invalid) return 1 ;;
+        *) return 2 ;;
+    esac
+}
+
+release_capability() {
+    local sha="$1" runtime_state acceptance_state runtime_id acceptance_id proof_state
+    validate_sha "$sha"
+    if release_filesystem_proof_state "$sha"; then
+        :
+    else
+        proof_state="$?"
+        [[ "$proof_state" -eq 1 ]] && printf 'definitively_invalid\n' || printf 'probe_error\n'
         return 0
     fi
-    contract_state="$(release_contract_state "$sha")"
-    [[ "$contract_state" == "valid" ]] || {
-        printf '%s\n' "$contract_state"
-        return 0
-    }
     runtime_state="$(image_reference_state "miloco-lab:$sha")"
     acceptance_state="$(image_reference_state "miloco-lab-acceptance:$sha")"
     case "$runtime_state:$acceptance_state" in
@@ -1386,23 +1439,34 @@ verify_running() {
 }
 
 status_release() {
-    local host="$1" path_state
+    local host="$1" path_state current_content sha proof_state
     require_root
     validate_host "$host"
-    if [[ -e "$LAB_ROOT" || -L "$LAB_ROOT" ]]; then
-        if exact_directory_state "$LAB_ROOT" 0755; then :; else path_state="$?"; die 4 "lab root is unsafe for status (state=$path_state)"; fi
-        if [[ -e "$DEPLOY_STATE_DIR" || -L "$DEPLOY_STATE_DIR" ]]; then
-            if exact_directory_state "$DEPLOY_STATE_DIR" 0755; then :; else path_state="$?"; die 4 "deploy-state parent is unsafe for status (state=$path_state)"; fi
-        fi
-    fi
-    [[ ! -L "$CURRENT_FILE" ]] || die 4 "current state record is unsafe"
-    if [[ ! -f "$CURRENT_FILE" ]]; then
+    if [[ ! -e "$LAB_ROOT" && ! -L "$LAB_ROOT" ]]; then
         printf 'not_deployed host=%s\n' "$host"
         return 0
     fi
-    require_safe_record "$CURRENT_FILE" || die 4 "current state record is unsafe"
-    local sha="$(<"$CURRENT_FILE")"
+    if exact_directory_state "$LAB_ROOT" 0755; then :; else path_state="$?"; die 4 "lab root is unsafe for status (state=$path_state)"; fi
+    if [[ ! -e "$DEPLOY_STATE_DIR" && ! -L "$DEPLOY_STATE_DIR" ]]; then
+        printf 'not_deployed host=%s\n' "$host"
+        return 0
+    fi
+    if exact_directory_state "$DEPLOY_STATE_DIR" 0755; then :; else path_state="$?"; die 4 "deploy-state parent is unsafe for status (state=$path_state)"; fi
+    if [[ ! -e "$CURRENT_FILE" && ! -L "$CURRENT_FILE" ]]; then
+        printf 'not_deployed host=%s\n' "$host"
+        return 0
+    fi
+    if safe_record_state "$CURRENT_FILE"; then :; else path_state="$?"; die 4 "current state record is unsafe (state=$path_state)"; fi
+    read_file_content "$CURRENT_FILE" current_content || die 4 "current state record cannot be read"
+    [[ "$current_content" =~ ^([0-9a-f]{40})$'\n'$ ]] || die 4 "current state record is invalid"
+    sha="${BASH_REMATCH[1]}"
     validate_sha "$sha"
+    if release_filesystem_proof_state "$sha"; then
+        :
+    else
+        proof_state="$?"
+        die 4 "current release proof is unsafe for status (state=$proof_state)"
+    fi
     local container_id image health observed_image
     container_id="$(compose_container_id "$host" "$sha" 10 || true)"
     image="not_running"

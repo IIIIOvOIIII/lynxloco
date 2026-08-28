@@ -128,13 +128,21 @@ definitively invalid. Contract verification distinguishes a successfully
 computed checksum or metadata mismatch from uncertainty: missing tools,
 unexpected exit codes or output, and filesystem, read, `find`, `stat`, `grep`,
 or checksum I/O failures are probe errors. `release.json` is parsed as JSON by
-`python3`, with duplicate keys rejected and the schema, full Git SHA, platform,
-and allowed build fields checked semantically. `SHA256SUMS`, artifact receipts,
-acceptance markers, file enumeration, per-file hash output, image listings, and
-image inspection results must have one exact, non-duplicated structure; partial,
-extra, empty, or malformed successful output is a probe error unless it proves a
-contract mismatch. Docker daemon/query failures and unexpected image output are
-probe errors as well. Probe errors stop cleanup without deleting anything.
+`python3`, with duplicate keys rejected. Its exact builder schema is required:
+schema `1`, the full Git SHA, a UTC `built_at` timestamp, platform
+`linux/amd64`, and the four build artifacts (`miloco`, `cli`, `miot`, and
+`models`) bound to their actual wheel or model-archive files. Missing, extra,
+conflicting, mis-typed, or control/acceptance artifact identities are rejected.
+`SHA256SUMS`, artifact receipts, acceptance markers, file enumeration, per-file
+hash output, image listings, and image inspection results must have one exact,
+non-duplicated structure. The regular-file set derived from the full release
+walk must equal the independent file-only walk and, excluding the manifest
+itself, the unique checksum set; `SHA256SUMS` must appear exactly once in both
+filesystem walks. Partial, extra, empty, duplicated, or malformed successful
+enumeration output is a probe error, while equal walks that prove an extra or
+missing checksummed payload file are a contract mismatch. Docker daemon/query
+failures and unexpected image output are probe errors as well. Probe errors
+stop cleanup without deleting anything.
 Invalid debris does not consume a historical slot.
 The current release plus two rollback-capable historical pairs are kept, and
 `previous` consumes one historical slot.
@@ -145,6 +153,13 @@ committed, deploy reports `activated_cleanup_failed` but preserves successful
 activation instead of pretending it rolled back. Failure evidence reports only
 bounded container presence, normalized health, and HTTP status codes.
 Application logs are never read or emitted by the release controller.
+
+Read-only `status` performs the same canonical-path and filesystem-proof checks
+before its first Compose or Docker query. The lab root, release parents, current
+release, deployment-state parents, current record, artifact receipt, acceptance
+marker, and complete release proof must all be non-symlinked, root-owned, at
+their exact modes and real paths. An invalid or uncertain path or proof fails
+closed without mutation and without contacting Docker.
 
 When a real AI-lab endpoint, model service, camera, or other external endpoint
 is absent, record that validation as `not_measured`. Do not substitute a mock,

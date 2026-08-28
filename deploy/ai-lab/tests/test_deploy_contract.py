@@ -1384,25 +1384,23 @@ def test_release_contract_classifier_separates_mismatch_from_tool_or_io_uncertai
     """The real classifier only calls a successfully confirmed mismatch invalid."""
     sha = "7" * 40
     lab_root = tmp_path / "miloco-lab"
-    release = lab_root / "releases" / sha
-    release.mkdir(parents=True)
+    release = _write_valid_classifier_release(lab_root, sha)
     release_json = release / "release.json"
-    release_json.write_text(
-        '{"schema": 1, "git_sha": "'
-        + (("8" * 40) if probe_case == "contract_mismatch" else sha)
-        + '", "platform": "linux/amd64"}\n',
-        encoding="utf-8",
-    )
     payload = release / "remote-release.sh"
-    payload.write_text("payload\n", encoding="utf-8")
-    digest = hashlib.sha256(payload.read_bytes()).hexdigest()
+    if probe_case == "contract_mismatch":
+        release_json.write_text(
+            release_json.read_text(encoding="utf-8").replace(sha, "8" * 40),
+            encoding="utf-8",
+        )
+        _refresh_release_checksums(release)
     if probe_case == "checksum_mismatch":
-        digest = "0" * 64
-    (release / "SHA256SUMS").write_text(
-        f"{hashlib.sha256(release_json.read_bytes()).hexdigest()}  release.json\n"
-        f"{digest}  remote-release.sh\n",
-        encoding="utf-8",
-    )
+        checksum_file = release / "SHA256SUMS"
+        checksum_file.write_text(
+            checksum_file.read_text(encoding="utf-8").replace(
+                hashlib.sha256(payload.read_bytes()).hexdigest(), "0" * 64
+            ),
+            encoding="utf-8",
+        )
 
     source = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8").rsplit(
         '\nmain "$@"', maxsplit=1
@@ -1454,25 +1452,49 @@ def test_release_contract_classifier_separates_mismatch_from_tool_or_io_uncertai
 
 def _write_valid_classifier_release(lab_root: Path, sha: str) -> Path:
     release = lab_root / "releases" / sha
-    release.mkdir(parents=True)
+    (release / "wheels").mkdir(parents=True)
+    (release / "models").mkdir()
+    artifacts = {
+        "miloco": "miloco-1.0.0-py3-none-any.whl",
+        "cli": "miloco_cli-1.0.0-py3-none-any.whl",
+        "miot": "miloco_miot-1.0.0-manylinux_2_28_x86_64.whl",
+        "models": "miloco-models-1.0.0.tar.gz",
+    }
+    for key, name in artifacts.items():
+        parent = "models" if key == "models" else "wheels"
+        (release / parent / name).write_text(f"{key}\n", encoding="utf-8")
     release_json = release / "release.json"
     release_json.write_text(
         '{"schema":1,"git_sha":"'
         + sha
         + '","built_at":"2026-08-28T00:00:00Z","platform":"linux/amd64",'
-        + '"artifacts":{"miloco":"miloco.whl","cli":"cli.whl",'
-        + '"miot":"miot.whl","models":"models.tar.gz"}}\n',
+        + '"artifacts":{"miloco":"miloco-1.0.0-py3-none-any.whl",'
+        + '"cli":"miloco_cli-1.0.0-py3-none-any.whl",'
+        + '"miot":"miloco_miot-1.0.0-manylinux_2_28_x86_64.whl",'
+        + '"models":"miloco-models-1.0.0.tar.gz"}}\n',
         encoding="utf-8",
     )
     payload = release / "remote-release.sh"
     payload.write_text("payload\n", encoding="utf-8")
     payload.chmod(0o555)
+    _refresh_release_checksums(release)
+    return release
+
+
+def _refresh_release_checksums(release: Path) -> None:
+    checksummed = sorted(
+        path
+        for path in release.rglob("*")
+        if path.is_file() and path.name != "SHA256SUMS"
+    )
     (release / "SHA256SUMS").write_text(
-        f"{hashlib.sha256(release_json.read_bytes()).hexdigest()}  release.json\n"
-        f"{hashlib.sha256(payload.read_bytes()).hexdigest()}  remote-release.sh\n",
+        "".join(
+            f"{hashlib.sha256(path.read_bytes()).hexdigest()}  "
+            f"{path.relative_to(release)}\n"
+            for path in checksummed
+        ),
         encoding="utf-8",
     )
-    return release
 
 
 def _run_release_classifier(
@@ -1536,6 +1558,94 @@ def test_release_classifier_treats_successful_incomplete_find_output_as_uncertai
     assert result.stdout.strip() == "probe_error"
 
 
+def test_release_classifier_cross_checks_full_tree_against_file_only_find(
+    tmp_path: Path,
+) -> None:
+    """A file seen by the full walk cannot be hidden by the file-only walk."""
+    sha = "2" * 40
+    lab_root = tmp_path / "miloco-lab"
+    release = _write_valid_classifier_release(lab_root, sha)
+    requirements = release / "requirements"
+    requirements.mkdir()
+    hidden = requirements / "backend.txt"
+    hidden.write_text("extra\n", encoding="utf-8")
+    _refresh_release_checksums(release)
+    override = (
+        'find() { case "$*" in '
+        "*'-type l'*|*'! -type d ! -type f'*|*'-xdev -print'*) command find \"$@\" ;; "
+        f"*'-type f -print'*) command find \"$@\" | command sed '\\|{hidden}|d' ;; "
+        '*) command find "$@" ;; esac; }'
+    )
+    result = _run_release_classifier(tmp_path, lab_root, sha, shell_override=override)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "probe_error"
+
+
+@pytest.mark.parametrize(
+    ("walk_kind", "missing_name"),
+    [
+        ("full", "SHA256SUMS"),
+        ("full", "remote-release.sh"),
+        ("files", "SHA256SUMS"),
+        ("files", "remote-release.sh"),
+    ],
+)
+def test_release_classifier_treats_successful_partial_walks_as_probe_errors(
+    tmp_path: Path, walk_kind: str, missing_name: str
+) -> None:
+    sha = "3" * 40
+    lab_root = tmp_path / "miloco-lab"
+    release = _write_valid_classifier_release(lab_root, sha)
+    missing = release / missing_name
+    target = "-xdev -print" if walk_kind == "full" else "-type f -print"
+    override = (
+        'find() { case "$*" in '
+        "*'-type l'*|*'! -type d ! -type f'*) command find \"$@\" ;; "
+        f"*'{target}'*) command find \"$@\" | command sed '\\|{missing}|d' ;; "
+        '*) command find "$@" ;; esac; }'
+    )
+    result = _run_release_classifier(tmp_path, lab_root, sha, shell_override=override)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "probe_error"
+
+
+@pytest.mark.parametrize("walk_kind", ["full", "files"])
+def test_release_classifier_treats_duplicate_walk_records_as_probe_errors(
+    tmp_path: Path, walk_kind: str
+) -> None:
+    sha = "4" * 40
+    lab_root = tmp_path / "miloco-lab"
+    release = _write_valid_classifier_release(lab_root, sha)
+    target = "-xdev -print" if walk_kind == "full" else "-type f -print"
+    duplicate = release if walk_kind == "full" else release / "release.json"
+    override = (
+        'find() { case "$*" in '
+        "*'-type l'*|*'! -type d ! -type f'*) command find \"$@\" ;; "
+        f"*'{target}'*) command find \"$@\"; printf '%s\\n' '{duplicate}' ;; "
+        '*) command find "$@" ;; esac; }'
+    )
+    result = _run_release_classifier(tmp_path, lab_root, sha, shell_override=override)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "probe_error"
+
+
+def test_release_classifier_treats_empty_file_only_walk_as_probe_error(
+    tmp_path: Path,
+) -> None:
+    sha = "5" * 40
+    lab_root = tmp_path / "miloco-lab"
+    _write_valid_classifier_release(lab_root, sha)
+    override = (
+        "find() { case \"$*\" in "
+        "*'-type l'*|*'! -type d ! -type f'*|*'-xdev -print'*) command find \"$@\" ;; "
+        "*'-type f -print'*) printf '' ;; "
+        "*) command find \"$@\" ;; esac; }"
+    )
+    result = _run_release_classifier(tmp_path, lab_root, sha, shell_override=override)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "probe_error"
+
+
 @pytest.mark.parametrize("hash_case", ["extra_line", "wrong_filename"])
 def test_release_classifier_requires_exact_single_file_hash_output(
     tmp_path: Path, hash_case: str
@@ -1592,16 +1702,88 @@ def test_release_classifier_uses_strict_json_semantics(
     release = _write_valid_classifier_release(lab_root, sha)
     metadata = release / "release.json"
     metadata.write_text(release_json.replace("{sha}", sha), encoding="utf-8")
-    checksum_file = release / "SHA256SUMS"
-    payload = release / "remote-release.sh"
-    checksum_file.write_text(
-        f"{hashlib.sha256(metadata.read_bytes()).hexdigest()}  release.json\n"
-        f"{hashlib.sha256(payload.read_bytes()).hexdigest()}  remote-release.sh\n",
-        encoding="utf-8",
-    )
+    _refresh_release_checksums(release)
     result = _run_release_classifier(tmp_path, lab_root, sha)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "definitively_invalid"
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        '{"schema":1,"git_sha":"{sha}","platform":"linux/amd64",'
+        '"artifacts":{"miloco":"miloco-1.0.0-py3-none-any.whl",'
+        '"cli":"miloco_cli-1.0.0-py3-none-any.whl",'
+        '"miot":"miloco_miot-1.0.0-manylinux_2_28_x86_64.whl",'
+        '"models":"miloco-models-1.0.0.tar.gz"}}\n',
+        '{"schema":1,"git_sha":"{sha}","built_at":"2026-08-28 00:00:00",'
+        '"platform":"linux/amd64","artifacts":{"miloco":"miloco-1.0.0-py3-none-any.whl",'
+        '"cli":"miloco_cli-1.0.0-py3-none-any.whl",'
+        '"miot":"miloco_miot-1.0.0-manylinux_2_28_x86_64.whl",'
+        '"models":"miloco-models-1.0.0.tar.gz"}}\n',
+        '{"schema":1,"git_sha":"{sha}","built_at":"2026-08-28T00:00:00Z",'
+        '"platform":"linux/amd64"}\n',
+        '{"schema":1,"git_sha":"{sha}","built_at":"2026-08-28T00:00:00Z",'
+        '"platform":"linux/amd64","extra":true,"artifacts":{'
+        '"miloco":"miloco-1.0.0-py3-none-any.whl",'
+        '"cli":"miloco_cli-1.0.0-py3-none-any.whl",'
+        '"miot":"miloco_miot-1.0.0-manylinux_2_28_x86_64.whl",'
+        '"models":"miloco-models-1.0.0.tar.gz"}}\n',
+        '{"schema":1,"git_sha":"{sha}","built_at":"2026-08-28T00:00:00Z",'
+        '"platform":"linux/amd64","artifacts":{'
+        '"miloco":"remote-release.sh","cli":"miloco_cli-1.0.0-py3-none-any.whl",'
+        '"miot":"miloco_miot-1.0.0-manylinux_2_28_x86_64.whl",'
+        '"models":"miloco-models-1.0.0.tar.gz"}}\n',
+        '{"schema":1,"git_sha":"{sha}","built_at":"2026-08-28T00:00:00Z",'
+        '"platform":"linux/amd64","artifacts":{'
+        '"miloco":"miloco_cli-1.0.0-py3-none-any.whl",'
+        '"cli":"miloco-1.0.0-py3-none-any.whl",'
+        '"miot":"miloco_miot-1.0.0-manylinux_2_28_x86_64.whl",'
+        '"models":"miloco-models-1.0.0.tar.gz"}}\n',
+        '{"schema":1,"git_sha":"{sha}","built_at":"2026-02-30T00:00:00Z",'
+        '"platform":"linux/amd64","artifacts":{'
+        '"miloco":"miloco-1.0.0-py3-none-any.whl",'
+        '"cli":"miloco_cli-1.0.0-py3-none-any.whl",'
+        '"miot":"miloco_miot-1.0.0-manylinux_2_28_x86_64.whl",'
+        '"models":"miloco-models-1.0.0.tar.gz"}}\n',
+        '{"schema":1,"git_sha":"{sha}","built_at":"2026-08-28T00:00:00Z",'
+        '"platform":"linux/amd64","artifacts":{'
+        '"miloco":"miloco-1.0.0-py3-none-any.whl",'
+        '"cli":"miloco_cli-1.0.0-py3-none-any.whl",'
+        '"miot":"miloco_miot-1.0.0-manylinux_2_28_x86_64.whl"}}\n',
+        '{"schema":1,"git_sha":"{sha}","built_at":"2026-08-28T00:00:00Z",'
+        '"platform":"linux/amd64","artifacts":{'
+        '"miloco":"miloco-1.0.0-py3-none-any.whl",'
+        '"cli":"miloco_cli-1.0.0-py3-none-any.whl",'
+        '"miot":"miloco_miot-1.0.0-manylinux_2_28_x86_64.whl",'
+        '"models":"miloco-models-1.0.0.tar.gz",'
+        '"remote":"remote-release.sh"}}\n',
+    ],
+)
+def test_release_classifier_requires_exact_builder_metadata_schema(
+    tmp_path: Path, metadata: str
+) -> None:
+    sha = "6" * 40
+    lab_root = tmp_path / "miloco-lab"
+    release = _write_valid_classifier_release(lab_root, sha)
+    (release / "release.json").write_text(
+        metadata.replace("{sha}", sha), encoding="utf-8"
+    )
+    _refresh_release_checksums(release)
+    result = _run_release_classifier(tmp_path, lab_root, sha)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "definitively_invalid"
+
+
+def test_release_classifier_accepts_exact_builder_metadata_schema(
+    tmp_path: Path,
+) -> None:
+    sha = "7" * 40
+    lab_root = tmp_path / "miloco-lab"
+    _write_valid_classifier_release(lab_root, sha)
+    result = _run_release_classifier(tmp_path, lab_root, sha)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "valid"
 
 
 @pytest.mark.parametrize(
@@ -2188,6 +2370,169 @@ def test_status_rejects_current_record_symlink_without_docker(tmp_path: Path) ->
     assert result.returncode == 4
     assert "unsafe" in result.stderr
     assert not docker_log.exists()
+
+
+def _write_valid_status_tree(lab_root: Path, sha: str) -> None:
+    _write_valid_classifier_release(lab_root, sha)
+    deploy_state = lab_root / "deploy-state"
+    artifacts = deploy_state / "artifacts"
+    accepted = deploy_state / "accepted"
+    artifacts.mkdir(parents=True)
+    accepted.mkdir()
+    archive_digest = "a" * 64
+    (deploy_state / "current").write_text(f"{sha}\n", encoding="utf-8")
+    (artifacts / sha).write_text(
+        "schema=1\n"
+        f"git_sha={sha}\n"
+        f"archive_sha256={archive_digest}\n"
+        f"controller_sha256={'b' * 64}\n"
+        f"allowlist_sha256={hashlib.sha256(ALLOWLIST.read_bytes()).hexdigest()}\n",
+        encoding="utf-8",
+    )
+    (accepted / sha).write_text(
+        "schema=1\n"
+        f"archive_sha256={archive_digest}\n"
+        f"runtime_image_id=sha256:{'c' * 64}\n"
+        f"acceptance_image_id=sha256:{'d' * 64}\n",
+        encoding="utf-8",
+    )
+
+
+def _run_status_harness(
+    tmp_path: Path, lab_root: Path, sha: str, *, shell_override: str = ""
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    source = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8").rsplit(
+        '\nmain "$@"', maxsplit=1
+    )[0]
+    source = source.replace(
+        'readonly LAB_ROOT="/opt/miloco-lab"', f'readonly LAB_ROOT="{lab_root}"'
+    )
+    docker_log = tmp_path / (
+        "status-docker-"
+        + hashlib.sha256(shell_override.encode()).hexdigest()[:8]
+        + ".log"
+    )
+    harness = tmp_path / (
+        "status-proof-"
+        + hashlib.sha256(shell_override.encode()).hexdigest()[:8]
+        + ".sh"
+    )
+    harness.write_text(
+        source
+        + "\nrequire_root() { :; }\n"
+        + "stat() { case \"$2\" in '%u:%g') printf '0:0\\n' ;; '%a') "
+        + "case \"$3\" in */remote-release.sh|*/container-entrypoint.sh|*/acceptance/scripts/*.sh) printf '555\\n' ;; "
+        + "*) [[ -d \"$3\" ]] && printf '755\\n' || printf '644\\n' ;; esac ;; *) return 74 ;; esac; }\n"
+        + shell_override
+        + "\n"
+        + f"compose_container_id() {{ printf 'compose\\n' >> '{docker_log}'; printf 'cid\\n'; }}\n"
+        + f"docker_command() {{ printf 'docker:%s\\n' \"$*\" >> '{docker_log}'; "
+        + f"printf 'miloco-lab:{sha}\\n'; }}\n"
+        + "container_health_status() { printf 'healthy\\n'; }\n"
+        + 'status_release "ai-lab01.esxi"\n',
+        encoding="utf-8",
+    )
+    harness.chmod(0o755)
+    result = subprocess.run(
+        [str(harness)], text=True, capture_output=True, check=False, timeout=5
+    )
+    return result, docker_log
+
+
+@pytest.mark.parametrize(
+    "path_case",
+    [
+        "releases_parent_symlink",
+        "current_release_symlink",
+        "artifacts_parent_symlink",
+        "accepted_parent_symlink",
+        "artifacts_bad_mode",
+        "artifact_record_symlink",
+        "acceptance_record_symlink",
+        "artifact_record_bad_owner",
+        "accepted_parent_bad_realpath",
+        "invalid_proof",
+    ],
+)
+def test_status_validates_all_release_proof_paths_before_docker(
+    tmp_path: Path, path_case: str
+) -> None:
+    sha = "8" * 40
+    lab_root = tmp_path / "miloco-lab"
+    _write_valid_status_tree(lab_root, sha)
+    release = lab_root / "releases" / sha
+    artifacts = lab_root / "deploy-state" / "artifacts"
+    accepted = lab_root / "deploy-state" / "accepted"
+    shell_override = ""
+    if path_case == "releases_parent_symlink":
+        target = tmp_path / "actual-releases"
+        (lab_root / "releases").rename(target)
+        (lab_root / "releases").symlink_to(target, target_is_directory=True)
+    elif path_case == "current_release_symlink":
+        target = tmp_path / "actual-release"
+        release.rename(target)
+        release.symlink_to(target, target_is_directory=True)
+    elif path_case in {"artifacts_parent_symlink", "accepted_parent_symlink"}:
+        parent = artifacts if path_case.startswith("artifacts") else accepted
+        target = tmp_path / f"actual-{parent.name}"
+        parent.rename(target)
+        parent.symlink_to(target, target_is_directory=True)
+    elif path_case == "artifacts_bad_mode":
+        shell_override = (
+            'stat() { if [[ "$2" == \'%a\' && "$3" == \''
+            + str(artifacts)
+            + "' ]]; then printf '700\\n'; "
+            "elif [[ \"$2\" == '%u:%g' ]]; then printf '0:0\\n'; "
+            "elif [[ \"$2\" == '%a' ]]; then [[ -d \"$3\" ]] && printf '755\\n' || printf '644\\n'; "
+            "else return 74; fi; }"
+        )
+    elif path_case in {"artifact_record_symlink", "acceptance_record_symlink"}:
+        record = (artifacts if path_case.startswith("artifact_") else accepted) / sha
+        outside = tmp_path / f"outside-{record.parent.name}"
+        outside.write_bytes(record.read_bytes())
+        record.unlink()
+        record.symlink_to(outside)
+    elif path_case == "artifact_record_bad_owner":
+        record = artifacts / sha
+        shell_override = (
+            'stat() { if [[ "$2" == \'%u:%g\' && "$3" == \''
+            + str(record)
+            + "' ]]; then printf '1000:1000\\n'; "
+            "elif [[ \"$2\" == '%u:%g' ]]; then printf '0:0\\n'; "
+            "elif [[ \"$2\" == '%a' ]]; then [[ -d \"$3\" ]] && printf '755\\n' || printf '644\\n'; "
+            "else return 74; fi; }"
+        )
+    elif path_case == "accepted_parent_bad_realpath":
+        shell_override = (
+            'realpath() { if [[ "$1" == \''
+            + str(accepted)
+            + "' ]]; then printf '/outside/accepted\\n'; "
+            'else command realpath "$@"; fi; }'
+        )
+    else:
+        marker = accepted / sha
+        marker.write_text(
+            marker.read_text(encoding="utf-8").replace("a" * 64, "e" * 64),
+            encoding="utf-8",
+        )
+
+    result, docker_log = _run_status_harness(
+        tmp_path, lab_root, sha, shell_override=shell_override
+    )
+    assert result.returncode == 4, result.stderr
+    assert not docker_log.exists(), "status must fail closed before every Docker probe"
+
+
+def test_status_with_valid_release_proof_reaches_read_only_docker_probe(
+    tmp_path: Path,
+) -> None:
+    sha = "9" * 40
+    lab_root = tmp_path / "miloco-lab"
+    _write_valid_status_tree(lab_root, sha)
+    result, docker_log = _run_status_harness(tmp_path, lab_root, sha)
+    assert result.returncode == 0, result.stderr
+    assert f"current={sha}" in result.stdout
+    assert docker_log.exists()
 
 
 def test_status_rejects_raw_lab_root_symlink_without_docker(tmp_path: Path) -> None:
