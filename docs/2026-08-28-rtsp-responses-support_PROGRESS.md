@@ -153,3 +153,10 @@
 - Expected result: 随包确定性有效 JPEG 必须经 Task 3 同一 adapter 发送到 `/responses`；404/405 的 `/models` 不得阻断视觉调用，其他 auth/rate/network 错误保持分类；只有真实颜色证明通过，generic/text-only/missing output 必须拒绝；无 Key/Bearer、显式协议和日志去敏保持正确。
 - Result: Achieved。`bcaaf47` 加入 32×32 红色 JPEG（wheel 已确认包含）及视觉 probe，Omni+admin preflight+tick 回归 562 passed；自审同时修复显式 Gemini 被模型名二次解析。独立审查发现 substring `red` 会让 `colored`/`redacted` 误通过；`ce25514` 收紧为规范化后仅精确接受 `red` 或 `red.`，拒绝额外单词和子串。独立 probe/admin/tick 复审 84 passed，结论 CLEAN。真实本地 VLM 视觉能力仍为 `not_measured`。
 - Next step: 执行 Responses Task 6，在 admin API、CLI 和 Web 中持久化/展示显式协议，所有 save/activate/test/retry 路径传入协议；Responses Key 可空，Chat/Gemini 保持既有 Key 门禁和跨 URL 凭据隔离。
+
+## 2026-08-28 12:47 SGT
+
+- Current work: 完成 Responses Task 6 的 admin/CLI/Web 显式协议管理、自动探测传播、模型发现隔离和独立审查修复。
+- Expected result: 旧档案只读解析并标记 inferred，新保存/测试必须显式协议；所有 save/activate/test/retry/tick/models 路径传播有效协议；Responses 可空 Key，Chat/Gemini 不放宽；Base URL/协议变化和模型发现不得复用旧 Key；Web/CLI 显式展示与序列化协议且不保留跨协议候选。
+- Result: Achieved。初始 `573fe51` 的 backend 77 passed、CLI 644 passed、Web 381 passed/1 skipped，typecheck/build 通过；独立审查发现 `/models` 仍缺协议、按 URL 猜 Gemini，并可能同 URL 跨协议复用 Key。`738ab54` 让 models body/API/Web 必填协议，Key identity 纳入 effective protocol，`fetch_models` 只按协议选 header/parser；Responses 空 Key 无 Authorization，404/405 返回 unsupported 供手填模型；Web 切协议清候选并失效旧 in-flight 结果。最终独立 focused backend 130 passed、Web 35 passed、typecheck 通过，结论 CLEAN。
+- Next step: 执行 Responses Task 7，以严格本地 fixture server 证明非流/SSE、图片硬上限、no-key/Bearer、breaker、trace 去敏和现有 parser 集成；加入真实服务 smoke，并在无实际 VLM 时明确记录 `not_measured`。
