@@ -27,8 +27,9 @@ COMPOSE_FILE = DEPLOY_DIR / "compose.yaml"
 ENTRYPOINT = DEPLOY_DIR / "container-entrypoint.sh"
 ACCEPTANCE_PYTEST = DEPLOY_DIR / "acceptance" / "pytest.ini"
 
+RUNTIME_PLATFORM = "linux/amd64"
 RUNTIME_BASE = (
-    "python:3.12-slim-bookworm@"
+    "--platform=linux/amd64 python:3.12-slim-bookworm@"
     "sha256:0f5b26b9518d002b6173fd61daad821fa340635ebfec5bba471013f9ca114579"
 )
 EXPECTED_RUNTIME_ENV = {
@@ -92,7 +93,10 @@ def _docker_stages() -> dict[str, str]:
     stage_name = ""
     stage_lines: list[str] = []
     for line in dockerfile.splitlines():
-        from_match = re.match(r"FROM\s+\S+(?:\s+AS\s+([A-Za-z0-9_-]+))?", line)
+        from_match = re.match(
+            r"FROM\s+(?:--platform=\S+\s+)?\S+(?:\s+AS\s+([A-Za-z0-9_-]+))?",
+            line,
+        )
         if from_match:
             if stage_name:
                 stages[stage_name] = "\n".join(stage_lines)
@@ -104,6 +108,31 @@ def _docker_stages() -> dict[str, str]:
     if stage_name:
         stages[stage_name] = "\n".join(stage_lines)
     return stages
+
+
+def _docker_stage_effective_config() -> dict[str, dict[str, str]]:
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    stage_config: dict[str, dict[str, str]] = {}
+    current_stage = ""
+    current_config: dict[str, str] = {}
+    for line in dockerfile.splitlines():
+        from_match = re.match(
+            r"FROM\s+(?:--platform=\S+\s+)?(\S+)(?:\s+AS\s+([A-Za-z0-9_-]+))?",
+            line,
+        )
+        if from_match:
+            if current_stage:
+                stage_config[current_stage] = current_config
+            parent = from_match.group(1)
+            current_stage = from_match.group(2) or f"stage-{len(stage_config)}"
+            current_config = dict(stage_config.get(parent, {}))
+            continue
+        instruction_match = re.match(r"(ENTRYPOINT|CMD)\s+(.+)", line)
+        if current_stage and instruction_match:
+            current_config[instruction_match.group(1)] = instruction_match.group(2)
+    if current_stage:
+        stage_config[current_stage] = current_config
+    return stage_config
 
 
 def _compose_service() -> dict[str, object]:
@@ -306,12 +335,27 @@ def test_acceptance_image_is_the_only_stage_with_acceptance_payload() -> None:
     assert ACCEPTANCE_PYTEST.read_text(encoding="utf-8").count("ai_lab_fixture") == 1
 
 
+def test_acceptance_image_resets_runtime_entrypoint_before_fixture_command() -> None:
+    """Catches inherited runtime entrypoints that wrap the acceptance pytest command."""
+    effective_config = _docker_stage_effective_config()
+    assert effective_config["runtime"]["ENTRYPOINT"] == '["container-entrypoint.sh"]'
+    assert effective_config["acceptance"]["ENTRYPOINT"] == "[]"
+    assert effective_config["acceptance"]["CMD"] == (
+        '["python", "-m", "pytest", "-q", "-m", "ai_lab_fixture"]'
+    )
+
+
 def test_docker_and_compose_do_not_define_secrets() -> None:
     """Catches API key, token, or secret injection through image or Compose config."""
     deploy_config = DOCKERFILE.read_text(encoding="utf-8") + "\n" + COMPOSE_FILE.read_text(
         encoding="utf-8"
     )
-    assert not re.search(r"(?i)(api[_-]?key|token|secret|password|credential)", deploy_config)
+    forbidden_names = (
+        r"api[_-]?key|token|secret|password|credential|"
+        r"rtsp[_-]?(?:url|uri|user(?:name)?|pass(?:word)?)|"
+        r"(?:uri|url)[_-]?(?:user(?:name)?|pass(?:word)?)"
+    )
+    assert not re.search(rf"(?i)({forbidden_names})", deploy_config)
     assert "secrets:" not in deploy_config
 
 
@@ -319,6 +363,7 @@ def test_compose_runs_host_network_read_only_with_one_persistent_state_path() ->
     """Catches runtime Compose configs that open extra writable or persistent paths."""
     service = _compose_service()
     assert service["image"] == "miloco-lab:${MILOCO_RELEASE_SHA}"
+    assert service["platform"] == RUNTIME_PLATFORM
     assert service["user"] == "10001:10001"
     assert service["network_mode"] == "host"
     assert service["restart"] == "unless-stopped"
