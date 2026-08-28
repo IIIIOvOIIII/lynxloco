@@ -7,6 +7,7 @@ import logging
 import threading
 import time as stdlib_time
 import weakref
+from builtins import BaseExceptionGroup
 from collections.abc import Callable
 from fractions import Fraction
 from types import ModuleType, SimpleNamespace
@@ -197,10 +198,12 @@ class _OverlapTrackingBlockingContainer(_Container):
         *,
         read_timeout: float = 0.1,
         failure: BaseException | None = None,
+        close_failure: BaseException | None = None,
     ) -> None:
         super().__init__([], video_stream=_stream("video", "h264"))
         self._read_timeout = read_timeout
         self._failure = failure
+        self._close_failure = close_failure
         self._inside_demux = False
         self._lock = threading.Lock()
         self.entered = threading.Event()
@@ -228,6 +231,8 @@ class _OverlapTrackingBlockingContainer(_Container):
             self.close_overlaps.append(self._inside_demux)
         self.close_threads.append(threading.get_ident())
         super().close()
+        if self._close_failure is not None:
+            raise self._close_failure
 
 
 class _YieldThenBlockContainer(_Container):
@@ -302,11 +307,19 @@ class _SequenceOpener:
 
 
 class _BlockingOpenSequence:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        failure: BaseException | None = None,
+        close_failure: BaseException | None = None,
+    ) -> None:
         self.started = threading.Event()
         self.release = threading.Event()
         self.second_started = threading.Event()
-        self.late_container = _Container([], video_stream=_stream("video", "h264"))
+        self.failure = failure
+        self.late_container = _OverlapTrackingBlockingContainer(
+            close_failure=close_failure,
+        )
         self.calls = 0
         self.active = 0
         self.max_active = 0
@@ -322,6 +335,8 @@ class _BlockingOpenSequence:
             if call == 1:
                 self.started.set()
                 self.release.wait(timeout=2.0)
+                if self.failure is not None:
+                    raise self.failure
                 return self.late_container
             self.second_started.set()
             raise _terminal_error()
@@ -902,18 +917,33 @@ async def test_external_session_cancellation_closes_and_joins_decode_worker(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "decode_failure",
-    [None, ConnectionResetError("decode failed during cancellation")],
-    ids=["clean-read-return", "read-exception"],
+    ("decode_failure", "close_failure"),
+    [
+        (None, None),
+        (ConnectionResetError("decode failed during cancellation"), None),
+        (None, RuntimeError("close failed during cancellation")),
+        (
+            ConnectionResetError("decode and close both failed"),
+            RuntimeError("close also failed"),
+        ),
+    ],
+    ids=[
+        "clean-read-return",
+        "read-exception",
+        "close-exception",
+        "read-and-close-exception",
+    ],
 )
 async def test_repeated_cancel_cannot_abandon_active_decode_cleanup(
     monkeypatch: pytest.MonkeyPatch,
     decode_failure: BaseException | None,
+    close_failure: BaseException | None,
 ) -> None:
     session_module = _rtsp_session()
     container = _OverlapTrackingBlockingContainer(
         read_timeout=2.0,
         failure=decode_failure,
+        close_failure=close_failure,
     )
     opener = _SequenceOpener(container, _terminal_error())
     monkeypatch.setattr(session_module.av, "open", opener)
@@ -940,13 +970,25 @@ async def test_repeated_cancel_cannot_abandon_active_decode_cleanup(
     )
 
     container.read_return.set()
-    task_result = await asyncio.gather(task, return_exceptions=True)
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await task
     await asyncio.wait_for(stopping, timeout=0.5)
     await asyncio.wait_for(restarting, timeout=0.5)
+    await _wait_until(lambda: opener.calls == 2)
     await session.stop()
 
     assert premature == (False, False, False, True, 1)
-    assert isinstance(task_result[0], asyncio.CancelledError)
+    expected_failures = tuple(
+        failure for failure in (decode_failure, close_failure) if failure is not None
+    )
+    if len(expected_failures) == 1:
+        assert raised.value.__cause__ is expected_failures[0]
+    elif len(expected_failures) == 2:
+        cause = raised.value.__cause__
+        assert isinstance(cause, BaseExceptionGroup)
+        assert cause.exceptions == expected_failures
+    else:
+        assert raised.value.__cause__ is None
     assert worker.done()
     assert container.exited.is_set()
     assert container.close_calls == 1
@@ -956,11 +998,25 @@ async def test_repeated_cancel_cannot_abandon_active_decode_cleanup(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("opener_failure", "close_failure"),
+    [
+        (None, None),
+        (ConnectionResetError("open failed during cancellation"), None),
+        (None, RuntimeError("late container close failed")),
+    ],
+    ids=["open-success", "open-exception", "close-exception"],
+)
 async def test_repeated_cancel_cannot_abandon_open_in_progress_cleanup(
     monkeypatch: pytest.MonkeyPatch,
+    opener_failure: BaseException | None,
+    close_failure: BaseException | None,
 ) -> None:
     session_module = _rtsp_session()
-    opener = _BlockingOpenSequence()
+    opener = _BlockingOpenSequence(
+        failure=opener_failure,
+        close_failure=close_failure,
+    )
     monkeypatch.setattr(session_module.av, "open", opener)
     session = session_module.RtspSession(_source())
 
@@ -986,17 +1042,102 @@ async def test_repeated_cancel_cannot_abandon_open_in_progress_cleanup(
     )
 
     opener.release.set()
-    task_result = await asyncio.gather(task, return_exceptions=True)
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await task
     await asyncio.wait_for(stopping, timeout=0.5)
     await asyncio.wait_for(restarting, timeout=0.5)
     await _wait_until(lambda: opener.second_started.is_set())
     await session.stop()
 
     assert premature == (False, False, False, True, False, 1)
-    assert isinstance(task_result[0], asyncio.CancelledError)
+    cause = raised.value.__cause__
+    if opener_failure is not None:
+        assert isinstance(cause, RtspSourceError)
+        assert cause.code == "connection_reset"
+    else:
+        assert cause is close_failure
     assert open_worker.done()
-    assert opener.late_container.close_calls == 1
+    assert opener.late_container.close_calls == (0 if opener_failure else 1)
     assert opener.max_active == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_phase", ["open", "close"])
+async def test_stop_during_open_propagates_owned_task_cleanup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_phase: str,
+) -> None:
+    session_module = _rtsp_session()
+    failure = RuntimeError(f"{failure_phase} cleanup failed")
+    opener = _BlockingOpenSequence(
+        failure=failure if failure_phase == "open" else None,
+        close_failure=failure if failure_phase == "close" else None,
+    )
+    classified: list[BaseException] = []
+    real_classify = session_module._classify_failure
+
+    def record_classification(
+        caught: BaseException,
+        *,
+        phase: str = "probe",
+    ) -> RtspSourceError:
+        classified.append(caught)
+        return real_classify(caught, phase=phase)
+
+    monkeypatch.setattr(session_module.av, "open", opener)
+    monkeypatch.setattr(session_module, "_classify_failure", record_classification)
+    session = session_module.RtspSession(_source())
+
+    await session.start(_unused_video_cb, _unused_audio_cb)
+    assert await asyncio.to_thread(opener.started.wait, 0.5)
+    stopping = asyncio.create_task(session.stop())
+    await asyncio.sleep(0.05)
+    opener.release.set()
+    await asyncio.wait_for(stopping, timeout=0.5)
+
+    if failure_phase == "open":
+        assert classified
+        assert isinstance(classified[0], RtspSourceError)
+        assert classified[0].code == "connection_failed"
+    else:
+        assert classified == [failure]
+    assert session._open_worker is None
+    assert opener.late_container.close_calls == (0 if failure_phase == "open" else 1)
+
+
+@pytest.mark.asyncio
+async def test_decode_close_failure_without_cancellation_reaches_classifier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_module = _rtsp_session()
+    close_failure = RuntimeError("decode close failed")
+    container = _OverlapTrackingBlockingContainer(close_failure=close_failure)
+    classified: list[BaseException] = []
+    real_classify = session_module._classify_failure
+
+    def record_classification(
+        caught: BaseException,
+        *,
+        phase: str = "probe",
+    ) -> RtspSourceError:
+        classified.append(caught)
+        return real_classify(caught, phase=phase)
+
+    monkeypatch.setattr(
+        session_module.av,
+        "open",
+        _SequenceOpener(container, _terminal_error()),
+    )
+    monkeypatch.setattr(session_module, "_classify_failure", record_classification)
+    monkeypatch.setattr(session_module, "reconnect_delay", lambda *_a, **_kw: 0.0)
+    session = session_module.RtspSession(_source())
+
+    await session.start(_unused_video_cb, _unused_audio_cb)
+    await _wait_until(lambda: session.is_terminal())
+    await session.stop()
+
+    assert close_failure in classified
+    assert container.close_calls == 1
 
 
 @pytest.mark.asyncio

@@ -6,6 +6,7 @@ import asyncio
 import random
 import threading
 import time
+from builtins import BaseExceptionGroup
 from collections import deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -147,12 +148,21 @@ class RtspSession:
             self._stop_thread.set()
             if self._stop_async is not None:
                 self._stop_async.set()
-            _, _, cancellation = await self._await_task_uninterruptibly(task)
+            _, task_failure, cancellation = await self._await_task_uninterruptibly(task)
             if self._task is task:
                 self._task = None
             self._clear_ingress()
             if cancellation is not None:
-                raise cancellation
+                cause = (
+                    task_failure.__cause__
+                    if isinstance(task_failure, asyncio.CancelledError)
+                    else task_failure
+                )
+                self._propagate_after_cleanup(cancellation, cause)
+            if task_failure is not None and not isinstance(
+                task_failure, asyncio.CancelledError
+            ):
+                self._propagate_after_cleanup(None, task_failure)
 
     def state(self) -> CameraSourceState:
         with self._ingress_lock:
@@ -387,28 +397,32 @@ class RtspSession:
         *,
         pending_cancel: asyncio.CancelledError | None = None,
     ) -> None:
-        container, _failure, cancellation = await self._await_task_uninterruptibly(
+        (
+            container,
+            opener_failure,
+            cancellation,
+        ) = await self._await_task_uninterruptibly(
             opener,
             pending_cancel=pending_cancel,
         )
+        close_failure: BaseException | None = None
         try:
             if container is not None:
                 closer = asyncio.create_task(
                     asyncio.to_thread(self._close_container_sync, container)
                 )
-                (
-                    _,
-                    _close_failure,
-                    cancellation,
-                ) = await self._await_task_uninterruptibly(
+                _, close_failure, cancellation = await self._await_task_uninterruptibly(
                     closer,
                     pending_cancel=cancellation,
                 )
         finally:
             if self._open_worker is opener:
                 self._open_worker = None
-        if cancellation is not None:
-            raise cancellation
+        self._propagate_after_cleanup(
+            cancellation,
+            opener_failure,
+            close_failure,
+        )
 
     async def _decode_until_stopped(
         self,
@@ -425,15 +439,35 @@ class RtspSession:
             self._stop_thread.set()
             if self._stop_async is not None:
                 self._stop_async.set()
-            _, _failure, cancellation = await self._await_task_uninterruptibly(
+            _, worker_failure, cancellation = await self._await_task_uninterruptibly(
                 worker,
                 pending_cancel=cancellation,
             )
             assert cancellation is not None
-            raise cancellation
+            self._propagate_after_cleanup(cancellation, worker_failure)
+            raise AssertionError("cancelled decode cleanup must re-raise")
         finally:
             if self._decode_worker is worker:
                 self._decode_worker = None
+
+    @staticmethod
+    def _propagate_after_cleanup(
+        cancellation: asyncio.CancelledError | None,
+        *failures: BaseException | None,
+    ) -> None:
+        """Apply cancellation-first precedence after all owned cleanup finishes."""
+        present = tuple(failure for failure in failures if failure is not None)
+        cause: BaseException | None = None
+        if len(present) == 1:
+            cause = present[0]
+        elif present:
+            cause = BaseExceptionGroup("RTSP owned task cleanup failed", present)
+        if cancellation is not None:
+            if cause is not None:
+                raise cancellation from cause
+            raise cancellation
+        if cause is not None:
+            raise cause
 
     @staticmethod
     async def _await_task_uninterruptibly(
@@ -441,7 +475,7 @@ class RtspSession:
         *,
         pending_cancel: asyncio.CancelledError | None = None,
     ) -> tuple[_TaskResult | None, BaseException | None, asyncio.CancelledError | None]:
-        """Finish one owned task, deferring caller cancellation until cleanup."""
+        """Wait for one owned task and return its outcome without propagating it."""
         cancellation = pending_cancel
         while not task.done():
             try:
@@ -474,11 +508,22 @@ class RtspSession:
         container: av.container.InputContainer,
         loop: asyncio.AbstractEventLoop,
     ) -> bool:
+        result: bool | None = None
+        decode_failure: BaseException | None = None
         try:
             with av.logging.Capture(local=True):
-                return self._decode_container_captured_sync(container, loop)
-        finally:
+                result = self._decode_container_captured_sync(container, loop)
+        except BaseException as failure:
+            decode_failure = failure
+
+        close_failure: BaseException | None = None
+        try:
             self._close_container_sync(container)
+        except BaseException as failure:
+            close_failure = failure
+        self._propagate_after_cleanup(None, decode_failure, close_failure)
+        assert result is not None
+        return result
 
     def _decode_container_captured_sync(
         self,
@@ -853,10 +898,7 @@ class RtspSession:
     @staticmethod
     def _close_container_sync(container: av.container.InputContainer) -> None:
         with av.logging.Capture(local=True):
-            try:
-                container.close()
-            except Exception:
-                pass
+            container.close()
 
     @staticmethod
     def _open_container_sync(
