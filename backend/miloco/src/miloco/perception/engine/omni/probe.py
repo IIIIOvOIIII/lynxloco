@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from miloco.perception.engine.omni.provider import OmniProviderAdapter
 
 _TIMEOUT = httpx.Timeout(15.0, connect=10.0)
+_RESPONSES_VISUAL_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 _ALLOWED_SCHEMES = ("http", "https")
 _VISUAL_PROBE_IMAGE = Path(__file__).with_name("assets") / "visual_probe_red.jpg"
 _VISUAL_PROBE_PROMPT = (
@@ -540,6 +541,7 @@ async def _probe_responses(
                 adapter.endpoint(base, model, stream=False),
                 headers={**auth_headers, "Content-Type": "application/json"},
                 json=body,
+                timeout=_RESPONSES_VISUAL_TIMEOUT,
             )
     except Exception as exc:  # noqa: BLE001
         return {

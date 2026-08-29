@@ -1208,6 +1208,52 @@ async def test_responses_visual_probe_classifies_response_timeout(monkeypatch):
     assert "slow" not in result["message"]
 
 
+async def test_responses_visual_probe_accepts_15_5_second_response_with_30_second_timeout(
+    monkeypatch,
+):
+    """A valid 15.5s visual response must not inherit the shared 15s read budget."""
+    effective_timeouts: list[httpx.Timeout] = []
+
+    class _LatencyAwareAsyncClient:
+        def __init__(self, *args, timeout: httpx.Timeout, **kwargs):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, *args, **kwargs):
+            return _FakeResp(404)
+
+        async def post(self, *args, **kwargs):
+            effective_timeout = kwargs.get("timeout", self.timeout)
+            effective_timeouts.append(effective_timeout)
+            if effective_timeout.read <= 15.5:
+                raise httpx.ReadTimeout("simulated 15.5 second response")
+            return _FakeResp(200, _responses_output("red"))
+
+    monkeypatch.setattr(probe.httpx, "AsyncClient", _LatencyAwareAsyncClient)
+
+    result = await probe.probe_omni(
+        "local-vlm",
+        "https://vlm.example/v1",
+        "",
+        api_protocol="openai_responses",
+    )
+
+    effective_timeout = effective_timeouts[0]
+    assert result["code"] == "ok", (
+        f"15.5s response was {result['code']} with "
+        f"read_timeout={effective_timeout.read}, "
+        f"connect_timeout={effective_timeout.connect}"
+    )
+    assert result["ok"] is True
+    assert effective_timeout.read == 30.0
+    assert effective_timeout.connect == 10.0
+
+
 async def test_responses_visual_probe_preserves_rate_limit_retry_after(monkeypatch):
     monkeypatch.setattr(
         probe.httpx,
