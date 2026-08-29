@@ -796,12 +796,13 @@ async function ensureMseDecoder(firstKeyNAL, firstKeyTs, generation) {
   video.classList.remove("hidden");
   $("codec").textContent = `${codecHint} (MSE / fmp4 via jmuxer)`;
 
-  const session = createReadyJmuxer({
+  let session;
+  session = createReadyJmuxer({
     JMuxer: window.JMuxer,
     node: video,
     timeoutMs: 3000,
+    isCurrent: () => generation === playerGeneration && mseSession === session,
     onError: (data) => {
-      if (generation !== playerGeneration) return;
       console.warn("jmuxer error", data);
       setState(t("mseDecodeError", data?.message || data), true);
     },

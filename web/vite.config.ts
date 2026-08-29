@@ -127,7 +127,7 @@ export default defineConfig(({ command }) => ({
   test: {
     environment: "node",
     globals: true,
-    include: ["tests/**/*.test.ts", "tests/**/*.test.tsx"],
+    include: ["tests/**/*.test.ts", "tests/**/*.test.tsx", "tests/**/*.test.js"],
     setupFiles: ["./tests/test-setup.ts"],
   },
 }));

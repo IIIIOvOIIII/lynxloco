@@ -5,6 +5,7 @@ function sessionError(code, message) {
 export function createReadyJmuxer({
   JMuxer,
   node,
+  isCurrent = () => true,
   onError,
   timeoutMs = 3000,
   timers = globalThis,
@@ -20,7 +21,7 @@ export function createReadyJmuxer({
   const destroyOnce = () => {
     if (destroyed) return;
     destroyed = true;
-    instance?.destroy?.();
+    try { instance?.destroy?.(); } catch {}
   };
   const ready = new Promise((resolve, reject) => {
     rejectReady = reject;
@@ -47,7 +48,9 @@ export function createReadyJmuxer({
       fps: 25,
       debug: false,
       onReady: () => signalReady(),
-      onError,
+      onError: (data) => {
+        if (isCurrent()) onError?.(data);
+      },
     });
   } catch (error) {
     readySettled = true;
@@ -60,10 +63,11 @@ export function createReadyJmuxer({
     ready,
     cancel() {
       timers.clearTimeout(timeoutId);
-      destroyOnce();
-      if (!readySettled) {
-        readySettled = true;
-        rejectReady(sessionError("jmuxer_cancelled", "JMuxer readiness was cancelled"));
+      try { destroyOnce(); } finally {
+        if (!readySettled) {
+          readySettled = true;
+          rejectReady(sessionError("jmuxer_cancelled", "JMuxer readiness was cancelled"));
+        }
       }
     },
   };
@@ -79,6 +83,11 @@ export async function feedFirstAccessUnitWhenReady({
     session.cancel();
     throw sessionError("jmuxer_cancelled", "stale player generation");
   }
-  readyMuxer.feed({ video: firstKeyNAL, duration: 40 });
+  try {
+    readyMuxer.feed({ video: firstKeyNAL, duration: 40 });
+  } catch (error) {
+    try { session.cancel(); } catch {}
+    throw error;
+  }
   return readyMuxer;
 }
