@@ -581,7 +581,9 @@ main() {
     if should_build "miloco-miot"; then build_miloco_miot; fi
     if should_build "miloco"; then
         build_miloco
-        validate_miloco_wheel_static_assets
+        if should_build "web"; then
+            validate_miloco_wheel_static_assets
+        fi
     fi
     if should_build "miloco-cli";  then build_miloco_cli; fi
     if should_build "openclaw";    then build_openclaw; fi

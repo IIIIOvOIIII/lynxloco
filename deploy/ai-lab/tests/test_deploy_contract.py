@@ -316,7 +316,9 @@ def _write_synthetic_wheel(
             wheel.writestr("miloco/static/watch-mse.js", "helper")
 
 
-def _run_miloco_build_sequence(project_root: Path) -> subprocess.CompletedProcess[str]:
+def _run_miloco_build_sequence(
+    project_root: Path, packages: str, *, validator_exit: int = 0
+) -> subprocess.CompletedProcess[str]:
     trace = project_root / "trace.log"
     return subprocess.run(
         ["bash"],
@@ -324,15 +326,15 @@ def _run_miloco_build_sequence(project_root: Path) -> subprocess.CompletedProces
             "set -euo pipefail\n"
             f"PROJECT_ROOT={shlex.quote(str(project_root))}\n"
             f"DIST_DIR={shlex.quote(str(project_root / 'dist'))}\n"
-            "PACKAGES=miloco\n"
+            f"PACKAGES={shlex.quote(packages)}\n"
             "log() { :; }\n"
             "check_prerequisites() { :; }\n"
             "resolve_version() { :; }\n"
             'should_build() { [[ ",$PACKAGES," == *",$1,"* ]]; }\n'
-            "build_web() { :; }\n"
+            f"build_web() {{ printf 'web\\n' >> {shlex.quote(str(trace))}; }}\n"
             "build_miloco_miot() { :; }\n"
-            f"build_miloco() {{ printf 'build\\n' >> {shlex.quote(str(trace))}; }}\n"
-            f"validate_miloco_wheel_static_assets() {{ printf 'validate\\n' >> {shlex.quote(str(trace))}; }}\n"
+            f"build_miloco() {{ printf 'miloco\\n' >> {shlex.quote(str(trace))}; }}\n"
+            f"validate_miloco_wheel_static_assets() {{ printf 'validate\\n' >> {shlex.quote(str(trace))}; return {validator_exit}; }}\n"
             "build_miloco_cli() { :; }\n"
             "build_openclaw() { :; }\n"
             "build_hermes() { :; }\n"
@@ -1251,14 +1253,43 @@ def test_miloco_wheel_validation_rejects_missing_required_watch_asset(
     assert missing_asset in result.stderr
 
 
-def test_miloco_build_sequence_validates_wheel_after_build(tmp_path: Path) -> None:
-    result = _run_miloco_build_sequence(tmp_path)
+def test_miloco_wheel_validation_rejects_zero_miloco_wheels(tmp_path: Path) -> None:
+    result = _run_miloco_wheel_validation(tmp_path)
+
+    assert result.returncode == 5
+    assert "found 0" in result.stderr
+
+
+def test_miloco_wheel_validation_rejects_multiple_true_miloco_wheels(tmp_path: Path) -> None:
+    _write_synthetic_wheel(tmp_path / "miloco-0.0.0-py3-none-any.whl", include_helper=True)
+    _write_synthetic_wheel(tmp_path / "miloco-0.0.1-py3-none-any.whl", include_helper=True)
+
+    result = _run_miloco_wheel_validation(tmp_path)
+
+    assert result.returncode == 5
+    assert "found 2" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("packages", "validator_exit", "expected_trace"),
+    [
+        ("miloco", 23, ["miloco"]),
+        ("web", 23, ["web"]),
+        ("web,miloco", 0, ["web", "miloco", "validate"]),
+    ],
+)
+def test_miloco_wheel_validation_runs_only_for_joint_web_miloco_build(
+    tmp_path: Path,
+    packages: str,
+    validator_exit: int,
+    expected_trace: list[str],
+) -> None:
+    result = _run_miloco_build_sequence(
+        tmp_path, packages, validator_exit=validator_exit
+    )
 
     assert result.returncode == 0, result.stderr
-    assert (tmp_path / "trace.log").read_text(encoding="utf-8").splitlines() == [
-        "build",
-        "validate",
-    ]
+    assert (tmp_path / "trace.log").read_text(encoding="utf-8").splitlines() == expected_trace
 
 
 def test_pack_platform_bundles_fails_for_missing_full_build_artifacts(tmp_path: Path) -> None:
