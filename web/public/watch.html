@@ -68,6 +68,7 @@
 <script type="module">
 import { createReadyJmuxer } from "/watch-mse.js";
 import { feedFirstAccessUnitWhenReady } from "/watch-mse.js";
+import { handleCurrentSocketTerminalClose } from "/watch-mse.js";
 
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
@@ -533,10 +534,14 @@ function connect() {
     setState(t("connectingCam"));
   }, { signal: sig });
   thisWs.addEventListener("close", (ev) => {
-    if (thisWs !== ws) return;  // 旧 socket 的迟到 close,忽略,别盖新连接状态
     // 后端 error 信令(camera_unreachable 等)已经设了更具体的文案 —— 不要用泛泛的
     // "已断开 (1011)" 覆盖它,否则住户看到的还是没头没尾的 code。
-    if (!serverWillClose) {
+    let terminalText;
+    let terminalIsErr;
+    if (serverWillClose) {
+      terminalText = $("state").textContent;
+      terminalIsErr = $("state").className === "err";
+    } else {
       const CLOSE_KEY = {
         4404: "cameraNotFound",
         4403: "cameraDisabled",
@@ -544,9 +549,15 @@ function connect() {
         1011: "streamFailed",
       };
       const closeKey = CLOSE_KEY[ev.code];
-      setState(closeKey ? t(closeKey) : t("disconnected", ev.code), ev.code !== 1000);
+      terminalText = closeKey ? t(closeKey) : t("disconnected", ev.code);
+      terminalIsErr = ev.code !== 1000;
     }
-    configured = false;
+    handleCurrentSocketTerminalClose({
+      closingSocket: thisWs,
+      currentSocket: ws,
+      cleanup: tearDown,
+      showReason: () => setState(terminalText, terminalIsErr),
+    });
   }, { signal: sig });
   thisWs.addEventListener("error", () => {
     if (thisWs !== ws) return;

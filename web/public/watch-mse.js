@@ -91,3 +91,15 @@ export async function feedFirstAccessUnitWhenReady({
   }
   return readyMuxer;
 }
+
+export function handleCurrentSocketTerminalClose({
+  closingSocket,
+  currentSocket,
+  cleanup,
+  showReason,
+}) {
+  if (closingSocket !== currentSocket) return false;
+  try { cleanup(); } catch {}
+  showReason();
+  return true;
+}

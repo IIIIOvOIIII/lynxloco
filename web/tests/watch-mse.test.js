@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createReadyJmuxer,
   feedFirstAccessUnitWhenReady,
+  handleCurrentSocketTerminalClose,
 } from "../public/watch-mse.js";
 
 let options;
@@ -228,5 +229,104 @@ describe("feedFirstAccessUnitWhenReady", () => {
     await expect(configured).rejects.toBe(feedError);
     expect(instance.feed).toHaveBeenCalledOnce();
     expect(instance.destroy).toHaveBeenCalledOnce();
+  });
+});
+
+describe("handleCurrentSocketTerminalClose", () => {
+  it("cancels pending readiness before preserving the terminal reason", async () => {
+    vi.useFakeTimers();
+    const socket = {};
+    let generation = 4;
+    const closedGeneration = generation;
+    let status = "connecting";
+    let fpsHandle = 17;
+    let videoSource = "blob:active-player";
+    const session = createReadyJmuxer({ JMuxer: FakeJMuxer, node: {} });
+    const configureResult = session.ready.catch((error) => {
+      if (closedGeneration !== generation || error?.code === "jmuxer_cancelled") return;
+      status = error.code;
+    });
+
+    const handled = handleCurrentSocketTerminalClose({
+      closingSocket: socket,
+      currentSocket: socket,
+      cleanup: () => {
+        generation += 1;
+        session.cancel();
+        fpsHandle = null;
+        videoSource = "";
+      },
+      showReason: () => { status = "specific stream failure"; },
+    });
+
+    await configureResult;
+    await vi.advanceTimersByTimeAsync(3000);
+    options.onReady();
+    await Promise.resolve();
+
+    expect(handled).toBe(true);
+    expect(generation).toBe(5);
+    expect(instance.destroy).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+    expect(fpsHandle).toBeNull();
+    expect(videoSource).toBe("");
+    expect(status).toBe("specific stream failure");
+  });
+
+  it("destroys ready playback and still shows the reason when cleanup throws", async () => {
+    const socket = {};
+    let status = "playing";
+    let fpsHandle = 23;
+    let videoPaused = false;
+    let videoSource = "blob:ready-player";
+    const session = createReadyJmuxer({
+      JMuxer: ThrowingDestroyJMuxer,
+      node: {},
+    });
+    options.onReady();
+    await session.ready;
+
+    const handled = handleCurrentSocketTerminalClose({
+      closingSocket: socket,
+      currentSocket: socket,
+      cleanup: () => {
+        session.cancel();
+        fpsHandle = null;
+        videoPaused = true;
+        videoSource = "";
+        throw new Error("transient cleanup failure");
+      },
+      showReason: () => { status = "camera disabled"; },
+    });
+
+    expect(handled).toBe(true);
+    expect(instance.destroy).toHaveBeenCalledOnce();
+    expect(fpsHandle).toBeNull();
+    expect(videoPaused).toBe(true);
+    expect(videoSource).toBe("");
+    expect(status).toBe("camera disabled");
+  });
+
+  it("ignores an old socket close after reconnect", () => {
+    const oldSocket = {};
+    const currentSocket = {};
+    let generation = 9;
+    let cleanupCalls = 0;
+    let status = "new player active";
+
+    const handled = handleCurrentSocketTerminalClose({
+      closingSocket: oldSocket,
+      currentSocket,
+      cleanup: () => {
+        cleanupCalls += 1;
+        generation += 1;
+      },
+      showReason: () => { status = "old socket closed"; },
+    });
+
+    expect(handled).toBe(false);
+    expect(generation).toBe(9);
+    expect(cleanupCalls).toBe(0);
+    expect(status).toBe("new player active");
   });
 });
