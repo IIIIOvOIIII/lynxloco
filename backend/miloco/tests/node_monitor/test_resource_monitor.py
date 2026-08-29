@@ -206,11 +206,11 @@ class TestMemoryCollect:
         assert "total_rss_kb" not in latest
         assert "python_heap" in latest
 
-    def test_smaps_parse_failure_keeps_old_latest(self, tmp_db, tmp_log_dir):
+    def test_memory_region_failure_keeps_old_latest(self, tmp_db, tmp_log_dir):
         rm = ResourceMonitor(get_monitor(), db_path=tmp_db, log_dir=tmp_log_dir)
         with (
             patch(
-                "miloco.node_monitor.resource_monitor.parse_smaps",
+                "miloco.node_monitor.resource_monitor._sample_mem",
                 return_value=_make_smaps(rss=111),
             ),
             patch(
@@ -222,7 +222,7 @@ class TestMemoryCollect:
         first_rss = rm._memory_latest.total_rss_kb
         with (
             patch(
-                "miloco.node_monitor.resource_monitor.parse_smaps",
+                "miloco.node_monitor.resource_monitor._sample_mem",
                 side_effect=OSError("boom"),
             ),
             patch(
@@ -255,7 +255,7 @@ class TestMemoryCollect:
         rm = ResourceMonitor(get_monitor(), db_path=tmp_db, log_dir=tmp_log_dir)
         with (
             patch(
-                "miloco.node_monitor.resource_monitor.parse_smaps",
+                "miloco.node_monitor.resource_monitor._sample_mem",
                 side_effect=OSError(),
             ),
             patch(
@@ -327,7 +327,7 @@ class TestProcCollect:
         rm = ResourceMonitor(get_monitor(), db_path=tmp_db, log_dir=tmp_log_dir)
         with (
             patch(
-                "miloco.node_monitor.resource_monitor.parse_smaps",
+                "miloco.node_monitor.resource_monitor._sample_mem",
                 side_effect=OSError(),
             ),
             patch(

@@ -101,7 +101,7 @@ class TestMemoryEndpoint:
     def test_200_full_snapshot(self, client, rm):
         with (
             patch(
-                "miloco.node_monitor.resource_monitor.parse_smaps",
+                "miloco.node_monitor.resource_monitor._sample_mem",
                 return_value=_make_smaps(),
             ),
             patch(
@@ -114,7 +114,7 @@ class TestMemoryEndpoint:
         resp = client.get("/api/monitor/memory")
         assert resp.status_code == 200
         data = resp.json()
-        # smaps 段
+        # memory region 段
         assert data["total_rss_kb"] == 600_000
         assert len(data["categories"]) == 2
         assert data["categories"][0]["name"] == "[heap]"
