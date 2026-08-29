@@ -23,3 +23,10 @@
 - Expected result: Produce an executable plan with exact interfaces, tests, commands, commit boundaries, evidence levels, production credential handling, and rollback, without changing runtime code or production state.
 - Result: Achieved. The plan reuses the existing camera registry, JMuxer fallback, provider adapters, synthetic red JPEG, circuit breaker, SSE stream, and immutable deployment controller; it introduces no new service or credential path.
 - Next step: User review and approval of the implementation plan, including the execution mode. No runtime code, lab host, production host, or active model profile was changed by this planning milestone.
+
+## 2026-08-29 21:20 SGT
+
+- Current work: Scheme A implementation and local verification complete.
+- Expected result: All three repairs pass focused and full local checks without production access.
+- Result: Achieved. Focused Web regressions passed with 182 passed and 1 skipped; focused backend regressions passed with 238 passed and 1 skipped. The full Web suite passed with 403 passed and 1 skipped, TypeScript type checking passed, the production Web build passed, and repository `local-ci --tests` exited successfully. The repository gate explicitly excluded three known macOS-only `node_monitor/smaps` cases; those checks remain not measured on this platform and are not counted as passes. Both approved diff baselines passed whitespace and scope checks. The privacy scan found only generic implementation text, prebuilt static assets, and synthetic test fixtures; it found no real credential, private endpoint, device identity, image material, or provider response body. The remaining warnings are dependency deprecations, Node test `localStorage` warnings, and the existing 508.43 kB frontend chunk-size warning.
+- Next step: Build one immutable candidate and deploy it sequentially to ai-lab01 and ai-lab02.
