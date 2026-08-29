@@ -1,6 +1,6 @@
 # RTSP perception memory bounds and transcoder coalescing design
 
-Status: Design approved on 2026-08-30; written specification pending user review.
+Status: Written specification approved by the user on 2026-08-30; implementation plan pending user review.
 
 ## 1. Context
 
