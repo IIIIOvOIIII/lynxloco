@@ -16,3 +16,10 @@
 - Expected result: Produce a complete, contradiction-free design that contains no implementation placeholders and does not broaden the closed diagnostic CO into code or production mutation.
 - Result: Achieved. The specification keeps the three repair units independently testable, preserves MIoT and RTSP management boundaries, requires explicit authorised API-key submission for the later protocol switch, and separates local, lab, and production evidence.
 - Next step: User review and written approval of the design specification. Only after that approval, write the task-by-task TDD implementation plan; no code or production change has been authorised by this milestone.
+
+## 2026-08-29 20:05 SGT
+
+- Current work: The written Scheme A design was approved. Converted it into a file-bounded, task-by-task TDD implementation and rollout plan with independent review gates for perception aggregation, JMuxer readiness, visual model preflight/error classification, live health presentation, immutable candidate verification, sequential AI-lab deployment, and a separate production CO.
+- Expected result: Produce an executable plan with exact interfaces, tests, commands, commit boundaries, evidence levels, production credential handling, and rollback, without changing runtime code or production state.
+- Result: Achieved. The plan reuses the existing camera registry, JMuxer fallback, provider adapters, synthetic red JPEG, circuit breaker, SSE stream, and immutable deployment controller; it introduces no new service or credential path.
+- Next step: User review and approval of the implementation plan, including the execution mode. No runtime code, lab host, production host, or active model profile was changed by this planning milestone.
