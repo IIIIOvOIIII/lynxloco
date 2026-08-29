@@ -10,7 +10,7 @@
 #   --packages <list>   逗号分隔的包列表（miloco-miot,miloco,miloco-cli,openclaw,web）
 #   -h, --help          显示帮助
 #
-# 注：每次构建前会默认清空 dist/
+# 注：每次构建前会清空 dist/ 下的构建产物，但保留 dist/lab/ 不可变发布。
 #
 # 退出码: 0=成功, 1=构建失败, 4=前置检查失败
 
@@ -35,6 +35,18 @@ die() { local code=$1; shift; log "ERROR: $*"; exit "$code"; }
 
 sha256() {
     shasum -a 256 "$@" 2>/dev/null || sha256sum "$@"
+}
+
+clean_dist() {
+    if [[ -L "$DIST_DIR" ]]; then
+        die 4 "dist/ 不能是符号链接"
+    fi
+    if [[ -e "$DIST_DIR" && ! -d "$DIST_DIR" ]]; then
+        die 4 "dist/ 不是目录"
+    fi
+
+    mkdir -p "$DIST_DIR"
+    find "$DIST_DIR" -mindepth 1 -maxdepth 1 ! -name lab -exec rm -rf -- {} +
 }
 
 # ─── 参数解析 ──────────────────────────────────────────────────────────────
@@ -566,10 +578,9 @@ main() {
 
     check_prerequisites
 
-    # 清空 dist/，保证每次构建都是干净产物。
-    log "清除 dist/ ..."
-    rm -rf "$DIST_DIR"
-    mkdir -p "$DIST_DIR"
+    # 清空顶层构建产物，保留 dist/lab/ 下的不可变发布。
+    log "清除 dist/ 构建产物（保留 dist/lab/）..."
+    clean_dist
 
     # 解析版本号（注入 SETUPTOOLS_SCM_PRETEND_VERSION，供后续所有构建拿到同一版本）
     resolve_version

@@ -250,6 +250,49 @@ def _build_function(name: str) -> str:
     return function.group()
 
 
+def _run_clean_dist(dist_dir: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash"],
+        input=(
+            "set -euo pipefail\n"
+            f"DIST_DIR={shlex.quote(str(dist_dir))}\n"
+            "log() { :; }\n"
+            'die() { exit "$1"; }\n'
+            f"{_build_function('clean_dist')}\n"
+            "clean_dist\n"
+        ),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+
+
+def _tree_proof_state(root: Path) -> tuple[tuple[str, str, str, int, int], ...]:
+    state: list[tuple[str, str, str, int, int]] = []
+    for path in (root, *sorted(root.rglob("*"))):
+        metadata = path.lstat()
+        if path.is_symlink():
+            kind = "symlink"
+            digest = hashlib.sha256(os.readlink(path).encode()).hexdigest()
+        elif path.is_file():
+            kind = "file"
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        else:
+            kind = "directory"
+            digest = "-"
+        state.append(
+            (
+                str(path.relative_to(root.parent)),
+                kind,
+                digest,
+                stat.S_IMODE(metadata.st_mode),
+                metadata.st_mtime_ns,
+            )
+        )
+    return tuple(state)
+
+
 def _run_build_web(project_root: Path) -> subprocess.CompletedProcess[str]:
     bin_dir = project_root / "bin"
     bin_dir.mkdir()
@@ -338,10 +381,11 @@ def _run_miloco_build_sequence(
             "build_miloco_cli() { :; }\n"
             "build_openclaw() { :; }\n"
             "build_hermes() { :; }\n"
-            "update_manifest() { :; }\n"
+            'update_manifest() { printf \'fresh manifest\\n\' > "$DIST_DIR/fresh-manifest.json"; }\n'
             "pack_models() { :; }\n"
             "pack_platform_bundles() { :; }\n"
             "pack_install_scripts() { :; }\n"
+            f"{_build_function('clean_dist')}\n"
             f"{_build_function('main')}\n"
             "main\n"
         ),
@@ -1714,6 +1758,114 @@ def test_build_and_help_do_not_require_ssh_identity(
     assert help_result.returncode == 0
     assert "MILOCO_SSH_IDENTITY" not in help_result.stderr
     assert "MILOCO_SSH_IDENTITY" not in build_result.stderr
+
+
+def test_build_cleanup_preserves_all_immutable_releases_and_removes_transients(
+    tmp_path: Path,
+) -> None:
+    """Catches a package cleanup deleting dist/lab or retaining stale package output."""
+    dist_dir = tmp_path / "dist with spaces"
+    release = dist_dir / "lab" / ("a" * 40)
+    proof_dir = release / "proof"
+    proof_dir.mkdir(parents=True)
+    (release / "archive.tar.gz").write_bytes(b"immutable archive\x00payload")
+    (release / "release.receipt").write_text(
+        "schema=1\narchive_sha256=fixture\n", encoding="utf-8"
+    )
+    (proof_dir / "metadata.json").write_text(
+        '{"acceptance":"passed"}\n', encoding="utf-8"
+    )
+
+    modes = {
+        dist_dir / "lab": 0o751,
+        release: 0o750,
+        proof_dir: 0o711,
+        release / "archive.tar.gz": 0o400,
+        release / "release.receipt": 0o440,
+        proof_dir / "metadata.json": 0o444,
+    }
+    for path, mode in modes.items():
+        path.chmod(mode)
+    fixed_mtime_ns = 946_684_800_123_456_789
+    for offset, path in enumerate(reversed(tuple(modes))):
+        stamp = fixed_mtime_ns + offset
+        os.utime(path, ns=(stamp, stamp))
+    immutable_before = _tree_proof_state(dist_dir / "lab")
+
+    (dist_dir / "miloco-stale.whl").write_bytes(b"stale wheel")
+    (dist_dir / "manifest.json").write_text("stale manifest", encoding="utf-8")
+    (dist_dir / "bundle.tar.gz").write_bytes(b"stale bundle")
+    (dist_dir / "install.sh").write_text("stale installer", encoding="utf-8")
+    (dist_dir / ".hidden-debris").write_text("hidden", encoding="utf-8")
+    (dist_dir / "tmp output" / "nested").mkdir(parents=True)
+    (dist_dir / "tmp output" / "nested" / "debris").write_text(
+        "temporary", encoding="utf-8"
+    )
+    (dist_dir / ".hidden-dir").mkdir()
+    (dist_dir / ".hidden-dir" / "debris").write_text("hidden", encoding="utf-8")
+    outside = tmp_path / "outside-target"
+    outside.write_bytes(b"must survive")
+    (dist_dir / "stale-link").symlink_to(outside)
+    (dist_dir / ".stale-lab-link").symlink_to(dist_dir / "lab", target_is_directory=True)
+
+    result = _run_clean_dist(dist_dir)
+
+    assert result.returncode == 0, result.stderr
+    assert [path.name for path in dist_dir.iterdir()] == ["lab"]
+    assert _tree_proof_state(dist_dir / "lab") == immutable_before
+    assert outside.read_bytes() == b"must survive"
+
+
+def test_build_main_preserves_prior_releases_across_consecutive_cleanup_boundaries(
+    tmp_path: Path,
+) -> None:
+    """Catches main bypassing release-preserving cleanup before package output."""
+    lab_dir = tmp_path / "dist" / "lab"
+    first_release = lab_dir / ("b" * 40)
+    first_release.mkdir(parents=True)
+    (first_release / "archive.tar.gz").write_bytes(b"first immutable release")
+    (first_release / "release.receipt").write_bytes(b"first receipt")
+    first_release.chmod(0o750)
+    for path in first_release.iterdir():
+        path.chmod(0o440)
+    fixed_mtime_ns = 978_307_200_987_654_321
+    for offset, path in enumerate((*first_release.iterdir(), first_release, lab_dir)):
+        stamp = fixed_mtime_ns + offset
+        os.utime(path, ns=(stamp, stamp))
+    first_before = _tree_proof_state(lab_dir)
+    (tmp_path / "dist" / ".first-build-debris").write_bytes(b"remove me")
+
+    first_build = _run_miloco_build_sequence(tmp_path, "")
+
+    assert first_build.returncode == 0, first_build.stderr
+    assert _tree_proof_state(lab_dir) == first_before
+    assert (tmp_path / "dist" / "fresh-manifest.json").read_text(
+        encoding="utf-8"
+    ) == "fresh manifest\n"
+    assert not (tmp_path / "dist" / ".first-build-debris").exists()
+
+    second_release = lab_dir / ("c" * 40)
+    second_release.mkdir()
+    (second_release / "archive.tar.gz").write_bytes(b"second immutable release")
+    (second_release / "release.receipt").write_bytes(b"second receipt")
+    second_release.chmod(0o710)
+    for path in second_release.iterdir():
+        path.chmod(0o400)
+    for offset, path in enumerate((*second_release.iterdir(), second_release, lab_dir)):
+        stamp = fixed_mtime_ns + 100 + offset
+        os.utime(path, ns=(stamp, stamp))
+    both_before = _tree_proof_state(lab_dir)
+    (tmp_path / "dist" / "fresh-manifest.json").write_bytes(b"stale output")
+    (tmp_path / "dist" / "second-build-debris").mkdir()
+
+    second_build = _run_miloco_build_sequence(tmp_path, "")
+
+    assert second_build.returncode == 0, second_build.stderr
+    assert _tree_proof_state(lab_dir) == both_before
+    assert (tmp_path / "dist" / "fresh-manifest.json").read_text(
+        encoding="utf-8"
+    ) == "fresh manifest\n"
+    assert not (tmp_path / "dist" / "second-build-debris").exists()
 
 
 def test_build_rejects_same_sha_before_rebuilding_or_mutating_proof(tmp_path: Path) -> None:
