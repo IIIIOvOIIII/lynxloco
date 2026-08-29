@@ -2,11 +2,12 @@ import { describe, expect, it } from "vitest";
 
 import { dispatchOmniHealthUpdated } from "@/api";
 import {
-  applyOmniHealth,
+  createOmniConfigRefreshController,
   omniDiscoveryRequest,
   omniProfileIdentity,
   omniProtocolSelection,
   omniProtocolFormPolicy,
+  omniSavedProfileTestLabelKey,
 } from "@/components/UsageOmniConfig";
 import { hasConfiguredOmni } from "@/components/PetAutoGenFlow";
 import type { OmniConfigState, OmniHealth } from "@/lib/types";
@@ -28,11 +29,11 @@ function fixtureHealth(overrides: Partial<OmniHealth> = {}): OmniHealth {
   };
 }
 
-function fixtureConfigState(): OmniConfigState {
+function fixtureConfigState(label = "active"): OmniConfigState {
   return {
     active: {
-      label: "active",
-      model: "vision",
+      label,
+      model: `${label}-vision`,
       base_url: "http://local/v1",
       api_protocol: "openai_responses",
       protocol_inferred: false,
@@ -42,8 +43,8 @@ function fixtureConfigState(): OmniConfigState {
     },
     profiles: [
       {
-        label: "active",
-        model: "vision",
+        label,
+        model: `${label}-vision`,
         base_url: "http://local/v1",
         api_protocol: "openai_responses",
         protocol_inferred: false,
@@ -53,6 +54,16 @@ function fixtureConfigState(): OmniConfigState {
       },
     ],
   };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
 }
 
 describe("Omni protocol form policy", () => {
@@ -90,37 +101,6 @@ describe("Omni protocol form policy", () => {
 });
 
 describe("Omni runtime health fan-out", () => {
-  it("replaces only the active health snapshot with the latest runtime health", () => {
-    const state = fixtureConfigState();
-    const health = fixtureHealth({
-      state: "error",
-      code: "visual_payload_rejected",
-      message: "visual request unsupported",
-      since_ms: 1_725_000_000_000,
-      consecutive_failures: 4,
-      last_probe_at_ms: 1_725_000_000_000,
-      last_probe_result: "fail",
-    });
-    const updated = applyOmniHealth(state, health);
-    expect(updated?.active.health).toEqual(health);
-    expect(updated?.profiles).toBe(state.profiles);
-  });
-
-  it("accepts recovery updates and leaves an unloaded configuration unloaded", () => {
-    const state = fixtureConfigState();
-    state.active.health = fixtureHealth({
-      state: "error",
-      code: "visual_payload_rejected",
-      message: "visual request unsupported",
-    });
-    const recovered = fixtureHealth({
-      last_probe_at_ms: 1_725_000_000_001,
-      last_probe_result: "ok",
-    });
-    expect(applyOmniHealth(state, recovered)?.active.health).toEqual(recovered);
-    expect(applyOmniHealth(null, recovered)).toBeNull();
-  });
-
   it("dispatches the latest health as the stable browser event detail", () => {
     const target = new EventTarget();
     const health = fixtureHealth({
@@ -134,6 +114,79 @@ describe("Omni runtime health fan-out", () => {
     });
     dispatchOmniHealthUpdated(health, target);
     expect(received).toEqual(health);
+  });
+
+  it("accepts only the latest authoritative config refresh", async () => {
+    const older = deferred<OmniConfigState>();
+    const latest = deferred<OmniConfigState>();
+    const requests = [older, latest];
+    const accepted: OmniConfigState[] = [];
+    const failures: unknown[] = [];
+    const controller = createOmniConfigRefreshController(
+      () => requests.shift()!.promise,
+      (state) => accepted.push(state),
+      (error) => failures.push(error),
+    );
+    const oldRun = controller.refresh();
+    const latestRun = controller.refresh();
+
+    latest.resolve(fixtureConfigState("current"));
+    await latestRun;
+    older.resolve(fixtureConfigState("stale"));
+    await oldRun;
+
+    expect(accepted.map((state) => state.active.label)).toEqual(["current"]);
+    expect(failures).toEqual([]);
+  });
+
+  it("reports only the latest failure and ignores invalidated or disposed results", async () => {
+    const staleFailure = deferred<OmniConfigState>();
+    const currentFailure = deferred<OmniConfigState>();
+    const invalidated = deferred<OmniConfigState>();
+    const afterDispose = deferred<OmniConfigState>();
+    const requests = [staleFailure, currentFailure, invalidated, afterDispose];
+    const accepted: OmniConfigState[] = [];
+    const failures: unknown[] = [];
+    const controller = createOmniConfigRefreshController(
+      () => requests.shift()!.promise,
+      (state) => accepted.push(state),
+      (error) => failures.push(error),
+    );
+    const staleRun = controller.refresh();
+    const currentRun = controller.refresh();
+    const currentError = new Error("refresh unavailable");
+
+    currentFailure.reject(currentError);
+    await currentRun;
+    staleFailure.reject(new Error("stale failure"));
+    await staleRun;
+
+    const invalidatedRun = controller.refresh();
+    controller.invalidate();
+    invalidated.resolve(fixtureConfigState("invalidated"));
+    await invalidatedRun;
+
+    const disposedRun = controller.refresh();
+    controller.dispose();
+    afterDispose.resolve(fixtureConfigState("after-dispose"));
+    await disposedRun;
+
+    expect(accepted).toEqual([]);
+    expect(failures).toEqual([currentError]);
+  });
+});
+
+describe("Saved profile visual preflight action", () => {
+  it("uses visual-preflight copy unless that exact row is running", () => {
+    expect(omniSavedProfileTestLabelKey("active", null)).toBe(
+      "usage.testVisualPreflight",
+    );
+    expect(omniSavedProfileTestLabelKey("active", "other")).toBe(
+      "usage.testVisualPreflight",
+    );
+    expect(omniSavedProfileTestLabelKey("active", "active")).toBe(
+      "usage.testing",
+    );
   });
 });
 

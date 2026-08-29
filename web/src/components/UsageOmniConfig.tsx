@@ -27,7 +27,6 @@ import {
 import type {
   OmniApiProtocol,
   OmniConfigState,
-  OmniHealth,
   OmniProfile,
   OmniTestResult,
 } from "@/lib/types";
@@ -57,14 +56,41 @@ export function omniProtocolFormPolicy(protocol: OmniApiProtocol) {
   } as const;
 }
 
-export function applyOmniHealth(
-  state: OmniConfigState | null,
-  health: OmniHealth,
-): OmniConfigState | null {
-  if (!state) return null;
+export function omniSavedProfileTestLabelKey(
+  profileLabel: string,
+  testingLabel: string | null,
+): "usage.testing" | "usage.testVisualPreflight" {
+  return testingLabel === profileLabel
+    ? "usage.testing"
+    : "usage.testVisualPreflight";
+}
+
+export function createOmniConfigRefreshController(
+  fetchConfig: () => Promise<OmniConfigState>,
+  acceptConfig: (state: OmniConfigState) => void,
+  rejectConfig: (error: unknown) => void,
+) {
+  let generation = 0;
+  let disposed = false;
+
   return {
-    ...state,
-    active: { ...state.active, health },
+    async refresh(): Promise<void> {
+      if (disposed) return;
+      const requestGeneration = ++generation;
+      try {
+        const next = await fetchConfig();
+        if (!disposed && requestGeneration === generation) acceptConfig(next);
+      } catch (error) {
+        if (!disposed && requestGeneration === generation) rejectConfig(error);
+      }
+    },
+    invalidate(): void {
+      generation += 1;
+    },
+    dispose(): void {
+      disposed = true;
+      generation += 1;
+    },
   };
 }
 
@@ -268,33 +294,47 @@ export function UsageOmniConfig() {
   // 删除确认弹窗(web 风格,代替 window.confirm):待删项 + 删除中
   const [deleteTarget, setDeleteTarget] = useState<OmniProfile | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const refreshControllerRef = useRef<ReturnType<
+    typeof createOmniConfigRefreshController
+  > | null>(null);
 
   useEffect(() => {
-    void load();
+    const controller = createOmniConfigRefreshController(
+      getOmniConfig,
+      (next) => {
+        setState(next);
+        setLoadErr(null);
+      },
+      (error) => {
+        setLoadErr(error instanceof Error ? error.message : t("usage.configLoadError"));
+      },
+    );
+    refreshControllerRef.current = controller;
+    const refresh = () => void controller.refresh();
+
+    refresh();
     // OmniHealthBanner 的 SSE 重连(backend 重启后)会 dispatch 此事件,
     // 让当前页面同步 refetch 最新 config,避免视觉与实际状态错位。
-    const onStale = () => void load();
+    const onStale = () => refresh();
+    // health payload 不带配置身份,不能直接写入页面当前行。每次事件只触发一次
+    // authoritative config refresh,由返回值同时确定 active 身份与对应 health。
+    const onHealth = () => refresh();
     window.addEventListener(OMNI_CONFIG_STALE_EVENT, onStale);
-    return () => window.removeEventListener(OMNI_CONFIG_STALE_EVENT, onStale);
-  }, []);
-
-  useEffect(() => {
-    const onHealth = (event: Event) => {
-      const health = (event as CustomEvent<OmniHealth>).detail;
-      if (!health) return;
-      setState((current) => applyOmniHealth(current, health));
-    };
     window.addEventListener(OMNI_HEALTH_UPDATED_EVENT, onHealth);
-    return () => window.removeEventListener(OMNI_HEALTH_UPDATED_EVENT, onHealth);
+    return () => {
+      window.removeEventListener(OMNI_CONFIG_STALE_EVENT, onStale);
+      window.removeEventListener(OMNI_HEALTH_UPDATED_EVENT, onHealth);
+      controller.dispose();
+      if (refreshControllerRef.current === controller) {
+        refreshControllerRef.current = null;
+      }
+    };
   }, []);
 
-  async function load() {
-    try {
-      setState(await getOmniConfig());
-      setLoadErr(null);
-    } catch (e) {
-      setLoadErr(e instanceof Error ? e.message : t("usage.configLoadError"));
-    }
+  function acceptMutation(next: OmniConfigState) {
+    refreshControllerRef.current?.invalidate();
+    setState(next);
+    setLoadErr(null);
   }
 
   const profiles = state?.profiles ?? [];
@@ -407,7 +447,7 @@ export function UsageOmniConfig() {
         original_label: target,
         activate: false, // 只入列表;启用由模型列表的「启用」负责
       });
-      setState(s);
+      acceptMutation(s);
       setAdding(false);
       setEditing(null);
       // 保存后清掉该条旧的行内测试结果(key/model 可能已变,旧 ✓ 会误导)。
@@ -507,7 +547,7 @@ export function UsageOmniConfig() {
         toast(`${t("usage.cannotEnable")}：${testReason(res)}`, severityOf(res) === "warn" ? "warn" : "danger");
         return;
       }
-      setState(await activateOmniConfig({ label: p.label }));
+      acceptMutation(await activateOmniConfig({ label: p.label }));
       toast(t("usage.activateSuccess"), "ok");
     } catch (e) {
       toast(e instanceof Error ? e.message : t("usage.activateFailed"), "danger");
@@ -520,7 +560,7 @@ export function UsageOmniConfig() {
   async function onDeactivate(p: OmniProfile) {
     setDeactivating(p.label);
     try {
-      setState(await deactivateOmniConfig({ label: p.label }));
+      acceptMutation(await deactivateOmniConfig({ label: p.label }));
       toast(t("usage.deactivateSuccess"), "ok");
     } catch (e) {
       toast(e instanceof Error ? e.message : t("usage.deactivateFailed"), "danger");
@@ -535,7 +575,7 @@ export function UsageOmniConfig() {
     if (!p) return;
     setDeleting(true);
     try {
-      setState(await deleteOmniConfig({ label: p.label }));
+      acceptMutation(await deleteOmniConfig({ label: p.label }));
       setRowTestResults((m) => {
         const next = { ...m };
         delete next[p.label];
@@ -732,7 +772,7 @@ export function UsageOmniConfig() {
                                 disabled={rowTesting === p.label}
                                 className="text-text-secondary hover:text-brand-primary disabled:opacity-60"
                               >
-                                {rowTesting === p.label ? t("usage.testing") : t("usage.test")}
+                                {t(omniSavedProfileTestLabelKey(p.label, rowTesting))}
                               </button>
                               <button
                                 type="button"
