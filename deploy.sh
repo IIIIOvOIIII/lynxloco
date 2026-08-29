@@ -4,9 +4,7 @@ set -euo pipefail
 
 readonly ALLOWED_HOST_1="ai-lab01.esxi"
 readonly ALLOWED_HOST_2="ai-lab02.esxi"
-readonly REMOTE_ROOT="/opt/miloco-lab"
-readonly REMOTE_RELEASES="${REMOTE_ROOT}/releases"
-readonly REMOTE_CONTROL_DIR="${REMOTE_ROOT}/control"
+readonly ALLOWED_HOST_3="docker.esxi"
 
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 case "$SCRIPT_PATH" in
@@ -51,9 +49,29 @@ validate_sha() {
 
 validate_host() {
     case "$1" in
-        "$ALLOWED_HOST_1"|"$ALLOWED_HOST_2") ;;
-        *) die 2 "host is not an approved AI-lab target" ;;
+        "$ALLOWED_HOST_1"|"$ALLOWED_HOST_2"|"$ALLOWED_HOST_3") ;;
+        *) die 2 "host is not an approved Miloco deployment target" ;;
     esac
+}
+
+remote_root_for_host() {
+    case "$1" in
+        "$ALLOWED_HOST_1"|"$ALLOWED_HOST_2")
+            printf '%s\n' "/opt/miloco-lab"
+            ;;
+        "$ALLOWED_HOST_3")
+            printf '%s\n' "/opt/miloco"
+            ;;
+        *)
+            die 2 "host is not an approved Miloco deployment target"
+            ;;
+    esac
+}
+
+remote_control_dir_for_host() {
+    local remote_root
+    remote_root="$(remote_root_for_host "$1")"
+    printf '%s/control\n' "$remote_root"
 }
 
 configure_ssh_identity() {
@@ -491,12 +509,14 @@ preflight_remote() {
 install_remote_controller() {
     local target_host="$1" controller_digest="$2"
     local controller="$PROJECT_ROOT/deploy/ai-lab/remote-release.sh"
-    local controller_dir controller_path
+    local remote_root remote_control_dir controller_dir controller_path
     [[ "$controller_digest" =~ ^[0-9a-f]{64}$ ]] || die 4 "invalid controller digest"
-    controller_dir="${REMOTE_CONTROL_DIR}/${controller_digest}"
-    controller_path="${REMOTE_CONTROL_DIR}/${controller_digest}/remote-release.sh"
+    remote_root="$(remote_root_for_host "$target_host")"
+    remote_control_dir="$(remote_control_dir_for_host "$target_host")"
+    controller_dir="${remote_control_dir}/${controller_digest}"
+    controller_path="${remote_control_dir}/${controller_digest}/remote-release.sh"
     ssh "${ssh_args[@]}" -- "$target_host" \
-        "set -euo pipefail; umask 077; test ! -L '${REMOTE_ROOT}'; install -d -o root -g root -m 0755 '${REMOTE_ROOT}'; test \"\$(stat -c '%u:%g' '${REMOTE_ROOT}')\" = 0:0; test ! -L '${REMOTE_CONTROL_DIR}'; install -d -o root -g root -m 0755 '${REMOTE_CONTROL_DIR}'; test \"\$(stat -c '%u:%g' '${REMOTE_CONTROL_DIR}')\" = 0:0; test ! -L '${controller_dir}'; install -d -o root -g root -m 0555 '${controller_dir}'; temporary=\$(mktemp '${REMOTE_CONTROL_DIR}/.${controller_digest}.XXXXXX'); trap 'rm -f -- \"\$temporary\"' EXIT; cat > \"\$temporary\"; printf '%s  %s\\n' '${controller_digest}' \"\$temporary\" | sha256sum -c - >/dev/null; chown root:root \"\$temporary\"; chmod 0555 \"\$temporary\"; if ! ln \"\$temporary\" '${controller_path}' 2>/dev/null; then test -e '${controller_path}'; fi; test -f '${controller_path}'; test ! -L '${controller_path}'; test \"\$(stat -c '%u:%g' '${controller_path}')\" = 0:0; printf '%s  %s\\n' '${controller_digest}' '${controller_path}' | sha256sum -c - >/dev/null; chmod 0555 '${controller_dir}'; test \"\$(realpath -e '${controller_path}')\" = '${controller_path}'" \
+        "set -euo pipefail; umask 077; test ! -L '${remote_root}'; install -d -o root -g root -m 0755 '${remote_root}'; test \"\$(stat -c '%u:%g' '${remote_root}')\" = 0:0; test ! -L '${remote_control_dir}'; install -d -o root -g root -m 0755 '${remote_control_dir}'; test \"\$(stat -c '%u:%g' '${remote_control_dir}')\" = 0:0; test ! -L '${controller_dir}'; install -d -o root -g root -m 0555 '${controller_dir}'; temporary=\$(mktemp '${remote_control_dir}/.${controller_digest}.XXXXXX'); trap 'rm -f -- \"\$temporary\"' EXIT; cat > \"\$temporary\"; printf '%s  %s\\n' '${controller_digest}' \"\$temporary\" | sha256sum -c - >/dev/null; chown root:root \"\$temporary\"; chmod 0555 \"\$temporary\"; if ! ln \"\$temporary\" '${controller_path}' 2>/dev/null; then test -e '${controller_path}'; fi; test -f '${controller_path}'; test ! -L '${controller_path}'; test \"\$(stat -c '%u:%g' '${controller_path}')\" = 0:0; printf '%s  %s\\n' '${controller_digest}' '${controller_path}' | sha256sum -c - >/dev/null; chmod 0555 '${controller_dir}'; test \"\$(realpath -e '${controller_path}')\" = '${controller_path}'" \
         < "$controller"
 }
 
@@ -506,7 +526,7 @@ deploy_remote() {
     sha="$clean_sha"
     archive="$PROJECT_ROOT/dist/lab/$sha/miloco-lab-${sha}.tar.gz"
     read_release_receipt "$sha"
-    controller_path="${REMOTE_CONTROL_DIR}/${receipt_controller_digest}/remote-release.sh"
+    controller_path="$(remote_control_dir_for_host "$target_host")/${receipt_controller_digest}/remote-release.sh"
     install_remote_controller "$target_host" "$receipt_controller_digest"
     ssh "${ssh_args[@]}" -- "$target_host" "$controller_path" preflight "$target_host"
     ssh "${ssh_args[@]}" -- "$target_host" "$controller_path" transaction "$target_host" "$sha" \

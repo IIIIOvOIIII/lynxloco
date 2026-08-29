@@ -2,17 +2,24 @@
 
 set -euo pipefail
 
-readonly LAB_ROOT="/opt/miloco-lab"
-readonly RELEASES_DIR="$LAB_ROOT/releases"
-readonly STATE_DIR="$LAB_ROOT/state"
-readonly DEPLOY_STATE_DIR="$LAB_ROOT/deploy-state"
-readonly CURRENT_FILE="$DEPLOY_STATE_DIR/current"
-readonly PREVIOUS_FILE="$DEPLOY_STATE_DIR/previous"
-readonly INCOMING_DIR="$LAB_ROOT/incoming"
-readonly CONTROL_DIR="$LAB_ROOT/control"
-readonly ARTIFACT_RECORDS_DIR="$DEPLOY_STATE_DIR/artifacts"
-readonly ACCEPTED_DIR="$DEPLOY_STATE_DIR/accepted"
-readonly TRANSITION_LOCK_FILE="$DEPLOY_STATE_DIR/transition.lock"
+LAB_ROOT="/opt/miloco-lab"
+RELEASES_DIR="$LAB_ROOT/releases"
+STATE_DIR="$LAB_ROOT/state"
+DEPLOY_STATE_DIR="$LAB_ROOT/deploy-state"
+CURRENT_FILE="$DEPLOY_STATE_DIR/current"
+PREVIOUS_FILE="$DEPLOY_STATE_DIR/previous"
+INCOMING_DIR="$LAB_ROOT/incoming"
+CONTROL_DIR="$LAB_ROOT/control"
+ARTIFACT_RECORDS_DIR="$DEPLOY_STATE_DIR/artifacts"
+ACCEPTED_DIR="$DEPLOY_STATE_DIR/accepted"
+TRANSITION_LOCK_FILE="$DEPLOY_STATE_DIR/transition.lock"
+SERVICE_PORT="1810"
+SERVER_URL="http://127.0.0.1:1810"
+COMPOSE_PROJECT="miloco-lab"
+RUNTIME_IMAGE_NAME="miloco-lab"
+ACCEPTANCE_IMAGE_NAME="miloco-lab-acceptance"
+CANDIDATE_RUNTIME_IMAGE_NAME="miloco-lab-candidate"
+CANDIDATE_ACCEPTANCE_IMAGE_NAME="miloco-lab-acceptance-candidate"
 readonly REMOTE_ALLOWLIST_SHA256="02852c989db9f4efd27d1df7e3872f60af982175eb7e1e9f4bf9b751f1754ddd"
 readonly HEALTH_TIMEOUT_SECONDS=120
 readonly MINIMUM_DISK_KIB=5242880
@@ -37,8 +44,8 @@ die() {
 
 validate_host() {
     case "$1" in
-        ai-lab01.esxi|ai-lab02.esxi) ;;
-        *) die 2 "host is not an approved AI-lab target" ;;
+        ai-lab01.esxi|ai-lab02.esxi|docker.esxi) ;;
+        *) die 2 "host is not an approved Miloco deployment target" ;;
     esac
 }
 
@@ -50,12 +57,84 @@ require_root() {
     [[ "$(id -u)" == "0" ]] || die 3 "remote release operations require root"
 }
 
-host_limits() {
+refresh_profile_paths() {
+    RELEASES_DIR="$LAB_ROOT/releases"
+    STATE_DIR="$LAB_ROOT/state"
+    DEPLOY_STATE_DIR="$LAB_ROOT/deploy-state"
+    CURRENT_FILE="$DEPLOY_STATE_DIR/current"
+    PREVIOUS_FILE="$DEPLOY_STATE_DIR/previous"
+    INCOMING_DIR="$LAB_ROOT/incoming"
+    CONTROL_DIR="$LAB_ROOT/control"
+    ARTIFACT_RECORDS_DIR="$DEPLOY_STATE_DIR/artifacts"
+    ACCEPTED_DIR="$DEPLOY_STATE_DIR/accepted"
+    TRANSITION_LOCK_FILE="$DEPLOY_STATE_DIR/transition.lock"
+}
+
+configure_host_profile() {
+    validate_host "$1"
     case "$1" in
-        ai-lab01.esxi) cpu_limit="3.0"; memory_limit="3072m" ;;
-        ai-lab02.esxi) cpu_limit="1.25"; memory_limit="1536m" ;;
-        *) die 2 "host has no resource profile" ;;
+        ai-lab01.esxi)
+            LAB_ROOT="/opt/miloco-lab"
+            SERVICE_PORT="1810"
+            SERVER_URL="http://127.0.0.1:1810"
+            COMPOSE_PROJECT="miloco-lab"
+            RUNTIME_IMAGE_NAME="miloco-lab"
+            ACCEPTANCE_IMAGE_NAME="miloco-lab-acceptance"
+            CANDIDATE_RUNTIME_IMAGE_NAME="miloco-lab-candidate"
+            CANDIDATE_ACCEPTANCE_IMAGE_NAME="miloco-lab-acceptance-candidate"
+            cpu_limit="3.0"
+            memory_limit="3072m"
+            ;;
+        ai-lab02.esxi)
+            LAB_ROOT="/opt/miloco-lab"
+            SERVICE_PORT="1810"
+            SERVER_URL="http://127.0.0.1:1810"
+            COMPOSE_PROJECT="miloco-lab"
+            RUNTIME_IMAGE_NAME="miloco-lab"
+            ACCEPTANCE_IMAGE_NAME="miloco-lab-acceptance"
+            CANDIDATE_RUNTIME_IMAGE_NAME="miloco-lab-candidate"
+            CANDIDATE_ACCEPTANCE_IMAGE_NAME="miloco-lab-acceptance-candidate"
+            cpu_limit="1.25"
+            memory_limit="1536m"
+            ;;
+        docker.esxi)
+            LAB_ROOT="/opt/miloco"
+            SERVICE_PORT="1811"
+            SERVER_URL="http://127.0.0.1:1811"
+            COMPOSE_PROJECT="miloco"
+            RUNTIME_IMAGE_NAME="miloco"
+            ACCEPTANCE_IMAGE_NAME="miloco-acceptance"
+            CANDIDATE_RUNTIME_IMAGE_NAME="miloco-candidate"
+            CANDIDATE_ACCEPTANCE_IMAGE_NAME="miloco-acceptance-candidate"
+            cpu_limit="2.0"
+            memory_limit="3072m"
+            ;;
     esac
+    refresh_profile_paths
+}
+
+host_limits() {
+    configure_host_profile "$1"
+}
+
+runtime_image_for_sha() {
+    validate_sha "$1"
+    printf '%s:%s\n' "$RUNTIME_IMAGE_NAME" "$1"
+}
+
+acceptance_image_for_sha() {
+    validate_sha "$1"
+    printf '%s:%s\n' "$ACCEPTANCE_IMAGE_NAME" "$1"
+}
+
+candidate_runtime_image_for_sha() {
+    validate_sha "$1"
+    printf '%s:%s\n' "$CANDIDATE_RUNTIME_IMAGE_NAME" "$1"
+}
+
+candidate_acceptance_image_for_sha() {
+    validate_sha "$1"
+    printf '%s:%s\n' "$CANDIDATE_ACCEPTANCE_IMAGE_NAME" "$1"
 }
 
 compose_command() {
@@ -68,11 +147,15 @@ compose_command() {
         compose_args=("$@")
     else
         validate_sha "$sha"
-        compose_args=(-p miloco-lab -f "$RELEASES_DIR/$sha/compose.yaml" "$@")
+        compose_args=(-p "$COMPOSE_PROJECT" -f "$RELEASES_DIR/$sha/compose.yaml" "$@")
     fi
     MILOCO_RELEASE_SHA="$sha" \
     MILOCO_CPU_LIMIT="$cpu_limit" \
     MILOCO_MEMORY_LIMIT="$memory_limit" \
+    MILOCO_IMAGE_NAME="$RUNTIME_IMAGE_NAME" \
+    MILOCO_STATE_DIR="$STATE_DIR" \
+    MILOCO_SERVER_PORT="$SERVICE_PORT" \
+    MILOCO_SERVER_URL="$SERVER_URL" \
         timeout --signal=KILL "${timeout_seconds}s" \
         docker compose "${compose_args[@]}"
 }
@@ -94,7 +177,7 @@ version_at_least() {
 preflight_release() {
     local host="$1"
     require_root
-    validate_host "$host"
+    configure_host_profile "$host"
     [[ ! -L "$LAB_ROOT" ]] || die 4 "$LAB_ROOT must not be a symlink"
     [[ ! -L "$RELEASES_DIR" && ! -L "$STATE_DIR" && ! -L "$DEPLOY_STATE_DIR" ]] || die 4 "lab subdirectories must not be symlinks"
     [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "x86_64" ]] || die 4 "platform must be linux/amd64"
@@ -126,18 +209,19 @@ preflight_release() {
     done < /proc/meminfo
     (( available_memory_kib >= required_memory_kib )) || die 4 "insufficient available memory"
 
-    local listeners current_sha container_id image_name container_pids
+    local listeners current_sha container_id image_name container_pids expected_image
     local remaining listener_pid container_pid listener_matches
-    listeners="$(ss -H -ltnp 'sport = :1810' 2>/dev/null || true)"
+    listeners="$(ss -H -ltnp "sport = :$SERVICE_PORT" 2>/dev/null || true)"
     if [[ -n "$listeners" ]]; then
-        [[ -f "$CURRENT_FILE" && ! -L "$CURRENT_FILE" ]] || die 4 "port 1810 is owned by an unrelated listener"
+        [[ -f "$CURRENT_FILE" && ! -L "$CURRENT_FILE" ]] || die 4 "port $SERVICE_PORT is owned by an unrelated listener"
         require_safe_record "$CURRENT_FILE" || die 4 "current state record is unsafe"
         current_sha="$(<"$CURRENT_FILE")"
         validate_sha "$current_sha"
         container_id="$(compose_command "$host" "$current_sha" 15 ps -q miloco 2>/dev/null || true)"
-        [[ -n "$container_id" ]] || die 4 "port 1810 is owned by an unrelated listener"
+        [[ -n "$container_id" ]] || die 4 "port $SERVICE_PORT is owned by an unrelated listener"
         image_name="$(docker_command 10 inspect --format '{{.Config.Image}}' "$container_id" 2>/dev/null || true)"
-        [[ "$image_name" == "miloco-lab:$current_sha" ]] || die 4 "port 1810 is owned by an unrelated listener"
+        expected_image="$(runtime_image_for_sha "$current_sha")"
+        [[ "$image_name" == "$expected_image" ]] || die 4 "port $SERVICE_PORT is owned by an unrelated listener"
         container_pids="$(docker_command 10 top "$container_id" -eo pid 2>/dev/null || true)"
         remaining="$listeners"
         listener_matches=0
@@ -152,13 +236,13 @@ preflight_release() {
                     break
                 fi
             done <<< "$container_pids"
-            (( owned_by_current == 1 )) || die 4 "port 1810 is owned by an unrelated listener"
+            (( owned_by_current == 1 )) || die 4 "port $SERVICE_PORT is owned by an unrelated listener"
             remaining="${remaining#*pid=$listener_pid}"
         done
-        (( listener_matches > 0 )) || die 4 "port 1810 listener ownership is unavailable"
+        (( listener_matches > 0 )) || die 4 "port $SERVICE_PORT listener ownership is unavailable"
     fi
-    printf 'preflight_ok host=%s platform=linux/amd64 docker=%s compose=%s port=1810 disk_kib=%s\n' \
-        "$host" "$docker_version" "$compose_version" "$disk_kib"
+    printf 'preflight_ok host=%s platform=linux/amd64 docker=%s compose=%s port=%s disk_kib=%s\n' \
+        "$host" "$docker_version" "$compose_version" "$SERVICE_PORT" "$disk_kib"
 }
 
 verify_release_tree() {
@@ -219,7 +303,7 @@ verify_release() {
     local sha="$1"
     validate_sha "$sha"
     local release="$RELEASES_DIR/$sha"
-    [[ "$release" == "/opt/miloco-lab/releases/$sha" ]] || die 4 "release path mismatch"
+    [[ "$release" == "$RELEASES_DIR/$sha" ]] || die 4 "release path mismatch"
     [[ ! -L "$LAB_ROOT" && ! -L "$RELEASES_DIR" && ! -L "$STATE_DIR" && ! -L "$DEPLOY_STATE_DIR" ]] || die 4 "lab paths must not be symlinks"
     require_safe_directory "$LAB_ROOT" || die 4 "lab root is unsafe"
     require_safe_directory "$RELEASES_DIR" || die 4 "release parent is unsafe"
@@ -414,7 +498,7 @@ verify_controller_self() {
 transaction_release() {
     local host="$1" sha="$2" archive_digest="$3" controller_digest="$4" allowlist_digest="$5" sha_state
     require_root
-    validate_host "$host"
+    configure_host_profile "$host"
     validate_sha "$sha"
     [[ "$archive_digest" =~ ^[0-9a-f]{64}$ \
         && "$controller_digest" =~ ^[0-9a-f]{64}$ \
@@ -463,7 +547,7 @@ probe_http_status() {
     http_status="$(timeout --signal=KILL "${remaining}s" \
         curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
         --connect-timeout "$probe_timeout" --max-time "$probe_timeout" \
-        http://127.0.0.1:1810/health 2>/dev/null || true)"
+        "http://127.0.0.1:${SERVICE_PORT}/health" 2>/dev/null || true)"
     [[ "$http_status" =~ ^[0-9]{3}$ ]] || http_status="000"
     printf '%s\n' "$http_status"
 }
@@ -759,8 +843,8 @@ published_sha_state() {
         return 0
     fi
 
-    runtime_state="$(image_reference_state "miloco-lab:$sha")"
-    acceptance_state="$(image_reference_state "miloco-lab-acceptance:$sha")"
+    runtime_state="$(image_reference_state "$(runtime_image_for_sha "$sha")")"
+    acceptance_state="$(image_reference_state "$(acceptance_image_for_sha "$sha")")"
     if [[ "$runtime_state" == "absent" && "$acceptance_state" == "absent" ]]; then
         printf 'new\n'
     elif [[ "$runtime_state" == "probe_error" || "$acceptance_state" == "probe_error" ]]; then
@@ -1056,7 +1140,7 @@ remove_image_references() {
 
 remove_candidate_image_tags() {
     local sha="$1"
-    remove_image_references "miloco-lab-candidate:$sha" "miloco-lab-acceptance-candidate:$sha"
+    remove_image_references "$(candidate_runtime_image_for_sha "$sha")" "$(candidate_acceptance_image_for_sha "$sha")"
 }
 
 cleanup_unaccepted_candidate() {
@@ -1128,8 +1212,8 @@ release_capability() {
         [[ "$proof_state" -eq 1 ]] && printf 'definitively_invalid\n' || printf 'probe_error\n'
         return 0
     fi
-    runtime_state="$(image_reference_state "miloco-lab:$sha")"
-    acceptance_state="$(image_reference_state "miloco-lab-acceptance:$sha")"
+    runtime_state="$(image_reference_state "$(runtime_image_for_sha "$sha")")"
+    acceptance_state="$(image_reference_state "$(acceptance_image_for_sha "$sha")")"
     case "$runtime_state:$acceptance_state" in
         probe_error:*|*:probe_error)
             printf 'probe_error\n'
@@ -1157,9 +1241,11 @@ release_capability() {
 
 build_images_and_accept() {
     local sha_state="$1" host="$2" sha="$3" release="$4" runtime_image_id acceptance_image_id capability
-    local runtime_image="miloco-lab:$sha" acceptance_image="miloco-lab-acceptance:$sha"
-    local candidate_runtime="miloco-lab-candidate:$sha"
-    local candidate_acceptance="miloco-lab-acceptance-candidate:$sha"
+    local runtime_image acceptance_image candidate_runtime candidate_acceptance
+    runtime_image="$(runtime_image_for_sha "$sha")"
+    acceptance_image="$(acceptance_image_for_sha "$sha")"
+    candidate_runtime="$(candidate_runtime_image_for_sha "$sha")"
+    candidate_acceptance="$(candidate_acceptance_image_for_sha "$sha")"
     case "$sha_state" in
         new) ;;
         existing)
@@ -1250,7 +1336,7 @@ commit_transition() {
 
 activate_release() {
     local host="$1" sha="$2" capability
-    validate_host "$host"
+    configure_host_profile "$host"
     capability="$(release_capability "$sha")"
     [[ "$capability" == "capable" ]] || die 4 "release is not verified and acceptance-approved"
     [[ ! -L "$DEPLOY_STATE_DIR" ]] || die 4 "deployment state path must not be a symlink"
@@ -1278,7 +1364,7 @@ activate_release() {
 build_and_activate_locked() {
     local sha_state="$1" host="$2" sha="$3" release="$RELEASES_DIR/$sha"
     require_root
-    validate_host "$host"
+    configure_host_profile "$host"
     verify_release "$sha"
     build_images_and_accept "$sha_state" "$host" "$sha" "$release"
     [[ ! -L "$STATE_DIR" ]] || die 4 "persistent state path must not be a symlink"
@@ -1289,7 +1375,7 @@ build_and_activate_locked() {
 verify_running() {
     local host="$1"
     require_root
-    validate_host "$host"
+    configure_host_profile "$host"
     [[ -f "$CURRENT_FILE" && ! -L "$CURRENT_FILE" ]] || die 4 "not deployed"
     require_safe_record "$CURRENT_FILE" || die 4 "current state record is unsafe"
     local sha="$(<"$CURRENT_FILE")"
@@ -1302,7 +1388,7 @@ verify_running() {
 status_release() {
     local host="$1" path_state current_content sha proof_state
     require_root
-    validate_host "$host"
+    configure_host_profile "$host"
     if [[ ! -e "$LAB_ROOT" && ! -L "$LAB_ROOT" ]]; then
         printf 'not_deployed host=%s\n' "$host"
         return 0
@@ -1328,13 +1414,14 @@ status_release() {
         proof_state="$?"
         die 4 "current release proof is unsafe for status (state=$proof_state)"
     fi
-    local container_id image health observed_image
+    local container_id image health observed_image expected_image
     container_id="$(compose_container_id "$host" "$sha" 10 || true)"
     image="not_running"
     health="not_running"
     if [[ -n "$container_id" ]]; then
         observed_image="$(docker_command 10 inspect --format '{{.Config.Image}}' "$container_id" 2>/dev/null || true)"
-        if [[ "$observed_image" == "miloco-lab:$sha" ]]; then
+        expected_image="$(runtime_image_for_sha "$sha")"
+        if [[ "$observed_image" == "$expected_image" ]]; then
             image="$observed_image"
         else
             image="unexpected"
@@ -1347,7 +1434,7 @@ status_release() {
 rollback_release() {
     local host="$1" sha="$2" capability
     require_root
-    validate_host "$host"
+    configure_host_profile "$host"
     acquire_transition_lock
     validate_sha "$sha"
     capability="$(release_capability "$sha")"

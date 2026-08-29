@@ -40,7 +40,7 @@ COPY container-entrypoint.sh /usr/local/bin/container-entrypoint.sh
 RUN chmod 0555 /usr/local/bin/container-entrypoint.sh
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:1810/health', timeout=3).close()"
+    CMD python -c "import os, urllib.request; port=os.environ.get('MILOCO_SERVER__PORT', '1810'); urllib.request.urlopen(f'http://127.0.0.1:{port}/health', timeout=3).close()"
 
 USER 10001:10001
 ENTRYPOINT ["container-entrypoint.sh"]
