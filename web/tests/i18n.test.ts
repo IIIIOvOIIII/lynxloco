@@ -80,6 +80,19 @@ describe("i18n 接线 smoke", () => {
   });
 });
 
+describe("视觉请求拒绝文案", () => {
+  it("zh/en 均明确区分文本连通与视觉请求被拒", () => {
+    expect(loadDomain("zh", "omniHealth.json")["omniHealth.codes.visual_payload_rejected"])
+      .toBe("端点可连接，但当前协议或视觉请求不受支持");
+    expect(loadDomain("en", "omniHealth.json")["omniHealth.codes.visual_payload_rejected"])
+      .toBe("The endpoint is reachable, but the selected protocol or visual request is unsupported");
+    expect(loadDomain("zh", "usage.json")["usage.testVisualPayloadRejected"])
+      .toBe("端点可连接，但当前协议或视觉请求不受支持");
+    expect(loadDomain("en", "usage.json")["usage.testVisualPayloadRejected"])
+      .toBe("The endpoint is reachable, but the selected protocol or visual request is unsupported");
+  });
+});
+
 // 守 USAGE 卡:组件里引用的 usage.* key(含 t("usage.X") 与 OMNI_CODE_KEY 的 "usage.X" 值)
 // 必须在 zh/en 都存在。这正是「删除弹窗渲染裸 key」事故的根因门——缺 key 时 i18next 回退为
 // key 字符串本身,界面显示 "usage.deleteDialogTitle" 这种,既有对齐测试查不出(两边都缺)。

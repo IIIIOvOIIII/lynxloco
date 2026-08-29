@@ -472,7 +472,7 @@ export interface OmniHealth {
     | null
     | "unreachable" | "timeout" | "http_error" | "rate_limited"
     | "bad_key" | "not_found" | "rejected_authed" | "bad_response"
-    | "no_key" | "cancelled";
+    | "visual_payload_rejected" | "no_key" | "cancelled";
   /** 本地化文案。 */
   message: string;
   /** 当前非 ok 状态起始时间;ok 时为 0。 */
@@ -541,7 +541,7 @@ export interface OmniTestResult {
   ok: boolean;
   /** 机器码,前端按它本地化;缺省回退 message。与 error_classifier.CODES 一致:
    *  ok / bad_key / no_key / not_found / rejected_authed / unreachable / timeout /
-   *  http_error / rate_limited / bad_response / cancelled。 */
+   *  http_error / rate_limited / bad_response / visual_payload_rejected / cancelled。 */
   code?: string;
   status?: number;
   latency_ms?: number;

@@ -579,6 +579,19 @@ export function subscribeOmniHealth(
   return impl.realSubscribeOmniHealth(onHealth, onOpen);
 }
 
+// omni 实时健康度的浏览器内 fan-out 事件:全局 banner 保持唯一 SSE 连接,
+// 其他页面只监听此事件,避免每个消费者各自建立 EventSource。
+export const OMNI_HEALTH_UPDATED_EVENT = "miloco:omni-health-updated";
+
+export function dispatchOmniHealthUpdated(
+  health: OmniHealth,
+  target: EventTarget = window,
+): void {
+  target.dispatchEvent(
+    new CustomEvent<OmniHealth>(OMNI_HEALTH_UPDATED_EVENT, { detail: health }),
+  );
+}
+
 // SSE 重连后广播的全局事件名:让「模型」页监听并 refetch config
 // (backend 重启会断 SSE,重连意味着 config 可能已变)。
 export const OMNI_CONFIG_STALE_EVENT = "miloco:omni-config-stale";

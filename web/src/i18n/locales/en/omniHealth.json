@@ -18,6 +18,7 @@
       "no_key": "API key not configured",
       "not_found": "Model or URL not found",
       "rejected_authed": "Connected, but the request was rejected (model name or API key may be wrong)",
+      "visual_payload_rejected": "The endpoint is reachable, but the selected protocol or visual request is unsupported",
       "bad_response": "Malformed response from Omni",
       "cancelled": "Retry was interrupted"
     }

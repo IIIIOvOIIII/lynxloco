@@ -15,6 +15,7 @@ import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
   OMNI_CONFIG_STALE_EVENT,
+  OMNI_HEALTH_UPDATED_EVENT,
   getOmniConfig,
   updateOmniConfig,
   activateOmniConfig,
@@ -26,6 +27,7 @@ import {
 import type {
   OmniApiProtocol,
   OmniConfigState,
+  OmniHealth,
   OmniProfile,
   OmniTestResult,
 } from "@/lib/types";
@@ -50,9 +52,20 @@ export function omniProtocolFormPolicy(protocol: OmniApiProtocol) {
     keyRequired: !responses,
     mediaCopyKey: responses ? "usage.responsesImageSequence" : "usage.videoAudioPerception",
     audioCopyKey: responses ? "usage.responsesNoCameraAudio" : null,
-    testLabelKey: responses ? "usage.testVisualPreflight" : "usage.testConnection",
+    testLabelKey: "usage.testVisualPreflight",
     samplingControlsVisible: !responses,
   } as const;
+}
+
+export function applyOmniHealth(
+  state: OmniConfigState | null,
+  health: OmniHealth,
+): OmniConfigState | null {
+  if (!state) return null;
+  return {
+    ...state,
+    active: { ...state.active, health },
+  };
 }
 
 export function omniProtocolSelection(apiProtocol: OmniApiProtocol) {
@@ -90,6 +103,7 @@ const OMNI_CODE_KEY: Record<string, string> = {
   bad_key: "usage.testBadKey",
   not_found: "usage.testNotFound",
   rejected_authed: "usage.testRejectedAuthed",
+  visual_payload_rejected: "usage.testVisualPayloadRejected",
   unreachable: "usage.testUnreachable",
   no_key: "usage.testNoKey",
   http_error: "usage.testHttpError",
@@ -262,6 +276,16 @@ export function UsageOmniConfig() {
     const onStale = () => void load();
     window.addEventListener(OMNI_CONFIG_STALE_EVENT, onStale);
     return () => window.removeEventListener(OMNI_CONFIG_STALE_EVENT, onStale);
+  }, []);
+
+  useEffect(() => {
+    const onHealth = (event: Event) => {
+      const health = (event as CustomEvent<OmniHealth>).detail;
+      if (!health) return;
+      setState((current) => applyOmniHealth(current, health));
+    };
+    window.addEventListener(OMNI_HEALTH_UPDATED_EVENT, onHealth);
+    return () => window.removeEventListener(OMNI_HEALTH_UPDATED_EVENT, onHealth);
   }, []);
 
   async function load() {
