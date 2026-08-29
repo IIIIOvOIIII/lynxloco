@@ -9,6 +9,8 @@ import type {
   Person,
   Pet,
   CameraSummary,
+  PerceptionCamera,
+  PerceptionCameraView,
   ScopeCamera,
   UsageStats,
 } from "@/lib/types";
@@ -30,6 +32,7 @@ import {
 } from "@/lib/cameraChannel";
 import { IconPlus, IconRefresh, IconPencil, IconTrash } from "@/lib/icons";
 import { isRtspLiveReady, isTerminalRtspError } from "@/lib/rtspPolling";
+import { buildPerceptionCameraViews } from "@/lib/perceptionCameraView";
 
 // 每摄像头「感知须知」prompt 长度上限（与 backend MAX_CAMERA_PROMPT_LEN 对齐）。
 const CAMERA_PROMPT_MAX_LEN = 500;
@@ -61,6 +64,8 @@ interface Props {
   pets?: Pet[];
   /** 宠物识别开关（features.petRecognition）——关闭时本页不展示宠物成员。 */
   petsEnabled?: boolean;
+  /** 当前感知订阅的权威列表；包含 MIoT 与 RTSP 来源。 */
+  perceptionCameras: PerceptionCamera[];
   /** 米家全集（含被禁用 / 离线），用于渲染所有摄像头卡片 + Switch。多通道相机每条
    *  通道一条记录（did 相同、channel 区分），channel 直接带在每条上供播放 / 分行。 */
   scopeCameras: ScopeCamera[];
@@ -111,6 +116,7 @@ export function HeroNow({
   persons,
   pets,
   petsEnabled = false,
+  perceptionCameras,
   scopeCameras,
   cameraSummaries = [],
   cameraStatusStale = false,
@@ -131,28 +137,24 @@ export function HeroNow({
 }: Props) {
   const { t } = useTranslation();
   const sorted = sortPersons(persons);
-  // 上区 = miloco **当前真正在投喂视频** 的相机。判据用后端权威字段 `connected`
-  // (= MiotService._connected_camera_dids() = 感知 camera_adapter.get_connected_devices()，
-  // 即真正建连、在喂解码帧给感知的那几路)，而不是 `inUse`(只是 KV 里的"想启用"意图——
-  // 启用了但 LAN 拉不起来时 inUse=true 却没真投喂)。再 **按 (did, channel) 稳定排序**:
-  // toggle 某路时其余卡 key+DOM 位置不变，React 复用其 iframe，不会连带把其它路的 watch
-  // 流断开重连。其余相机(未投喂:未启用 / 启用中未连上 / 超出上限)进下区「无流」横向列表。
-  const { streamingCams, benchCams } = useMemo(() => {
-    // 多通道相机两条记录 did 相同，需按 channel 二级排序 + 用 (did, channel) 复合键
-    // 判定归属，否则同名两行会互相顶掉（同一 did 只留一条）。
-    const key = (c: ScopeCamera) => `${c.did}|${c.channel}`;
-    const byDidChannel = (a: ScopeCamera, b: ScopeCamera) => {
-      if (a.did !== b.did) return a.did < b.did ? -1 : 1;
-      return a.channel - b.channel;
-    };
-    const sorted = [...scopeCameras].sort(byDidChannel);
-    // 不再前端截断:connected 集天然受后端 MAX_ENABLED_CAMERAS 约束(感知接入层按流路数
-    // 截断、只连前 N 路；主动 enable 超限也被 toggle_camera 挡下)，展示集即真实投喂集。
-    const streaming = sorted.filter((c) => c.connected);
-    const sset = new Set(streaming.map(key));
-    const bench = sorted.filter((c) => !sset.has(key(c)));
-    return { streamingCams: streaming, benchCams: bench };
-  }, [scopeCameras]);
+  const perceptionViews = useMemo(
+    () => buildPerceptionCameraViews(perceptionCameras, cameraSummaries, scopeCameras),
+    [perceptionCameras, cameraSummaries, scopeCameras],
+  );
+  const activeMiotIds = useMemo(
+    () => new Set(
+      perceptionViews
+        .filter((view) => view.sourceType === "miot" && view.miotScope)
+        .map((view) => view.id),
+    ),
+    [perceptionViews],
+  );
+  const benchCams = useMemo(
+    () => scopeCameras.filter((camera) =>
+      !activeMiotIds.has(synthFeedDid(camera.did, camera.channel, camera.channelCount > 1)),
+    ),
+    [scopeCameras, activeMiotIds],
+  );
   // 今日 token 用量小入口（omni 计费）
   const todayUsage = useAsync<UsageStats>(
     () => getUsageStats("today"),
@@ -237,7 +239,7 @@ export function HeroNow({
       )}
       <CameraSection
         scopeCameras={scopeCameras}
-        streamingCams={streamingCams}
+        perceptionViews={perceptionViews}
         benchCams={benchCams}
         maxStreamCams={maxStreamCams}
         miotHasCamera={miotHasCamera}
@@ -484,8 +486,8 @@ function RtspCameraSection({
 
 interface CameraSectionProps {
   scopeCameras: ScopeCamera[];
-  /** 上区:带实时流的相机(inUse=true，≤4，按 did 稳定排序) */
-  streamingCams: ScopeCamera[];
+  /** 上区：perception API 权威的当前订阅相机，来源可为 MIoT 或 RTSP。 */
+  perceptionViews: PerceptionCameraView[];
   /** 下区:无流横向列出的相机(未启用 / 超出上限) */
   benchCams: ScopeCamera[];
   /** 最多投喂数(后端 MAX_ENABLED_CAMERAS)，用于满额置灰下区「启用」 */
@@ -499,9 +501,33 @@ interface CameraSectionProps {
   showEmpty: boolean;
 }
 
+function SourceNeutralCamCard({ camera }: { camera: PerceptionCameraView }) {
+  const { t } = useTranslation();
+
+  return (
+    <article className="w-[min(82vw,420px)] shrink-0 snap-start rounded-xl border border-border bg-bg-primary p-3">
+      <LivePlayerPlaceholder
+        cameraName={camera.name}
+        roomName={camera.roomName}
+        cameraId={camera.id}
+        className="mb-3"
+      />
+      <div className="flex flex-wrap items-center gap-1.5 text-caption text-text-secondary">
+        <span className="text-body text-text-primary">{camera.name}</span>
+        {camera.sourceType === "rtsp" && (
+          <span className="rounded border border-border px-1.5 py-0.5 text-text-tertiary">
+            {t("rtspCamera.sourceRtsp")}
+          </span>
+        )}
+        {camera.roomName && <span>{camera.roomName}</span>}
+      </div>
+    </article>
+  );
+}
+
 function CameraSection({
   scopeCameras,
-  streamingCams,
+  perceptionViews,
   benchCams,
   maxStreamCams,
   miotHasCamera,
@@ -524,7 +550,10 @@ function CameraSection({
       setRefreshing(false);
     }
   };
-  const total = scopeCameras.length;
+  const perceptionCount = perceptionViews.length;
+  const miotActiveCount = scopeCameras.filter((camera) => camera.inUse).length;
+  const hasLiveCards = perceptionViews.length > 0;
+  const hasMiotRows = scopeCameras.length > 0;
   // 出现多于一条记录的物理 did = 多通道相机；这些相机每卡/每行才拼镜头标签，好让同名
   // 同房间的两条彼此区分（单通道不显示，免噪声）。逻辑收在 @/lib/cameraChannel（可单测）。
   // 多通道判据用后端权威信号 channelCount>1（与 backend/CLI 同口径），不用「同 did 出现几行」代理。
@@ -540,13 +569,12 @@ function CameraSection({
   const feedDidOf = (c: ScopeCamera): string =>
     synthFeedDid(c.did, c.channel, isMulti(c));
   const hasMic = (c: ScopeCamera): boolean => channelHasMic(c.channel);
-  const activeCount = scopeCameras.filter((c) => c.inUse).length;
-  const allOn = total > 0 && activeCount === total;
-  const allOff = activeCount === 0;
+  const allOn = scopeCameras.length > 0 && miotActiveCount === scopeCameras.length;
+  const allOff = miotActiveCount === 0;
   // 满额判断按 inUse(=活跃集:未拉黑 + 三态好 + 上限内)计数,与后端 toggle_camera 的
   // 上限校验同口径——后端也数「可用集」(离线/局域网不可达/镜头关的不占名额)。所以
   // 面板显示的名额 = 后端认的名额,不会出现「看着有位、点开启却被后端拒」。
-  const atCapacity = activeCount >= maxStreamCams;
+  const atCapacity = miotActiveCount >= maxStreamCams;
   // 「全开」只能开「可用且未投喂」的**通道**——不可用(云端离线/局域网不可达/该路镜头关)
   // 后端 toggle_camera 会整批拒绝。全拆按通道走：每路一个合成 did，各自独立(不去重物理 did)。
   const enableableDids = scopeCameras
@@ -654,11 +682,12 @@ function CameraSection({
         <div className="flex items-baseline gap-2">
           <SectionLabel>{t("hero.liveLabel")}</SectionLabel>
         </div>
-        {total > 0 && (
+        {(hasLiveCards || hasMiotRows) && (
           <div className="text-caption flex items-center gap-2 text-text-tertiary">
             <span className="num">
-              {t("hero.perceivingCount", { n: activeCount })}
+              {t("hero.perceivingCount", { n: perceptionCount })}
             </span>
+            {hasMiotRows && <>
             <button
               type="button"
               onClick={() => runBulk(enableableDids, true)}
@@ -685,10 +714,11 @@ function CameraSection({
             >
               {t("hero.allOff")}
             </button>
+            </>}
           </div>
         )}
       </div>
-      {total === 0 ? showEmpty ? (
+      {!hasLiveCards && !hasMiotRows ? showEmpty ? (
         <div className="text-body rounded-lg bg-bg-primary border border-dashed border-border-strong text-text-secondary py-8 px-5 text-center">
           {miotHasCamera ? (
             <>
@@ -705,16 +735,15 @@ function CameraSection({
         </div>
       ) : null : (
         <>
-          {/* 上区:最多 4 路「带实时流」的相机,按物理 did 分组——每台一张卡(卡内每通道
-              一个小窗),整台一套开关。卡 key=物理 did,稳定排序,toggle 某台时其余卡
-              key+位置不变，React 复用其 iframe，不会连带把其它台的流断开重连。 */}
-          {streamingCams.length > 0 ? (
+          {hasLiveCards ? (
             <div className="flex gap-3 overflow-x-auto snap-x snap-mandatory pb-2 -mx-1 px-1">
-              {streamingCams.map((c) => {
-                const feedDid = feedDidOf(c);
-                return (
+              {perceptionViews.map((view) =>
+                view.sourceType === "miot" && view.miotScope ? (() => {
+                  const c = view.miotScope;
+                  const feedDid = feedDidOf(c);
+                  return (
                   <CamCardWithToggle
-                    key={feedDid}
+                    key={view.id}
                     cam={c}
                     channelLabel={channelLabelOf(c)}
                     // 拾音只在有 mic 的通道(球机/ch0)显示;枪机(ch1)永久无音频不给开关。
@@ -734,8 +763,11 @@ function CameraSection({
                       openPromptEditor(feedDid, channelLabelOf(c) ? `${c.name} · ${channelLabelOf(c)}` : c.name, c.perceptionPrompt)
                     }
                   />
-                );
-              })}
+                  );
+                })() : (
+                  <SourceNeutralCamCard key={view.id} camera={view} />
+                ),
+              )}
             </div>
           ) : (
             <div className="text-body rounded-lg bg-bg-primary border border-dashed border-border-strong text-text-secondary py-6 px-5 text-center">

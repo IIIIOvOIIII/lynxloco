@@ -340,6 +340,7 @@ function MainApp() {
               persons={persons.data}
               pets={pets.data}
               petsEnabled={features.data?.petRecognition ?? false}
+              perceptionCameras={cameras.data}
               scopeCameras={scopeCameras.data}
               cameraSummaries={cameraSummaries.data}
               cameraStatusStale={cameraSummaryState.stale}

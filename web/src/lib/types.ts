@@ -284,6 +284,16 @@ export interface CameraSummary {
   errorMessage: string | null;
 }
 
+export interface PerceptionCameraView {
+  id: string;
+  name: string;
+  roomName?: string;
+  sourceType: CameraSourceType | null;
+  connected: boolean | null;
+  summary: CameraSummary | null;
+  miotScope: ScopeCamera | null;
+}
+
 /** POST/PUT /api/cameras/rtsp payload；enabled 由独立端点管理。 */
 export interface RtspSourceInput {
   name: string;
