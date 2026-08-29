@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable
@@ -38,6 +39,7 @@ from miloco.perception.collect.miot_camera_source import (
 from miloco.perception.collect.stream_buffer import (
     MultiTrackSyncBuffer,
     StreamFragment,
+    TrackRetentionPolicy,
 )
 from miloco.perception.schema import (
     DecodedAudioFrame,
@@ -66,6 +68,20 @@ def _unix_ms() -> int:
 
 
 _CAMERA_TRACKS = ["decoded_video", "decoded_audio"]
+_RTSP_VIDEO_BUFFER_BYTES = 128 * 1024 * 1024
+
+
+def _normalize_perception_fps(raw: object) -> int:
+    """Return a safe, positive perception frame rate."""
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError, OverflowError):
+        return 1
+
+
+def _perception_input_fps() -> int:
+    raw = get_settings().perception.engine.get("input", {}).get("fps", 3)
+    return _normalize_perception_fps(raw)
 
 
 @dataclass
@@ -84,6 +100,10 @@ class _CameraDeviceState:
     # Clock calibration: epoch_delta = unix_ms - monotonic_ms (locked on first frame)
     # Used to convert monotonic wall_ms to unix timestamps for display.
     epoch_delta: int | None = None
+    rtsp_target_fps: int | None = None
+    last_rtsp_video_admit_ms: int | None = None
+    rtsp_admitted_frames: int = 0
+    rtsp_dropped_frames: int = 0
 
 
 class CameraDeviceAdapter(BaseDeviceAdapter):
@@ -98,6 +118,7 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
         on_window_ready: Callable[[], None] | None = None,
         *,
         miot_proxy: MiotProxy | None = None,
+        perception_fps_provider: Callable[[], int] = _perception_input_fps,
     ) -> None:
         if sources is not None and miot_proxy is not None:
             raise ValueError("Pass camera sources or miot_proxy, not both")
@@ -113,6 +134,7 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
         self._sync_lock = asyncio.Lock()
         self._miot_proxy = miot_proxy
         self._on_window_ready = on_window_ready
+        self._perception_fps_provider = perception_fps_provider
         self._devices: dict[str, _CameraDeviceState] = {}
         self._did_sources: dict[str, CameraSourceDriver] = {}
         self._did_source_types: dict[str, str] = {}
@@ -282,6 +304,19 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
         self._known_devices[did] = source
 
         collect_cfg = get_settings().perception.collect
+        rtsp_target_fps: int | None = None
+        retention_policy: TrackRetentionPolicy | None = None
+        if camera_source.source_type == "rtsp":
+            rtsp_target_fps = _normalize_perception_fps(self._perception_fps_provider())
+            retention_policy = TrackRetentionPolicy(
+                track="decoded_video",
+                max_items_per_window=math.ceil(
+                    rtsp_target_fps * collect_cfg.window_size
+                )
+                + 1,
+                max_payload_bytes=_RTSP_VIDEO_BUFFER_BYTES,
+                payload_size=lambda item: item.frame.nbytes,
+            )
 
         state = _CameraDeviceState(
             did=did,
@@ -292,7 +327,9 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
                 on_window_ready=self._on_window_ready,
                 window_settle_ms=collect_cfg.settle_ms,
                 buffer_full_action=collect_cfg.full_action,
+                retention_policy=retention_policy,
             ),
+            rtsp_target_fps=rtsp_target_fps,
         )
         self._devices[did] = state
         try:
@@ -610,6 +647,20 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
             decode_ms = 0.0
         return decode_ms
 
+    @staticmethod
+    def _admit_rtsp_video(state: _CameraDeviceState, now_ms: int) -> bool:
+        """Apply one RTSP device's host-monotonic perception cadence."""
+        target_fps = state.rtsp_target_fps
+        if target_fps is None:
+            return True
+        last = state.last_rtsp_video_admit_ms
+        if last is not None and now_ms - last < 1000 / target_fps:
+            state.rtsp_dropped_frames += 1
+            return False
+        state.last_rtsp_video_admit_ms = now_ms
+        state.rtsp_admitted_frames += 1
+        return True
+
     def _make_decoded_video_callback(self, did: str):
         """Decoded video frame callback: feeds decoded_video track in sync buffer.
 
@@ -632,6 +683,9 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
                     h.skip_rolling()
                     return
                 wall_ms, unix_ms = self._calibrate(state, ts)
+                if not self._admit_rtsp_video(state, wall_ms):
+                    h.skip_rolling()
+                    return
                 decode_latency_ms = self._compute_decode_latency(
                     recv_unix_ms, decoded_unix_ms
                 )

@@ -178,6 +178,7 @@ class RtspCameraSource:
                     entry.video_cb,
                     entry.audio_cb,
                 )
+                reconcile_dids.add(did)
 
             return RtspApplyResult(success, frozenset(reconcile_dids))
 

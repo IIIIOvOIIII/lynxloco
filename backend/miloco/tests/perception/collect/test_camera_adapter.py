@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import logging
+import weakref
 from types import SimpleNamespace
 from typing import Literal, cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -598,7 +600,12 @@ async def test_real_source_adapter_apply_diff_lifecycle(
     )
     settings = [configured]
     rtsp = RtspCameraSource(lambda: settings)
-    adapter = CameraDeviceAdapter(sources=[rtsp])
+    adapter = CameraDeviceAdapter(sources=[rtsp], perception_fps_provider=lambda: 1)
+    wall_times = iter([1, 101, 201, 301])
+    monkeypatch.setattr(
+        "miloco.perception.collect.camera_adapter._monotonic_ms",
+        lambda: next(wall_times),
+    )
     runner = MagicMock()
     runner.is_running = True
     service = PerceptionService(
@@ -618,6 +625,10 @@ async def test_real_source_adapter_apply_diff_lifecycle(
     first_session = rtsp.get_session(camera_id)
     assert first_session is not None
     assert set(adapter.get_connected_devices()) == {camera_id}
+    first_frame = adapter.peek_latest_frame(camera_id)
+    assert first_frame is not None
+    first_frame_ref = weakref.ref(first_frame)
+    del first_frame
 
     settings = [settings[0].model_copy(update={"name": "renamed", "room_name": "hall"})]
     assert await service.sync_camera_sources() is True
@@ -635,7 +646,10 @@ async def test_real_source_adapter_apply_diff_lifecycle(
     assert isinstance(replacement, _AdapterRtspSession)
     assert first_session.stop_count == 1
     assert replacement.stop_count == 0
-    assert len(_AdapterRtspSession.instances) == 2
+    assert len(_AdapterRtspSession.instances) == 3
+    gc.collect()
+    assert first_frame_ref() is None
+    assert adapter._devices[camera_id].rtsp_admitted_frames == 1
 
     settings = [settings[0].model_copy(update={"enabled": False})]
     assert await service.sync_camera_sources() is True
