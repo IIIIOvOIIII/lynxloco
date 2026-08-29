@@ -66,6 +66,9 @@
 </footer>
 
 <script type="module">
+import { createReadyJmuxer } from "/watch-mse.js";
+import { feedFirstAccessUnitWhenReady } from "/watch-mse.js";
+
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
 if (params.get("embedded") === "1") document.body.classList.add("embedded");
@@ -103,6 +106,8 @@ const I18N = {
     decodeFailed: (msg) => "解码失败：" + msg,
     decoderError: (msg) => "解码器错误：" + msg,
     mseDecodeError: (msg) => "MSE 解码异常:" + msg,
+    mseReadyTimeout: "MSE 初始化超时，请重试串流",
+    autoplayBlocked: "画面已就绪，请点击播放",
     noHevcLanHttp: "LAN HTTP 下无法解码 H.265",
     noWebCodecs: "浏览器不支持 WebCodecs（请用 Chrome / Edge / Firefox 最新版）",
     noHevcDecoder: "浏览器没有可用的 H.265 / HEVC 解码器",
@@ -141,6 +146,8 @@ const I18N = {
     decodeFailed: (msg) => "Couldn't decode: " + msg,
     decoderError: (msg) => "Decoder error: " + msg,
     mseDecodeError: (msg) => "MSE decode error: " + msg,
+    mseReadyTimeout: "MSE setup timed out; retry the stream",
+    autoplayBlocked: "Video is ready; press play to continue",
     noHevcLanHttp: "Can't decode H.265 over LAN HTTP",
     noWebCodecs: "Your browser doesn't support WebCodecs (please use the latest Chrome / Edge / Firefox)",
     noHevcDecoder: "No H.265 / HEVC decoder available in your browser",
@@ -343,6 +350,8 @@ let stats = {
 // MSE 路径 jmuxer 不支持 H.265 — H.265 cam 在 LAN HTTP 下会报解码失败。
 const useMSE = !("VideoDecoder" in window);
 let jmuxer = null;
+let mseSession = null;
+let playerGeneration = 0;
 let mseFpsRaf = null;
 let lastMseTs = 0;  // 上一帧 WS 时间戳(ms),用于算 jmuxer feed duration
 
@@ -434,6 +443,15 @@ function hideLoading() {
 }
 
 function tearDown() {
+  playerGeneration += 1;
+  if (mseSession) {
+    try { mseSession.cancel(); } catch {}
+    mseSession = null;
+    jmuxer = null;
+  } else {
+    try { jmuxer?.destroy?.(); } catch {}
+    jmuxer = null;
+  }
   configured = false;
   codecHint = "h264";
   serverWillClose = false;
@@ -441,8 +459,6 @@ function tearDown() {
   stats.lastWsTs = 0;
   try { decoder?.close?.(); } catch {}
   decoder = null;
-  try { jmuxer?.destroy?.(); } catch {}
-  jmuxer = null;
   lastMseTs = 0;
   if (mseFpsRaf) {
     // requestVideoFrameCallback 的 handle 用 cancelVideoFrameCallback 取消,
@@ -574,13 +590,25 @@ function onMessage(ev) {
       // Copy the NAL bytes; the underlying ArrayBuffer of `ev.data` could
       // theoretically be reclaimed before ensureDecoder resolves.
       const naluCopy = new Uint8Array(nalu);
-      ensureDecoderInFlight = ensureDecoder(naluCopy, ts)
-        .then(() => setState(t("decoding")))
-        .catch((e) => {
-          console.error("configure error", e);
-          setState(t("decoderConfigFailed", e.message), true);
+      const generation = playerGeneration;
+      const configurePromise = ensureDecoder(naluCopy, ts, generation);
+      ensureDecoderInFlight = configurePromise;
+      configurePromise
+        .then(() => {
+          if (generation === playerGeneration) setState(t("decoding"));
         })
-        .finally(() => { ensureDecoderInFlight = null; });
+        .catch((e) => {
+          if (generation !== playerGeneration || e?.code === "jmuxer_cancelled") return;
+          console.error("configure error", e);
+          if (e?.code === "jmuxer_ready_timeout") {
+            setState(t("mseReadyTimeout"), true);
+          } else {
+            setState(t("decoderConfigFailed", e.message), true);
+          }
+        })
+        .finally(() => {
+          if (ensureDecoderInFlight === configurePromise) ensureDecoderInFlight = null;
+        });
     }
     return;
   }
@@ -687,8 +715,8 @@ async function pickCodecString(firstKeyNAL) {
   return null;
 }
 
-async function ensureDecoder(firstKeyNAL, firstKeyTs) {
-  if (useMSE) return ensureMseDecoder(firstKeyNAL, firstKeyTs);
+async function ensureDecoder(firstKeyNAL, firstKeyTs, generation) {
+  if (useMSE) return ensureMseDecoder(firstKeyNAL, firstKeyTs, generation);
   if (!("VideoDecoder" in window)) {
     throw new Error(t("noWebCodecs"));
   }
@@ -757,7 +785,7 @@ async function ensureDecoder(firstKeyNAL, firstKeyTs) {
 
 // MSE + jmuxer 路径 init:LAN HTTP 等非 secure context 下走这里,jmuxer 把
 // Annex-B NAL → fmp4 fragment 喂给 <video>,绕开 SecureContext API 限制。
-async function ensureMseDecoder(firstKeyNAL, firstKeyTs) {
+async function ensureMseDecoder(firstKeyNAL, firstKeyTs, generation) {
   if (typeof window.JMuxer === "undefined") {
     throw new Error(t("mseLibMissing"));
   }
@@ -768,17 +796,23 @@ async function ensureMseDecoder(firstKeyNAL, firstKeyTs) {
   video.classList.remove("hidden");
   $("codec").textContent = `${codecHint} (MSE / fmp4 via jmuxer)`;
 
-  jmuxer = new window.JMuxer({
+  const session = createReadyJmuxer({
+    JMuxer: window.JMuxer,
     node: video,
-    mode: "video",
-    flushingTime: 0,         // 立即 flush,降低延迟到 1 帧
-    fps: 25,
-    debug: false,
+    timeoutMs: 3000,
     onError: (data) => {
+      if (generation !== playerGeneration) return;
       console.warn("jmuxer error", data);
       setState(t("mseDecodeError", data?.message || data), true);
     },
   });
+  mseSession = session;
+  const readyMuxer = await feedFirstAccessUnitWhenReady({
+    session,
+    firstKeyNAL,
+    isCurrent: () => generation === playerGeneration && mseSession === session,
+  });
+  jmuxer = readyMuxer;
 
   // playing 时同步分辨率,跟 WebCodecs 路径口径一致。
   video.addEventListener("playing", () => {
@@ -810,12 +844,15 @@ async function ensureMseDecoder(firstKeyNAL, firstKeyTs) {
     mseFpsRaf = video.requestVideoFrameCallback(cb);
   }
 
-  // 喂第一个 IDR(SPS/PPS+IDR 在同一 access unit 里)。jmuxer 内部用 SPS
-  // 推 codec 配置,后续 P 帧才能解。duration 40ms 跟 onMessage 里同款假设。
+  // 第一个 IDR(SPS/PPS+IDR 在同一 access unit 里)已由 readiness helper
+  // 在 JMuxer onReady 后精确喂一次。jmuxer 内部用 SPS 推 codec 配置,
+  // 后续 P 帧才能解。duration 40ms 跟 onMessage 里同款假设。
   // lastMseTs = firstKeyTs 让第二帧能用 ts2-firstKeyTs 算真实间隔,不再 fallback 40。
-  jmuxer.feed({ video: firstKeyNAL, duration: 40 });
   lastMseTs = firstKeyTs;
   configured = true;
+  void video.play().catch(() => {
+    if (generation === playerGeneration) setState(t("autoplayBlocked"));
+  });
 }
 
 

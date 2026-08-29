@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import "./watch-mse.test.js";
 
 const page = readFileSync(
   fileURLToPath(new URL("../public/watch.html", import.meta.url)),
