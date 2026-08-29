@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import gc
+import weakref
 from collections.abc import AsyncGenerator, Callable
 from fractions import Fraction
 from pathlib import Path
@@ -585,6 +587,43 @@ async def test_transcoder_burst_keeps_one_push_and_latest_pending() -> None:
     assert transcoder.push_tasks[0] is transcoder.push_tasks[1]
     assert feed.transcode_pending is None
     await viewer.aclose()
+
+
+@pytest.mark.asyncio
+async def test_callback_ingress_releases_superseded_frames_before_loop_yield() -> None:
+    backend = _PacketBackend()
+    transcoder = _BlockingPushTranscoder()
+
+    async def resolve(_camera_id: str) -> LiveStreamSource:
+        return _source(backend, codec="hevc", source_type="rtsp")
+
+    hub = LiveStreamHub(resolve, transcoder_factory=lambda _on_error: transcoder)
+    viewer = hub.subscribe("rtsp:camera")
+    first_output = asyncio.create_task(_next(viewer))
+    await asyncio.sleep(0)
+
+    active_frame = np.full((16, 16, 3), 1, dtype=np.uint8)
+    active_ref = weakref.ref(active_frame)
+    backend.frame_listeners[0](active_frame, 1)
+    del active_frame
+    await asyncio.wait_for(transcoder.push_entered.wait(), 0.5)
+
+    burst = [np.full((16, 16, 3), value, dtype=np.uint8) for value in range(2, 101)]
+    burst_refs = [weakref.ref(frame) for frame in burst]
+    try:
+        for pts, frame in enumerate(burst, start=2):
+            backend.frame_listeners[0](frame, pts)
+        del frame
+        del burst
+        gc.collect()
+
+        assert active_ref() is not None
+        assert sum(ref() is not None for ref in burst_refs[:-1]) == 0
+        assert burst_refs[-1]() is not None
+    finally:
+        transcoder.push_release.set()
+        await asyncio.wait_for(first_output, 0.5)
+        await viewer.aclose()
 
 
 @pytest.mark.asyncio

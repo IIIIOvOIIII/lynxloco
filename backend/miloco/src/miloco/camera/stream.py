@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections import deque
 from collections.abc import AsyncGenerator, Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
 import numpy as np
@@ -109,6 +110,12 @@ class _CameraFeed:
     transcode_task: asyncio.Task[None] | None = None
     transcode_push_task: asyncio.Task[None] | None = None
     transcode_pending: tuple[NDArray[np.uint8], int | None] | None = None
+    transcode_handoff_scheduled: bool = False
+    transcode_ingress_closed: bool = True
+    transcode_ingress_ready: bool = False
+    transcode_ingress_lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False
+    )
     transcode_coalesced_frames: int = 0
     h264_decoder_config: bytes = b""
     dropped_packets: int = 0
@@ -221,9 +228,7 @@ class LiveStreamHub:
                     loop.call_soon_threadsafe(self._publish, camera_id, feed, packet)
 
                 def receive_frame(frame: NDArray[np.uint8], pts: int | None) -> None:
-                    loop.call_soon_threadsafe(
-                        self._schedule_frame, camera_id, feed, frame, pts
-                    )
+                    self._schedule_frame(loop, camera_id, feed, frame, pts)
 
                 def source_closed(error_code: str | None) -> None:
                     loop.call_soon_threadsafe(
@@ -245,6 +250,7 @@ class LiveStreamHub:
                 except Exception:
                     if self._feeds.get(camera_id) is feed:
                         self._feeds.pop(camera_id, None)
+                    self._close_transcode_ingress(feed)
                     self._detach_source(feed)
                     self._states[camera_id] = LiveStreamState(
                         viewer_count=0,
@@ -319,7 +325,7 @@ class LiveStreamHub:
             if feed.mode == "transcoding":
                 return
             if packet.codec != "h264":
-                asyncio.create_task(self._activate_transcoder(camera_id, feed))
+                self._request_transcoder_activation(camera_id, feed)
                 return
             compatibility_checked = False
             compatible = True
@@ -336,7 +342,7 @@ class LiveStreamHub:
                     compatible = False
                     break
             if not compatibility_checked or not compatible:
-                asyncio.create_task(self._activate_transcoder(camera_id, feed))
+                self._request_transcoder_activation(camera_id, feed)
                 return
             for subscriber in tuple(feed.subscribers.values()):
                 try:
@@ -472,6 +478,8 @@ class LiveStreamHub:
         if feed.transcoder is not None:
             feed.mode = "transcoding"
             return
+        with feed.transcode_ingress_lock:
+            feed.transcode_ingress_closed = False
         loop = asyncio.get_running_loop()
 
         def on_error(error_code: str) -> None:
@@ -487,32 +495,97 @@ class LiveStreamHub:
         feed.mode = "transcoding"
         ready_attach = getattr(transcoder, "attach_ready", None)
         stream = await ready_attach() if callable(ready_attach) else transcoder.attach()
+        if self._feeds.get(camera_id) is not feed or feed.transcoder is not transcoder:
+            try:
+                await stream.aclose()
+            except Exception:
+                pass
+            return
         feed.transcode_stream = stream
         feed.transcode_task = asyncio.create_task(
             self._consume_transcoder(camera_id, feed, transcoder, stream)
         )
+        schedule_handoff = False
+        with feed.transcode_ingress_lock:
+            if not feed.transcode_ingress_closed:
+                feed.transcode_ingress_ready = True
+                if (
+                    feed.transcode_pending is not None
+                    and not feed.transcode_handoff_scheduled
+                ):
+                    feed.transcode_handoff_scheduled = True
+                    schedule_handoff = True
+        if schedule_handoff:
+            loop.call_soon(self._start_transcode_drain, camera_id, feed)
+
+    def _request_transcoder_activation(
+        self,
+        camera_id: str,
+        source_feed: _CameraFeed,
+    ) -> None:
+        with source_feed.transcode_ingress_lock:
+            if not source_feed.transcode_ingress_closed:
+                return
+            asyncio.create_task(self._activate_transcoder(camera_id, source_feed))
+            source_feed.transcode_ingress_closed = False
 
     def _schedule_frame(
         self,
+        loop: asyncio.AbstractEventLoop,
         camera_id: str,
         source_feed: _CameraFeed,
         frame: NDArray[np.uint8],
         pts: int | None,
     ) -> None:
-        feed = self._feeds.get(camera_id)
-        if feed is not source_feed or feed.mode != "transcoding":
-            return
-        transcoder = feed.transcoder
-        if transcoder is None:
-            return
-        if feed.transcode_pending is not None:
-            feed.transcode_coalesced_frames += 1
-        feed.transcode_pending = (frame, pts)
-        task = feed.transcode_push_task
-        if task is None or task.done():
-            feed.transcode_push_task = asyncio.create_task(
-                self._drain_transcode_frames(camera_id, feed, transcoder)
-            )
+        with source_feed.transcode_ingress_lock:
+            if source_feed.transcode_ingress_closed:
+                return
+            if source_feed.transcode_pending is not None:
+                source_feed.transcode_coalesced_frames += 1
+            source_feed.transcode_pending = (frame, pts)
+            if (
+                source_feed.transcode_handoff_scheduled
+                or not source_feed.transcode_ingress_ready
+            ):
+                return
+            source_feed.transcode_handoff_scheduled = True
+            try:
+                loop.call_soon_threadsafe(
+                    self._start_transcode_drain, camera_id, source_feed
+                )
+            except RuntimeError:
+                source_feed.transcode_pending = None
+                source_feed.transcode_handoff_scheduled = False
+                source_feed.transcode_ingress_closed = True
+
+    def _start_transcode_drain(
+        self,
+        camera_id: str,
+        source_feed: _CameraFeed,
+    ) -> None:
+        with source_feed.transcode_ingress_lock:
+            if source_feed.transcode_ingress_closed:
+                source_feed.transcode_pending = None
+                source_feed.transcode_handoff_scheduled = False
+                return
+            if not source_feed.transcode_ingress_ready:
+                source_feed.transcode_handoff_scheduled = False
+                return
+            transcoder = source_feed.transcoder
+            if (
+                self._feeds.get(camera_id) is not source_feed
+                or source_feed.mode != "transcoding"
+                or transcoder is None
+            ):
+                source_feed.transcode_pending = None
+                source_feed.transcode_handoff_scheduled = False
+                source_feed.transcode_ingress_closed = True
+                return
+            task = source_feed.transcode_push_task
+            if task is None or task.done():
+                source_feed.transcode_push_task = asyncio.create_task(
+                    self._drain_transcode_frames(camera_id, source_feed, transcoder)
+                )
 
     async def _drain_transcode_frames(
         self,
@@ -527,12 +600,16 @@ class LiveStreamHub:
                     or source_feed.transcoder is not transcoder
                 ):
                     return
-                pending, source_feed.transcode_pending = (
-                    source_feed.transcode_pending,
-                    None,
-                )
-                if pending is None:
-                    return
+                with source_feed.transcode_ingress_lock:
+                    if source_feed.transcode_ingress_closed:
+                        return
+                    pending, source_feed.transcode_pending = (
+                        source_feed.transcode_pending,
+                        None,
+                    )
+                    if pending is None:
+                        source_feed.transcode_handoff_scheduled = False
+                        return
                 frame, pts = pending
                 await transcoder.push_frame(frame, pts)
                 if (
@@ -543,6 +620,7 @@ class LiveStreamHub:
         except asyncio.CancelledError:
             raise
         except Exception:
+            self._close_transcode_ingress(source_feed)
             self._transcoder_failed(camera_id, source_feed, "transcode_failed")
         finally:
             if source_feed.transcode_push_task is asyncio.current_task():
@@ -576,6 +654,7 @@ class LiveStreamHub:
         source_feed: _CameraFeed,
         error_code: str,
     ) -> None:
+        self._close_transcode_ingress(source_feed)
         asyncio.create_task(
             self._handle_transcoder_failed(camera_id, source_feed, error_code)
         )
@@ -617,7 +696,7 @@ class LiveStreamHub:
         await self._stop_transcoder(feed)
 
     async def _stop_transcoder(self, feed: _CameraFeed) -> None:
-        feed.transcode_pending = None
+        self._close_transcode_ingress(feed)
         push_task, feed.transcode_push_task = feed.transcode_push_task, None
         current = asyncio.current_task()
         if push_task is not None and push_task is not current:
@@ -654,9 +733,18 @@ class LiveStreamHub:
         stopping = self._stopping.get(camera_id)
         if stopping is not None:
             return stopping
+        self._close_transcode_ingress(feed)
         stopping = asyncio.create_task(self._shutdown_registered(camera_id, feed))
         self._stopping[camera_id] = stopping
         return stopping
+
+    @staticmethod
+    def _close_transcode_ingress(feed: _CameraFeed) -> None:
+        with feed.transcode_ingress_lock:
+            feed.transcode_ingress_closed = True
+            feed.transcode_ingress_ready = False
+            feed.transcode_pending = None
+            feed.transcode_handoff_scheduled = False
 
     async def _shutdown_registered(self, camera_id: str, feed: _CameraFeed) -> None:
         current = asyncio.current_task()
