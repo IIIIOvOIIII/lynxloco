@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from collections.abc import AsyncGenerator, Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -45,6 +46,7 @@ class _FrameInput:
 
 _STOP = object()
 _VIEWER_CLOSED = object()
+_EMITTED_TIMESTAMP_HISTORY = 256
 
 
 def _create_libx264_codec() -> av.VideoCodecContext:
@@ -76,7 +78,7 @@ class SharedH264Transcoder:
         self._dropped_frames = 0
         self._force_keyframe = False
         self._error_code: str | None = None
-        self._emitted_timestamps: list[int] = []
+        self._emitted_timestamps: deque[int] = deque(maxlen=_EMITTED_TIMESTAMP_HISTORY)
 
     def attach(self) -> AsyncGenerator[bytes, None]:
         async def stream() -> AsyncGenerator[bytes, None]:
@@ -104,7 +106,6 @@ class SharedH264Transcoder:
     async def push_frame(self, frame: NDArray[np.uint8], pts: int | None) -> None:
         if frame.ndim != 3 or frame.shape[2] != 3:
             raise ValueError("video frame must be a three-channel image")
-        image = np.ascontiguousarray(frame, dtype=np.uint8).copy()
         async with self._lock:
             queue = self._input
             if self._active_generation is None or queue is None:
@@ -115,6 +116,7 @@ class SharedH264Transcoder:
                     self._dropped_frames += 1
                 except asyncio.QueueEmpty:
                     pass
+            image = np.ascontiguousarray(frame, dtype=np.uint8).copy()
             queue.put_nowait(_FrameInput(image, pts))
 
     async def stop(self) -> None:

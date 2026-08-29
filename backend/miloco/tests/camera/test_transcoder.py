@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import weakref
 from collections.abc import AsyncGenerator
 
 import av
+import miloco.camera.transcoder as transcoder_module
 import numpy as np
 import pytest
 from miloco.camera.transcoder import SharedH264Transcoder, TranscodeConfig
@@ -97,6 +99,132 @@ async def test_input_queue_is_bounded_and_drops_stale_frames() -> None:
     assert transcoder.queue_depth == 2
     assert transcoder.dropped_frames == 4
     release.set()
+    await asyncio.wait_for(pending, 2)
+    await viewer.aclose()
+
+
+@pytest.mark.asyncio
+async def test_push_frame_rejects_invalid_shapes_without_copying(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    copy_calls = 0
+    original_ascontiguousarray = transcoder_module.np.ascontiguousarray
+
+    def count_copy(*args, **kwargs):
+        nonlocal copy_calls
+        copy_calls += 1
+        return original_ascontiguousarray(*args, **kwargs)
+
+    monkeypatch.setattr(transcoder_module.np, "ascontiguousarray", count_copy)
+    transcoder = SharedH264Transcoder()
+
+    with pytest.raises(ValueError, match="three-channel"):
+        await transcoder.push_frame(np.zeros((64, 96), dtype=np.uint8), 1)
+
+    assert copy_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_push_frame_rejects_inactive_frames_without_copying(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    copy_calls = 0
+    original_ascontiguousarray = transcoder_module.np.ascontiguousarray
+
+    def count_copy(*args, **kwargs):
+        nonlocal copy_calls
+        copy_calls += 1
+        return original_ascontiguousarray(*args, **kwargs)
+
+    monkeypatch.setattr(transcoder_module.np, "ascontiguousarray", count_copy)
+    transcoder = SharedH264Transcoder()
+
+    await transcoder.push_frame(_frame(), 1)
+
+    assert copy_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_push_frame_copies_active_generation_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    copy_calls = 0
+    original_ascontiguousarray = transcoder_module.np.ascontiguousarray
+
+    def count_copy(*args, **kwargs):
+        nonlocal copy_calls
+        copy_calls += 1
+        return original_ascontiguousarray(*args, **kwargs)
+
+    monkeypatch.setattr(transcoder_module.np, "ascontiguousarray", count_copy)
+    transcoder = SharedH264Transcoder()
+    viewer, pending = await _start_viewer(transcoder)
+
+    await transcoder.push_frame(_frame(), 1)
+
+    assert copy_calls == 1
+    await asyncio.wait_for(pending, 2)
+    await viewer.aclose()
+
+
+@pytest.mark.asyncio
+async def test_full_input_queue_releases_stale_frame_before_copying_newest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    transcoder = SharedH264Transcoder(
+        TranscodeConfig(queue_size=2),
+        codec_factory=_blocking_codec_factory(entered, release),
+    )
+    viewer, pending = await _start_viewer(transcoder)
+    try:
+        await transcoder.push_frame(_frame(value=1), 1)
+        assert await asyncio.to_thread(entered.wait, 1)
+
+        depths = []
+        for value in (2, 3):
+            await transcoder.push_frame(_frame(value=value), value)
+            depths.append(transcoder.queue_depth)
+        assert transcoder._input is not None
+        stale_input = transcoder._input._queue[0]
+        stale_frame = weakref.ref(stale_input.frame)
+        del stale_input
+
+        stale_released_before_copy: list[bool] = []
+        original_ascontiguousarray = transcoder_module.np.ascontiguousarray
+
+        def observe_copy(*args, **kwargs):
+            stale_released_before_copy.append(stale_frame() is None)
+            return original_ascontiguousarray(*args, **kwargs)
+
+        monkeypatch.setattr(transcoder_module.np, "ascontiguousarray", observe_copy)
+        await transcoder.push_frame(_frame(value=4), 4)
+        depths.append(transcoder.queue_depth)
+
+        assert max(depths) <= 2
+        assert stale_released_before_copy == [True]
+        assert stale_frame() is None
+        assert transcoder._input is not None
+        assert [item.frame[0, 0, 0] for item in transcoder._input._queue] == [3, 4]
+    finally:
+        release.set()
+        await asyncio.wait_for(pending, 2)
+        await viewer.aclose()
+
+
+@pytest.mark.asyncio
+async def test_emitted_timestamp_history_retains_the_latest_256_values() -> None:
+    transcoder = SharedH264Transcoder()
+    viewer, pending = await _start_viewer(transcoder)
+
+    transcoder._publish(
+        transcoder.generation,
+        tuple((b"safe-packet", timestamp) for timestamp in range(300)),
+    )
+
+    assert len(transcoder.emitted_timestamps) == 256
+    assert transcoder.emitted_timestamps == tuple(range(44, 300))
     await asyncio.wait_for(pending, 2)
     await viewer.aclose()
 
