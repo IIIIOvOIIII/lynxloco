@@ -362,6 +362,56 @@ def test_retry_open_recoverable_probe_still_fails_stays_warn(client, mock_probe)
     assert health["state"] == "warn" and health["last_probe_result"] == "fail"
 
 
+def test_retry_visual_payload_rejected_opens_config(client, mock_probe):
+    """Manual retry must use the same config mapping as the automatic probe tick."""
+    client.put(
+        "/api/admin/omni-config",
+        json={
+            "label": "甲",
+            "model": "m1",
+            "base_url": "https://x/v1",
+            "api_protocol": "openai_chat_completions",
+            "api_key": "sk-xxxxxx",
+            "activate": True,
+        },
+    )
+    import asyncio
+
+    from miloco.perception.engine.omni.circuit_breaker import (
+        CircuitState,
+        get_omni_circuit_breaker,
+    )
+    from miloco.perception.engine.omni.error_classifier import (
+        ClassifiedError,
+        ErrorCategory,
+    )
+
+    cb = get_omni_circuit_breaker()
+
+    async def _fill():
+        for _ in range(3):
+            await cb.record_failure(
+                ClassifiedError("unreachable", "m", ErrorCategory.RECOVERABLE)
+            )
+
+    asyncio.run(_fill())
+    mock_probe.set(
+        {
+            "ok": False,
+            "code": "visual_payload_rejected",
+            "message": "端点可连接，但当前协议或视觉请求不受支持",
+        }
+    )
+
+    response = client.post("/api/admin/omni-config/retry")
+
+    assert response.status_code == 200
+    health = response.json()["data"]["active"]["health"]
+    assert cb.state_for_test() == CircuitState.OPEN_CONFIG
+    assert health["state"] == "error"
+    assert health["code"] == "visual_payload_rejected"
+
+
 def test_retry_open_config_bad_key_stays_error(client, mock_probe):
     """OPEN_CONFIG 下 retry 仍失败(bad_key) → 保持 error 态。"""
     client.put(

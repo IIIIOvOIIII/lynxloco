@@ -1428,6 +1428,7 @@ async def retry_omni_probe(current_user: str = Depends(verify_token)):
     from miloco.perception.engine.omni.error_classifier import (
         ClassifiedError,
         ErrorCategory,
+        category_for_code,
     )
 
     cb = get_omni_circuit_breaker()
@@ -1493,11 +1494,7 @@ async def retry_omni_probe(current_user: str = Depends(verify_token)):
         await cb.record_probe_result(True, None)
     else:
         code = result.get("code", "unreachable")
-        cat = (
-            ErrorCategory.CONFIG
-            if code in ("bad_key", "not_found", "rejected_authed")
-            else ErrorCategory.RECOVERABLE
-        )
+        cat = category_for_code(code)
         await cb.record_probe_result(
             False,
             ClassifiedError(

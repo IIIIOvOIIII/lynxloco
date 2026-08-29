@@ -1,6 +1,6 @@
 """omni 调用异常/响应到统一错误码集合的映射。
 
-映射规则见 spec §2。CODES 与 web 前端 omniHealth.codes 一一对应(10 个 code),
+映射规则见 spec §2。CODES 与 web 前端 omniHealth.codes 一一对应,
 前端直接复用 i18n。「测试连接」结果表 OMNI_CODE_KEY 是本集合的裁剪变体:去掉
 probe 路径不会产生的 timeout(probe 把所有异常统一归 unreachable)、加上成功码 ok。
 """
@@ -38,6 +38,7 @@ CODES: set[str] = {
     "no_key",
     "not_found",
     "rejected_authed",
+    "visual_payload_rejected",
     "bad_response",
     "cancelled",
 }
@@ -52,9 +53,27 @@ _MESSAGES: dict[str, str] = {
     "no_key": "未配置 API Key",
     "not_found": "模型或地址不存在",
     "rejected_authed": "已连接，但请求被拒绝（模型名或 API Key 可能有误）",
+    "visual_payload_rejected": "端点可连接，但当前协议或视觉请求不受支持",
     "bad_response": "omni 响应格式异常",
     "cancelled": "重试被中断",
 }
+
+_SAFE_PROVIDER_CONFIG_CODES = {
+    "invalid_api_key": "bad_key",
+    "authentication_error": "bad_key",
+    "unauthorized": "bad_key",
+    "permission_denied": "bad_key",
+    "model_not_found": "not_found",
+    "invalid_model": "not_found",
+}
+
+CONFIG_CODES = frozenset(
+    {"bad_key", "no_key", "not_found", "rejected_authed", "visual_payload_rejected"}
+)
+
+
+def category_for_code(code: str) -> ErrorCategory:
+    return ErrorCategory.CONFIG if code in CONFIG_CODES else ErrorCategory.RECOVERABLE
 
 
 def classify_exception(exc: BaseException) -> ClassifiedError:
@@ -76,7 +95,28 @@ def classify_exception(exc: BaseException) -> ClassifiedError:
     )
 
 
-def classify_response(resp: httpx.Response) -> ClassifiedError | None:
+def safe_provider_config_code(resp: httpx.Response) -> str | None:
+    try:
+        payload = resp.json()
+    except (json.JSONDecodeError, httpx.ResponseNotRead, RuntimeError, ValueError):
+        return None
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(error, dict):
+        return None
+    for field in ("code", "type"):
+        value = error.get(field)
+        if isinstance(value, str):
+            mapped = _SAFE_PROVIDER_CONFIG_CODES.get(value.casefold().strip())
+            if mapped:
+                return mapped
+    return None
+
+
+def classify_response(
+    resp: httpx.Response,
+    *,
+    visual_request: bool = False,
+) -> ClassifiedError | None:
     """HTTP 响应 → ClassifiedError；2xx 返 None(调用方按成功处理)。"""
     s = resp.status_code
     if 200 <= s < 300:
@@ -88,9 +128,10 @@ def classify_response(resp: httpx.Response) -> ClassifiedError | None:
             "not_found", _MESSAGES["not_found"], ErrorCategory.CONFIG
         )
     if s in (400, 422):
-        return ClassifiedError(
-            "rejected_authed", _MESSAGES["rejected_authed"], ErrorCategory.CONFIG
-        )
+        code = safe_provider_config_code(resp)
+        if code is None:
+            code = "visual_payload_rejected" if visual_request else "rejected_authed"
+        return ClassifiedError(code, _MESSAGES[code], ErrorCategory.CONFIG)
     if s == 429:
         retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
         return ClassifiedError(

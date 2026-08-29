@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 
 import httpx
+import pytest
+from miloco.perception.engine.omni import provider
 from miloco.perception.engine.omni.error_classifier import (
     ErrorCategory,
     classify_exception,
@@ -12,9 +14,18 @@ from miloco.perception.engine.omni.error_classifier import (
 )
 
 
-def _resp(status: int, headers: dict | None = None) -> httpx.Response:
+def _resp(
+    status: int,
+    headers: dict | None = None,
+    *,
+    json_body: object | None = None,
+) -> httpx.Response:
+    kwargs = {"json": json_body} if json_body is not None else {}
     return httpx.Response(
-        status, headers=headers or {}, request=httpx.Request("GET", "https://x/y")
+        status,
+        headers=headers or {},
+        request=httpx.Request("GET", "https://x/y"),
+        **kwargs,
     )
 
 
@@ -89,6 +100,113 @@ def test_400_is_rejected_authed():
 
 def test_422_is_rejected_authed():
     assert classify_response(_resp(422)).code == "rejected_authed"
+
+
+def test_400_visual_request_is_visual_payload_rejected_config():
+    """Generic visual 400 must not be misreported as an API-key failure."""
+    result = classify_response(_resp(400), visual_request=True)
+    assert result.code == "visual_payload_rejected"
+    assert result.category == ErrorCategory.CONFIG
+    assert "API Key" not in result.message
+
+
+def test_422_non_visual_request_keeps_generic_rejection():
+    result = classify_response(_resp(422), visual_request=False)
+    assert result.code == "rejected_authed"
+
+
+@pytest.mark.parametrize(
+    ("provider_code", "expected"),
+    [
+        ("invalid_api_key", "bad_key"),
+        ("authentication_error", "bad_key"),
+        ("model_not_found", "not_found"),
+        ("invalid_model", "not_found"),
+    ],
+)
+def test_safe_structured_error_code_overrides_visual_fallback(
+    provider_code, expected
+):
+    """Removing the structured allow-list would collapse known config errors."""
+    result = classify_response(
+        _resp(400, json_body={"error": {"code": provider_code}}),
+        visual_request=True,
+    )
+    assert result.code == expected
+
+
+def test_safe_structured_error_type_overrides_visual_fallback():
+    result = classify_response(
+        _resp(422, json_body={"error": {"type": "permission_denied"}}),
+        visual_request=True,
+    )
+    assert result.code == "bad_key"
+
+
+def test_free_form_provider_message_does_not_override_visual_fallback():
+    """Provider prose is untrusted and must never drive auth/model classification."""
+    result = classify_response(
+        _resp(
+            400,
+            json_body={
+                "error": {
+                    "message": "invalid_api_key model_not_found sk-secret data:image"
+                }
+            },
+        ),
+        visual_request=True,
+    )
+    assert result.code == "visual_payload_rejected"
+    assert "sk-secret" not in result.message
+    assert "data:image" not in result.message
+
+
+def test_messages_have_visual_input_only_for_image_or_video_blocks():
+    assert provider.messages_have_visual_input(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:image/jpeg;base64,eA==",
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+    assert provider.messages_have_visual_input(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "video_url",
+                        "video_url": {
+                            "url": "data:video/mp4;base64,eA==",
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+    assert not provider.messages_have_visual_input(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": "data:audio/m4a;base64,eA==",
+                        },
+                    }
+                ],
+            }
+        ]
+    )
 
 
 def test_429_is_rate_limited_recoverable():

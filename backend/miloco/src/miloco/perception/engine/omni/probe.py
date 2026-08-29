@@ -1,7 +1,7 @@
 """omni provider 连通性探测。
 
 统一被 web preflight (admin/router.py) 与运行时 circuit_breaker HALF_OPEN 复用。
-两阶段探测：GET /models 验鉴权+可达；再 max_tokens=1 chat 真校验模型。
+两阶段探测：GET /models 验鉴权+可达；再用合成红色 JPEG 真校验视觉能力。
 
 返回统一形状 {ok, code, status?, latency_ms?, message}。code 集合与 spec §2 一致。
 """
@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -16,8 +17,11 @@ from urllib.parse import urlparse
 
 import httpx
 
+from miloco.perception.engine.omni.error_classifier import safe_provider_config_code
+
 if TYPE_CHECKING:
     from miloco.config.settings import OmniApiProtocol
+    from miloco.perception.engine.omni.provider import OmniProviderAdapter
 
 _TIMEOUT = httpx.Timeout(15.0, connect=10.0)
 _ALLOWED_SCHEMES = ("http", "https")
@@ -172,9 +176,9 @@ async def _probe_stream_chat(
     headers: dict[str, str],
     body: dict[str, Any],
     t0: float,
-) -> tuple[int, int, bool, dict[str, str]]:
-    """流式探测:开 SSE stream,读第一条 data 行就视为可达。返回
-    (status_code, latency_ms, ok, resp_headers)。非 200 status 回带原始 response
+    adapter: OmniProviderAdapter,
+) -> tuple[int, int, str | None, dict[str, str]]:
+    """流式探测:解析 SSE 并返回累积输出。非 200 status 回带原始 response
     headers,让上层 429 分支能读 Retry-After —— 否则 forced-stream provider (Qwen)
     撞 429 时熔断退避会丢掉 server 明示的等待时长,与非流式路径 (MiMo) 行为不一致。"""
     async with client.stream(
@@ -185,19 +189,32 @@ async def _probe_stream_chat(
     ) as resp:
         if resp.status_code != 200:
             await resp.aread()  # 允许连接释放
-            return resp.status_code, 0, False, dict(resp.headers)
-        # 读到任一 data 行即算可达 (200 已经通过);不等 [DONE] 避免 max_tokens=1 下
-        # provider 拖延 keep-alive 直到 _TIMEOUT。
+            return resp.status_code, 0, None, dict(resp.headers)
+        output_parts: list[str] = []
         async for line in resp.aiter_lines():
             line = line.strip()
-            if line.startswith("data: "):
+            if not line.startswith("data: "):
+                continue
+            data = line[6:]
+            if data == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+                delta, _usage = adapter.parse_stream_chunk(chunk)
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                 latency_ms = round((time.monotonic() - t0) * 1000)
-                return 200, latency_ms, True, {}
-        # 流开完无 data 行 → 视为 http_error(RECOVERABLE),返 500 让上层 http_error
-        # 兜底分支处理(与 bad_response 都归 RECOVERABLE、cap 同为 _default 600s,
-        # 运行时行为无差;此处选 http_error 是让 code 与状态码语义一致 —— 无 payload
-        # 更像上游异常而非结构错)。
-        return 500, 0, False, {}
+                return 200, latency_ms, None, {}
+            if delta is not None and not isinstance(delta, str):
+                latency_ms = round((time.monotonic() - t0) * 1000)
+                return 200, latency_ms, None, {}
+            if delta:
+                output_parts.append(delta)
+        latency_ms = round((time.monotonic() - t0) * 1000)
+        return 200, latency_ms, "".join(output_parts), {}
+
+
+def _visual_answer_is_red(value: Any) -> bool:
+    return isinstance(value, str) and value.casefold().strip() in {"red", "red."}
 
 
 async def probe_chat(
@@ -206,7 +223,7 @@ async def probe_chat(
     api_key: str,
     api_protocol: OmniApiProtocol | None = None,
 ) -> dict[str, Any]:
-    """极简 chat 探测(max_tokens=1)真校验模型是否可用。
+    """使用合成红色 JPEG 的 chat 探测(max_tokens=16)真校验视觉能力。
 
     走 provider adapter 生成 body,兼容不同 provider 的强制要求(Qwen 强制
     stream=True + modalities=["text"])。之前硬编码非流式 body 打 Qwen 会被
@@ -222,9 +239,9 @@ async def probe_chat(
 
     adapter = get_adapter(api_protocol, model)
     body = adapter.build_request_body(
-        [{"role": "user", "content": "ping"}],
+        _visual_probe_messages(),
         model=model,
-        max_tokens=1,
+        max_tokens=16,
         temperature=0.0,
         top_p=1.0,
         stream=False,  # 请求非流式;adapter 若强制 stream=True (Qwen) 会覆盖
@@ -242,20 +259,27 @@ async def probe_chat(
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             if forced_stream:
-                # forced-stream provider (Qwen):走 SSE 流,读第一条有效 data chunk 就
-                # 视为可达(不等 [DONE],避免 max_tokens=1 下 provider 拖延 keep-alive
-                # 撑到超时)。任何一条 status_code / auth / model 错都会在开 stream 时
-                # 直接抛,与非流式行为对齐。
-                status_code, latency_ms, ok, resp_headers = await _probe_stream_chat(
-                    client, url, headers, body, t0
+                # forced-stream provider (Qwen):走 SSE 流并用 adapter 累积输出文本，
+                # 直到 [DONE] 或流结束后再验证视觉答案。任何 status/auth/model 错
+                # 都在开 stream 时直接返回，与非流式行为对齐。
+                status_code, latency_ms, output_text, resp_headers = (
+                    await _probe_stream_chat(client, url, headers, body, t0, adapter)
                 )
-                if ok:
+                if status_code == 200:
+                    if not _visual_answer_is_red(output_text):
+                        return {
+                            "ok": False,
+                            "code": "bad_response",
+                            "status": 200,
+                            "latency_ms": latency_ms,
+                            "message": "视觉预检未识别合成图片",
+                        }
                     return {
                         "ok": True,
                         "code": "ok",
                         "status": status_code,
                         "latency_ms": latency_ms,
-                        "message": "连接正常",
+                        "message": "视觉预检通过",
                     }
                 # 非 200: 复用下方 status_code 分支;把 headers 一起塞进 _FakeStatusResp,
                 # 429 分支能读 Retry-After,行为与非流式路径对齐。
@@ -278,29 +302,24 @@ async def probe_chat(
         # 走 json.loads + 非 dict → bad_response,probe 需对齐,否则 mock/异常网关下 probe
         # 误判 ok,熔断状态被 record_probe_result(True) 复位 CLOSED,与真实调用行为背离。
         try:
-            payload = r.json()
-        except Exception:  # noqa: BLE001 — 任何解码错都归 bad_response
+            normalized = adapter.parse_response(r.json())
+            output_text = normalized["choices"][0]["message"]["content"]
+        except (json.JSONDecodeError, IndexError, KeyError, TypeError, ValueError):
+            output_text = None
+        if not _visual_answer_is_red(output_text):
             return {
                 "ok": False,
                 "code": "bad_response",
                 "status": 200,
                 "latency_ms": latency_ms,
-                "message": "omni 响应格式异常",
-            }
-        if not isinstance(payload, dict):
-            return {
-                "ok": False,
-                "code": "bad_response",
-                "status": 200,
-                "latency_ms": latency_ms,
-                "message": "omni 响应格式异常",
+                "message": "视觉预检未识别合成图片",
             }
         return {
             "ok": True,
             "code": "ok",
             "status": 200,
             "latency_ms": latency_ms,
-            "message": "连接正常",
+            "message": "视觉预检通过",
         }
     if r.status_code in (401, 403):
         return {
@@ -317,15 +336,24 @@ async def probe_chat(
             "message": "模型或地址不存在",
         }
     if r.status_code in (400, 422):
-        # OpenAI 兼容族此前有 GET /models 预检拦过 401/403，到这里 400 多为请求体/模型名被拒；
-        # 但原生协议(Gemini)无预检、且部分 provider 对无效 key 就返回 400(而非 401/403)——
-        # 故 400 也可能是 key 无效,无法仅凭 status code 区分,文案同时提示两种可能。
+        code = safe_provider_config_code(r)
+        if code is not None:
+            return {
+                "ok": False,
+                "code": code,
+                "status": r.status_code,
+                "latency_ms": latency_ms,
+                "message": {
+                    "bad_key": "API Key 无效或无权限",
+                    "not_found": "模型或地址不存在",
+                }[code],
+            }
         return {
             "ok": False,
-            "code": "rejected_authed",
+            "code": "visual_payload_rejected",
             "status": r.status_code,
             "latency_ms": latency_ms,
-            "message": "已连接，但请求被拒绝（模型名或 API Key 可能有误）",
+            "message": "端点可连接，但当前协议或视觉请求不受支持",
         }
     if r.status_code == 429:
         # 429 不加分支时会掉到 http_error 兜底,后果:上层用 http_error 走 _default cap
@@ -367,7 +395,12 @@ def _retry_after_seconds(response: Any) -> float | None:
         return None
 
 
-def _probe_http_failure(response: Any, latency_ms: int) -> dict[str, Any]:
+def _probe_http_failure(
+    response: Any,
+    latency_ms: int,
+    *,
+    visual_request: bool = False,
+) -> dict[str, Any]:
     status = response.status_code
     if status in (401, 403):
         return {
@@ -386,12 +419,20 @@ def _probe_http_failure(response: Any, latency_ms: int) -> dict[str, Any]:
             "message": "模型或地址不存在",
         }
     if status in (400, 422):
+        code = safe_provider_config_code(response)
+        if code is None:
+            code = "visual_payload_rejected" if visual_request else "rejected_authed"
         return {
             "ok": False,
-            "code": "rejected_authed",
+            "code": code,
             "status": status,
             "latency_ms": latency_ms,
-            "message": "已连接，但请求被拒绝（模型名或 API Key 可能有误）",
+            "message": {
+                "bad_key": "API Key 无效或无权限",
+                "not_found": "模型或地址不存在",
+                "rejected_authed": "已连接，但请求被拒绝（模型名或 API Key 可能有误）",
+                "visual_payload_rejected": "端点可连接，但当前协议或视觉请求不受支持",
+            }[code],
         }
     if status == 429:
         result: dict[str, Any] = {
@@ -414,7 +455,7 @@ def _probe_http_failure(response: Any, latency_ms: int) -> dict[str, Any]:
     }
 
 
-def _responses_visual_messages() -> list[dict[str, Any]]:
+def _visual_probe_messages() -> list[dict[str, Any]]:
     image_data = base64.b64encode(_VISUAL_PROBE_IMAGE.read_bytes()).decode("ascii")
     return [
         {
@@ -459,10 +500,11 @@ async def _probe_responses(
                 return _probe_http_failure(
                     models_response,
                     round((time.monotonic() - t0) * 1000),
+                    visual_request=False,
                 )
 
             body = adapter.build_request_body(
-                _responses_visual_messages(),
+                _visual_probe_messages(),
                 model=model,
                 max_tokens=16,
                 temperature=0.0,
@@ -483,7 +525,7 @@ async def _probe_responses(
 
     latency_ms = round((time.monotonic() - t0) * 1000)
     if response.status_code != 200:
-        return _probe_http_failure(response, latency_ms)
+        return _probe_http_failure(response, latency_ms, visual_request=True)
 
     try:
         raw = response.json()
@@ -517,10 +559,7 @@ async def _probe_responses(
         usage_warning = True
 
     output_text = normalized["choices"][0]["message"]["content"]
-    if not isinstance(output_text, str) or output_text.casefold().strip() not in {
-        "red",
-        "red.",
-    }:
+    if not _visual_answer_is_red(output_text):
         return {
             "ok": False,
             "code": "bad_response",

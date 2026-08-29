@@ -793,6 +793,31 @@ async def test_fused_http_error_log_omits_raw_body_base64_and_key(
 
 
 @pytest.mark.asyncio
+async def test_fused_visual_400_opens_visual_payload_rejected_breaker(
+    monkeypatch,
+) -> None:
+    """Dropping fused-message context would report a visual rejection as generic."""
+    calls: list[dict[str, Any]] = []
+    response = httpx.Response(
+        400,
+        request=httpx.Request("POST", "http://127.0.0.1:8000/v1/responses"),
+    )
+    monkeypatch.setattr(
+        omni,
+        "_get_fused_http_client",
+        lambda timeout: _FusedClient(response, calls),
+    )
+
+    for _ in range(3):
+        with pytest.raises(omni_client.OmniError):
+            await omni._call_omni_messages(_messages(), _responses_config())
+
+    snapshot = get_omni_circuit_breaker().snapshot()
+    assert snapshot.code == "visual_payload_rejected"
+    assert "API Key" not in snapshot.message
+
+
+@pytest.mark.asyncio
 async def test_fused_non_dict_log_omits_raw_response(monkeypatch, caplog) -> None:
     calls: list[dict[str, Any]] = []
     raw = ["NON_DICT_RAW_SECRET"]

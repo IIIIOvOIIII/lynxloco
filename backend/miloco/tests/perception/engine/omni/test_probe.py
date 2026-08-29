@@ -49,7 +49,7 @@ def recording_http_server():
         def do_POST(self):  # noqa: N802
             self._record()
             if self.path == "/v1/chat/completions":
-                self._json({"choices": []})
+                self._json({"choices": [{"message": {"content": "red"}}]})
             else:
                 self._json({}, 404)
 
@@ -288,7 +288,11 @@ async def test_fetch_models_responses_adds_bearer_only_when_key_present(monkeypa
 
 async def test_probe_chat_ok(monkeypatch):
     monkeypatch.setattr(
-        probe.httpx, "AsyncClient", _fake_async_client(resp=_FakeResp(200))
+        probe.httpx,
+        "AsyncClient",
+        _fake_async_client(
+            resp=_FakeResp(200, {"choices": [{"message": {"content": "red"}}]})
+        ),
     )
     r = await probe.probe_chat("m1", "https://ok/v1", "sk-x")
     assert r["ok"] is True and r["code"] == "ok" and r["status"] == 200
@@ -311,20 +315,55 @@ async def test_probe_chat_not_found(monkeypatch):
     assert r["code"] == "not_found" and r["status"] == 404
 
 
-async def test_probe_chat_rejected_authed_on_400(monkeypatch):
+async def test_probe_chat_visual_400_is_visual_payload_rejected(monkeypatch):
     monkeypatch.setattr(
         probe.httpx, "AsyncClient", _fake_async_client(resp=_FakeResp(400))
     )
     r = await probe.probe_chat("m1", "https://ok/v1", "sk-x")
-    assert r["code"] == "rejected_authed"
+    assert r["code"] == "visual_payload_rejected"
+    assert "API Key" not in r["message"]
 
 
-async def test_probe_chat_rejected_authed_on_422(monkeypatch):
+async def test_probe_chat_visual_422_is_visual_payload_rejected(monkeypatch):
     monkeypatch.setattr(
         probe.httpx, "AsyncClient", _fake_async_client(resp=_FakeResp(422))
     )
     r = await probe.probe_chat("m1", "https://ok/v1", "sk-x")
-    assert r["code"] == "rejected_authed"
+    assert r["code"] == "visual_payload_rejected"
+
+
+@pytest.mark.parametrize(
+    ("provider_code", "expected"),
+    [
+        ("invalid_api_key", "bad_key"),
+        ("model_not_found", "not_found"),
+    ],
+)
+async def test_probe_chat_structured_config_code_overrides_visual_fallback(
+    monkeypatch, provider_code, expected
+):
+    """Removing the safe override would hide known auth/model failures."""
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_async_client(
+            resp=_FakeResp(
+                400,
+                {
+                    "error": {
+                        "code": provider_code,
+                        "message": "RAW_PROVIDER_SECRET data:image",
+                    }
+                },
+            )
+        ),
+    )
+
+    result = await probe.probe_chat("m1", "https://ok/v1", "sk-x")
+
+    assert result["code"] == expected
+    assert "RAW_PROVIDER_SECRET" not in result["message"]
+    assert "data:image" not in result["message"]
 
 
 async def test_probe_chat_http_error_on_500(monkeypatch):
@@ -441,7 +480,10 @@ async def test_probe_omni_get_ok_then_chat_ok(monkeypatch):
         probe.httpx,
         "AsyncClient",
         _fake_async_client(
-            get_resp=_FakeResp(200, {"data": [{"id": "m1"}]}), post_resp=_FakeResp(200)
+            get_resp=_FakeResp(200, {"data": [{"id": "m1"}]}),
+            post_resp=_FakeResp(
+                200, {"choices": [{"message": {"content": "red"}}]}
+            ),
         ),
     )
     r = await probe.probe_omni("m1", "https://ok/v1", "sk-x")
@@ -538,7 +580,7 @@ async def test_probe_chat_uses_adapter_body_for_qwen(monkeypatch):
     stream_resp = _FakeStreamResp(
         200,
         lines=[
-            'data: {"choices":[{"delta":{"content":"pong"}}]}',
+            'data: {"choices":[{"delta":{"content":"red"}}]}',
             "data: [DONE]",
         ],
     )
@@ -574,7 +616,7 @@ async def test_probe_chat_non_qwen_still_uses_post(monkeypatch):
         "AsyncClient",
         _fake_async_client(
             get_resp=_FakeResp(200, {"data": [{"id": "xiaomi/mimo-v2.5"}]}),
-            post_resp=_FakeResp(200, {"choices": [{"message": {"content": "pong"}}]}),
+            post_resp=_FakeResp(200, {"choices": [{"message": {"content": "red"}}]}),
         ),
     )
     r = await probe.probe_omni("xiaomi/mimo-v2.5", "https://mimo.example/v1", "sk-x")
@@ -598,6 +640,159 @@ async def test_probe_chat_stream_429_preserves_retry_after(monkeypatch):
     assert r["code"] == "rate_limited"
     # 关键:Retry-After 被解析出来传给上层 _grow_backoff_locked
     assert r["retry_after_seconds"] == 45.0
+
+
+@pytest.mark.parametrize(
+    ("protocol", "model", "expected_path"),
+    [
+        ("openai_chat_completions", "xiaomi/mimo-v2.5", "/v1/chat/completions"),
+        ("gemini_native", "gemini-vision", "/models/gemini-vision:generateContent"),
+    ],
+)
+async def test_non_responses_probe_uses_the_synthetic_red_image(
+    monkeypatch, caplog, protocol, model, expected_path
+):
+    """Removing the image block must fail because reachability alone is not visual proof."""
+    calls: list[tuple[str, str, dict]] = []
+    payload = (
+        {"choices": [{"message": {"content": "red"}}]}
+        if protocol == "openai_chat_completions"
+        else {"candidates": [{"content": {"parts": [{"text": "red"}]}}]}
+    )
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_async_client(
+            get_resp=_FakeResp(200, {"data": [{"id": model}]}),
+            post_resp=_FakeResp(200, payload),
+            calls=calls,
+        ),
+    )
+
+    result = await probe.probe_omni(
+        model, "https://vlm.example/v1", "sk-secret", protocol
+    )
+
+    assert result["ok"] is True
+    post = next(call for call in calls if call[0] == "POST")
+    assert post[1].endswith(expected_path)
+    assert "image" in json.dumps(post[2]["json"])
+    assert "sk-secret" not in result["message"]
+    assert "sk-secret" not in caplog.text
+    assert "data:image" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("protocol", "model", "payload"),
+    [
+        (
+            "openai_chat_completions",
+            "xiaomi/mimo-v2.5",
+            {"choices": [{"message": {"content": "Request acknowledged."}}]},
+        ),
+        (
+            "gemini_native",
+            "gemini-vision",
+            {
+                "candidates": [
+                    {"content": {"parts": [{"text": "Request acknowledged."}]}}
+                ]
+            },
+        ),
+    ],
+)
+async def test_non_responses_probe_rejects_text_only_acknowledgement(
+    monkeypatch, protocol, model, payload
+):
+    """Accepting an arbitrary 200 response would let text-only endpoints go green."""
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_async_client(
+            get_resp=_FakeResp(200, {"data": [{"id": model}]}),
+            post_resp=_FakeResp(200, payload),
+        ),
+    )
+
+    result = await probe.probe_omni(
+        model, "https://vlm.example/v1", "sk-secret", protocol
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "bad_response"
+
+
+async def test_forced_stream_probe_rejects_non_red_answer(monkeypatch):
+    """Accepting the first SSE data line would hide a non-visual Qwen response."""
+    stream_resp = _FakeStreamResp(
+        200,
+        lines=[
+            'data: {"choices":[{"delta":{"content":"acknowledged"}}]}',
+            "data: [DONE]",
+        ],
+    )
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_stream_client(_FakeResp(200, {"data": []}), stream_resp),
+    )
+
+    result = await probe.probe_omni(
+        "qwen3.5-omni-plus",
+        "https://qwen.example/v1",
+        "sk-x",
+        "openai_chat_completions",
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "bad_response"
+
+
+async def test_forced_stream_probe_rejects_malformed_sse_json(monkeypatch):
+    """Malformed provider SSE is a bad response, not a reachability success."""
+    stream_resp = _FakeStreamResp(200, lines=["data: {not-json", "data: [DONE]"])
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_stream_client(_FakeResp(200, {"data": []}), stream_resp),
+    )
+
+    result = await probe.probe_omni(
+        "qwen3.5-omni-plus",
+        "https://qwen.example/v1",
+        "sk-x",
+        "openai_chat_completions",
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "bad_response"
+
+
+async def test_forced_stream_probe_rejects_non_string_provider_delta(monkeypatch):
+    """A malformed adapter delta is a provider response failure, not unreachable."""
+    stream_resp = _FakeStreamResp(
+        200,
+        lines=[
+            'data: {"choices":[{"delta":{"content":{"secret":"value"}}}]}',
+            "data: [DONE]",
+        ],
+    )
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_stream_client(_FakeResp(200, {"data": []}), stream_resp),
+    )
+
+    result = await probe.probe_omni(
+        "qwen3.5-omni-plus",
+        "https://qwen.example/v1",
+        "sk-x",
+        "openai_chat_completions",
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "bad_response"
+    assert "secret" not in result["message"]
 
 
 # ─── OpenAI Responses visual preflight ─────────────────────────────────────
@@ -913,6 +1108,97 @@ async def test_responses_visual_probe_preserves_rate_limit_retry_after(monkeypat
     assert result["retry_after_seconds"] == 17.0
 
 
+async def test_responses_models_400_is_non_visual_rejected_and_skips_post(monkeypatch):
+    """A discovery failure cannot prove that the provider rejected image input."""
+    calls: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_async_client(
+            get_resp=_FakeResp(
+                400,
+                {"error": {"message": "RAW_PROVIDER_SECRET data:image"}},
+            ),
+            post_resp=_FakeResp(200, _responses_output("red")),
+            calls=calls,
+        ),
+    )
+
+    result = await probe.probe_omni(
+        "local-vlm",
+        "https://vlm.example/v1",
+        "responses-key",
+        api_protocol="openai_responses",
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "rejected_authed"
+    assert result["code"] != "visual_payload_rejected"
+    assert [call[0] for call in calls] == ["GET"]
+    assert "RAW_PROVIDER_SECRET" not in result["message"]
+    assert "data:image" not in result["message"]
+
+
+async def test_responses_visual_400_is_visual_payload_rejected(monkeypatch):
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_async_client(
+            get_resp=_FakeResp(404),
+            post_resp=_FakeResp(400),
+        ),
+    )
+
+    result = await probe.probe_omni(
+        "local-vlm",
+        "https://vlm.example/v1",
+        "",
+        api_protocol="openai_responses",
+    )
+
+    assert result["code"] == "visual_payload_rejected"
+    assert "API Key" not in result["message"]
+
+
+@pytest.mark.parametrize(
+    ("provider_code", "expected"),
+    [
+        ("invalid_api_key", "bad_key"),
+        ("model_not_found", "not_found"),
+    ],
+)
+async def test_responses_visual_structured_config_code_overrides_fallback(
+    monkeypatch, provider_code, expected
+):
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_async_client(
+            get_resp=_FakeResp(404),
+            post_resp=_FakeResp(
+                400,
+                {
+                    "error": {
+                        "code": provider_code,
+                        "message": "RAW_PROVIDER_SECRET data:image",
+                    }
+                },
+            ),
+        ),
+    )
+
+    result = await probe.probe_omni(
+        "local-vlm",
+        "https://vlm.example/v1",
+        "responses-key",
+        api_protocol="openai_responses",
+    )
+
+    assert result["code"] == expected
+    assert "RAW_PROVIDER_SECRET" not in result["message"]
+    assert "data:image" not in result["message"]
+
+
 async def test_explicit_responses_protocol_never_falls_back_by_model_name(monkeypatch):
     for model in ("qwen3.5-omni-plus", "gemini-vision"):
         calls: list[tuple[str, str, dict]] = []
@@ -944,7 +1230,10 @@ async def test_explicit_gemini_probe_protocol_overrides_model_name(monkeypatch):
         probe.httpx,
         "AsyncClient",
         _fake_async_client(
-            post_resp=_FakeResp(200, {"candidates": [{"content": {"parts": []}}]}),
+            post_resp=_FakeResp(
+                200,
+                {"candidates": [{"content": {"parts": [{"text": "red"}]}}]},
+            ),
             calls=calls,
         ),
     )

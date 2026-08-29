@@ -30,6 +30,7 @@ from miloco.perception.engine.omni.provider import (
     LocalMediaInfo,
     OmniProviderAdapter,
     get_adapter,
+    messages_have_visual_input,
     resolve_api_protocol,
 )
 from miloco.perception.snapshot_context import push_omni_trace
@@ -219,6 +220,7 @@ async def call_omni(
         )
 
     messages = _build_messages(payload, adapter)
+    visual_request = messages_have_visual_input(messages)
 
     body = adapter.build_request_body(
         messages,
@@ -247,7 +249,7 @@ async def call_omni(
         async with httpx.AsyncClient(timeout=config.timeout) as client:
             if not forced_stream:
                 resp = await client.post(url, headers=headers, json=body)
-                classified = classify_response(resp)
+                classified = classify_response(resp, visual_request=visual_request)
                 if classified is not None:
                     await cb.record_failure(classified)
                     logger.error("Omni API error %d", resp.status_code)
@@ -264,7 +266,10 @@ async def call_omni(
                         client, url, headers, body, adapter
                     )
                 except httpx.HTTPStatusError as e:
-                    classified = classify_response(e.response)
+                    classified = classify_response(
+                        e.response,
+                        visual_request=visual_request,
+                    )
                     if classified is not None:
                         await cb.record_failure(classified)
                         logger.error(
@@ -584,6 +589,7 @@ async def call_omni_stream(
         )
 
     messages = _build_messages(payload, adapter)
+    visual_request = messages_have_visual_input(messages)
 
     body = adapter.build_request_body(
         messages,
@@ -620,7 +626,7 @@ async def call_omni_stream(
                 headers=headers,
                 json=body,
             ) as resp:
-                classified = classify_response(resp)
+                classified = classify_response(resp, visual_request=visual_request)
                 if classified is not None:
                     await resp.aread()
                     await cb.record_failure(classified)

@@ -35,6 +35,20 @@ OmniMediaMode = Literal["video_audio", "image_sequence"]
 _warned_non_flash_gemini: set[str] = set()
 
 
+def messages_have_visual_input(messages: list[dict[str, Any]]) -> bool:
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") in {
+                "image_url",
+                "video_url",
+            }:
+                return True
+    return False
+
+
 @dataclass(frozen=True)
 class LocalMediaInfo:
     """本地编码后的视频/音频实际参数。"""

@@ -89,6 +89,7 @@ async def _run_omni_probe() -> None:
     from miloco.perception.engine.omni.error_classifier import (
         ClassifiedError,
         ErrorCategory,
+        category_for_code,
     )
     from miloco.perception.engine.omni.provider import resolve_api_protocol
 
@@ -113,11 +114,7 @@ async def _run_omni_probe() -> None:
             await cb.record_probe_result(True, None)
             return
         code = result.get("code", "unreachable")
-        cat = (
-            ErrorCategory.CONFIG
-            if code in ("bad_key", "not_found", "rejected_authed")
-            else ErrorCategory.RECOVERABLE
-        )
+        cat = category_for_code(code)
         await cb.record_probe_result(
             False,
             ClassifiedError(

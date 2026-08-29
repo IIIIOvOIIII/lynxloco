@@ -129,6 +129,45 @@ async def test_tick_drive_probe_failure_grows_backoff(monkeypatch, _mock_omni_co
     assert cb._probe_in_flight is False  # 位清了
 
 
+async def test_tick_visual_payload_rejected_opens_config(
+    monkeypatch, _mock_omni_config
+):
+    """Treating the new probe code as recoverable would keep retrying bad visual config."""
+    from miloco.perception import processor as _processor
+
+    async def _fake_probe(model, base_url, api_key, api_protocol):
+        return {
+            "ok": False,
+            "code": "visual_payload_rejected",
+            "message": "端点可连接，但当前协议或视觉请求不受支持",
+        }
+
+    monkeypatch.setattr("miloco.perception.engine.omni.probe.probe_omni", _fake_probe)
+
+    cb = get_omni_circuit_breaker()
+    for _ in range(3):
+        await cb.record_failure(
+            ClassifiedError("unreachable", "m", ErrorCategory.RECOVERABLE)
+        )
+    cb._next_probe_at_monotonic = time.monotonic() - 1.0
+
+    class _Stub:
+        pass
+
+    pipe = _Stub()
+    pipe.drive_omni_probe = _processor.PipelineProcessor.drive_omni_probe.__get__(
+        pipe, _Stub
+    )
+
+    pipe.drive_omni_probe()
+    await _wait_no_in_flight(cb)
+
+    snapshot = cb.snapshot()
+    assert cb.state_for_test() == CircuitState.OPEN_CONFIG
+    assert snapshot.state == "error"
+    assert snapshot.code == "visual_payload_rejected"
+
+
 async def test_tick_drive_noop_when_closed(_mock_omni_config):
     """CLOSED 稳态下 drive_omni_probe 直接 sync 返回,不 spawn。"""
     from miloco.perception import omni_probe_registry as _registry

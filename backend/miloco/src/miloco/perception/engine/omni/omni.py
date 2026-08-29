@@ -42,7 +42,10 @@ from miloco.perception.engine.omni.prompt_builder import (
     build_stream_prompt,
     format_person_label,
 )
-from miloco.perception.engine.omni.provider import get_adapter
+from miloco.perception.engine.omni.provider import (
+    get_adapter,
+    messages_have_visual_input,
+)
 from miloco.perception.engine.omni.response_parser import (
     parse_identity_assignments,
     parse_omni_response,
@@ -306,6 +309,7 @@ async def _call_omni_messages(
         raise ValueError(
             "MILOCO_MODEL__OMNI__API_KEY is not set; cannot call fused omni"
         )
+    visual_request = messages_have_visual_input(messages)
 
     body = adapter.build_request_body(
         messages,
@@ -334,7 +338,7 @@ async def _call_omni_messages(
         await cb.before_call()
         if not forced_stream:
             resp = await client.post(url, headers=headers, json=body)
-            classified = classify_response(resp)
+            classified = classify_response(resp, visual_request=visual_request)
             if classified is not None:
                 await cb.record_failure(classified)
                 logger.error(
@@ -358,7 +362,10 @@ async def _call_omni_messages(
                     client, url, headers, body, adapter
                 )
             except httpx.HTTPStatusError as e:
-                classified = classify_response(e.response)
+                classified = classify_response(
+                    e.response,
+                    visual_request=visual_request,
+                )
                 if classified is not None:
                     await cb.record_failure(classified)
                     logger.error(

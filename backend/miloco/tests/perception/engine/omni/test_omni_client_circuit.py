@@ -84,6 +84,13 @@ def _payload() -> dict:
     return {"system_prompt": "sys", "user_content": "u"}
 
 
+def _visual_payload() -> dict:
+    return {
+        **_payload(),
+        "crops": [{"media_type": "image/jpeg", "data": "eA=="}],
+    }
+
+
 # ─── call_omni × 熔断 ───────────────────────────────────────────────────────
 
 
@@ -128,6 +135,34 @@ async def test_call_omni_three_consecutive_404_open_config(monkeypatch):
         with pytest.raises(omni_client.OmniError):
             await omni_client.call_omni(_payload(), _cfg())
     assert get_omni_circuit_breaker().snapshot().code == "not_found"
+
+
+async def test_call_omni_visual_400_opens_visual_payload_rejected(monkeypatch):
+    """Dropping visual context would misclassify an image-bearing 400 as generic."""
+    monkeypatch.setattr(
+        omni_client.httpx, "AsyncClient", _fake_async_client(resp=_FakeResp(400))
+    )
+
+    for _ in range(3):
+        with pytest.raises(omni_client.OmniError):
+            await omni_client.call_omni(_visual_payload(), _cfg())
+
+    snapshot = get_omni_circuit_breaker().snapshot()
+    assert snapshot.code == "visual_payload_rejected"
+    assert "API Key" not in snapshot.message
+
+
+async def test_call_omni_text_only_400_keeps_generic_rejection(monkeypatch):
+    """A text-only request must not claim that the provider rejected visual input."""
+    monkeypatch.setattr(
+        omni_client.httpx, "AsyncClient", _fake_async_client(resp=_FakeResp(400))
+    )
+
+    for _ in range(3):
+        with pytest.raises(omni_client.OmniError):
+            await omni_client.call_omni(_payload(), _cfg())
+
+    assert get_omni_circuit_breaker().snapshot().code == "rejected_authed"
 
 
 async def test_call_omni_three_connect_errors_open_recoverable(monkeypatch):
@@ -407,3 +442,85 @@ async def test_call_omni_forced_stream_500_records_failure(monkeypatch):
     snap = get_omni_circuit_breaker().snapshot()
     assert snap.state == "warn"
     assert snap.code == "http_error"
+
+
+async def test_call_omni_forced_stream_visual_400_uses_visual_context(monkeypatch):
+    """The forced-stream exception branch must classify the original visual request."""
+    from miloco.perception.engine.omni import provider
+
+    orig_adapter = provider.get_adapter(None, "m")
+
+    class _StreamAdapter:
+        auth_required = True
+
+        def build_request_body(self, messages, **kw):
+            kw["stream"] = True
+            return orig_adapter.build_request_body(messages, **kw)
+
+        def endpoint(self, base_url, model, *, stream):
+            return orig_adapter.endpoint(base_url, model, stream=stream)
+
+        def auth_headers(self, api_key):
+            return orig_adapter.auth_headers(api_key)
+
+    monkeypatch.setattr(
+        omni_client, "get_adapter", lambda protocol, model: _StreamAdapter()
+    )
+
+    async def _raise_400(*args, **kwargs):
+        raise httpx.HTTPStatusError(
+            "visual rejected",
+            request=httpx.Request("POST", "https://x/v1/chat/completions"),
+            response=httpx.Response(400),
+        )
+
+    monkeypatch.setattr(omni_client, "_collect_stream_response", _raise_400)
+    monkeypatch.setattr(omni_client.httpx, "AsyncClient", _forced_stream_client_ok())
+
+    for _ in range(3):
+        with pytest.raises(omni_client.OmniError):
+            await omni_client.call_omni(_visual_payload(), _cfg())
+
+    assert (
+        get_omni_circuit_breaker().snapshot().code == "visual_payload_rejected"
+    )
+
+
+async def test_call_omni_live_stream_visual_400_uses_visual_context(monkeypatch):
+    """The public streaming path must retain visual context before reading the body."""
+
+    class _StreamResp(_FakeResp):
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def aread(self):
+            return b""
+
+    class _StreamClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def stream(self, *args, **kwargs):
+            return _StreamResp(400)
+
+    monkeypatch.setattr(omni_client.httpx, "AsyncClient", _StreamClient)
+
+    async def _consume_once():
+        return [item async for item in omni_client.call_omni_stream(_visual_payload(), _cfg())]
+
+    for _ in range(3):
+        with pytest.raises(omni_client.OmniError):
+            await _consume_once()
+
+    assert (
+        get_omni_circuit_breaker().snapshot().code == "visual_payload_rejected"
+    )
