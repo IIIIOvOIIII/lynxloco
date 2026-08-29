@@ -286,7 +286,7 @@ async def test_fixture_perception_and_uvicorn_live_view_share_one_rtsp_session(
         enabled=True,
     )
     source = RtspCameraSource(lambda: [setting])
-    adapter = CameraDeviceAdapter(sources=[source])
+    adapter = CameraDeviceAdapter(sources=[source], perception_fps_provider=lambda: 25)
     collector = MultimodalCollector([adapter])
     settings = SimpleNamespace(camera=SimpleNamespace(rtsp_sources=[setting]))
     service = CameraService(

@@ -107,6 +107,9 @@ class _CameraFeed:
     transcoder: H264Transcoder | None = None
     transcode_stream: AsyncGenerator[bytes, None] | None = None
     transcode_task: asyncio.Task[None] | None = None
+    transcode_push_task: asyncio.Task[None] | None = None
+    transcode_pending: tuple[NDArray[np.uint8], int | None] | None = None
+    transcode_coalesced_frames: int = 0
     h264_decoder_config: bytes = b""
     dropped_packets: int = 0
 
@@ -500,28 +503,50 @@ class LiveStreamHub:
         if feed is not source_feed or feed.mode != "transcoding":
             return
         transcoder = feed.transcoder
-        if transcoder is not None:
-            asyncio.create_task(
-                self._push_transcode_frame(camera_id, feed, transcoder, frame, pts)
+        if transcoder is None:
+            return
+        if feed.transcode_pending is not None:
+            feed.transcode_coalesced_frames += 1
+        feed.transcode_pending = (frame, pts)
+        task = feed.transcode_push_task
+        if task is None or task.done():
+            feed.transcode_push_task = asyncio.create_task(
+                self._drain_transcode_frames(camera_id, feed, transcoder)
             )
 
-    async def _push_transcode_frame(
+    async def _drain_transcode_frames(
         self,
         camera_id: str,
         source_feed: _CameraFeed,
         transcoder: H264Transcoder,
-        frame: NDArray[np.uint8],
-        pts: int | None,
     ) -> None:
-        if (
-            self._feeds.get(camera_id) is not source_feed
-            or source_feed.transcoder is not transcoder
-        ):
-            return
         try:
-            await transcoder.push_frame(frame, pts)
+            while True:
+                if (
+                    self._feeds.get(camera_id) is not source_feed
+                    or source_feed.transcoder is not transcoder
+                ):
+                    return
+                pending, source_feed.transcode_pending = (
+                    source_feed.transcode_pending,
+                    None,
+                )
+                if pending is None:
+                    return
+                frame, pts = pending
+                await transcoder.push_frame(frame, pts)
+                if (
+                    self._feeds.get(camera_id) is not source_feed
+                    or source_feed.transcoder is not transcoder
+                ):
+                    return
+        except asyncio.CancelledError:
+            raise
         except Exception:
             self._transcoder_failed(camera_id, source_feed, "transcode_failed")
+        finally:
+            if source_feed.transcode_push_task is asyncio.current_task():
+                source_feed.transcode_push_task = None
 
     async def _consume_transcoder(
         self,
@@ -592,6 +617,13 @@ class LiveStreamHub:
         await self._stop_transcoder(feed)
 
     async def _stop_transcoder(self, feed: _CameraFeed) -> None:
+        feed.transcode_pending = None
+        push_task, feed.transcode_push_task = feed.transcode_push_task, None
+        current = asyncio.current_task()
+        if push_task is not None and push_task is not current:
+            push_task.cancel()
+            await asyncio.gather(push_task, return_exceptions=True)
+
         transcoder, feed.transcoder = feed.transcoder, None
         task, feed.transcode_task = feed.transcode_task, None
         stream, feed.transcode_stream = feed.transcode_stream, None
@@ -600,7 +632,6 @@ class LiveStreamHub:
                 await transcoder.stop()
             except Exception:
                 pass
-        current = asyncio.current_task()
         if task is not None and task is not current:
             await asyncio.gather(task, return_exceptions=True)
         if stream is not None and task is None:

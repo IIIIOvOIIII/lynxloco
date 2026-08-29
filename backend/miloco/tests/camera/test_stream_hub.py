@@ -453,6 +453,33 @@ class _FakeTranscoder:
         await self.queue.put(None)
 
 
+class _BlockingPushTranscoder(_FakeTranscoder):
+    def __init__(
+        self,
+        *,
+        stop_entered: asyncio.Event | None = None,
+        stop_release: asyncio.Event | None = None,
+    ) -> None:
+        super().__init__(stop_entered=stop_entered, stop_release=stop_release)
+        self.push_entered = asyncio.Event()
+        self.push_release = asyncio.Event()
+        self.push_cancelled = asyncio.Event()
+        self.received: list[int] = []
+        self.push_tasks: list[asyncio.Task[object] | None] = []
+
+    async def push_frame(self, frame: np.ndarray, pts: int | None) -> None:
+        del pts
+        self.received.append(int(frame[0, 0, 0]))
+        self.push_tasks.append(asyncio.current_task())
+        self.push_entered.set()
+        try:
+            await self.push_release.wait()
+        except asyncio.CancelledError:
+            self.push_cancelled.set()
+            raise
+        await self.queue.put(b"encoded:" + bytes([self.received[-1]]))
+
+
 class _ReadyBoundaryTranscoder:
     """Expose whether the hub registers output before accepting a frame."""
 
@@ -515,6 +542,291 @@ async def test_transcoder_output_is_attached_before_first_decoded_frame() -> Non
     assert await asyncio.wait_for(pending, 0.5) == b"encoded:\x17"
     assert transcoder.lost_frames == 0
     await viewer.aclose()
+
+
+@pytest.mark.asyncio
+async def test_transcoder_burst_keeps_one_push_and_latest_pending() -> None:
+    backend = _PacketBackend()
+    transcoder = _BlockingPushTranscoder()
+
+    async def resolve(_camera_id: str) -> LiveStreamSource:
+        return _source(backend, codec="hevc", source_type="rtsp")
+
+    hub = LiveStreamHub(
+        resolve,
+        transcoder_factory=lambda _on_error: transcoder,
+    )
+    viewer = hub.subscribe("rtsp:camera")
+    first_output = asyncio.create_task(_next(viewer))
+    await asyncio.sleep(0)
+
+    backend.emit_frame(1, 1)
+    await asyncio.wait_for(transcoder.push_entered.wait(), 0.5)
+    feed = hub._feeds["rtsp:camera"]
+    for value in range(2, 100):
+        backend.emit_frame(value, value)
+    latest_frame = np.full((16, 16, 3), 100, dtype=np.uint8)
+    backend.frame_listeners[0](latest_frame, 100)
+    await asyncio.sleep(0)
+
+    assert transcoder.received == [1]
+    assert feed.transcode_pending is not None
+    assert feed.transcode_pending[0] is latest_frame
+    assert int(feed.transcode_pending[0][0, 0, 0]) == 100
+    assert feed.transcode_push_task is not None
+    assert not feed.transcode_push_task.done()
+    assert feed.transcode_coalesced_frames == 98
+
+    transcoder.push_release.set()
+    assert await asyncio.wait_for(first_output, 0.5) == b"encoded:\x01"
+    second_output = await _next(viewer)
+    assert second_output == b"encoded:d"
+    assert transcoder.received == [1, 100]
+    assert transcoder.push_tasks[0] is transcoder.push_tasks[1]
+    assert feed.transcode_pending is None
+    await viewer.aclose()
+
+
+@pytest.mark.asyncio
+async def test_last_viewer_detach_releases_pending_before_transcoder_stop() -> None:
+    backend = _PacketBackend()
+    stop_entered = asyncio.Event()
+    stop_release = asyncio.Event()
+    transcoder = _BlockingPushTranscoder(
+        stop_entered=stop_entered,
+        stop_release=stop_release,
+    )
+
+    async def resolve(_camera_id: str) -> LiveStreamSource:
+        return _source(backend, codec="hevc", source_type="rtsp")
+
+    hub = LiveStreamHub(resolve, transcoder_factory=lambda _on_error: transcoder)
+    viewer = hub.subscribe("rtsp:camera")
+    waiting = asyncio.create_task(_next(viewer))
+    await asyncio.sleep(0)
+    backend.emit_frame(1)
+    await asyncio.wait_for(transcoder.push_entered.wait(), 0.5)
+    feed = hub._feeds["rtsp:camera"]
+    backend.emit_frame(2)
+    await asyncio.sleep(0)
+
+    waiting.cancel()
+    await asyncio.wait_for(stop_entered.wait(), 0.5)
+
+    assert transcoder.push_cancelled.is_set()
+    assert feed.transcode_pending is None
+    assert feed.transcode_push_task is None
+    assert feed.transcoder is None
+    assert hub.state("rtsp:camera").mode == "idle"
+
+    stop_release.set()
+    await asyncio.gather(waiting, return_exceptions=True)
+    assert hub.state("rtsp:camera").error_code is None
+
+
+@pytest.mark.asyncio
+async def test_close_camera_clears_blocked_transcode_input_before_stop() -> None:
+    backend = _PacketBackend()
+    stop_entered = asyncio.Event()
+    stop_release = asyncio.Event()
+    transcoder = _BlockingPushTranscoder(
+        stop_entered=stop_entered,
+        stop_release=stop_release,
+    )
+
+    async def resolve(_camera_id: str) -> LiveStreamSource:
+        return _source(backend, codec="hevc", source_type="rtsp")
+
+    hub = LiveStreamHub(resolve, transcoder_factory=lambda _on_error: transcoder)
+    viewer = hub.subscribe("rtsp:camera")
+    waiting = asyncio.create_task(_next(viewer))
+    await asyncio.sleep(0)
+    backend.emit_frame(1)
+    await asyncio.wait_for(transcoder.push_entered.wait(), 0.5)
+    feed = hub._feeds["rtsp:camera"]
+    backend.emit_frame(2)
+    await asyncio.sleep(0)
+
+    closing = asyncio.create_task(hub.close_camera("rtsp:camera"))
+    await asyncio.wait_for(stop_entered.wait(), 0.5)
+
+    assert feed.transcode_pending is None
+    assert feed.transcode_push_task is None
+    assert feed.transcoder is None
+
+    stop_release.set()
+    await asyncio.wait_for(closing, 0.5)
+    with pytest.raises(StopAsyncIteration):
+        await waiting
+
+
+@pytest.mark.asyncio
+async def test_source_close_clears_blocked_transcode_input_before_stop() -> None:
+    backend = _PacketBackend()
+    stop_entered = asyncio.Event()
+    stop_release = asyncio.Event()
+    transcoder = _BlockingPushTranscoder(
+        stop_entered=stop_entered,
+        stop_release=stop_release,
+    )
+
+    async def resolve(_camera_id: str) -> LiveStreamSource:
+        return _source(backend, codec="hevc", source_type="rtsp")
+
+    hub = LiveStreamHub(resolve, transcoder_factory=lambda _on_error: transcoder)
+    viewer = hub.subscribe("rtsp:camera")
+    waiting = asyncio.create_task(_next(viewer))
+    await asyncio.sleep(0)
+    backend.emit_frame(1)
+    await asyncio.wait_for(transcoder.push_entered.wait(), 0.5)
+    feed = hub._feeds["rtsp:camera"]
+    backend.emit_frame(2)
+    await asyncio.sleep(0)
+
+    backend.stop()
+    await asyncio.wait_for(stop_entered.wait(), 0.5)
+
+    assert feed.transcode_pending is None
+    assert feed.transcode_push_task is None
+    assert feed.transcoder is None
+    stopping = hub._stopping["rtsp:camera"]
+    stop_release.set()
+    await asyncio.wait_for(asyncio.shield(stopping), 0.5)
+    with pytest.raises(StopAsyncIteration):
+        await waiting
+
+
+@pytest.mark.asyncio
+async def test_transcoder_failure_clears_blocked_transcode_input_before_stop() -> None:
+    backend = _PacketBackend()
+    stop_entered = asyncio.Event()
+    stop_release = asyncio.Event()
+    transcoder = _BlockingPushTranscoder(
+        stop_entered=stop_entered,
+        stop_release=stop_release,
+    )
+
+    async def resolve(_camera_id: str) -> LiveStreamSource:
+        return _source(backend, codec="hevc", source_type="rtsp")
+
+    def factory(on_error: Callable[[str], None]) -> _BlockingPushTranscoder:
+        transcoder.on_error = on_error
+        return transcoder
+
+    hub = LiveStreamHub(resolve, transcoder_factory=factory)
+    viewer = hub.subscribe("rtsp:camera")
+    waiting = asyncio.create_task(_next(viewer))
+    await asyncio.sleep(0)
+    backend.emit_frame(1)
+    await asyncio.wait_for(transcoder.push_entered.wait(), 0.5)
+    feed = hub._feeds["rtsp:camera"]
+    backend.emit_frame(2)
+    await asyncio.sleep(0)
+
+    assert transcoder.on_error is not None
+    transcoder.on_error("transcode_failed")
+    await asyncio.wait_for(stop_entered.wait(), 0.5)
+
+    assert feed.transcode_pending is None
+    assert feed.transcode_push_task is None
+    assert feed.transcoder is None
+    stopping = hub._stopping["rtsp:camera"]
+    stop_release.set()
+    await asyncio.wait_for(asyncio.shield(stopping), 0.5)
+    with pytest.raises(StopAsyncIteration):
+        await waiting
+    assert hub.state("rtsp:camera").error_code == "transcode_failed"
+
+
+@pytest.mark.asyncio
+async def test_stale_frame_callback_cannot_schedule_replacement_feed() -> None:
+    old_backend = _PacketBackend()
+    replacement_backend = _PacketBackend()
+    backends = iter((old_backend, replacement_backend))
+    created: list[_FakeTranscoder] = []
+
+    async def resolve(_camera_id: str) -> LiveStreamSource:
+        return _source(next(backends), codec="hevc", source_type="rtsp")
+
+    def factory(on_error: Callable[[str], None]) -> _FakeTranscoder:
+        transcoder = _FakeTranscoder()
+        transcoder.on_error = on_error
+        created.append(transcoder)
+        return transcoder
+
+    hub = LiveStreamHub(resolve, transcoder_factory=factory)
+    old_viewer = hub.subscribe("rtsp:camera")
+    old_waiting = asyncio.create_task(_next(old_viewer))
+    await asyncio.sleep(0)
+    stale_listener = old_backend.frame_listeners[0]
+    await hub.close_camera("rtsp:camera")
+    with pytest.raises(StopAsyncIteration):
+        await old_waiting
+
+    replacement = hub.subscribe("rtsp:camera")
+    replacement_waiting = asyncio.create_task(_next(replacement))
+    await asyncio.sleep(0)
+    stale_listener(np.full((16, 16, 3), 90, dtype=np.uint8), 90)
+    await asyncio.sleep(0)
+    replacement_feed = hub._feeds["rtsp:camera"]
+
+    assert replacement_feed.transcode_pending is None
+    assert replacement_feed.transcode_push_task is None
+    assert created[1].pushes == 0
+
+    replacement_backend.emit_frame(91, 91)
+    assert await replacement_waiting == b"encoded:["
+    await replacement.aclose()
+
+
+@pytest.mark.asyncio
+async def test_two_cameras_coalesce_without_blocking_each_other() -> None:
+    first_backend = _PacketBackend()
+    second_backend = _PacketBackend()
+    created: list[_BlockingPushTranscoder] = []
+
+    async def resolve(camera_id: str) -> LiveStreamSource:
+        backend = first_backend if camera_id == "rtsp:first" else second_backend
+        return _source(backend, codec="hevc", source_type="rtsp")
+
+    def factory(on_error: Callable[[str], None]) -> _BlockingPushTranscoder:
+        transcoder = _BlockingPushTranscoder()
+        transcoder.on_error = on_error
+        created.append(transcoder)
+        return transcoder
+
+    hub = LiveStreamHub(resolve, transcoder_factory=factory)
+    first = hub.subscribe("rtsp:first")
+    second = hub.subscribe("rtsp:second")
+    first_waiting = asyncio.create_task(_next(first))
+    second_waiting = asyncio.create_task(_next(second))
+    await asyncio.sleep(0)
+
+    first_backend.emit_frame(1, 1)
+    await asyncio.wait_for(created[0].push_entered.wait(), 0.5)
+    for value in range(2, 11):
+        first_backend.emit_frame(value, value)
+    second_backend.emit_frame(20, 20)
+    await asyncio.wait_for(created[1].push_entered.wait(), 0.5)
+    for value in range(21, 31):
+        second_backend.emit_frame(value, value)
+    await asyncio.sleep(0)
+
+    assert created[0].received == [1]
+    assert created[1].received == [20]
+    assert hub._feeds["rtsp:first"].transcode_coalesced_frames == 8
+    assert hub._feeds["rtsp:second"].transcode_coalesced_frames == 9
+
+    created[1].push_release.set()
+    assert await second_waiting == b"encoded:\x14"
+    assert await _next(second) == b"encoded:\x1e"
+    assert created[0].received == [1]
+
+    created[0].push_release.set()
+    assert await first_waiting == b"encoded:\x01"
+    assert await _next(first) == b"encoded:\x0a"
+    await first.aclose()
+    await second.aclose()
 
 
 @pytest.mark.asyncio
@@ -725,6 +1037,10 @@ async def test_compatible_h264_uses_normalizer_without_transcoder() -> None:
     assert output.startswith(b"\x00\x00\x00\x01\x67")
     assert created == 0
     assert hub.state("rtsp:camera").mode == "passthrough"
+    feed = hub._feeds["rtsp:camera"]
+    assert feed.transcoder is None
+    assert feed.transcode_push_task is None
+    assert feed.transcode_pending is None
     await viewer.aclose()
 
 
