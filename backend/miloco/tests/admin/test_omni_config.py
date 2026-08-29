@@ -1055,13 +1055,16 @@ def _fake_async_client(resp=None, exc=None, get_resp=None, post_resp=None):
 
 
 def test_test_connection_ok_chat_succeeds(client, monkeypatch, real_probe):
-    """GET /models 过鉴权/可达预检后,极简 chat 调通 → ok(连接正常)。不再以模型在不在列表为准。"""
+    """GET /models 预检后，视觉 chat 返回 red → ok。"""
     from miloco.perception.engine.omni import probe
 
     monkeypatch.setattr(
         probe.httpx,
         "AsyncClient",
-        _fake_async_client(resp=_FakeResp(200, {"data": [{"id": "m1"}]})),
+        _fake_async_client(
+            get_resp=_FakeResp(200, {"data": [{"id": "m1"}]}),
+            post_resp=_FakeResp(200, {"choices": [{"message": {"content": "red"}}]}),
+        ),
     )
     data = client.post(
         "/api/admin/omni-config/test",
@@ -1074,7 +1077,7 @@ def test_test_connection_ok_chat_succeeds(client, monkeypatch, real_probe):
     ).json()["data"]
     assert data["ok"] is True
     assert data["code"] == "ok"
-    assert data["message"] == "连接正常"
+    assert data["message"] == "视觉预检通过"
 
 
 def test_test_connection_ok_even_if_model_not_listed(client, monkeypatch, real_probe):
@@ -1088,7 +1091,7 @@ def test_test_connection_ok_even_if_model_not_listed(client, monkeypatch, real_p
         "AsyncClient",
         _fake_async_client(
             get_resp=_FakeResp(200, {"data": [{"id": "other"}]}),
-            post_resp=_FakeResp(200),
+            post_resp=_FakeResp(200, {"choices": [{"message": {"content": "red"}}]}),
         ),
     )
     data = client.post(
@@ -1128,8 +1131,8 @@ def test_test_connection_not_found(client, monkeypatch, real_probe):
     assert data["code"] == "not_found"
 
 
-def test_test_connection_rejected_authed(client, monkeypatch, real_probe):
-    # GET /models 404 → 回退 chat,chat 返 400(鉴权过、仅请求体被拒)→ rejected_authed
+def test_test_connection_visual_payload_rejected(client, monkeypatch, real_probe):
+    """GET /models 404 后，视觉 chat 返回未分类 400 应标记视觉载荷被拒。"""
     from miloco.perception.engine.omni import probe
 
     monkeypatch.setattr(
@@ -1149,7 +1152,8 @@ def test_test_connection_rejected_authed(client, monkeypatch, real_probe):
         },
     ).json()["data"]
     assert data["ok"] is False
-    assert data["code"] == "rejected_authed"
+    assert data["code"] == "visual_payload_rejected"
+    assert "bad request" not in data["message"]
 
 
 def test_test_connection_bad_key(client, monkeypatch, real_probe):
@@ -1323,7 +1327,15 @@ def test_test_connection_gemini_skips_preflight_uses_goog_key(
 
     calls: list = []
     monkeypatch.setattr(
-        p.httpx, "AsyncClient", _recording_async_client(calls, post_resp=_FakeResp(200))
+        p.httpx,
+        "AsyncClient",
+        _recording_async_client(
+            calls,
+            post_resp=_FakeResp(
+                200,
+                {"candidates": [{"content": {"parts": [{"text": "red"}]}}]},
+            ),
+        ),
     )
     data = client.post(
         "/api/admin/omni-config/test",
