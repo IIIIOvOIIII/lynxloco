@@ -15,6 +15,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -231,6 +232,116 @@ def _run_pack_platform_bundles(
             "log() { :; }\n"
             f"{function.group()}\n"
             "pack_platform_bundles\n"
+        ),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+
+
+def _build_function(name: str) -> str:
+    build_script = REPOSITORY_ROOT / "scripts" / "build.sh"
+    function = re.search(
+        rf"(?ms)^{re.escape(name)}\(\) \{{\n.*?^\}}\n",
+        build_script.read_text(encoding="utf-8"),
+    )
+    assert function is not None, f"scripts/build.sh must define {name}"
+    return function.group()
+
+
+def _run_build_web(project_root: Path) -> subprocess.CompletedProcess[str]:
+    bin_dir = project_root / "bin"
+    bin_dir.mkdir()
+    pnpm = bin_dir / "pnpm"
+    pnpm.write_text("#!/usr/bin/env sh\nexit 0\n", encoding="utf-8")
+    pnpm.chmod(0o755)
+    return subprocess.run(
+        ["bash"],
+        input=(
+            "set -euo pipefail\n"
+            f"PROJECT_ROOT={shlex.quote(str(project_root))}\n"
+            "RESOLVED_PEP=0.0.0\n"
+            "log() { :; }\n"
+            'die() { exit "$1"; }\n'
+            f"{_build_function('build_web')}\n"
+            "build_web\n"
+        ),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+        env={**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"},
+    )
+
+
+def _prepare_web_build_tree(project_root: Path, *, include_helper: bool) -> Path:
+    web_dist = project_root / "web" / "dist"
+    (web_dist / "assets").mkdir(parents=True)
+    (web_dist / "fonts").mkdir()
+    (web_dist / "index.html").write_text("index", encoding="utf-8")
+    (web_dist / "watch.html").write_text("watch", encoding="utf-8")
+    if include_helper:
+        (web_dist / "watch-mse.js").write_text("fresh helper", encoding="utf-8")
+    static = project_root / "backend" / "miloco" / "src" / "miloco" / "static"
+    static.mkdir(parents=True)
+    return static
+
+
+def _run_miloco_wheel_validation(dist_dir: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash"],
+        input=(
+            "set -euo pipefail\n"
+            f"DIST_DIR={shlex.quote(str(dist_dir))}\n"
+            "log() { :; }\n"
+            'die() { exit "$1"; }\n'
+            f"{_build_function('validate_miloco_wheel_static_assets')}\n"
+            "validate_miloco_wheel_static_assets\n"
+        ),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+
+
+def _write_synthetic_wheel(
+    path: Path, *, include_watch_html: bool = True, include_helper: bool
+) -> None:
+    with zipfile.ZipFile(path, "w") as wheel:
+        if include_watch_html:
+            wheel.writestr("miloco/static/watch.html", "watch")
+        if include_helper:
+            wheel.writestr("miloco/static/watch-mse.js", "helper")
+
+
+def _run_miloco_build_sequence(project_root: Path) -> subprocess.CompletedProcess[str]:
+    trace = project_root / "trace.log"
+    return subprocess.run(
+        ["bash"],
+        input=(
+            "set -euo pipefail\n"
+            f"PROJECT_ROOT={shlex.quote(str(project_root))}\n"
+            f"DIST_DIR={shlex.quote(str(project_root / 'dist'))}\n"
+            "PACKAGES=miloco\n"
+            "log() { :; }\n"
+            "check_prerequisites() { :; }\n"
+            "resolve_version() { :; }\n"
+            'should_build() { [[ ",$PACKAGES," == *",$1,"* ]]; }\n'
+            "build_web() { :; }\n"
+            "build_miloco_miot() { :; }\n"
+            f"build_miloco() {{ printf 'build\\n' >> {shlex.quote(str(trace))}; }}\n"
+            f"validate_miloco_wheel_static_assets() {{ printf 'validate\\n' >> {shlex.quote(str(trace))}; }}\n"
+            "build_miloco_cli() { :; }\n"
+            "build_openclaw() { :; }\n"
+            "build_hermes() { :; }\n"
+            "update_manifest() { :; }\n"
+            "pack_models() { :; }\n"
+            "pack_platform_bundles() { :; }\n"
+            "pack_install_scripts() { :; }\n"
+            f"{_build_function('main')}\n"
+            "main\n"
         ),
         text=True,
         capture_output=True,
@@ -1083,6 +1194,71 @@ def test_partial_build_returns_without_openclaw_bundle(tmp_path: Path) -> None:
         tmp_path, "web,miloco-miot,miloco,miloco-cli"
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_build_web_copies_required_mse_helper(tmp_path: Path) -> None:
+    static = _prepare_web_build_tree(tmp_path, include_helper=True)
+
+    result = _run_build_web(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert (static / "watch-mse.js").read_text(encoding="utf-8") == "fresh helper"
+
+
+def test_build_web_rejects_missing_mse_helper_after_stale_cleanup(tmp_path: Path) -> None:
+    static = _prepare_web_build_tree(tmp_path, include_helper=False)
+    stale_helper = static / "watch-mse.js"
+    stale_helper.write_text("stale helper", encoding="utf-8")
+
+    result = _run_build_web(tmp_path)
+
+    assert result.returncode == 5
+    assert not stale_helper.exists()
+
+
+def test_miloco_wheel_validation_accepts_both_required_watch_assets(tmp_path: Path) -> None:
+    _write_synthetic_wheel(tmp_path / "miloco-0.0.0-py3-none-any.whl", include_helper=True)
+    _write_synthetic_wheel(tmp_path / "miloco_cli-0.0.0-py3-none-any.whl", include_helper=False)
+    _write_synthetic_wheel(tmp_path / "miloco_miot-0.0.0-py3-none-any.whl", include_helper=False)
+
+    result = _run_miloco_wheel_validation(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("include_watch_html", "include_helper", "missing_asset"),
+    [
+        (True, False, "miloco/static/watch-mse.js"),
+        (False, True, "miloco/static/watch.html"),
+    ],
+)
+def test_miloco_wheel_validation_rejects_missing_required_watch_asset(
+    tmp_path: Path,
+    include_watch_html: bool,
+    include_helper: bool,
+    missing_asset: str,
+) -> None:
+    _write_synthetic_wheel(
+        tmp_path / "miloco-0.0.0-py3-none-any.whl",
+        include_watch_html=include_watch_html,
+        include_helper=include_helper,
+    )
+
+    result = _run_miloco_wheel_validation(tmp_path)
+
+    assert result.returncode == 5
+    assert missing_asset in result.stderr
+
+
+def test_miloco_build_sequence_validates_wheel_after_build(tmp_path: Path) -> None:
+    result = _run_miloco_build_sequence(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "trace.log").read_text(encoding="utf-8").splitlines() == [
+        "build",
+        "validate",
+    ]
 
 
 def test_pack_platform_bundles_fails_for_missing_full_build_artifacts(tmp_path: Path) -> None:

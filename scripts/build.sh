@@ -179,6 +179,44 @@ build_miloco() {
     (cd "$PROJECT_ROOT/backend/miloco" && uv build --out-dir "$DIST_DIR")
 }
 
+validate_miloco_wheel_static_assets() {
+    if ! python3 - "$DIST_DIR" <<'PY'
+import pathlib
+import sys
+import zipfile
+
+dist_dir = pathlib.Path(sys.argv[1])
+wheels = sorted(dist_dir.glob("miloco-*.whl"))
+if len(wheels) != 1:
+    print(
+        f"expected exactly one miloco-*.whl, found {len(wheels)}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+required = (
+    "miloco/static/watch.html",
+    "miloco/static/watch-mse.js",
+)
+try:
+    with zipfile.ZipFile(wheels[0]) as wheel:
+        missing = sorted(set(required).difference(wheel.namelist()))
+except (OSError, zipfile.BadZipFile) as exc:
+    print(f"cannot inspect {wheels[0].name}: {exc}", file=sys.stderr)
+    raise SystemExit(1) from exc
+
+if missing:
+    print(
+        f"{wheels[0].name} missing required static assets: {', '.join(missing)}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
+    then
+        die 5 "miloco wheel 静态资源校验失败"
+    fi
+}
+
 build_miloco_cli() {
     log "构建 miloco-cli ..."
     (cd "$PROJECT_ROOT/cli" && uv build --out-dir "$DIST_DIR")
@@ -232,7 +270,8 @@ build_web() {
     # 会累积旧 hashed chunk,一并清。static/ 整体不进 git(见 .gitignore),源码树初始
     # 状态下不存在 static/ 任何 web 资产,只有 build 后短暂出现用于打 wheel。
     rm -rf "$web_static/assets" "$web_static/index.html" "$web_static/fonts" \
-        "$web_static/favicon.svg" "$web_static/watch.html" "$web_static/vendor"
+        "$web_static/favicon.svg" "$web_static/watch.html" \
+        "$web_static/watch-mse.js" "$web_static/vendor"
     mkdir -p "$web_static"
     (
         cd "$PROJECT_ROOT/web"
@@ -249,7 +288,7 @@ build_web() {
     # 在 web/public(唯一真源),vite build 已把 public/* 拷进 dist;这里和 index.html
     # /assets 同等处理,把「构建产物」落进 static,让 backend wheel 带上可直接 serve
     # 的真文件。static/ 不进 git,源码树初始状态下不出现这些文件。
-    for item in index.html assets fonts favicon.svg watch.html vendor; do
+    for item in index.html assets fonts favicon.svg watch.html watch-mse.js vendor; do
         if [[ -e "$PROJECT_ROOT/web/dist/$item" ]]; then
             cp -R "$PROJECT_ROOT/web/dist/$item" "$web_static/"
         fi
@@ -260,9 +299,10 @@ build_web() {
     # 会把残缺的 static 一并打进 wheel，发布后住户访问 1810 拿到死页才发现。
     # fonts 也列为必需——index.html `<link rel="preload" href="/fonts/...">` 强制
     # 引用，缺了 fonts 浏览器 console 会一直爆 404 + 字号退化到 monospace fallback。
-    # watch.html 也是必需真文件(从 web/dist 落,缺了 /watch 页 503),这里硬校验防漏拷。
+    # watch.html 和它加载的 MSE helper 都是必需真文件；这里硬校验防漏拷。
     if [[ ! -f "$web_static/index.html" || ! -d "$web_static/assets" \
-          || ! -d "$web_static/fonts" || ! -f "$web_static/watch.html" ]]; then
+          || ! -d "$web_static/fonts" || ! -f "$web_static/watch.html" \
+          || ! -f "$web_static/watch-mse.js" ]]; then
         die 5 "web build 产物缺失（${web_static}），wheel 会带上残缺 web"
     fi
 }
@@ -539,7 +579,10 @@ main() {
     # build_miloco 打 wheel 时把 static 目录一起打包进 wheel
     if should_build "web";         then build_web; fi
     if should_build "miloco-miot"; then build_miloco_miot; fi
-    if should_build "miloco";      then build_miloco; fi
+    if should_build "miloco"; then
+        build_miloco
+        validate_miloco_wheel_static_assets
+    fi
     if should_build "miloco-cli";  then build_miloco_cli; fi
     if should_build "openclaw";    then build_openclaw; fi
     if should_build "hermes";     then build_hermes; fi
