@@ -530,9 +530,11 @@ class _FakeStreamResp:
         status_code: int,
         lines: list[str] | None = None,
         headers: httpx.Headers | dict[str, str] | None = None,
+        json_data: object | None = None,
     ):
         self.status_code = status_code
         self._lines = lines or []
+        self._json = json_data if json_data is not None else {}
         # 强制包成 httpx.Headers,即使传入 plain dict 也走真实 httpx 语义
         self.headers = httpx.Headers(headers or {})
 
@@ -548,6 +550,9 @@ class _FakeStreamResp:
 
     async def aread(self):
         return b""
+
+    def json(self):
+        return self._json
 
 
 def _fake_stream_client(get_resp, stream_resp):
@@ -640,6 +645,57 @@ async def test_probe_chat_stream_429_preserves_retry_after(monkeypatch):
     assert r["code"] == "rate_limited"
     # 关键:Retry-After 被解析出来传给上层 _grow_backoff_locked
     assert r["retry_after_seconds"] == 45.0
+
+
+@pytest.mark.parametrize(
+    ("status", "json_body", "expected"),
+    [
+        (
+            400,
+            {
+                "error": {
+                    "code": "invalid_api_key",
+                    "message": "FORCED_STREAM_RAW_SECRET data:image",
+                }
+            },
+            "bad_key",
+        ),
+        (
+            422,
+            {
+                "error": {
+                    "type": "model_not_found",
+                    "message": "FORCED_STREAM_RAW_SECRET data:image",
+                }
+            },
+            "not_found",
+        ),
+    ],
+)
+async def test_probe_chat_stream_preserves_only_safe_structured_config_code(
+    monkeypatch, caplog, status, json_body, expected
+):
+    """Discarding the drained error body hides known auth/model failures."""
+    stream_resp = _FakeStreamResp(status, json_data=json_body)
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_stream_client(_FakeResp(200, {"data": []}), stream_resp),
+    )
+
+    result = await probe.probe_omni(
+        "qwen3.5-omni-plus",
+        "https://qwen.example/v1",
+        "sk-x",
+        "openai_chat_completions",
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == expected
+    assert "FORCED_STREAM_RAW_SECRET" not in result["message"]
+    assert "data:image" not in result["message"]
+    assert "FORCED_STREAM_RAW_SECRET" not in caplog.text
+    assert "data:image" not in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -793,6 +849,72 @@ async def test_forced_stream_probe_rejects_non_string_provider_delta(monkeypatch
     assert result["ok"] is False
     assert result["code"] == "bad_response"
     assert "secret" not in result["message"]
+
+
+async def test_forced_stream_probe_rejects_malformed_nested_openai_sse(
+    monkeypatch, caplog
+):
+    """An AttributeError from a nested SSE shape must stay inside parsing."""
+    stream_resp = _FakeStreamResp(
+        200,
+        lines=[
+            'data: {"choices":[{"delta":[]}],"provider_value":"SSE_RAW_SECRET"}',
+            "data: [DONE]",
+        ],
+    )
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_stream_client(_FakeResp(200, {"data": []}), stream_resp),
+    )
+
+    result = await probe.probe_omni(
+        "qwen3.5-omni-plus",
+        "https://qwen.example/v1",
+        "sk-x",
+        "openai_chat_completions",
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "bad_response"
+    assert "SSE_RAW_SECRET" not in result["message"]
+    assert "SSE_RAW_SECRET" not in caplog.text
+
+
+async def test_gemini_probe_rejects_malformed_candidate_content(
+    monkeypatch, caplog
+):
+    """Malformed Gemini candidates must not escape the response boundary."""
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_async_client(
+            post_resp=_FakeResp(
+                200,
+                {
+                    "candidates": [
+                        {
+                            "content": [
+                                {"parts": "GEMINI_RAW_SECRET"},
+                            ]
+                        }
+                    ]
+                },
+            ),
+        ),
+    )
+
+    result = await probe.probe_omni(
+        "gemini-vision",
+        "https://gemini.example/v1beta",
+        "gemini-key",
+        "gemini_native",
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "bad_response"
+    assert "GEMINI_RAW_SECRET" not in result["message"]
+    assert "GEMINI_RAW_SECRET" not in caplog.text
 
 
 # ─── OpenAI Responses visual preflight ─────────────────────────────────────

@@ -177,10 +177,12 @@ async def _probe_stream_chat(
     body: dict[str, Any],
     t0: float,
     adapter: OmniProviderAdapter,
-) -> tuple[int, int, str | None, dict[str, str]]:
-    """流式探测:解析 SSE 并返回累积输出。非 200 status 回带原始 response
-    headers,让上层 429 分支能读 Retry-After —— 否则 forced-stream provider (Qwen)
-    撞 429 时熔断退避会丢掉 server 明示的等待时长,与非流式路径 (MiMo) 行为不一致。"""
+) -> tuple[int, int, str | None, dict[str, str], str | None]:
+    """流式探测:解析 SSE 并返回累积输出。
+
+    非 200 status 回带 response headers 与已映射的安全配置码。上层可保留
+    Retry-After 和 allow-listed auth/model 分类，但不会接触 provider 原始 body。
+    """
     async with client.stream(
         "POST",
         url,
@@ -189,7 +191,12 @@ async def _probe_stream_chat(
     ) as resp:
         if resp.status_code != 200:
             await resp.aread()  # 允许连接释放
-            return resp.status_code, 0, None, dict(resp.headers)
+            safe_config_code = (
+                safe_provider_config_code(resp)
+                if resp.status_code in (400, 422)
+                else None
+            )
+            return resp.status_code, 0, None, dict(resp.headers), safe_config_code
         output_parts: list[str] = []
         async for line in resp.aiter_lines():
             line = line.strip()
@@ -201,16 +208,22 @@ async def _probe_stream_chat(
             try:
                 chunk = json.loads(data)
                 delta, _usage = adapter.parse_stream_chunk(chunk)
-            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            except (
+                AttributeError,
+                json.JSONDecodeError,
+                KeyError,
+                TypeError,
+                ValueError,
+            ):
                 latency_ms = round((time.monotonic() - t0) * 1000)
-                return 200, latency_ms, None, {}
+                return 200, latency_ms, None, {}, None
             if delta is not None and not isinstance(delta, str):
                 latency_ms = round((time.monotonic() - t0) * 1000)
-                return 200, latency_ms, None, {}
+                return 200, latency_ms, None, {}, None
             if delta:
                 output_parts.append(delta)
         latency_ms = round((time.monotonic() - t0) * 1000)
-        return 200, latency_ms, "".join(output_parts), {}
+        return 200, latency_ms, "".join(output_parts), {}, None
 
 
 def _visual_answer_is_red(value: Any) -> bool:
@@ -256,15 +269,20 @@ async def probe_chat(
         "Content-Type": "application/json",
     }
     t0 = time.monotonic()
+    stream_safe_config_code: str | None = None
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             if forced_stream:
                 # forced-stream provider (Qwen):走 SSE 流并用 adapter 累积输出文本，
                 # 直到 [DONE] 或流结束后再验证视觉答案。任何 status/auth/model 错
                 # 都在开 stream 时直接返回，与非流式行为对齐。
-                status_code, latency_ms, output_text, resp_headers = (
-                    await _probe_stream_chat(client, url, headers, body, t0, adapter)
-                )
+                (
+                    status_code,
+                    latency_ms,
+                    output_text,
+                    resp_headers,
+                    stream_safe_config_code,
+                ) = await _probe_stream_chat(client, url, headers, body, t0, adapter)
                 if status_code == 200:
                     if not _visual_answer_is_red(output_text):
                         return {
@@ -281,8 +299,8 @@ async def probe_chat(
                         "latency_ms": latency_ms,
                         "message": "视觉预检通过",
                     }
-                # 非 200: 复用下方 status_code 分支;把 headers 一起塞进 _FakeStatusResp,
-                # 429 分支能读 Retry-After,行为与非流式路径对齐。
+                # 非 200:复用下方 status_code 分支。headers 保留 Retry-After；
+                # allow-listed auth/model 只通过 stream_safe_config_code 传递。
                 r = _FakeStatusResp(status_code, {}, "", resp_headers)
             else:
                 r = await client.post(  # type: ignore[assignment]
@@ -304,7 +322,14 @@ async def probe_chat(
         try:
             normalized = adapter.parse_response(r.json())
             output_text = normalized["choices"][0]["message"]["content"]
-        except (json.JSONDecodeError, IndexError, KeyError, TypeError, ValueError):
+        except (
+            AttributeError,
+            json.JSONDecodeError,
+            IndexError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ):
             output_text = None
         if not _visual_answer_is_red(output_text):
             return {
@@ -336,7 +361,7 @@ async def probe_chat(
             "message": "模型或地址不存在",
         }
     if r.status_code in (400, 422):
-        code = safe_provider_config_code(r)
+        code = stream_safe_config_code or safe_provider_config_code(r)
         if code is not None:
             return {
                 "ok": False,
