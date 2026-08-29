@@ -14,11 +14,21 @@ import logging
 import threading
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Callable, Generic, TypeVar
+from typing import Callable, Generic, Literal, TypeVar
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+
+@dataclass(frozen=True)
+class TrackRetentionPolicy:
+    """Optional bounded-retention policy for one payload-bearing track."""
+
+    track: str
+    max_items_per_window: int
+    max_payload_bytes: int
+    payload_size: Callable[[object], int]
 
 
 @dataclass
@@ -37,6 +47,7 @@ class StreamFragment(Generic[T]):
     data: T
     stream_ts: int  # ms, device-relative timestamp (for intra-device A/V sync)
     wall_ms: int  # ms, monotonic wall-clock timestamp (for cross-device alignment)
+    retained_payload_bytes: int = field(default=0, repr=False, compare=False)
 
 
 @dataclass
@@ -76,11 +87,21 @@ class MultiTrackSyncBuffer:
         on_window_ready: Callable[[], None] | None = None,
         window_settle_ms: int = 500,
         buffer_full_action: str = "keep",
-    ):
+        retention_policy: TrackRetentionPolicy | None = None,
+    ) -> None:
         if not track_names:
             raise ValueError("track_names must not be empty")
         if window_ms <= 0:
             raise ValueError("window_ms must be positive")
+        if retention_policy is not None:
+            if retention_policy.track not in track_names:
+                raise ValueError("retention_policy.track must be a registered track")
+            if retention_policy.max_items_per_window <= 0:
+                raise ValueError(
+                    "retention_policy.max_items_per_window must be positive"
+                )
+            if retention_policy.max_payload_bytes <= 0:
+                raise ValueError("retention_policy.max_payload_bytes must be positive")
 
         self._track_names: frozenset[str] = frozenset(track_names)
         self._window_ms = window_ms
@@ -88,6 +109,14 @@ class MultiTrackSyncBuffer:
         self._max_windows = max_windows
         self._on_window_ready = on_window_ready
         self._buffer_full_action = buffer_full_action
+        self._retention_policy = retention_policy
+        self._retained_payload_bytes = 0
+        self._peak_retained_payload_bytes = 0
+        self._retention_dropped_items = 0
+        self._retention_last_action: (
+            Literal["frame_limit", "byte_limit", "oversized", "invalid_payload"] | None
+        ) = None
+        self._invalid_payload_warning_emitted = False
 
         # 丢包统计:put 路径累加,consume_drop_stats() 拉取增量后清零。
         # 全部在 self._lock 内读写。
@@ -137,6 +166,117 @@ class MultiTrackSyncBuffer:
             self._ready_keys.add(key)
             self._ready_queue.append(key)
 
+    def _record_retention_drop_locked(
+        self,
+        action: Literal["frame_limit", "byte_limit", "oversized", "invalid_payload"],
+    ) -> None:
+        self._retention_dropped_items += 1
+        self._retention_last_action = action
+
+    def _warn_invalid_payload_once_locked(self) -> None:
+        if not self._invalid_payload_warning_emitted:
+            logger.warning(
+                "[stream_buffer] invalid retention payload measurement; dropping fragment"
+            )
+            self._invalid_payload_warning_emitted = True
+
+    def _payload_size_locked(self, track: str, data: object) -> int | None:
+        policy = self._retention_policy
+        if policy is None or track != policy.track:
+            return 0
+        try:
+            size = policy.payload_size(data)
+        except Exception:
+            self._record_retention_drop_locked("invalid_payload")
+            self._warn_invalid_payload_once_locked()
+            return None
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            self._record_retention_drop_locked("invalid_payload")
+            self._warn_invalid_payload_once_locked()
+            return None
+        return size
+
+    def _remove_ready_key_locked(self, key: int) -> None:
+        if key in self._ready_keys:
+            self._ready_keys.discard(key)
+            try:
+                self._ready_queue.remove(key)
+            except ValueError:
+                pass
+
+    def _cleanup_empty_window_locked(self, window: _TimeWindow) -> None:
+        if window.tracks:
+            return
+        key = window.window_start_ms
+        if self._windows.get(key) is window:
+            self._windows.pop(key, None)
+            self._remove_ready_key_locked(key)
+        else:
+            try:
+                self._drained.remove(window)
+            except ValueError:
+                pass
+
+    def _discard_fragment_locked(
+        self,
+        window: _TimeWindow,
+        track: str,
+        index: int,
+        *,
+        action: Literal["frame_limit", "byte_limit", "oversized", "invalid_payload"],
+    ) -> None:
+        fragment = window.tracks[track].pop(index)
+        self._retained_payload_bytes -= fragment.retained_payload_bytes
+        self._record_retention_drop_locked(action)
+        if not window.tracks[track]:
+            window.tracks.pop(track)
+            window.tracks_seen.discard(track)
+        self._cleanup_empty_window_locked(window)
+
+    def _discard_window_payload_locked(self, window: _TimeWindow) -> None:
+        self._retained_payload_bytes -= sum(
+            fragment.retained_payload_bytes
+            for fragments in window.tracks.values()
+            for fragment in fragments
+        )
+
+    def _remove_window_locked(self, key: int) -> _TimeWindow | None:
+        window = self._windows.pop(key, None)
+        self._remove_ready_key_locked(key)
+        if window is not None:
+            self._discard_window_payload_locked(window)
+        return window
+
+    def _clear_payload_locked(self) -> None:
+        for window in self._windows.values():
+            self._discard_window_payload_locked(window)
+        for window in self._drained:
+            self._discard_window_payload_locked(window)
+
+    def _enforce_byte_limit_locked(self) -> None:
+        policy = self._retention_policy
+        if policy is None:
+            return
+        while self._retained_payload_bytes > policy.max_payload_bytes:
+            candidates = [
+                (window, index, fragment)
+                for window in list(self._drained) + list(self._windows.values())
+                for index, fragment in enumerate(window.tracks.get(policy.track, []))
+            ]
+            if not candidates:
+                return
+            window, index, _fragment = min(
+                candidates,
+                key=lambda candidate: (
+                    candidate[0].window_start_ms,
+                    candidate[2].wall_ms,
+                    candidate[2].stream_ts,
+                ),
+            )
+            self._discard_fragment_locked(
+                window, policy.track, index, action="byte_limit"
+            )
+
     def _expire_old_windows(self, current_wall_ms: int) -> None:
         """Mark closed windows as ready, with a settle grace period.
 
@@ -165,7 +305,7 @@ class MultiTrackSyncBuffer:
                 for t in self._first_window_keys:
                     if self._first_window_keys[t] == wkey:
                         self._first_window_keys[t] = None
-                self._windows.pop(wkey, None)
+                self._remove_window_locked(wkey)
                 continue
 
             win = self._windows[wkey]
@@ -192,6 +332,14 @@ class MultiTrackSyncBuffer:
 
         should_signal = False
         with self._lock:
+            payload_bytes = self._payload_size_locked(track, data)
+            if payload_bytes is None:
+                return
+            policy = self._retention_policy
+            if policy is not None and payload_bytes > policy.max_payload_bytes:
+                self._record_retention_drop_locked("oversized")
+                return
+
             key = self._window_key(wall_ms)
 
             # Record each track's first window key (it will be partial)
@@ -201,10 +349,24 @@ class MultiTrackSyncBuffer:
 
             win = self._get_or_create_window(key)
 
-            win.tracks.setdefault(track, []).append(
-                StreamFragment(data=data, stream_ts=stream_ts, wall_ms=wall_ms)
+            fragment = StreamFragment(
+                data=data,
+                stream_ts=stream_ts,
+                wall_ms=wall_ms,
+                retained_payload_bytes=payload_bytes,
             )
+            win.tracks.setdefault(track, []).append(fragment)
             win.tracks_seen.add(track)
+            self._retained_payload_bytes += payload_bytes
+            self._peak_retained_payload_bytes = max(
+                self._peak_retained_payload_bytes,
+                self._retained_payload_bytes,
+            )
+
+            if policy is not None and track == policy.track:
+                while len(win.tracks.get(track, [])) > policy.max_items_per_window:
+                    self._discard_fragment_locked(win, track, 0, action="frame_limit")
+                self._enforce_byte_limit_locked()
 
             # Expire older windows — uses actual wall_ms (not aligned key)
             # so the settle grace period is measured precisely.
@@ -225,34 +387,44 @@ class MultiTrackSyncBuffer:
 
                 if self._buffer_full_action == "clear":
                     dropped = ready_before + active_before
+                    self._clear_payload_locked()
                     self._windows.clear()
                     self._ready_queue.clear()
                     self._ready_keys.clear()
                     self._drained.clear()
                     should_signal = False
                     win = self._get_or_create_window(key)
-                    win.tracks.setdefault(track, []).append(
-                        StreamFragment(data=data, stream_ts=stream_ts, wall_ms=wall_ms)
-                    )
+                    win.tracks.setdefault(track, []).append(fragment)
                     win.tracks_seen.add(track)
+                    self._retained_payload_bytes += fragment.retained_payload_bytes
+                    self._peak_retained_payload_bytes = max(
+                        self._peak_retained_payload_bytes,
+                        self._retained_payload_bytes,
+                    )
                     self._dropped_since_drain += dropped
                     self._last_overflow_action = "clear"
                     logger.warning(
                         "[stream_buffer] overflow → clear: ready=%d active=%d max=%d dropped=%d",
-                        ready_before, active_before, self._max_windows, dropped,
+                        ready_before,
+                        active_before,
+                        self._max_windows,
+                        dropped,
                     )
                 elif self._buffer_full_action == "drop":
                     dropped = 0
                     while len(self._ready_queue) > self._max_windows:
                         oldest_key = self._ready_queue.popleft()
                         self._ready_keys.discard(oldest_key)
-                        self._windows.pop(oldest_key, None)
+                        self._remove_window_locked(oldest_key)
                         dropped += 1
                     self._dropped_since_drain += dropped
                     self._last_overflow_action = "drop"
                     logger.warning(
                         "[stream_buffer] overflow → drop: ready=%d active=%d max=%d dropped=%d",
-                        ready_before, active_before, self._max_windows, dropped,
+                        ready_before,
+                        active_before,
+                        self._max_windows,
+                        dropped,
                     )
 
         if should_signal and self._on_window_ready:
@@ -315,7 +487,7 @@ class MultiTrackSyncBuffer:
             # (默认 3),3× 余量;调小 max_windows 或加大 peek duration_ms 前须复核这条
             # (peek_latest 入口有超限 debug 日志兜底)。
             while len(self._drained) > self._max_windows:
-                self._drained.popleft()
+                self._discard_window_payload_locked(self._drained.popleft())
 
             if newest_win is None:
                 return None
@@ -355,8 +527,10 @@ class MultiTrackSyncBuffer:
             logger.debug(
                 "[stream_buffer] peek duration_ms=%d 超过 _drained 回看上限 %d "
                 "(max_windows=%d × window_ms=%d),更早的帧已被裁剪,返回值可能截断",
-                target_ms, self._max_windows * self._window_ms,
-                self._max_windows, self._window_ms,
+                target_ms,
+                self._max_windows * self._window_ms,
+                self._max_windows,
+                self._window_ms,
             )
 
         with self._lock:
@@ -409,9 +583,36 @@ class MultiTrackSyncBuffer:
         with self._lock:
             return len(self._windows)
 
+    @property
+    def retained_payload_bytes(self) -> int:
+        """Current retained bytes for the configured payload-bearing track."""
+        with self._lock:
+            return self._retained_payload_bytes
+
+    @property
+    def peak_retained_payload_bytes(self) -> int:
+        """Largest retained payload total observed during this buffer lifetime."""
+        with self._lock:
+            return self._peak_retained_payload_bytes
+
+    @property
+    def retention_dropped_items(self) -> int:
+        """Number of fragments dropped by the retention policy."""
+        with self._lock:
+            return self._retention_dropped_items
+
+    @property
+    def retention_last_action(
+        self,
+    ) -> Literal["frame_limit", "byte_limit", "oversized", "invalid_payload"] | None:
+        """Most recent retention-policy drop reason."""
+        with self._lock:
+            return self._retention_last_action
+
     def clear(self) -> None:
         """Remove all windows and reset state."""
         with self._lock:
+            self._clear_payload_locked()
             self._windows.clear()
             self._ready_queue.clear()
             self._ready_keys.clear()
