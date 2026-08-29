@@ -1153,6 +1153,7 @@ def test_test_connection_visual_payload_rejected(client, monkeypatch, real_probe
     ).json()["data"]
     assert data["ok"] is False
     assert data["code"] == "visual_payload_rejected"
+    assert data["message"] == "端点可连接，但当前协议或视觉请求不受支持"
     assert "bad request" not in data["message"]
 
 
