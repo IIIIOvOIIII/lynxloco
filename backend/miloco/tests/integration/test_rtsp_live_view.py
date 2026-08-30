@@ -21,11 +21,12 @@ import uvicorn
 from fastapi import FastAPI, Header, WebSocket
 from miloco.camera.router import (
     _get_camera_service,
+    _get_live_jpeg_stream_hub,
     _get_live_stream_hub,
     router,
 )
 from miloco.camera.service import CameraService
-from miloco.camera.stream import LiveStreamHub
+from miloco.camera.stream import LiveJpegStreamHub, LiveStreamHub
 from miloco.config.settings import RtspSourceSettings
 from miloco.perception.collect import rtsp_session as session_module
 from miloco.perception.collect.camera_adapter import CameraDeviceAdapter
@@ -312,6 +313,9 @@ async def test_fixture_perception_and_uvicorn_live_view_share_one_rtsp_session(
     app.include_router(router, prefix="/api")
     app.dependency_overrides[_get_camera_service] = lambda: service
     app.dependency_overrides[_get_live_stream_hub] = lambda: hub
+    app.dependency_overrides[_get_live_jpeg_stream_hub] = lambda: LiveJpegStreamHub(
+        service.resolve_live_stream
+    )
 
     access_log = io.StringIO()
     access_handler = logging.StreamHandler(access_log)
