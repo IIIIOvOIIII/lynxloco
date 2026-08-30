@@ -34,3 +34,17 @@
 - Expected result: Push-time CI and the local wrapper both use a synthetic test-only credential while runtime `server.token` remains empty-token fail-closed.
 - Result: Achieved. `.github/workflows/ci.yml` now supplies an isolated config search path and `local-ci-service-token` only to the backend test step. A faithful local invocation of that exact environment and `uv run pytest -v` passed 4033 tests with 1 expected skip. The explicit empty-service-token auth dependency test still passed (4 tests), and `./scripts/local-ci.sh --tests` passed all six checks.
 - Next step: Final review the updated committed source tree, then open a production CO for `miloco.esxi`, back up runtime data, deploy the exact reviewed SHA through the approved path, and verify setup/login plus service-token callers in production.
+
+## 2026-08-31 01:53 +08
+
+- Current work: Completed the final whole-branch review and the single permitted final-review fix wave for dashboard authentication.
+- Expected result: The branch is ready to merge after final scoped re-review.
+- Result: Partial. The final fix wave resolved the reviewed CSRF multi-tab instability, public password endpoint abuse controls, frontend stale-auth transition, logout CSRF enforcement, and related router test gaps in commit `faebbbe0912d6ce67f018998ac47d726d8b019df`; the fixer reported backend auth, related SSE/camera suites, frontend auth/users tests, typecheck/build, scoped Ruff, `git diff --check`, and full `./scripts/local-ci.sh --tests` all green. The scoped re-review confirmed those original findings were addressed, but found one new fix-introduced important defect: sanitized Pydantic validation responses still include non-JSON-serializable `ctx.error`, so whitespace-only setup username validation can turn the intended HTTP 422 into HTTP 500.
+- Next step: Request one explicit extra final-review fix authorization, then patch the validation-error sanitizer, add a focused regression, rerun auth-focused tests and `./scripts/local-ci.sh --tests`, and re-review the small fix before merge/push.
+
+## 2026-08-31 07:33 +08
+
+- Current work: Completed the user-approved extra targeted final-review fix for validation-error serialization.
+- Expected result: Pydantic validation errors remain JSON-serializable, raw request inputs stay redacted, the whitespace-only setup username case returns HTTP 422 instead of HTTP 500, and the branch is ready for merge/push preparation.
+- Result: Achieved. Commit `c9aea50f4a94147565d04e4698b704e473f55c56` recursively sanitizes validation error details, omits non-serializable nested objects such as `ctx.error`, preserves raw `input` redaction, and adds a focused regression for whitespace-only setup usernames. The implementer reported the focused regression, backend auth suite, scoped Ruff, full `./scripts/local-ci.sh --tests`, and `git diff --check` all green. Scoped re-review confirmed the sanitizer finding is addressed and found no new Critical/Important breakage.
+- Next step: Prepare the branch for merge/push publication. Production deployment to `miloco.esxi` remains a separate CO/PAM-gated action with pre-deploy data backup and browser/CLI smoke verification.
