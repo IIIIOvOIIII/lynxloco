@@ -27,3 +27,10 @@
 - Expected result: `./scripts/local-ci.sh --tests` is green, legacy endpoint tests authenticate with synthetic service credentials, explicit auth-negative tests stay anonymous, and no development browser proxy can add `server.token`.
 - Result: Achieved. The full local-CI gate passed all six checks: backend tests, Hermes tests (187 passed, 2 skipped), and installer shell syntax. Backend legacy endpoint clients now receive a synthetic local-CI Bearer credential by default while auth/SSE/camera boundary suites remain opt-out and retain their anonymous/wrong-token assertions. Vite is loopback-only, preserves browser cookie/CSRF auth, has no token-reading/injection hook, and no longer exposes `pnpm dev`. Targeted Vite auth-boundary tests, typecheck, and production build passed.
 - Next step: Final review the updated committed source tree, then open a production CO for `miloco.esxi`, back up runtime data, deploy the exact reviewed SHA through the approved path, and verify setup/login plus service-token callers in production.
+
+## 2026-08-31 01:35 +08
+
+- Current work: Completed Task 8 fix round 2 to align the repository backend CI job with the authenticated legacy-client test boundary.
+- Expected result: Push-time CI and the local wrapper both use a synthetic test-only credential while runtime `server.token` remains empty-token fail-closed.
+- Result: Achieved. `.github/workflows/ci.yml` now supplies an isolated config search path and `local-ci-service-token` only to the backend test step. A faithful local invocation of that exact environment and `uv run pytest -v` passed 4033 tests with 1 expected skip. The explicit empty-service-token auth dependency test still passed (4 tests), and `./scripts/local-ci.sh --tests` passed all six checks.
+- Next step: Final review the updated committed source tree, then open a production CO for `miloco.esxi`, back up runtime data, deploy the exact reviewed SHA through the approved path, and verify setup/login plus service-token callers in production.
