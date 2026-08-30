@@ -46,10 +46,6 @@ def valid_service_token(token: str | None) -> bool:
     return token is not None and hmac.compare_digest(token, expected)
 
 
-def _service_token_is_configured() -> bool:
-    return bool(get_settings().server.token)
-
-
 def verify_service_token(request: Request) -> AuthContext:
     if valid_service_token(extract_bearer_token(request.headers.get("Authorization"))):
         return AuthContext(kind="service", subject="service")
@@ -72,8 +68,6 @@ def verify_dashboard_or_service_auth(request: Request) -> AuthContext:
     if dashboard:
         require_csrf_for_cookie_writes(request)
         return dashboard
-    if not _service_token_is_configured():
-        return AuthContext(kind="service", subject="service")
     raise AuthenticationException("Authentication required")
 
 
@@ -88,8 +82,6 @@ def verify_dashboard_or_service_query_fallback(request: Request) -> AuthContext:
     if dashboard:
         require_csrf_for_cookie_writes(request)
         return dashboard
-    if not _service_token_is_configured():
-        return AuthContext(kind="service", subject="service")
     raise AuthenticationException("Authentication required")
 
 
@@ -106,8 +98,6 @@ def verify_websocket_dashboard_or_service(websocket: WebSocket) -> AuthContext:
         if auth is not None:
             user, _session = auth
             return AuthContext(kind="dashboard", subject=user.id, user=user)
-    if not _service_token_is_configured():
-        return AuthContext(kind="service", subject="service")
     raise AuthenticationException("Authentication required")
 
 

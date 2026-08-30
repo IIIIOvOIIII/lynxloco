@@ -1,11 +1,18 @@
+import pytest
 from fastapi import Depends, FastAPI, Request
 from fastapi.testclient import TestClient
+from fastapi.websockets import WebSocket
 from miloco.auth.router import router as auth_router
 from miloco.auth.service import CSRF_HEADER_NAME
 from miloco.config import reset_settings
 from miloco.database.connector import init_database
-from miloco.middleware import verify_token
+from miloco.middleware import (
+    verify_token,
+    verify_token_query_fallback,
+    verify_websocket_token,
+)
 from miloco.middleware.exception_handler import handle_exception
+from miloco.middleware.exceptions import AuthenticationException
 from miloco.schema.common_schema import NormalResponse
 
 
@@ -38,10 +45,10 @@ def _reset_database_connector() -> None:
     connector_module.db_connector = None
 
 
-def _client(tmp_path, monkeypatch) -> TestClient:
+def _client(tmp_path, monkeypatch, service_token: str = "service-token") -> TestClient:
     monkeypatch.setenv("MILOCO_HOME", str(tmp_path))
     monkeypatch.setenv("MILOCO_DATABASE__PATH", str(tmp_path / "miloco.db"))
-    monkeypatch.setenv("MILOCO_SERVER__TOKEN", "service-token")
+    monkeypatch.setenv("MILOCO_SERVER__TOKEN", service_token)
     _reset_database_connector()
     reset_settings()
     init_database()
@@ -87,3 +94,33 @@ def test_unauthenticated_request_is_401(tmp_path, monkeypatch) -> None:
     client = _client(tmp_path, monkeypatch)
 
     assert client.get("/api/protected").status_code == 401
+
+
+def test_empty_service_token_rejects_all_dependency_variants(
+    tmp_path, monkeypatch
+) -> None:
+    client = _client(tmp_path, monkeypatch, service_token="")
+    http_scope = {
+        "type": "http",
+        "headers": [],
+        "query_string": b"",
+        "path": "/api/protected",
+    }
+    websocket_scope = {
+        "type": "websocket",
+        "headers": [],
+        "query_string": b"",
+        "path": "/api/protected",
+    }
+
+    async def receive() -> dict:
+        return {"type": "websocket.disconnect"}
+
+    async def send(_message: dict) -> None:
+        return None
+
+    assert client.get("/api/protected").status_code == 401
+    with pytest.raises(AuthenticationException):
+        verify_token_query_fallback(Request(http_scope))
+    with pytest.raises(AuthenticationException):
+        verify_websocket_token(WebSocket(websocket_scope, receive, send))

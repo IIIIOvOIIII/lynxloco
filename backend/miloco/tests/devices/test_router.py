@@ -74,6 +74,7 @@ class _FakeHaService:
 @pytest.fixture(autouse=True)
 def _isolated_backend(tmp_path, monkeypatch):
     monkeypatch.setenv("MILOCO_HOME", str(tmp_path))
+    monkeypatch.setenv("MILOCO_SERVER__TOKEN", "test-token")
     reset_settings()
     manager = get_manager()
     monkeypatch.setattr(manager, "_miot_service", _FakeMiotService(), raising=False)

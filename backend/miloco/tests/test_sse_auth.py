@@ -32,16 +32,18 @@ def _mk_request(headers=None, query=None) -> Request:
 
 
 class TestVerifyTokenQueryFallback:
-    def test_no_token_configured_passes(self, monkeypatch):
-        """server.token="" 时直接 return,不抛."""
+    def test_no_token_configured_rejects(self, monkeypatch):
+        """server.token="" 时必须 fail closed."""
         monkeypatch.setenv("MILOCO_SERVER__TOKEN", "")
         from miloco.config import reset_settings
 
         reset_settings()
         from miloco.middleware.auth_middleware import verify_token_query_fallback
+        from miloco.middleware.exceptions import AuthenticationException
 
         req = _mk_request()
-        verify_token_query_fallback(req)  # 不抛即 pass
+        with pytest.raises(AuthenticationException):
+            verify_token_query_fallback(req)
 
     def test_correct_header_passes(self, monkeypatch):
         monkeypatch.setenv("MILOCO_SERVER__TOKEN", "secret-123")
