@@ -973,7 +973,7 @@ async def test_responses_visual_probe_without_key_sends_valid_red_jpeg(monkeypat
 
     body = calls[1][2]["json"]
     assert body["model"] == "local-vlm"
-    assert body["max_output_tokens"] == 16
+    assert body["max_output_tokens"] == 256
     assert body["stream"] is False
     assert "temperature" not in body
     assert "top_p" not in body
@@ -991,6 +991,65 @@ async def test_responses_visual_probe_without_key_sends_valid_red_jpeg(monkeypat
         assert isinstance(pixel, tuple)
         red, green, blue = pixel
     assert red > 240 and green < 20 and blue < 20
+
+
+async def test_responses_visual_probe_budget_allows_reasoning_before_text(monkeypatch):
+    """Qwen-like Responses servers may spend small output budgets on reasoning first."""
+    calls: list[tuple[str, str, dict]] = []
+
+    class _ReasoningBudgetClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, *args, **kwargs):
+            calls.append(("GET", args[0], kwargs))
+            return _FakeResp(404)
+
+        async def post(self, *args, **kwargs):
+            calls.append(("POST", args[0], kwargs))
+            max_output_tokens = kwargs["json"]["max_output_tokens"]
+            if max_output_tokens < 256:
+                return _FakeResp(
+                    200,
+                    {
+                        "status": "completed",
+                        "output": [
+                            {"type": "reasoning", "summary": []},
+                            {
+                                "type": "message",
+                                "content": [
+                                    {"type": "output_text", "text": ""},
+                                ],
+                            },
+                        ],
+                        "usage": {
+                            "input_tokens": 110,
+                            "output_tokens": max_output_tokens,
+                            "total_tokens": 110 + max_output_tokens,
+                            "input_tokens_details": {"cached_tokens": 0},
+                        },
+                    },
+                )
+            return _FakeResp(200, _responses_output("red"))
+
+    monkeypatch.setattr(probe.httpx, "AsyncClient", _ReasoningBudgetClient)
+
+    result = await probe.probe_omni(
+        "qwen3.5:2b-mlx",
+        "http://127.0.0.1:11434/v1",
+        "",
+        api_protocol="openai_responses",
+    )
+
+    assert result["ok"] is True
+    post_body = calls[1][2]["json"]
+    assert post_body["max_output_tokens"] == 256
 
 
 async def test_responses_visual_probe_sends_bearer_key(monkeypatch):

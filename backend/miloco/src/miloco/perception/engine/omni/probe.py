@@ -25,6 +25,7 @@ if TYPE_CHECKING:
 
 _TIMEOUT = httpx.Timeout(15.0, connect=10.0)
 _RESPONSES_VISUAL_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
+_RESPONSES_VISUAL_MAX_OUTPUT_TOKENS = 256
 _ALLOWED_SCHEMES = ("http", "https")
 _VISUAL_PROBE_IMAGE = Path(__file__).with_name("assets") / "visual_probe_red.jpg"
 _VISUAL_PROBE_PROMPT = (
@@ -532,7 +533,7 @@ async def _probe_responses(
             body = adapter.build_request_body(
                 _visual_probe_messages(),
                 model=model,
-                max_tokens=16,
+                max_tokens=_RESPONSES_VISUAL_MAX_OUTPUT_TOKENS,
                 temperature=0.0,
                 top_p=1.0,
                 stream=False,

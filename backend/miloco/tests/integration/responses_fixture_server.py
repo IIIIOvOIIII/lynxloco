@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+from miloco.perception.engine.omni.probe import _RESPONSES_VISUAL_MAX_OUTPUT_TOKENS
+
 
 @dataclass(frozen=True)
 class RecordedRequest:
@@ -138,14 +140,17 @@ class _ResponsesHandler(BaseHTTPRequestHandler):
         if self.fixture.malformed_response:
             self._json_response(200, {"id": "resp_malformed", "output": []})
             return
-        if self.fixture.hang_perception and body.get("max_output_tokens") != 16:
+        is_visual_probe = (
+            body.get("max_output_tokens") == _RESPONSES_VISUAL_MAX_OUTPUT_TOKENS
+        )
+        if self.fixture.hang_perception and not is_visual_probe:
             self.fixture.perception_hang_started.set()
             self.fixture._release_perception_hang.wait(timeout=60)
             return
 
         output_text = (
             "red"
-            if body.get("max_output_tokens") == 16
+            if is_visual_probe
             else json.dumps(
                 {
                     "caption": "fixture saw the room",
