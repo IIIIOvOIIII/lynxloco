@@ -1282,13 +1282,39 @@ class TestBatchVideoHasAudio:
 
 
 class TestExamplesGatedByAudio:
-    """无音频时也撤掉「# 输出实例」——例句输出含 speeches/env_sounds，schema 已剥离，
-    留着会与 schema 自相矛盾、并可能诱导模型照搬音频字段。"""
+    """无音频时保留纯视觉示例，避免 Responses 图片序列路径只剩 schema、无 few-shot 锚点。
 
-    def test_render_examples_dropped_when_no_audio(self):
+    旧的音视频示例含 speeches/env_sounds，仍不得混入无音频场景。
+    """
+
+    def test_render_examples_keep_visual_only_when_no_audio(self):
         from miloco.perception.engine.omni.field_registry import SceneDescriptor
 
-        assert _render_examples(SceneDescriptor(route="video", has_audio=False)) == ""
+        out = _render_examples(SceneDescriptor(route="video", has_audio=False))
+
+        assert "# 输出实例" in out
+        assert '"caption"' in out
+        assert "speeches" not in out
+        assert "env_sounds" not in out
+
+    def test_render_examples_keep_visual_identity_when_no_audio_and_candidates(self):
+        from miloco.perception.engine.omni.field_registry import SceneDescriptor
+
+        out = _render_examples(
+            SceneDescriptor(
+                route="video",
+                has_audio=False,
+                has_identity=True,
+                identity_match_disabled=True,
+            )
+        )
+
+        assert '"identities"' in out
+        assert '"unknown"' in out
+        assert '"no_person"' in out
+        assert "对照图片库" not in out
+        assert "speeches" not in out
+        assert "env_sounds" not in out
 
     def test_render_examples_kept_when_audio(self):
         from miloco.perception.engine.omni.field_registry import SceneDescriptor
@@ -1296,10 +1322,13 @@ class TestExamplesGatedByAudio:
         out = _render_examples(SceneDescriptor(route="video", has_audio=True))
         assert "# 输出实例" in out
 
-    def test_build_prompt_no_audio_drops_env_sounds_example(self):
-        """端到端：无音频时整份 system prompt 不再出现例句里的音频字段示范。"""
+    def test_build_prompt_no_audio_keeps_visual_example_without_audio_fields(self):
+        """端到端：无音频时整份 system prompt 仍示范视觉 JSON，但不出现音频字段示范。"""
         sp = build_prompt(_video_packet(audio_active=False), OmniContext())["system_prompt"]
-        assert "# 输出实例" not in sp
+        assert "# 输出实例" in sp
+        assert '"caption"' in sp
+        assert "speeches" not in sp
+        assert "env_sounds" not in sp
         assert "重物倒地声" not in sp  # _EXAMPLE_CHAIN 里的 env_sounds 示范
 
     def test_build_prompt_audio_active_keeps_example(self):

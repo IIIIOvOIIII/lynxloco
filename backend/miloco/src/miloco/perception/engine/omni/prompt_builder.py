@@ -43,6 +43,9 @@ from .constants import (
     _EXAMPLE_CHAIN,
     _EXAMPLE_CHAIN_NO_NAME,
     _EXAMPLE_IDENTITY,
+    _EXAMPLE_VISUAL_IDENTITY,
+    _EXAMPLE_VISUAL_IDENTITY_NO_MATCH,
+    _EXAMPLE_VISUAL_ONLY,
     _HISTORY_HEADER,
     _OUTPUT_MODE_FREE,
     _OUTPUT_MODE_JSON,
@@ -773,9 +776,9 @@ def _render_examples(scene: SceneDescriptor) -> str:
     audio 场景无 caption/identity 字段，两条实例的输出均含 caption（视觉），与 audio
     schema 不符，故 audio 不附实例——其输出字段少、已由「# 字段说明」充分约束。
 
-    has_audio=False（video 路由音频未过 gate）同理：两条实例的输出都含 speeches /
-    env_sounds 等音频派生字段，而此时 schema 已把它们剥掉；附上会与 schema 自相矛盾、
-    并可能诱导模型照搬音频字段，故一并不附（caption/suggestions 由「# 字段说明」约束）。
+    has_audio=False（video 路由音频未过 gate / Responses 图片序列）时：改用纯视觉
+    few-shot。旧音视频实例的输出含 speeches/env_sounds，仍不得注入；但 caption /
+    identities 仍是本场景核心输出，需要示例锚定，否则弱 JSON 跟随模型容易返回合法空对象。
 
     has_speech=False（VAD 判无人声、speeches 已剥）时：实例 A 的输出含 speeches（且是
     needs_response 指令），留着会与剥掉的 schema 矛盾、并重新诱导脑补人声指令，故不附
@@ -786,8 +789,18 @@ def _render_examples(scene: SceneDescriptor) -> str:
     spec / schema（只判 unknown/no_person、无 gallery）自相矛盾，且抵消库空省 token 的
     目标；身份任务已由精简版「## identities」充分约束。实例 B 无 identities 字段、照常附。
     """
-    if scene.route == "audio" or not scene.has_audio:
+    if scene.route == "audio":
         return ""
+    if not scene.has_audio:
+        examples = []
+        if scene.has_identity:
+            examples.append(
+                _EXAMPLE_VISUAL_IDENTITY_NO_MATCH
+                if scene.identity_match_disabled
+                else _EXAMPLE_VISUAL_IDENTITY
+            )
+        examples.append(_EXAMPLE_VISUAL_ONLY)
+        return "# 输出实例\n\n" + "\n\n".join(examples)
     examples = []
     if scene.has_identity and scene.has_speech and not scene.identity_match_disabled:
         examples.append(_EXAMPLE_IDENTITY)

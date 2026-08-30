@@ -100,6 +100,29 @@ _EXAMPLE_IDENTITY = """\
 输出：
 {"identities":[{"track_id":1,"name":"小明","confidence":0.88,"reason":"五官与小明 gallery 清晰一致"},{"track_id":2,"name":"unknown","confidence":0,"reason":"五官与小明对不上，仅同性别"}],"caption":"小明坐在电脑前操作鼠标键盘，屏幕显示游戏画面","speeches":[{"speaker":"小明","content":"把客厅灯调暗一点","is_complete":true,"needs_response":true}]}"""
 
+# OpenAI Responses 图片序列路径没有音轨，SceneDescriptor.has_audio=False。该场景的 schema
+# 会剥掉 speeches/env_sounds，但仍必须给模型一个「纯视觉也要输出 caption」的 few-shot 锚点，
+# 否则弱 JSON 跟随模型容易返回合法但无内容的 {}，生产诊断会落成 semantic_empty。
+_EXAMPLE_VISUAL_ONLY = """\
+## 实例 B — 本轮独立观察（仅画面）
+本轮（节选）：当前时间 02:31:00；厨房台面上有锅具和水杯，水槽旁的台面保持静止
+输出：
+{"caption":"厨房台面上有锅具和水杯，水槽旁的台面保持静止"}"""
+
+_EXAMPLE_VISUAL_IDENTITY = """\
+## 实例 A — 身份识别（仅画面）
+本轮（节选）：<gallery> 含小明（男）、小红（女）；当前时间 02:30:15；待识别 track 1、track 2
+观察：track 1 正脸清晰，五官与小明 gallery 一致 → 认出小明；track 2 有真实人体但脸部模糊、无法和任何成员逐项核对 → unknown。小明坐电脑前操作鼠标键盘
+输出：
+{"identities":[{"track_id":1,"name":"小明","confidence":0.88,"reason":"五官与小明清晰一致"},{"track_id":2,"name":"unknown","confidence":0.55,"reason":"有人但脸部模糊"}],"caption":"小明坐在电脑前操作鼠标键盘，旁边有一名陌生人经过"}"""
+
+_EXAMPLE_VISUAL_IDENTITY_NO_MATCH = """\
+## 实例 A — 身份库为空（仅画面）
+本轮（节选）：本轮无注册成员；当前时间 02:30:15；待识别 track 1、track 2
+观察：track 1 是真实人体但无法匹配成员 → unknown；track 2 是落地扇被误框成人形 → no_person。客厅沙发旁有人站立，旁边有一台落地扇
+输出：
+{"identities":[{"track_id":1,"name":"unknown","confidence":0.76,"reason":"确有人体"},{"track_id":2,"name":"no_person","confidence":0.9,"reason":"落地扇误检成人"}],"caption":"陌生人站在客厅沙发旁，旁边有一台落地扇"}"""
+
 # 输出实例——本轮独立观察（始终注入），演示如实描述本轮 + 空字段省略。
 # suggestion 不带 prev_id：去重交给系统按事件链自动做，模型只管如实报本轮。
 _EXAMPLE_CHAIN = """\
