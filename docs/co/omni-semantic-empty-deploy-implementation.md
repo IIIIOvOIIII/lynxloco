@@ -1,0 +1,62 @@
+# Miloco Omni semantic-empty prompt repair deployment to miloco.esxi
+
+## Scope
+
+Deploy the local Miloco release built from source SHA `ee037668974a319ce5459c33e27ba7980e42ab4c` to `miloco.esxi` through the existing installer/sync installation semantics used for prior Miloco VM updates. Because the operator Mac has an old rsync client and `miloco.esxi` does not currently provide a remote rsync binary, transfer uses a bounded tar-over-SSH copy of only `dist/` and `scripts/` into a CO-specific staging directory, then runs the same remote install operations as `scripts/sync-to-remote.sh`. The release version is `2026.8.6.post1.dev223+gee0376689`.
+
+The code change is limited to the Miloco Omni prompt builder: OpenAI Responses image-sequence / video-without-audio prompts now include pure-visual JSON examples for caption and identity output, while still excluding audio-derived fields (`speeches`, `env_sounds`). This addresses production diagnostics where the endpoint was reachable and parser-clean but returned semantically empty structured results.
+
+Do not migrate, print, rewrite, rotate, or disclose Xiaomi account tokens, RTSP URLs or credentials, Omni API keys, service bearer tokens, cookies, camera images, raw model prompts, or raw model responses.
+
+## Local artifact evidence
+
+- Source SHA: `ee037668974a319ce5459c33e27ba7980e42ab4c`
+- Previous production source SHA observed before this repair: `ed6fdff96eab101684d7e27eb87c6548ad3f7170`
+- Version: `2026.8.6.post1.dev223+gee0376689`
+- `dist/install.sh` SHA256: `5fb2b943f636bfff005a1c164ca4e0495c9beba872892c63bc6cf9b3eb39b24a`
+- `dist/miloco-linux-x86_64-2026.8.6.post1.dev223+gee0376689.tar.gz` SHA256: `9a57f0ca955c018ced8915458e39c3f5da4ce69622f0d01a0b8c7dea8d59f30f`
+- `dist/miloco-openclaw-plugin-2026.8.6-post1.dev223.tgz` SHA256: `af1ab72223fb6844682725154759592bfc73bf49ee8c2f58a04e099ac1b0960f`
+- `dist/miloco-2026.8.6.post1.dev223+gee0376689-py3-none-any.whl` SHA256: `f3937a02cb723c0812e1ad59e8b96eecc0c31d9d7c066e1ec40830ad92a4b5e0`
+- `dist/miloco_cli-2026.8.6.post1.dev223+gee0376689-py3-none-any.whl` SHA256: `bb1849fd53edaabbed569e60bdb830998a85fe571bfa8c1da31d6c2a8953ac3b`
+- `dist/miloco_miot-2026.8.6.post1.dev223+gee0376689-py3-none-manylinux_2_28_x86_64.whl` SHA256: `5d44947e448c86a038188be6b1dc88f6371d3f5f2ff514922317e044cbacb2bc`
+
+## Pre-checks
+
+1. Use the approved PAM scope only for `miloco.esxi` as `root`.
+2. Verify the local source SHA is exactly `ee037668974a319ce5459c33e27ba7980e42ab4c`.
+3. Verify the local artifacts and SHA256 values listed above before upload.
+4. On `miloco.esxi`, capture bounded non-secret pre-change evidence:
+   - `miloco-cli --version`;
+   - `miloco-cli service status`;
+   - Miloco `/health`;
+   - OpenClaw gateway status;
+   - Miloco OpenClaw plugin status/version;
+   - current runtime-summary diagnostic shape, without printing service tokens, prompts, raw model responses, frames, or camera URLs.
+5. Stop before mutation if the current service is not identifiable, if Miloco cannot be safely restarted, or if a usable rollback path to the previous package release cannot be identified.
+
+## Execution steps
+
+1. Confirm the Change Order is in `Implement` state and PAM is active for `miloco.esxi/root`.
+2. Confirm the local repository has no uncommitted tracked source changes and `HEAD` is the approved source SHA.
+3. Create a CO-specific staging directory under `/root`, such as `/root/miloco-plugin-CHG260830036-ee03766-<timestamp>`.
+4. Upload only local `dist/` and `scripts/` to that staging directory using tar-over-SSH; do not upload the full repository, `.git`, credentials, local config, caches, or raw data.
+5. In the staging directory, install the selected artifacts with the same operations as `scripts/sync-to-remote.sh`: `uv tool install` for Miloco with the matching Linux x86_64 MIoT wheel, `uv tool install` for `miloco-cli`, `uv tool install supervisor --force`, `openclaw plugins install --force` for the plugin tgz, `scripts/register-skill-tools.sh`, `openclaw plugins registry --refresh`, and `openclaw gateway restart`.
+6. Restart only the existing Miloco/OpenClaw managed services through the installer/sync flow; do not alter saved RTSP camera definitions, Xiaomi account state, model API keys, database content, or host networking.
+7. Ensure Miloco remains published on the existing LAN backend endpoint `http://miloco.esxi:1810`.
+
+## Verification steps
+
+1. On `miloco.esxi`, verify `miloco-cli --version` reports `2026.8.6.post1.dev223+gee0376689` or an equivalent local build version for source SHA `ee037668`.
+2. Verify `miloco-cli service status` reports the backend running and managed.
+3. Verify Miloco health locally and over LAN:
+   - `curl -fsS http://127.0.0.1:1810/health`;
+   - `curl -fsS http://miloco.esxi:1810/health`.
+4. Verify the dashboard root returns HTTP 200 HTML from `http://miloco.esxi:1810/`.
+5. Verify authenticated runtime summary using the local service token without printing it:
+   - engine running and ready;
+   - active RTSP sources visible;
+   - latest Omni diagnostic visible;
+   - effective Omni timeout remains `120.0`.
+6. Wait for at least one post-deploy realtime Omni inference attempt and verify the latest diagnostic is not `semantic_empty`, or record a bounded failure with sanitized evidence if the endpoint still returns empty structured JSON.
+7. Verify the OpenClaw gateway remains healthy and `miloco-openclaw-plugin` remains loaded with conversation access enabled when supported.
+8. Confirm no secrets, RTSP URLs, API keys, cookies, service tokens, camera frames, raw prompts, or raw model responses were printed to command output, CO notes, logs captured for this change, or final reporting.

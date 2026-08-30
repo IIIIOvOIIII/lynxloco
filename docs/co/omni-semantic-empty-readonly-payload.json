@@ -1,0 +1,17 @@
+{
+  "description": "Read-only investigation of Miloco Omni empty structured diagnostic on miloco.esxi.",
+  "implementation_plan": "Read-only investigation for the latest Miloco Omni diagnostic showing an empty structured result on `miloco.esxi`.\n\nSteps:\n\n1. Verify the Miloco service health and running package version.\n2. Inspect bounded, recent backend logs for sanitized Omni/perception diagnostics.\n3. Query Miloco local APIs with the existing service token only inside the production host shell, without printing or storing the token.\n4. Inspect the runtime summary, latest perception counters, and database row counts for recent perception logs and meaningful events.\n5. Classify whether the empty structured result is an expected no-event state or a contract/runtime defect.\n6. Do not modify files, services, camera configuration, model configuration, secrets, database state, or OpenClaw settings under this read-only change.",
+  "impacted_service": "Miloco",
+  "change_items": "miloco.esxi",
+  "change_category": "Software",
+  "is_emergency": false,
+  "rollback_plan": "This is a read-only investigation and does not change production state.\n\nRollback plan:\n\n1. No service rollback is required because no mutation is planned.\n2. If any command unexpectedly creates a temporary local diagnostic file on the production host, remove only that exact temporary file before closure.\n3. Close the change as `Successfully Closed` when investigation completes, or `Not Executed` if no production access occurs.",
+  "maintenance_window_hours": 1.0,
+  "pam_request": {
+    "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEQt1SqzUH1tYJmAw7DvaXHMkQwAUfzKF9D2+zk/X/is openclaw-co@mac-mini",
+    "target_hosts": [
+      "miloco.esxi"
+    ],
+    "target_user": "root"
+  }
+}
