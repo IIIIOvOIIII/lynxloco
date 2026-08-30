@@ -35,7 +35,12 @@ This refutes the "no LLM participates at all" hypothesis. The current evidence p
 2. The simpler prompt can receive non-JSON text that Miloco cannot parse into semantic fields.
 3. The production fused-shape prompt can exceed the current timeout before a usable response is returned.
 
-The implementation should therefore prioritize visibility for `provider_http_ok_but_parse_skipped` and `fused_shape_timeout` separately from pure endpoint reachability.
+The implementation should therefore prioritize visibility for `provider_http_ok_but_parse_skipped` and `fused_shape_timeout` separately from pure endpoint reachability. The realtime repair target is now explicit:
+
+- Realtime/fused Omni model request timeout must be raised to `120.0` seconds end-to-end.
+- OpenAI Responses visual/image-sequence requests must require one parseable structured JSON object matching Miloco's active route schema.
+- Plain-language prose outside JSON, Markdown fenced JSON, or other unstructured output must not be treated as a successful perception result.
+- If a provider supports native Responses structured-output request fields, Miloco may use them through adapter-gated fixture-tested support; otherwise the prompt-level JSON-only contract plus parser diagnostics is the required minimum.
 
 ## Goals
 
@@ -65,7 +70,9 @@ Add bounded, credential-safe diagnostics for realtime Omni calls and then repair
 - Capture field counts after parse: caption count, matched rule count, suggestion count, complete speech count, incomplete speech count, skipped flag, parser fallback flag, and error code.
 - Compare realtime output structure with on-demand/probe behavior.
 - Distinguish HTTP success with non-JSON text from provider timeout in production fused-shape requests.
+- Increase effective realtime/fused Omni model timeout to 120 seconds so slower local visual models can complete before being classified as timeout.
 - Tighten the visual caption contract so a normal visible video/image window should return a non-empty `caption`.
+- Require structured JSON output for visual Responses calls; natural-language text remains a degraded parse/contract failure.
 - Keep strict filtering for rules, suggestions, actions, and voice responses.
 
 ## Non-Goals

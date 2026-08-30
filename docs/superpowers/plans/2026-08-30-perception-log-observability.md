@@ -28,6 +28,8 @@ Implementation implication:
 
 - Do not treat the next work as "wire the LLM endpoint from scratch".
 - Keep Phase 1 runtime visibility.
+- Revise the realtime Omni contract before implementation: the realtime/fused model request timeout target is `120.0` seconds, not the currently observed 30-second default.
+- Responses visual calls must require one parseable structured JSON object matching Miloco's perception schema; plain-language prose outside JSON must remain a parser/diagnostic failure, not a silent success.
 - In Phase 2, explicitly distinguish:
   - provider not reachable;
   - provider HTTP success but no output text;
@@ -46,6 +48,8 @@ Implementation implication:
 - Do not relax action dispatch, rule matching, suggestions, or voice-response safety.
 - Do not add automatic retention deletion.
 - Do not remove adjacent deduplication.
+- Realtime/fused Omni model calls must use an effective 120-second timeout, with `10.0` seconds retained for TCP connect timeout unless a test proves a different connect timeout is necessary.
+- OpenAI Responses visual/image-sequence prompts must require JSON-only structured output. If request-level structured output is added, it must be adapter-gated and covered by local fixture tests; unsupported endpoints must fail visibly rather than falling back to unstructured prose without diagnostics.
 - Use TDD for implementation tasks: write a failing test first, then implement the smallest production change.
 - Preserve existing public API behavior. New API surface must be additive.
 - Production deployment to `miloco.esxi` requires a separate approved Software CO/PAM window after local implementation is complete.
@@ -1009,25 +1013,163 @@ Expected: tests and build pass.
 
 ## Phase 2: Realtime Empty Semantics Diagnosis and Repair
 
-### Task 7: Tighten Realtime Caption Contract
+### Task 7: Tighten Realtime Model Timeout and Structured JSON Contract
 
-**Purpose:** Repair the current failure mode where a reachable visual endpoint returns non-JSON text or times out under the production fused-shape prompt, while preserving strictness for rule hits, suggestions, and actions.
+**Purpose:** Repair the current failure mode where a reachable visual endpoint returns non-JSON text or times out under the production fused-shape prompt, while preserving strictness for rule hits, suggestions, and actions. The realtime/fused model timeout must become 120 seconds, and visual Responses prompts must require model output to be structured JSON.
 
 **Files:**
 
+- Modify: `backend/miloco/src/miloco/config/settings.py`
+- Modify: `backend/miloco/src/miloco/perception/engine/config.py`
 - Modify: `backend/miloco/src/miloco/perception/engine/omni/field_registry.py`
+- Modify: `backend/miloco/src/miloco/perception/engine/omni/omni.py`
+- Modify: `backend/miloco/src/miloco/perception/engine/omni/omni_client.py`
+- Modify only if using native Responses structured output after fixture proof: `backend/miloco/src/miloco/perception/engine/omni/provider.py`
+- Modify: `backend/miloco/tests/test_settings.py`
+- Modify: `backend/miloco/tests/perception/engine/omni/test_responses_provider.py`
 - Modify: `backend/miloco/tests/perception/engine/omni/test_prompt_builder.py`
 - Modify only if tests prove parser adjustment is needed: `backend/miloco/src/miloco/perception/engine/omni/response_parser.py`
 
 **Policy:**
 
+- Effective realtime/fused `OmniConfig.timeout` must be `120.0` seconds. This applies to the default engine config and to live model settings after the user switches or edits an Omni profile.
+- `model.omni.timeout` must exist in settings, default to `120.0`, persist with profiles, and propagate into `perception.engine["omni"]["timeout"]`.
+- `resolve_live_omni_config()` must refresh `timeout` from current settings instead of preserving a stale engine-start snapshot.
+- `_get_fused_http_client(timeout)` must rebuild its cached `httpx.AsyncClient` when the effective timeout changes, otherwise a 30-second client created before config refresh can survive indefinitely.
+- Fused HTTP timeout must be `httpx.Timeout(120.0, connect=10.0)` for the current requirement. Do not change the connect timeout unless a targeted test proves connect timeout is the failing boundary.
 - For video/image routes with usable visible content, `caption` should be non-empty.
 - For Responses image-sequence routes, the prompt must make JSON-only output explicit in the system instruction and field contract; natural-language prose outside the JSON object is a parser failure.
+- The required output shape is exactly one JSON object containing only fields rendered by `render_schema(...)` for the active route. Do not allow Markdown fences, explanation text, leading/trailing commentary, or best-effort prose fallback to count as success.
+- If native Responses structured-output request fields are implemented, add them only through `OpenAIResponsesAdapter` and only after fixture tests prove the endpoint accepts the field shape. If the endpoint rejects native structured-output fields, keep the prompt-only JSON contract and surface `provider_http_error` or `provider_http_ok_but_parse_skipped` explicitly.
 - For unusable visual input, model may leave caption empty or use the existing safe degraded wording if parser already supports it.
 - Keep audio-only routes free of `caption`.
 - Do not instruct the model to invent events, suggestions, rule hits, or actions.
 
-- [ ] Step 1: Add failing prompt-builder tests.
+- [ ] Step 1: Add failing timeout settings and propagation tests.
+
+Add tests to `backend/miloco/tests/test_settings.py`:
+
+```py
+def test_model_omni_timeout_defaults_to_120_seconds():
+    from miloco.config.settings import OmniModelSettings
+    from miloco.perception.engine.config import OmniConfig
+
+    assert OmniModelSettings().timeout == 120.0
+    assert OmniConfig().timeout == 120.0
+```
+
+```py
+def test_model_omni_timeout_propagates_to_perception_engine():
+    from miloco.config.settings import MilocoSettings, ModelSettings, OmniModelSettings
+
+    settings = MilocoSettings(
+        model=ModelSettings(
+            omni=OmniModelSettings(
+                model="local-vlm",
+                base_url="http://127.0.0.1:11434/v1",
+                api_key="",
+                api_protocol="openai_responses",
+                timeout=120.0,
+            )
+        )
+    )
+
+    assert settings.perception.engine["omni"]["timeout"] == 120.0
+```
+
+Add a focused test near existing `resolve_live_omni_config` coverage:
+
+```py
+def test_resolve_live_omni_config_refreshes_timeout(monkeypatch):
+    from miloco.perception.engine.config import OmniConfig
+    from miloco.perception.engine.omni.omni_client import resolve_live_omni_config
+
+    live = OmniConfig(
+        model="local-vlm",
+        base_url="http://127.0.0.1:11434/v1",
+        api_key="",
+        api_protocol="openai_responses",
+        timeout=120.0,
+    )
+    monkeypatch.setattr(
+        "miloco.config.get_settings",
+        lambda: type("S", (), {"model": type("M", (), {"omni": live})()})(),
+    )
+
+    resolved = resolve_live_omni_config(
+        OmniConfig(
+            model="local-vlm",
+            base_url="http://127.0.0.1:11434/v1",
+            api_key="",
+            api_protocol="openai_responses",
+            timeout=30.0,
+        )
+    )
+
+    assert resolved.timeout == 120.0
+```
+
+- [ ] Step 2: Add failing fused client timeout rebuild test.
+
+Add to `backend/miloco/tests/perception/engine/omni/test_responses_provider.py` or a small dedicated fused-client test file:
+
+```py
+@pytest.mark.asyncio
+async def test_fused_http_client_uses_120_second_read_timeout_and_rebuilds_on_change():
+    from miloco.perception.engine.omni import omni
+
+    omni._fused_http_client = None
+    omni._fused_http_client_loop = None
+    omni._fused_http_client_timeout = None
+
+    first = omni._get_fused_http_client(30.0)
+    second = omni._get_fused_http_client(120.0)
+
+    assert second is not first
+    assert second.timeout.read == 120.0
+    assert second.timeout.connect == 10.0
+
+    await first.aclose()
+    await second.aclose()
+```
+
+This test intentionally starts with a 30-second client to prove the implementation does not keep a stale pre-change client when the effective timeout changes to 120 seconds.
+
+- [ ] Step 3: Implement the 120-second timeout path.
+
+Implementation requirements:
+
+1. Add `timeout: float = Field(default=120.0, description="Omni model request timeout in seconds")` to `OmniModelSettings`.
+2. Change `OmniConfig.timeout` default from `30.0` to `120.0`.
+3. In `MilocoSettings._propagate_model_omni_to_perception()`, include `"timeout": self.model.omni.timeout` in the merged `omni` dict.
+4. In `resolve_live_omni_config()`, include `timeout=o.timeout` in the `replace(...)` call.
+5. In `omni.py`, track the cached fused client timeout, for example:
+
+```py
+_fused_http_client_timeout: float | None = None
+```
+
+Then rebuild when it changes:
+
+```py
+global _fused_http_client, _fused_http_client_loop, _fused_http_client_timeout
+if (
+    _fused_http_client is None
+    or _fused_http_client_loop is not loop
+    or _fused_http_client.is_closed
+    or _fused_http_client_timeout != timeout
+):
+    _fused_http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(timeout, connect=10.0),
+        limits=httpx.Limits(max_keepalive_connections=4, max_connections=8),
+    )
+    _fused_http_client_loop = loop
+    _fused_http_client_timeout = timeout
+```
+
+If closing the previous client is safe in the current async context, close it before replacing; otherwise document why loop-bound client disposal is intentionally left to process lifetime as the current code does.
+
+- [ ] Step 4: Add failing prompt-builder tests.
 
 Append tests near existing caption/schema tests:
 
@@ -1052,6 +1194,7 @@ def test_video_system_prompt_requires_json_only_output_for_responses_image_seque
 
     assert "JSON" in prompt
     assert "不要输出 JSON 外的解释" in prompt or "仅输出 JSON" in prompt
+    assert "Markdown" in prompt or "```" in prompt
 ```
 
 ```py
@@ -1063,7 +1206,7 @@ def test_audio_only_route_still_omits_caption_contract():
     assert '"caption"' not in schema
 ```
 
-- [ ] Step 2: Update `CAPTION.spec_md`.
+- [ ] Step 5: Update `CAPTION.spec_md` and centralized JSON-only output instruction.
 
 Add one early bullet under `## caption`:
 
@@ -1075,11 +1218,21 @@ Do not edit `MATCHED_RULES`, `SUGGESTIONS`, or action instructions unless a test
 
 Also strengthen the JSON-only instruction in the centralized prompt constants if the existing output-mode wording is insufficient for the new test. Keep this change limited to output format wording; do not alter business meaning.
 
-- [ ] Step 3: Verify targeted prompt tests.
+- [ ] Step 6: Optionally add native Responses structured-output request support only if fixture-compatible.
+
+If local fixture and the configured provider support a Responses structured-output field, add adapter-level support in `OpenAIResponsesAdapter.build_request_body(...)` so the request asks the provider for JSON schema output. The body must remain compatible with existing fixture tests, and a test must assert that the JSON schema or JSON-object request field is present only for `openai_responses` visual/image-sequence calls.
+
+Do not make this a blind requirement if the current internal endpoint rejects native schema fields; in that case, the required contract remains prompt-level JSON-only plus parser/diagnostic enforcement. Unsupported native structured output must be explicit in diagnostics or tests, not hidden.
+
+- [ ] Step 7: Verify targeted timeout and prompt tests.
 
 ```bash
 cd backend/miloco
-uv run pytest tests/perception/engine/omni/test_prompt_builder.py -q
+uv run pytest \
+  tests/test_settings.py \
+  tests/perception/engine/omni/test_responses_provider.py \
+  tests/perception/engine/omni/test_prompt_builder.py \
+  -q
 ```
 
 Expected: pass.
