@@ -94,3 +94,6 @@ eval/sampled_*.json
 
 # opengrep / semgrep 本地扫描产物（含全量命中片段与绝对路径），只在本地看，不入库。
 .opengrep-out/
+
+# Codex / Superpowers execution scratch: task ledgers, reports, review packages.
+.superpowers/
