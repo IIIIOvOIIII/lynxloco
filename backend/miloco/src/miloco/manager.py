@@ -368,6 +368,21 @@ class Manager:
         return self._miot_service
 
     @property
+    def home_assistant_service(self):
+        """Home Assistant service lazy singleton.
+
+        Kept lazy so management API tests and disabled deployments do not have
+        to initialize MIoT/perception first.
+        """
+        svc = getattr(self, "_home_assistant_service", None)
+        if svc is None:
+            from miloco.home_assistant.service import HomeAssistantService
+
+            svc = HomeAssistantService()
+            self._home_assistant_service = svc
+        return svc
+
+    @property
     def person_service(self) -> PersonService:
         return self._person_service
 

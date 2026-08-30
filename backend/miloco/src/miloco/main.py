@@ -33,6 +33,7 @@ from miloco.config import get_settings, register_reset_hook
 from miloco.database.connector import init_database
 from miloco.dispatch import AgentDispatcher, set_agent_dispatcher
 from miloco.home_profile.router import router as home_profile_router
+from miloco.home_assistant.router import router as home_assistant_router
 from miloco.manager import get_manager
 from miloco.middleware.exception_handler import handle_exception
 from miloco.miot.router import router as miot_router
@@ -533,6 +534,7 @@ async def catch_all_exceptions_middleware(request: Request, call_next):
 
 app.include_router(admin_router, prefix="/api")
 app.include_router(miot_router, prefix="/api")
+app.include_router(home_assistant_router, prefix="/api")
 app.include_router(camera_router, prefix="/api")
 # person_router 与 pet_router 共用 prefix="/identity"：路径首段互斥（/persons* vs /pets*）、
 # 两侧都无首段通配路由，故注册顺序无关；新增路由须维持这一互斥，否则先注册者会遮蔽后者。
