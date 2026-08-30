@@ -243,3 +243,32 @@ class DashboardAuthRepo:
         return self.db.execute_update(
             "DELETE FROM dashboard_session WHERE expires_at <= ?", (now_ms,)
         )
+
+    def touch_session(self, session_id: str, timestamp: int) -> bool:
+        return (
+            self.db.execute_update(
+                "UPDATE dashboard_session SET last_seen_at = ? WHERE id = ?",
+                (timestamp, session_id),
+            )
+            > 0
+        )
+
+    def touch_user_login(self, user_id: str, timestamp: int) -> bool:
+        return (
+            self.db.execute_update(
+                "UPDATE dashboard_user SET last_login_at = ?, updated_at = ? WHERE id = ?",
+                (timestamp, timestamp, user_id),
+            )
+            > 0
+        )
+
+    def update_session_csrf(
+        self, session_id: str, csrf_hash: str, timestamp: int
+    ) -> bool:
+        return (
+            self.db.execute_update(
+                "UPDATE dashboard_session SET csrf_hash = ?, last_seen_at = ? WHERE id = ?",
+                (csrf_hash, timestamp, session_id),
+            )
+            > 0
+        )

@@ -28,6 +28,7 @@ from fastapi.responses import (
 )
 
 from miloco.admin.router import router as admin_router
+from miloco.auth.router import router as auth_router
 from miloco.camera.router import router as camera_router
 from miloco.config import get_settings, register_reset_hook
 from miloco.database.connector import init_database
@@ -533,6 +534,7 @@ async def catch_all_exceptions_middleware(request: Request, call_next):
         return handle_exception(request, exc)
 
 
+app.include_router(auth_router, prefix="/api")
 app.include_router(admin_router, prefix="/api")
 app.include_router(miot_router, prefix="/api")
 app.include_router(home_assistant_router, prefix="/api")
