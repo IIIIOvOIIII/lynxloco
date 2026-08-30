@@ -35,10 +35,19 @@ describe("auth-aware apiFetch", () => {
     expect(new Headers(init.headers).get("X-Miloco-CSRF")).toBe("csrf-token");
   });
 
-  it("keeps legacy multipart requests in cookie mode with csrf but no bearer", () => {
+  it("keeps legacy safe reads in cookie mode without csrf or bearer", () => {
     setCsrfToken("csrf-token");
 
-    const headers = new Headers(authHeaders({ "Content-Type": "application/json" }));
+    const headers = new Headers(authHeaders());
+
+    expect(headers.has("X-Miloco-CSRF")).toBe(false);
+    expect(headers.has("Authorization")).toBe(false);
+  });
+
+  it("keeps legacy multipart writes in cookie mode with csrf but no bearer", () => {
+    setCsrfToken("csrf-token");
+
+    const headers = new Headers(authHeaders({ "Content-Type": "application/json" }, "POST"));
 
     expect(headers.get("X-Miloco-CSRF")).toBe("csrf-token");
     expect(headers.has("Authorization")).toBe(false);

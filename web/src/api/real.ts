@@ -590,7 +590,7 @@ export async function realEnrollPersonSample(
   const resp = await fetch(`/api/identity/persons/${personId}/samples`, {
     method: "POST",
     body: form,
-    headers: authHeaders(),
+    headers: authHeaders(undefined, "POST"),
   });
   if (!resp.ok) {
     const body = await resp.json().catch(() => ({}));
@@ -672,7 +672,7 @@ export async function realObservePet(
   const resp = await fetch("/api/identity/pets:observe", {
     method: "POST",
     body: form,
-    headers: authHeaders(),
+    headers: authHeaders(undefined, "POST"),
     signal,
   });
   if (!resp.ok) {
@@ -732,7 +732,7 @@ export async function realUploadPetAvatar(
   const resp = await fetch(`/api/identity/pets/${encodeURIComponent(petId)}/avatar`, {
     method: "POST",
     body: form,
-    headers: authHeaders(),
+    headers: authHeaders(undefined, "POST"),
   });
   if (!resp.ok) {
     const body = await resp.json().catch(() => ({}));
@@ -752,7 +752,7 @@ export async function realUploadPersonAvatar(
   const resp = await fetch(`/api/identity/persons/${personId}/avatar`, {
     method: "POST",
     body: form,
-    headers: authHeaders(),
+    headers: authHeaders(undefined, "POST"),
   });
   if (!resp.ok) {
     const body = await resp.json().catch(() => ({}));
@@ -786,7 +786,7 @@ export async function realUploadPetReferenceCrops(
     {
       method: "POST",
       body: form,
-      headers: authHeaders(),
+      headers: authHeaders(undefined, "POST"),
     },
   );
   if (!resp.ok) {

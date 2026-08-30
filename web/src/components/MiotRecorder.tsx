@@ -120,7 +120,7 @@ export function MiotRecorder({ cameras, onDone, onCancel }: Props) {
         `&channel=${channel}&duration_ms=${RECORD_SECONDS * 1000}`;
       const r = await fetch(url, {
         method: "POST",
-        headers: authHeaders(),
+        headers: authHeaders(undefined, "POST"),
         signal: ctrl.signal,
       });
       if (!r.ok) {

@@ -11,9 +11,17 @@
 import i18n from "@/i18n";
 import { getCsrfToken } from "./client";
 
-export function authHeaders(extra?: Record<string, string>): Record<string, string> {
+function isUnsafeMethod(method: string): boolean {
+  const normalized = method.toUpperCase();
+  return normalized === "POST" || normalized === "PUT" || normalized === "PATCH" || normalized === "DELETE";
+}
+
+export function authHeaders(
+  extra?: Record<string, string>,
+  method = "GET",
+): Record<string, string> {
   const csrfToken = getCsrfToken();
-  return csrfToken
+  return csrfToken && isUnsafeMethod(method)
     ? { ...(extra ?? {}), "X-Miloco-CSRF": csrfToken }
     : (extra ?? {});
 }
@@ -52,7 +60,7 @@ export async function extractCandidates(
   const r = await fetch(`/api/identity/persons/${personId}/extract`, {
     method: "POST",
     body: form,
-    headers: authHeaders(),
+    headers: authHeaders(undefined, "POST"),
   });
   if (!r.ok) {
     const err = await r.json().catch(() => ({}));
@@ -114,7 +122,7 @@ export async function saveSamplesBatch(
 ): Promise<SaveBatchResult> {
   const r = await fetch(`/api/identity/persons/${personId}/samples/batch`, {
     method: "POST",
-    headers: authHeaders({ "Content-Type": "application/json" }),
+    headers: authHeaders({ "Content-Type": "application/json" }, "POST"),
     body: JSON.stringify({ items }),
   });
   if (!r.ok) {
