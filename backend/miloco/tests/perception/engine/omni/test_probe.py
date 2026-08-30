@@ -1182,6 +1182,7 @@ async def test_responses_visual_probe_rejects_model_that_always_answers_red(
             post_resps=[
                 _FakeResp(200, _responses_output("red")),
                 _FakeResp(200, _responses_output("red")),
+                _FakeResp(200, _responses_output("red")),
             ],
             calls=calls,
         ),
@@ -1196,7 +1197,39 @@ async def test_responses_visual_probe_rejects_model_that_always_answers_red(
 
     assert result["ok"] is False
     assert result["code"] == "bad_response"
-    assert [call[0] for call in calls] == ["GET", "POST", "POST"]
+    assert [call[0] for call in calls] == ["GET", "POST", "POST", "POST"]
+
+
+async def test_responses_visual_probe_retries_once_after_color_mismatch(
+    monkeypatch,
+):
+    """A single flaky color answer should not block an otherwise valid VLM."""
+    calls: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_async_client_post_sequence(
+            get_resp=_FakeResp(404),
+            post_resps=[
+                _FakeResp(200, _responses_output("blue")),
+                _FakeResp(200, _responses_output("red")),
+                _FakeResp(200, _responses_output("blue")),
+                _FakeResp(200, _responses_structured_output()),
+            ],
+            calls=calls,
+        ),
+    )
+
+    result = await probe.probe_omni(
+        "grok-4.6",
+        "https://vlm.example/v1",
+        "sk-x",
+        api_protocol="openai_responses",
+    )
+
+    assert result["ok"] is True
+    assert result["code"] == "ok"
+    assert [call[0] for call in calls] == ["GET", "POST", "POST", "POST", "POST"]
 
 
 async def test_responses_visual_probe_budget_allows_reasoning_before_text(monkeypatch):

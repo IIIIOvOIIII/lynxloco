@@ -29,6 +29,7 @@ _RESPONSES_VISUAL_TIMEOUT = httpx.Timeout(120.0, connect=10.0)
 _RESPONSES_STRUCTURED_TIMEOUT = httpx.Timeout(120.0, connect=10.0)
 _RESPONSES_VISUAL_MAX_OUTPUT_TOKENS = 256
 _RESPONSES_STRUCTURED_MAX_OUTPUT_TOKENS = 1024
+_RESPONSES_VISUAL_MAX_ATTEMPTS = 2
 _ALLOWED_SCHEMES = ("http", "https")
 _VISUAL_PROBE_SIZE = (32, 32)
 _RESPONSES_VISUAL_PROBES = (
@@ -708,40 +709,46 @@ async def _probe_responses(
                 )
 
             for expected_color, rgb in _RESPONSES_VISUAL_PROBES:
-                body = adapter.build_request_body(
-                    _visual_probe_messages(rgb),
-                    model=model,
-                    max_tokens=_RESPONSES_VISUAL_MAX_OUTPUT_TOKENS,
-                    temperature=0.0,
-                    top_p=1.0,
-                    stream=False,
-                )
-                response = await client.post(
-                    adapter.endpoint(base, model, stream=False),
-                    headers={**auth_headers, "Content-Type": "application/json"},
-                    json=body,
-                    timeout=_RESPONSES_VISUAL_TIMEOUT,
-                )
-                if response.status_code != 200:
-                    return _probe_http_failure(
+                matched_expected_color = False
+                for _attempt in range(_RESPONSES_VISUAL_MAX_ATTEMPTS):
+                    body = adapter.build_request_body(
+                        _visual_probe_messages(rgb),
+                        model=model,
+                        max_tokens=_RESPONSES_VISUAL_MAX_OUTPUT_TOKENS,
+                        temperature=0.0,
+                        top_p=1.0,
+                        stream=False,
+                    )
+                    response = await client.post(
+                        adapter.endpoint(base, model, stream=False),
+                        headers={**auth_headers, "Content-Type": "application/json"},
+                        json=body,
+                        timeout=_RESPONSES_VISUAL_TIMEOUT,
+                    )
+                    if response.status_code != 200:
+                        return _probe_http_failure(
+                            response,
+                            round((time.monotonic() - t0) * 1000),
+                            visual_request=True,
+                        )
+
+                    output_text, error, warn = _responses_output_text(
+                        adapter,
                         response,
                         round((time.monotonic() - t0) * 1000),
-                        visual_request=True,
+                        bad_response_message="Responses 视觉预检响应格式异常",
+                        blank_output_message=_VISUAL_PROBE_EMPTY_MESSAGE,
                     )
+                    if error is not None:
+                        return error
+                    assert output_text is not None
+                    usage_warning = usage_warning or warn
 
-                output_text, error, warn = _responses_output_text(
-                    adapter,
-                    response,
-                    round((time.monotonic() - t0) * 1000),
-                    bad_response_message="Responses 视觉预检响应格式异常",
-                    blank_output_message=_VISUAL_PROBE_EMPTY_MESSAGE,
-                )
-                if error is not None:
-                    return error
-                assert output_text is not None
-                usage_warning = usage_warning or warn
+                    if _visual_answer_is(output_text, expected_color):
+                        matched_expected_color = True
+                        break
 
-                if not _visual_answer_is(output_text, expected_color):
+                if not matched_expected_color:
                     return {
                         "ok": False,
                         "code": "bad_response",
