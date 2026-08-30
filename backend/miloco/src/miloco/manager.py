@@ -383,6 +383,17 @@ class Manager:
         return svc
 
     @property
+    def devices_service(self):
+        """Unified MIoT + Home Assistant device service lazy singleton."""
+        svc = getattr(self, "_devices_service", None)
+        if svc is None:
+            from miloco.devices.service import DevicesService
+
+            svc = DevicesService(self.miot_service, self.home_assistant_service)
+            self._devices_service = svc
+        return svc
+
+    @property
     def person_service(self) -> PersonService:
         return self._person_service
 

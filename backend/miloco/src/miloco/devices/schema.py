@@ -24,6 +24,9 @@ class UnifiedSpecEntry(BaseModel):
     iid: str = Field(..., min_length=1)
     type_name: str = Field(..., min_length=1)
     description: str = ""
+    service_type_name: str = ""
+    service_description: str = ""
+    prop_description: str = ""
     format: str = ""
     readable: bool = False
     writeable: bool = False
@@ -66,7 +69,7 @@ class UnifiedHomeInfo(BaseModel):
     home_name: str = ""
     devices: list[UnifiedDeviceInfo] = Field(default_factory=list)
     scenes: list[UnifiedSceneInfo] = Field(default_factory=list)
-    areas: list[str] = Field(default_factory=list)
+    areas: list[dict[str, object]] = Field(default_factory=list)
 
 
 class UnifiedPropertyItem(BaseModel):
@@ -124,4 +127,3 @@ def parse_ha_device_id(device_id: str) -> tuple[str, str] | None:
     if len(parts) != 3 or parts[0] != "ha" or not parts[1] or not parts[2]:
         return None
     return parts[1], parts[2]
-
