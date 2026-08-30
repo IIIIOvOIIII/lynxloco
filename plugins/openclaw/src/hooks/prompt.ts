@@ -212,7 +212,12 @@ function buildTimezoneBlock(): string {
 
 const DEVICE_CATALOG_INTRO = `## 设备目录
 下方 \`# devices catalog\` 是预注入的高频设备子集（≤50 台，非全量），字段规则见下方目录头部的注释。它**只用于快速拿到已点名单台设备的 did / spec_name**，不是全屋设备的全集。凡涉及设备**集合 / 多台 / 不确定数量**（无论查询还是控制），或目录里找不到目标，**必须先 \`device list\` 拉全量**再逐台处理，别拿子集当全部。
-**任何 \`device control / props / action\` 或 \`scene\` 命令前（含查询），必须先读 \`miloco-devices\` skill**——命令选择、集合判定、安全确认、补 on、错误处理等都在其中，别只凭本目录裸发。`;
+**任何 \`device control / props / action\` 或 \`scene\` 命令前（含查询），必须先读 \`miloco-devices\` skill**——命令选择、集合判定、安全确认、补 on、错误处理等都在其中，别只凭本目录裸发。
+
+Home Assistant safety:
+- Do not invent Home Assistant entity IDs.
+- do not call raw Home Assistant services or arbitrary HA service names.
+- Read-only HA devices may be described or queried but must not be controlled.`;
 
 // 感知日志逐轮全量注入、随一天增长会挤占上下文（它替换掉的家庭档案块原本按 token 截断），
 // 故设一个字符上限；超限时保留末尾（日志按时间追加，尾部即最近），并提示用 memory_search 查全量。

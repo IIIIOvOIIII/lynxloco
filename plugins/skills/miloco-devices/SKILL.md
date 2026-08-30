@@ -1,6 +1,6 @@
 ---
 name: miloco-devices
-description: 查询与控制米家智能家居设备。查询能力包括设备开关状态、运行状态、电量、设定温度、当前温湿度、PM2.5 等环境与设备数据；控制能力包括开关灯、调节空调温度/模式/风速、控制窗帘开合、启动或停止扫地机器人、开关摄像头等设备操作；场景能力包括触发已有米家场景，如回家、离家、睡眠等智能场景；以及刷新设备列表缓存。
+description: 查询与控制米家及 Home Assistant 智能家居设备。查询能力包括设备开关状态、运行状态、电量、设定温度、当前温湿度、PM2.5 等环境与设备数据；控制能力包括开关灯、调节空调温度/模式/风速、控制窗帘开合、启动或停止扫地机器人、开关摄像头等设备操作；场景能力包括触发已有场景，如回家、离家、睡眠等智能场景；以及刷新设备列表缓存。
 metadata:
   author: miloco
   version: "1.7"
@@ -12,7 +12,7 @@ metadata:
 
 # miloco-devices
 
-处理米家智能家居设备交互，通过 `miloco-cli` 查询、控制、米家设备；触发米家场景。
+处理米家与 Home Assistant 智能家居设备交互，通过 `miloco-cli` 查询、控制设备；触发已有场景。
 
 ## 何时激活
 
@@ -51,6 +51,14 @@ metadata:
 - **感知事件触发 → 在事件「来自：房间」里找对应设备**：按该房间缩小范围。⚠️ 事件里 `did=` 是来源设备（摄像头/传感器），不是要控制的目标。
 - 仍找不到 → `miloco-cli device refresh` 重试一次 → 回"没找到"，**禁止编造 did**。
 - `device list` 很轻量、返回快，有需求直接调用；输出都是**行式记录**（每行一条完整记录、`|` 分隔），可以用 grep 过滤。
+- `device list` 设备行格式为 `did|source|device_name|room|category|online|control`；`source=home_assistant` 表示设备来自 Home Assistant，`control=read_only` 表示只能查询或描述。
+
+### Home Assistant 安全规则
+
+- Do not invent Home Assistant entity IDs.
+- Do not call arbitrary HA service or raw Home Assistant service names; always use `miloco-cli device ...` with backend-exposed `did` / `spec_name`.
+- Read-only HA devices (`control=read_only`) may be described or queried, but must not be controlled.
+- Home Assistant 设备控制必须走 Miloco 暴露的 `spec_name` / `iid`；不要绕过 Miloco 后端去拼 HA domain/service/payload。
 
 ### 步骤 3 · 确定 spec
 
@@ -194,7 +202,7 @@ miloco-cli device control 4912 --set brightness 30 --set on true ; miloco-cli de
 
 ## 边界
 
-- ❌ 不支持非米家生态设备 / 第三方 API / 绕过安全规范的指令
+- ❌ 不支持绕过 Miloco 统一设备 API 直接调用第三方 API / arbitrary HA service
 - ❌ 禁止编造 did / spec_name / model
 - ⚠️ 单次 ≤10 个设备，超出自动拆分
 - ✅ 支持 `scene trigger` 触发已有场景、`device refresh` 刷新缓存

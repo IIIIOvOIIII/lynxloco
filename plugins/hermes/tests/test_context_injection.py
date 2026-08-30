@@ -48,6 +48,22 @@ def test_full_includes_catalog_and_capabilities(tmp_miloco_home, monkeypatch):
     assert "## 家庭档案" in ctx
 
 
+def test_catalog_context_forbids_raw_home_assistant_calls(tmp_miloco_home, monkeypatch):
+    monkeypatch.setattr(
+        ci,
+        "get_catalog",
+        lambda: "# devices catalog\nha:primary:light.kitchen|home_assistant|厨房灯|厨房|light|online|read_only",
+    )
+
+    out = ci.inject_context(session_id="agent:main:miloco", user_message="打开厨房灯")
+
+    assert out is not None
+    ctx = out["context"]
+    assert "do not call raw Home Assistant services" in ctx
+    assert "Do not invent Home Assistant entity IDs" in ctx
+    assert "Read-only HA devices" in ctx
+
+
 def test_minimal_includes_identity_notify_timezone(tmp_miloco_home, monkeypatch):
     """minimal profile 注入 identity + timezone + notify + language（对齐 OpenClaw）。"""
     monkeypatch.setattr(ci, "get_catalog", lambda: "# devices catalog\nx")

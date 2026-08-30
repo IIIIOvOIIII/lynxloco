@@ -288,6 +288,20 @@ describe("before_prompt_build 组装", () => {
     expect(noCat.appendSystemContext ?? "").not.toContain("## 设备目录");
   });
 
+  it("catalog 段明确禁止原始 Home Assistant service 调用", async () => {
+    const { api, run } = makeApi();
+    registerBeforePromptBuildHook(api, {} as any);
+
+    getCatalog.mockResolvedValue(
+      "# devices catalog\nha:primary:light.kitchen|home_assistant|厨房灯|厨房|light|online|read_only",
+    );
+    const r = await run("agent:main:miloco");
+
+    expect(r.appendSystemContext).toContain("do not call raw Home Assistant services");
+    expect(r.appendSystemContext).toContain("Do not invent Home Assistant entity IDs");
+    expect(r.appendSystemContext).toContain("Read-only HA devices");
+  });
+
   it("被邀请会话中的普通设备指令不会抢锁 onboarding", async () => {
     writeOnboardingInviteState(["wechat:s1", "telegram:s2"]);
     const { api, run } = makeApi();
