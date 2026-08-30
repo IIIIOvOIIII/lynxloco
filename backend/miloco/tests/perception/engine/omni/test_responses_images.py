@@ -280,6 +280,30 @@ def test_fused_responses_uses_only_bounded_sequence_images() -> None:
     )
 
 
+def test_fused_responses_appends_json_caption_guard_after_images() -> None:
+    packet = _packet([_image(value) for value in (10, 20, 30)])
+
+    payload = build_fused_payload(
+        packets=[packet],
+        context=OmniContext(room_name="客厅", current_time="12:00:00"),
+        candidates=[],
+        gallery_snapshot={},
+        adapter=OpenAIResponsesAdapter(),
+    )
+    user_blocks = payload["messages"][-1]["content"]
+    image_indexes = [
+        index for index, block in enumerate(user_blocks) if block["type"] == "image_url"
+    ]
+
+    assert image_indexes
+    assert user_blocks[-1]["type"] == "text"
+    assert max(image_indexes) < len(user_blocks) - 1
+    guard = user_blocks[-1]["text"]
+    assert "input_image" in guard
+    assert "只返回一个合法 JSON 对象" in guard
+    assert "caption 必须是非空字符串" in guard
+
+
 @pytest.mark.asyncio
 async def test_run_omni_resolves_adapter_before_prompt_construction() -> None:
     packet = _packet([_image(10)])

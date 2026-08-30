@@ -84,6 +84,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_RESPONSES_IMAGE_JSON_GUARD = (
+    "输出要求：请只返回一个合法 JSON 对象。因为本轮已经附上可用 input_image，"
+    "caption 必须是非空字符串；没有命中规则、建议、语音或环境声音时可以省略"
+    "对应字段或返回空数组，但不能返回空对象。"
+)
+
 
 @dataclass(frozen=True)
 class EncodedInputImage:
@@ -1073,6 +1079,8 @@ def _build_fused_user_content(
         }
         for image in input_images
     )
+    if input_images:
+        content.append({"type": "text", "text": _RESPONSES_IMAGE_JSON_GUARD})
 
     # 主 video
     # video_b64 size sanity check — PyAV 编码异常情况下可能返回非空但损坏的极短
