@@ -107,7 +107,7 @@ configure_host_profile() {
             CANDIDATE_RUNTIME_IMAGE_NAME="miloco-candidate"
             CANDIDATE_ACCEPTANCE_IMAGE_NAME="miloco-acceptance-candidate"
             cpu_limit="2.0"
-            memory_limit="3072m"
+            memory_limit="4096m"
             ;;
     esac
     refresh_profile_paths
@@ -196,6 +196,7 @@ preflight_release() {
     host_limits "$host"
     local required_memory_kib available_memory_kib key value unit
     case "$memory_limit" in
+        4096m) required_memory_kib=4194304 ;;
         3072m) required_memory_kib=3145728 ;;
         1536m) required_memory_kib=1572864 ;;
         *) die 4 "invalid memory profile" ;;

@@ -1415,7 +1415,11 @@ def test_remote_checksum_and_acceptance_precede_activation() -> None:
     assert "configure_host_profile()" in remote
     assert re.search(r"ai-lab01\.esxi\).*?cpu_limit=\"3\.0\".*?memory_limit=\"3072m\"", remote, re.S)
     assert re.search(r"ai-lab02\.esxi\).*?cpu_limit=\"1\.25\".*?memory_limit=\"1536m\"", remote, re.S)
-    assert re.search(r"docker\.esxi\).*?SERVICE_PORT=\"1811\".*?cpu_limit=\"2\.0\"", remote, re.S)
+    assert re.search(
+        r"docker\.esxi\).*?SERVICE_PORT=\"1811\".*?cpu_limit=\"2\.0\".*?memory_limit=\"4096m\"",
+        remote,
+        re.S,
+    )
 
 
 def test_activation_and_health_failure_preserve_rollback_state() -> None:
@@ -2181,7 +2185,7 @@ def test_remote_docker_esxi_profile_uses_port_1811_and_production_names(
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "new"
     assert wrapper_log.read_text(encoding="utf-8").startswith(
-        f"sha={sha} cpu=2.0 memory=3072m image=miloco state=/opt/miloco/state "
+        f"sha={sha} cpu=2.0 memory=4096m image=miloco state=/opt/miloco/state "
         "port=1811 url=http://127.0.0.1:1811 args=--signal=KILL 7s docker compose "
         f"-p miloco -f /opt/miloco/releases/{sha}/compose.yaml ps -q miloco"
     )

@@ -263,13 +263,20 @@ class LiveStreamHub:
                     )
                     raise
 
-                if source.source_type == "rtsp" and source.input_codec == "hevc":
+                if source.source_type == "rtsp" and source.input_codec in {
+                    "h264",
+                    "hevc",
+                }:
                     await self._activate_transcoder(camera_id, feed)
 
             subscriber_id = self._next_subscriber_id
             self._next_subscriber_id += 1
             normalizer: object | None = None
-            if feed.source.source_type == "rtsp" and feed.source.input_codec == "h264":
+            if (
+                feed.source.source_type == "rtsp"
+                and feed.source.input_codec == "h264"
+                and feed.mode != "transcoding"
+            ):
                 from miloco.camera.h264 import H264AnnexBNormalizer
 
                 normalizer = H264AnnexBNormalizer()

@@ -254,7 +254,7 @@ def _decode_h264(chunk: bytes) -> list[av.VideoFrame]:
             "h264_video_audio.mkv",
             "rtsp:00000000-0000-0000-0000-000000000901",
             "h264",
-            "passthrough",
+            "transcoding",
             1,
         ),
         (
