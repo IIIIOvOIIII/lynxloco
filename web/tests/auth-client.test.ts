@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { apiFetch, setCsrfToken } from "@/api/client";
-import { authHeaders } from "@/api/register";
+import { authHeaders, extractCandidates } from "@/api/register";
 
 describe("auth-aware apiFetch", () => {
   beforeEach(() => {
@@ -44,12 +44,25 @@ describe("auth-aware apiFetch", () => {
     expect(headers.has("Authorization")).toBe(false);
   });
 
-  it("keeps legacy multipart writes in cookie mode with csrf but no bearer", () => {
+  it("sends csrf but neither bearer nor JSON content type for multipart writes", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify({
+        code: 0,
+        data: { is_video: false, n_frames: 1, candidates: [], auto_selected: { body: [], face: [] } },
+      }), { status: 200 })),
+    );
     setCsrfToken("csrf-token");
 
-    const headers = new Headers(authHeaders({ "Content-Type": "application/json" }, "POST"));
+    await extractCandidates("person-1", new Blob(["sample"], { type: "image/jpeg" }), "sample.jpg");
 
+    const [, init] = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    const headers = new Headers(init.headers);
+
+    expect(init.method).toBe("POST");
+    expect(init.body).toBeInstanceOf(FormData);
     expect(headers.get("X-Miloco-CSRF")).toBe("csrf-token");
     expect(headers.has("Authorization")).toBe(false);
+    expect(headers.has("Content-Type")).toBe(false);
   });
 });
