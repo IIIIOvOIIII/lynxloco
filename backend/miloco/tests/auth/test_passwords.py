@@ -13,6 +13,7 @@ def test_hash_password_uses_argon2_and_never_echoes_plaintext() -> None:
     assert "correct horse battery" not in password_hash
     assert verify_password("correct horse battery", password_hash) is True
     assert verify_password("wrong horse battery", password_hash) is False
+    assert verify_password("correct horse battery", "not-an-argon2-hash") is False
 
 
 def test_password_policy_requires_eight_characters() -> None:

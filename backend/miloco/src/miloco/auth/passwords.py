@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from argon2 import PasswordHasher
-from argon2.exceptions import VerificationError, VerifyMismatchError
+from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 
 
 class PasswordPolicyError(ValueError):
@@ -24,5 +24,5 @@ def hash_password(password: str) -> str:
 def verify_password(password: str, password_hash: str) -> bool:
     try:
         return _PASSWORD_HASHER.verify(password_hash, password)
-    except (VerificationError, VerifyMismatchError):
+    except (InvalidHashError, VerificationError, VerifyMismatchError):
         return False

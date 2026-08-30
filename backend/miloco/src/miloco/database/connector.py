@@ -89,7 +89,7 @@ def _create_dashboard_user_table_on(conn: sqlite3.Connection) -> None:
             username_norm TEXT NOT NULL UNIQUE,
             display_name TEXT NOT NULL DEFAULT '',
             password_hash TEXT NOT NULL,
-            role TEXT NOT NULL DEFAULT 'admin',
+            role TEXT NOT NULL DEFAULT 'admin' CHECK (role = 'admin'),
             enabled INTEGER NOT NULL DEFAULT 1,
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL,

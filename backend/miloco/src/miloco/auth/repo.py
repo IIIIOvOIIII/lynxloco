@@ -72,6 +72,8 @@ class DashboardAuthRepo:
         username_norm = normalize_username(username)
         if not username_norm:
             raise ValueError("username_required")
+        if role != "admin":
+            raise ValueError("role_not_supported")
 
         timestamp = now_ms()
         user_id = uuid.uuid4().hex
