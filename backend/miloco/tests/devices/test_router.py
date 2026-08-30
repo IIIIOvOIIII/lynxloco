@@ -11,7 +11,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from miloco.config import reset_settings
-from miloco.devices.schema import DeviceSource, UnifiedActionResult
 from miloco.home_assistant.schema import HaErrorCode, HomeAssistantError
 from miloco.main import app
 from miloco.manager import get_manager
