@@ -57,6 +57,7 @@ import { RtspCameraDialog } from "./components/RtspCameraDialog";
 import { ToastHost, toast } from "./components/Toast";
 import { UsagePage } from "./components/UsagePage";
 import type { HomeId } from "./lib/types";
+import { hasActivePerceptionCamera } from "./lib/perceptionActivity";
 import { PerfPage } from "./components/PerfPage";
 import { IconMoon, IconSun } from "./lib/icons";
 import { useTheme } from "./hooks/useTheme";
@@ -681,12 +682,16 @@ function MainApp() {
             status={status.data}
             allCamerasOff={
               // 未就绪时兜底 false（宁可短暂显"在看家"，不误报"待机中"）
-              // 注意：不要加 data.length > 0 守卫——[].every() 本就返回 true（空集全称量化），
-              // 无摄像头家庭（scopeCameras.data === []）应正确显示"待机中"而非"在看家"。
+              // 注意：空集在 hasActivePerceptionCamera 中自然为 false——无摄像头家庭
+              // 仍正确显示"待机中";但 RTSP summary 未就绪/暂时刷新失败时不凭 MIoT 空集/全关
+              // 误报待机,保持原来的安全偏置。
               !scopeCameras.loading &&
               !scopeCameras.error &&
               !!scopeCameras.data &&
-              scopeCameras.data.every((c) => !c.inUse)
+              !cameraSummaries.loading &&
+              !cameraSummaryState.fatalError &&
+              !!cameraSummaries.data &&
+              !hasActivePerceptionCamera(scopeCameras.data, cameraSummaries.data)
             }
             onConnectMiot={() => setMiotBindOpen(true)}
             onWakeUp={async () => {

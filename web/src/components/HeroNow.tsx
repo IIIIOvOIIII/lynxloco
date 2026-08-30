@@ -58,6 +58,59 @@ function setVoiceOnConfirmed(): void {
   }
 }
 
+export function RtspPerceptionSwitch({
+  camera,
+  busy,
+  disabled = false,
+  label,
+  busyLabel,
+  ariaLabel,
+  title,
+  onToggle,
+}: {
+  camera: CameraSummary;
+  busy: boolean;
+  disabled?: boolean;
+  label: string;
+  busyLabel: string;
+  ariaLabel: string;
+  title: string;
+  onToggle: (camera: CameraSummary, enabled: boolean) => void | Promise<void>;
+}) {
+  const isDisabled = busy || disabled;
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={camera.enabled}
+      aria-label={ariaLabel}
+      title={title}
+      disabled={isDisabled}
+      onClick={() => {
+        if (isDisabled) return;
+        onToggle(camera, !camera.enabled);
+      }}
+      className={`inline-flex h-7 items-center gap-1.5 rounded-lg border border-border px-2 text-caption text-text-primary transition-colors hover:border-border-strong focus-visible:ring-2 focus-visible:ring-brand-primary focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50 ${
+        camera.enabled ? "bg-brand-soft" : "bg-bg-secondary"
+      }`}
+    >
+      <span
+        aria-hidden
+        className={`relative inline-flex h-[14px] w-[26px] shrink-0 rounded-full transition-colors ${
+          camera.enabled ? "bg-brand-primary" : "bg-black/60"
+        }`}
+      >
+        <span
+          className={`absolute left-0.5 top-0.5 inline-block h-2.5 w-2.5 rounded-full bg-white shadow-sm transition-transform ${
+            camera.enabled ? "translate-x-[12px]" : "translate-x-0"
+          }`}
+        />
+      </span>
+      <span>{busy && !camera.enabled ? busyLabel : label}</span>
+    </button>
+  );
+}
+
 interface Props {
   persons: Person[];
   /** 宠物花名册；仅在 petsEnabled 为真时于「家人」后追加展示。 */
@@ -292,11 +345,11 @@ function RtspCameraSection({
     }
   };
 
-  const runToggle = async (camera: CameraSummary) => {
+  const runToggle = async (camera: CameraSummary, enabled: boolean) => {
     if (!onToggle || busyId) return;
     setBusyId(camera.id);
     try {
-      await onToggle(camera, !camera.enabled);
+      await onToggle(camera, enabled);
     } finally {
       setBusyId(null);
     }
@@ -426,16 +479,25 @@ function RtspCameraSection({
                     >
                       <IconTrash width={14} height={14} />
                     </button>
-                    <button
-                      type="button"
-                      disabled={busy || !onToggle}
-                      onClick={() => void runToggle(camera)}
-                      className="rounded-md border border-border px-2 py-1.5 text-caption text-text-primary hover:border-border-strong disabled:opacity-50"
-                    >
-                      {busy && !camera.enabled
-                        ? t("rtspCamera.enableTesting")
-                        : t(camera.enabled ? "rtspCamera.disable" : "rtspCamera.enable")}
-                    </button>
+                    <RtspPerceptionSwitch
+                      camera={camera}
+                      busy={busy}
+                      disabled={!onToggle}
+                      label={t("rtspCamera.perception")}
+                      busyLabel={t("rtspCamera.enableTesting")}
+                      ariaLabel={t(
+                        camera.enabled
+                          ? "rtspCamera.toggleAriaDisable"
+                          : "rtspCamera.toggleAriaEnable",
+                        { name: camera.name },
+                      )}
+                      title={t(
+                        camera.enabled
+                          ? "rtspCamera.toggleTitleDisable"
+                          : "rtspCamera.toggleTitleEnable",
+                      )}
+                      onToggle={(target, enabled) => void runToggle(target, enabled)}
+                    />
                   </div>
                 </div>
               </article>

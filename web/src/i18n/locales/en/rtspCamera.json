@@ -42,6 +42,13 @@
     "updated": "RTSP camera updated",
     "deleted": "RTSP camera deleted",
     "enableTesting": "Testing connection before enabling…",
+    "perception": "Perception",
+    "perceptionOn": "Perception enabled",
+    "perceptionOff": "Perception disabled",
+    "toggleAriaEnable": "Enable RTSP perception for {{name}}",
+    "toggleAriaDisable": "Disable RTSP perception for {{name}}",
+    "toggleTitleEnable": "Enable this RTSP camera for Miloco perception after a connection test",
+    "toggleTitleDisable": "Disable Miloco perception for this RTSP camera",
     "errors": {
       "name": "Enter a camera name",
       "url": "Enter a valid RTSP URL",

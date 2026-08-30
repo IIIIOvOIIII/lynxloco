@@ -42,6 +42,13 @@
     "updated": "RTSP 摄像头已更新",
     "deleted": "RTSP 摄像头已删除",
     "enableTesting": "启用前正在测试连接…",
+    "perception": "感知",
+    "perceptionOn": "感知已启用",
+    "perceptionOff": "感知已停用",
+    "toggleAriaEnable": "启用 {{name}} 的 RTSP 感知",
+    "toggleAriaDisable": "停用 {{name}} 的 RTSP 感知",
+    "toggleTitleEnable": "启用后 Miloco 会测试并接入这路 RTSP 摄像头进行感知",
+    "toggleTitleDisable": "停用后 Miloco 不再处理这路 RTSP 摄像头",
     "errors": {
       "name": "请填写摄像头名称",
       "url": "请填写有效的 RTSP 地址",
