@@ -9,7 +9,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from miloco.config import reset_settings
+from miloco.home_assistant.schema import HomeAssistantTestResult
 from miloco.main import app
+from miloco.manager import get_manager
 
 
 @pytest.fixture(autouse=True)
@@ -84,3 +86,38 @@ def test_control_policy_rejects_blocked_domain() -> None:
     assert response.status_code == 400
     assert "secret-token" not in response.text
 
+
+def test_home_assistant_test_alias_matches_public_spec(monkeypatch) -> None:
+    class _FakeHaService:
+        async def test_config(self, *, base_url: str, token: str, verify_tls: bool):
+            assert base_url == "http://ha.local:8123"
+            assert token == "secret-token"
+            assert verify_tls is True
+            return HomeAssistantTestResult(
+                ok=True,
+                connected=True,
+                message="ok",
+            )
+
+    manager = get_manager()
+    monkeypatch.setattr(
+        manager,
+        "_home_assistant_service",
+        _FakeHaService(),
+        raising=False,
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/home-assistant/test",
+        headers={"Authorization": "Bearer test-token"},
+        json={
+            "enabled": True,
+            "base_url": "http://ha.local:8123",
+            "token": "secret-token",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"]["connected"] is True
+    assert "secret-token" not in response.text

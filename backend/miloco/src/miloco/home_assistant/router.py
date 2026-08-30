@@ -61,6 +61,7 @@ async def save_config(
 
 
 @router.post("/config/test", response_model=NormalResponse)
+@router.post("/test", response_model=NormalResponse)
 async def test_config(
     body: HomeAssistantConfigUpdate,
     current_user: str = Depends(verify_token),
@@ -114,4 +115,3 @@ async def update_entity_policy(
         body.control_enabled,
     )
     return NormalResponse(code=0, message="ok", data=view.model_dump())
-
