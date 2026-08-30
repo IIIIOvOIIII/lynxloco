@@ -159,14 +159,14 @@ def test_service_token_remains_compatible_with_auth_me(tmp_path, monkeypatch) ->
     }
 
 
-def test_service_token_can_manage_users_and_session_cannot_yet(
+def test_service_token_and_dashboard_session_can_list_users(
     tmp_path, monkeypatch
 ) -> None:
     dashboard_client = _client(tmp_path, monkeypatch)
     _setup(dashboard_client)
     service_client = _service_client()
 
-    denied = dashboard_client.get("/api/users")
+    listed_with_session = dashboard_client.get("/api/users")
     created = service_client.post(
         "/api/users",
         json={
@@ -178,7 +178,7 @@ def test_service_token_can_manage_users_and_session_cannot_yet(
     )
     listed = service_client.get("/api/users")
 
-    assert denied.status_code == 401
+    assert listed_with_session.status_code == 200
     assert created.status_code == 200
     assert created.json()["data"]["username"] == "operator"
     assert listed.status_code == 200

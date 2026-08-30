@@ -28,14 +28,15 @@ from fastapi.responses import (
 )
 
 from miloco.admin.router import router as admin_router
+from miloco.auth.dependencies import require_csrf_for_cookie_writes
 from miloco.auth.router import router as auth_router
 from miloco.camera.router import router as camera_router
 from miloco.config import get_settings, register_reset_hook
 from miloco.database.connector import init_database
 from miloco.devices.router import router as devices_router
 from miloco.dispatch import AgentDispatcher, set_agent_dispatcher
-from miloco.home_profile.router import router as home_profile_router
 from miloco.home_assistant.router import router as home_assistant_router
+from miloco.home_profile.router import router as home_profile_router
 from miloco.manager import get_manager
 from miloco.middleware.exception_handler import handle_exception
 from miloco.miot.router import router as miot_router
@@ -529,6 +530,7 @@ app = FastAPI(
 async def catch_all_exceptions_middleware(request: Request, call_next):
     """Global exception handling middleware"""
     try:
+        require_csrf_for_cookie_writes(request)
         return await call_next(request)
     except Exception as exc:
         return handle_exception(request, exc)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Request, Response
 
+from miloco.auth.dependencies import AuthContext, verify_dashboard_or_service_auth
 from miloco.auth.schema import (
     LoginRequest,
     PasswordChangeRequest,
@@ -10,7 +11,6 @@ from miloco.auth.schema import (
     UserUpdateRequest,
 )
 from miloco.auth.service import AuthService
-from miloco.middleware import verify_token
 from miloco.schema.common_schema import NormalResponse
 
 router = APIRouter(tags=["Dashboard Auth"])
@@ -63,18 +63,18 @@ def auth_logout(
 
 @router.get("/auth/me", response_model=NormalResponse)
 def auth_me(
-    request: Request, service: AuthService = Depends(get_auth_service)
+    request: Request,
+    _auth: AuthContext = Depends(verify_dashboard_or_service_auth),
+    service: AuthService = Depends(get_auth_service),
 ) -> NormalResponse:
     data = service.status(request)
-    if not data.authenticated:
-        verify_token(request)
     return NormalResponse(code=0, message="ok", data=data.model_dump())
 
 
 @router.get("/users", response_model=NormalResponse)
 def list_users(
     service: AuthService = Depends(get_auth_service),
-    _: None = Depends(verify_token),
+    _auth: AuthContext = Depends(verify_dashboard_or_service_auth),
 ) -> NormalResponse:
     return NormalResponse(
         code=0,
@@ -87,7 +87,7 @@ def list_users(
 def create_user(
     body: UserCreateRequest,
     service: AuthService = Depends(get_auth_service),
-    _: None = Depends(verify_token),
+    _auth: AuthContext = Depends(verify_dashboard_or_service_auth),
 ) -> NormalResponse:
     return NormalResponse(
         code=0, message="ok", data=service.create_user(body).model_dump()
@@ -99,12 +99,16 @@ def update_user(
     user_id: str,
     body: UserUpdateRequest,
     service: AuthService = Depends(get_auth_service),
-    _: None = Depends(verify_token),
+    _auth: AuthContext = Depends(verify_dashboard_or_service_auth),
 ) -> NormalResponse:
     return NormalResponse(
         code=0,
         message="ok",
-        data=service.update_user(user_id, body, None).model_dump(),
+        data=service.update_user(
+            user_id,
+            body,
+            _auth.subject if _auth.kind == "dashboard" else None,
+        ).model_dump(),
     )
 
 
@@ -113,7 +117,7 @@ def change_password(
     user_id: str,
     body: PasswordChangeRequest,
     service: AuthService = Depends(get_auth_service),
-    _: None = Depends(verify_token),
+    _auth: AuthContext = Depends(verify_dashboard_or_service_auth),
 ) -> NormalResponse:
     return NormalResponse(
         code=0, message="ok", data=service.change_password(user_id, body).model_dump()
@@ -124,7 +128,10 @@ def change_password(
 def delete_user(
     user_id: str,
     service: AuthService = Depends(get_auth_service),
-    _: None = Depends(verify_token),
+    _auth: AuthContext = Depends(verify_dashboard_or_service_auth),
 ) -> NormalResponse:
-    service.delete_user(user_id, None)
+    service.delete_user(
+        user_id,
+        _auth.subject if _auth.kind == "dashboard" else None,
+    )
     return NormalResponse(code=0, message="ok")
