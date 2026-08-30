@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from collections import deque
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass, field
@@ -119,6 +120,472 @@ class _CameraFeed:
     transcode_coalesced_frames: int = 0
     h264_decoder_config: bytes = b""
     dropped_packets: int = 0
+
+
+@dataclass
+class _JpegSubscriber:
+    frames: deque[bytes]
+    ready: asyncio.Event
+    closed: bool = False
+
+
+@dataclass
+class _JpegCameraFeed:
+    source: LiveStreamSource
+    subscribers: dict[int, _JpegSubscriber]
+    frame_detach: Callable[[], None] = lambda: None
+    lifecycle_detach: Callable[[], None] = lambda: None
+    pending_frame: tuple[NDArray[np.uint8], int | None] | None = None
+    encode_task: asyncio.Task[None] | None = None
+    encode_scheduled: bool = False
+    encode_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    next_allowed_monotonic: float = 0.0
+    dropped_frames: int = 0
+
+
+def _idle_stream_state(*, dropped_packets: int = 0) -> LiveStreamState:
+    return LiveStreamState(
+        viewer_count=0,
+        mode="idle",
+        input_codec=None,
+        output_codec=None,
+        queue_depth=0,
+        dropped_packets=dropped_packets,
+        error_code=None,
+    )
+
+
+def _encode_jpeg_frame(
+    frame: NDArray[np.uint8],
+    *,
+    quality: int,
+    max_width: int,
+    max_height: int,
+) -> bytes:
+    import cv2
+
+    if frame.ndim != 3 or frame.shape[2] != 3:
+        raise RuntimeError("unsupported_frame_shape")
+    height, width = frame.shape[:2]
+    if height <= 0 or width <= 0:
+        raise RuntimeError("unsupported_frame_shape")
+
+    source = frame
+    scale = min(max_width / width, max_height / height, 1.0)
+    if scale < 1.0:
+        resized_width = max(1, int(width * scale))
+        resized_height = max(1, int(height * scale))
+        source = cv2.resize(
+            source,
+            (resized_width, resized_height),
+            interpolation=cv2.INTER_AREA,
+        )
+    if source.dtype != np.uint8:
+        source = source.astype(np.uint8)
+    if not source.flags["C_CONTIGUOUS"]:
+        source = np.ascontiguousarray(source)
+
+    ok, encoded = cv2.imencode(
+        ".jpg",
+        source,
+        [int(cv2.IMWRITE_JPEG_QUALITY), quality],
+    )
+    if not ok:
+        raise RuntimeError("jpeg_encode_failed")
+    return encoded.tobytes()
+
+
+class LiveJpegStreamHub:
+    """Fan out decoded RTSP frames as browser-safe bounded JPEG previews."""
+
+    def __init__(
+        self,
+        resolver: LiveStreamResolver,
+        *,
+        queue_size: int = 2,
+        quality: int = 80,
+        max_width: int = 1280,
+        max_height: int = 720,
+        min_interval_seconds: float = 0.125,
+    ) -> None:
+        if queue_size < 1:
+            raise ValueError("queue_size must be positive")
+        if max_width < 1 or max_height < 1:
+            raise ValueError("max dimensions must be positive")
+        self._resolver = resolver
+        self._queue_size = queue_size
+        self._quality = max(1, min(95, quality))
+        self._max_width = max_width
+        self._max_height = max_height
+        self._min_interval_seconds = max(0.0, min_interval_seconds)
+        self._feeds: dict[str, _JpegCameraFeed] = {}
+        self._stopping: dict[str, asyncio.Task[None]] = {}
+        self._states: dict[str, LiveStreamState] = {}
+        self._lock = asyncio.Lock()
+        self._next_subscriber_id = 0
+
+    async def subscribe(self, camera_id: str) -> AsyncGenerator[bytes, None]:
+        subscriber_id, subscriber = await self._attach(camera_id)
+        try:
+            while True:
+                await subscriber.ready.wait()
+                subscriber.ready.clear()
+                while subscriber.frames:
+                    yield subscriber.frames.popleft()
+                if subscriber.closed:
+                    return
+        finally:
+            await self._detach(camera_id, subscriber_id)
+
+    async def close_camera(self, camera_id: str) -> None:
+        while True:
+            async with self._lock:
+                stopping = self._stopping.get(camera_id)
+                if stopping is None:
+                    feed = self._feeds.pop(camera_id, None)
+                    if feed is None:
+                        self._states[camera_id] = _idle_stream_state()
+                        return
+                    for subscriber in feed.subscribers.values():
+                        subscriber.closed = True
+                        subscriber.frames.clear()
+                        subscriber.ready.set()
+                    self._states[camera_id] = _idle_stream_state(
+                        dropped_packets=feed.dropped_frames
+                    )
+                    stopping = self._start_shutdown_locked(camera_id, feed)
+            await asyncio.shield(stopping)
+
+    def state(self, camera_id: str) -> LiveStreamState:
+        feed = self._feeds.get(camera_id)
+        if feed is None:
+            return self._states.get(camera_id, _idle_stream_state())
+        queue_depth = max(
+            (len(subscriber.frames) for subscriber in feed.subscribers.values()),
+            default=0,
+        )
+        return LiveStreamState(
+            viewer_count=len(feed.subscribers),
+            mode="transcoding",
+            input_codec=feed.source.input_codec,
+            output_codec="jpeg",
+            queue_depth=queue_depth,
+            dropped_packets=feed.dropped_frames,
+            error_code=None,
+        )
+
+    async def _attach(self, camera_id: str) -> tuple[int, _JpegSubscriber]:
+        while True:
+            await self._wait_for_shutdown(camera_id)
+            await self._lock.acquire()
+            if camera_id in self._stopping:
+                self._lock.release()
+                continue
+            break
+        try:
+            feed = self._feeds.get(camera_id)
+            if feed is None:
+                source = await self._resolver(camera_id)
+                frame_adder = getattr(source.backend, "add_video_frame_listener", None)
+                if source.source_type != "rtsp" or not callable(frame_adder):
+                    self._states[camera_id] = LiveStreamState(
+                        viewer_count=0,
+                        mode="error",
+                        input_codec=source.input_codec,
+                        output_codec=None,
+                        queue_depth=0,
+                        dropped_packets=0,
+                        error_code="stream_unavailable",
+                    )
+                    raise RuntimeError("Camera JPEG stream backend is unavailable")
+                loop = asyncio.get_running_loop()
+                feed = _JpegCameraFeed(source, {})
+                self._feeds[camera_id] = feed
+
+                def receive_frame(frame: NDArray[np.uint8], pts: int | None) -> None:
+                    self._schedule_frame(loop, camera_id, feed, frame, pts)
+
+                def source_closed(error_code: str | None) -> None:
+                    loop.call_soon_threadsafe(
+                        self._source_closed, camera_id, feed, error_code
+                    )
+
+                try:
+                    feed.frame_detach = frame_adder(receive_frame)
+                    close_adder = getattr(source.backend, "add_close_listener", None)
+                    if callable(close_adder):
+                        feed.lifecycle_detach = close_adder(source_closed)
+                except Exception:
+                    if self._feeds.get(camera_id) is feed:
+                        self._feeds.pop(camera_id, None)
+                    self._detach_source(feed)
+                    self._states[camera_id] = LiveStreamState(
+                        viewer_count=0,
+                        mode="error",
+                        input_codec=source.input_codec,
+                        output_codec=None,
+                        queue_depth=0,
+                        dropped_packets=0,
+                        error_code="stream_unavailable",
+                    )
+                    raise
+
+            subscriber_id = self._next_subscriber_id
+            self._next_subscriber_id += 1
+            subscriber = _JpegSubscriber(deque(), asyncio.Event())
+            feed.subscribers[subscriber_id] = subscriber
+            return subscriber_id, subscriber
+        finally:
+            self._lock.release()
+
+    async def _detach(self, camera_id: str, subscriber_id: int) -> None:
+        stopping: asyncio.Task[None] | None = None
+        async with self._lock:
+            feed = self._feeds.get(camera_id)
+            if feed is None:
+                return
+            subscriber = feed.subscribers.pop(subscriber_id, None)
+            if subscriber is not None:
+                subscriber.closed = True
+                subscriber.frames.clear()
+                subscriber.ready.set()
+            if feed.subscribers:
+                return
+            self._feeds.pop(camera_id, None)
+            self._states[camera_id] = _idle_stream_state(
+                dropped_packets=feed.dropped_frames
+            )
+            stopping = self._start_shutdown_locked(camera_id, feed)
+        if stopping is not None:
+            await asyncio.shield(stopping)
+
+    def _schedule_frame(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        camera_id: str,
+        source_feed: _JpegCameraFeed,
+        frame: NDArray[np.uint8],
+        pts: int | None,
+    ) -> None:
+        del pts
+        now = time.monotonic()
+        with source_feed.encode_lock:
+            if self._feeds.get(camera_id) is not source_feed:
+                return
+            if now < source_feed.next_allowed_monotonic:
+                source_feed.dropped_frames += 1
+                return
+            source_feed.next_allowed_monotonic = (
+                now + self._min_interval_seconds
+            )
+            if source_feed.pending_frame is not None:
+                source_feed.dropped_frames += 1
+            source_feed.pending_frame = (frame, None)
+            if source_feed.encode_scheduled:
+                return
+            task = source_feed.encode_task
+            if task is not None and not task.done():
+                return
+            source_feed.encode_scheduled = True
+        try:
+            loop.call_soon_threadsafe(
+                self._start_encode_drain, camera_id, source_feed
+            )
+        except RuntimeError:
+            with source_feed.encode_lock:
+                source_feed.pending_frame = None
+                source_feed.encode_scheduled = False
+
+    def _start_encode_drain(
+        self,
+        camera_id: str,
+        source_feed: _JpegCameraFeed,
+    ) -> None:
+        with source_feed.encode_lock:
+            source_feed.encode_scheduled = False
+            if self._feeds.get(camera_id) is not source_feed:
+                source_feed.pending_frame = None
+                return
+            task = source_feed.encode_task
+            if task is not None and not task.done():
+                return
+            source_feed.encode_task = asyncio.create_task(
+                self._drain_jpeg_frames(camera_id, source_feed)
+            )
+
+    async def _drain_jpeg_frames(
+        self,
+        camera_id: str,
+        source_feed: _JpegCameraFeed,
+    ) -> None:
+        try:
+            while True:
+                with source_feed.encode_lock:
+                    if self._feeds.get(camera_id) is not source_feed:
+                        source_feed.pending_frame = None
+                        return
+                    pending, source_feed.pending_frame = (
+                        source_feed.pending_frame,
+                        None,
+                    )
+                    if pending is None:
+                        return
+                frame, _pts = pending
+                jpeg = await asyncio.to_thread(
+                    _encode_jpeg_frame,
+                    frame,
+                    quality=self._quality,
+                    max_width=self._max_width,
+                    max_height=self._max_height,
+                )
+                feed = self._feeds.get(camera_id)
+                if feed is not source_feed:
+                    return
+                for subscriber in tuple(source_feed.subscribers.values()):
+                    self._enqueue_frame(source_feed, subscriber, jpeg)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._source_failed(camera_id, source_feed, "stream_failed")
+        finally:
+            should_restart = False
+            current = asyncio.current_task()
+            with source_feed.encode_lock:
+                if source_feed.encode_task is current:
+                    source_feed.encode_task = None
+                    if (
+                        source_feed.pending_frame is not None
+                        and not source_feed.encode_scheduled
+                        and self._feeds.get(camera_id) is source_feed
+                    ):
+                        source_feed.encode_scheduled = True
+                        should_restart = True
+            if should_restart:
+                try:
+                    asyncio.get_running_loop().call_soon(
+                        self._start_encode_drain, camera_id, source_feed
+                    )
+                except RuntimeError:
+                    with source_feed.encode_lock:
+                        source_feed.pending_frame = None
+                        source_feed.encode_scheduled = False
+
+    def _enqueue_frame(
+        self,
+        feed: _JpegCameraFeed,
+        subscriber: _JpegSubscriber,
+        jpeg: bytes,
+    ) -> None:
+        if subscriber.closed:
+            return
+        subscriber.frames.append(jpeg)
+        if len(subscriber.frames) > self._queue_size:
+            subscriber.frames.popleft()
+            feed.dropped_frames += 1
+        subscriber.ready.set()
+
+    def _source_closed(
+        self,
+        camera_id: str,
+        source_feed: _JpegCameraFeed,
+        error_code: str | None,
+    ) -> None:
+        asyncio.create_task(
+            self._handle_source_closed(camera_id, source_feed, error_code)
+        )
+
+    def _source_failed(
+        self,
+        camera_id: str,
+        source_feed: _JpegCameraFeed,
+        error_code: str,
+    ) -> None:
+        asyncio.create_task(
+            self._handle_source_closed(camera_id, source_feed, error_code)
+        )
+
+    async def _handle_source_closed(
+        self,
+        camera_id: str,
+        source_feed: _JpegCameraFeed,
+        error_code: str | None,
+    ) -> None:
+        async with self._lock:
+            feed = self._feeds.get(camera_id)
+            if feed is not source_feed:
+                return
+            self._feeds.pop(camera_id, None)
+            for subscriber in feed.subscribers.values():
+                subscriber.closed = True
+                subscriber.frames.clear()
+                subscriber.ready.set()
+            if error_code is None:
+                self._states[camera_id] = _idle_stream_state(
+                    dropped_packets=feed.dropped_frames
+                )
+            else:
+                self._states[camera_id] = LiveStreamState(
+                    viewer_count=0,
+                    mode="error",
+                    input_codec=feed.source.input_codec,
+                    output_codec=None,
+                    queue_depth=0,
+                    dropped_packets=feed.dropped_frames,
+                    error_code=(
+                        error_code if error_code == "stream_failed" else error_code
+                    ),
+                )
+            stopping = self._start_shutdown_locked(camera_id, feed)
+        await asyncio.shield(stopping)
+
+    async def _wait_for_shutdown(self, camera_id: str) -> None:
+        while True:
+            async with self._lock:
+                stopping = self._stopping.get(camera_id)
+            if stopping is None:
+                return
+            await asyncio.shield(stopping)
+
+    def _start_shutdown_locked(
+        self, camera_id: str, feed: _JpegCameraFeed
+    ) -> asyncio.Task[None]:
+        stopping = self._stopping.get(camera_id)
+        if stopping is not None:
+            return stopping
+        stopping = asyncio.create_task(self._shutdown_registered(camera_id, feed))
+        self._stopping[camera_id] = stopping
+        return stopping
+
+    async def _shutdown_registered(
+        self, camera_id: str, feed: _JpegCameraFeed
+    ) -> None:
+        current = asyncio.current_task()
+        try:
+            self._detach_source(feed)
+            with feed.encode_lock:
+                feed.pending_frame = None
+                feed.encode_scheduled = False
+                task, feed.encode_task = feed.encode_task, None
+            if task is not None and task is not current:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        finally:
+            async with self._lock:
+                if self._stopping.get(camera_id) is current:
+                    self._stopping.pop(camera_id, None)
+
+    @staticmethod
+    def _detach_source(feed: _JpegCameraFeed) -> None:
+        frame_detach, feed.frame_detach = feed.frame_detach, lambda: None
+        lifecycle_detach, feed.lifecycle_detach = (
+            feed.lifecycle_detach,
+            lambda: None,
+        )
+        for detach in (frame_detach, lifecycle_detach):
+            try:
+                detach()
+            except Exception:
+                pass
 
 
 class LiveStreamHub:

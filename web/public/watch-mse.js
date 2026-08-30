@@ -103,3 +103,15 @@ export function handleCurrentSocketTerminalClose({
   showReason();
   return true;
 }
+
+export function shouldUseJpegCanvasFallback({
+  cameraId,
+  isSecureContext,
+  hasVideoDecoder,
+}) {
+  return (
+    typeof cameraId === "string"
+    && cameraId.startsWith("rtsp:")
+    && (!isSecureContext || !hasVideoDecoder)
+  );
+}

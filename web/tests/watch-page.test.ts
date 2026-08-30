@@ -56,9 +56,11 @@ describe("bundled camera viewer", () => {
     expect(page).toContain("cameraIdFromPath()");
   });
 
-  it("treats every binary message as an Annex B H264 chunk", () => {
+  it("keeps H264 as the default binary path after the JPEG fallback split", () => {
     expect(page).toContain('codecHint = "h264"');
-    expect(page).toContain("const nalu = new Uint8Array(ev.data)");
+    expect(page).toContain("if (useJpegCanvas) {");
+    expect(page).toContain("handleJpegPayload(payload)");
+    expect(page).toContain("const nalu = payload");
     expect(page).not.toContain("buf.subarray(16)");
   });
 });

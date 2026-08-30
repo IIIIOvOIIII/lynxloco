@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import io
 import weakref
 from collections.abc import AsyncGenerator, Callable
 from fractions import Fraction
@@ -13,9 +14,11 @@ import pytest
 from miloco.camera.service import CameraConflictError, CameraService
 from miloco.camera.stream import (
     EncodedVideoPacket,
+    LiveJpegStreamHub,
     LiveStreamHub,
     LiveStreamSource,
 )
+from PIL import Image
 
 
 def _packet(value: int, *, keyframe: bool = False) -> EncodedVideoPacket:
@@ -1039,6 +1042,40 @@ async def test_rtsp_hevc_and_h264_select_shared_transcoder(codec: str) -> None:
     assert created[0].stop_count == 0
     await second.aclose()
     assert created[0].stop_count == 1
+    assert backend.frame_listeners == []
+
+
+@pytest.mark.asyncio
+async def test_rtsp_jpeg_stream_encodes_bgr_frames_for_canvas_fallback() -> None:
+    backend = _PacketBackend()
+
+    async def resolve(_camera_id: str) -> LiveStreamSource:
+        return _source(backend, codec="h264", source_type="rtsp")
+
+    hub = LiveJpegStreamHub(
+        resolve,
+        max_width=64,
+        max_height=64,
+        min_interval_seconds=0.0,
+    )
+    viewer = hub.subscribe("rtsp:camera")
+    pending = asyncio.create_task(_next(viewer))
+    await asyncio.sleep(0)
+
+    frame = np.zeros((16, 16, 3), dtype=np.uint8)
+    frame[:, :, 0] = 255
+    backend.frame_listeners[0](frame, 123)
+
+    jpeg = await pending
+    decoded = np.asarray(Image.open(io.BytesIO(jpeg)).convert("RGB"))
+
+    assert jpeg.startswith(b"\xff\xd8")
+    assert decoded.shape[:2] == (16, 16)
+    assert int(decoded[:, :, 0].mean()) < 50
+    assert int(decoded[:, :, 1].mean()) < 50
+    assert int(decoded[:, :, 2].mean()) > 200
+    assert hub.state("rtsp:camera").output_codec == "jpeg"
+    await viewer.aclose()
     assert backend.frame_listeners == []
 
 

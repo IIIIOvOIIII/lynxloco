@@ -16,7 +16,12 @@ from typing import Any
 from starlette.websockets import WebSocketState
 
 from miloco.camera.service import CameraService
-from miloco.camera.stream import EncodedVideoPacket, LiveStreamHub, LiveStreamSource
+from miloco.camera.stream import (
+    EncodedVideoPacket,
+    LiveJpegStreamHub,
+    LiveStreamHub,
+    LiveStreamSource,
+)
 from miloco.config import get_settings
 from miloco.database.kv_repo import KVRepo, SystemConfigKeys
 from miloco.database.person_repo import PersonRepo
@@ -388,6 +393,7 @@ class Manager:
         self._miot_live_backends: dict[tuple[str, int], _MiotLiveStreamBackend] = {}
         self._live_stream_camera_ids: set[str] = set()
         self._live_stream_hub = LiveStreamHub(self._resolve_live_stream)
+        self._live_jpeg_stream_hub = LiveJpegStreamHub(self._resolve_live_stream)
 
     async def _resolve_live_stream(self, camera_id: str) -> LiveStreamSource:
         source = await self._camera_service.resolve_live_stream(camera_id)
@@ -409,14 +415,25 @@ class Manager:
     def live_stream_hub(self) -> LiveStreamHub:
         return self._live_stream_hub
 
+    @property
+    def live_jpeg_stream_hub(self) -> LiveJpegStreamHub:
+        return self._live_jpeg_stream_hub
+
     async def shutdown_live_streams(self) -> None:
         hub = getattr(self, "_live_stream_hub", None)
-        if hub is None:
+        jpeg_hub = getattr(self, "_live_jpeg_stream_hub", None)
+        if hub is None and jpeg_hub is None:
             return
         camera_ids = set(getattr(self, "_live_stream_camera_ids", ()))
-        camera_ids.update(getattr(hub, "_feeds", ()))
+        if hub is not None:
+            camera_ids.update(getattr(hub, "_feeds", ()))
+        if jpeg_hub is not None:
+            camera_ids.update(getattr(jpeg_hub, "_feeds", ()))
         for camera_id in camera_ids:
-            await hub.close_camera(camera_id)
+            if hub is not None:
+                await hub.close_camera(camera_id)
+            if jpeg_hub is not None:
+                await jpeg_hub.close_camera(camera_id)
         backends = tuple(getattr(self, "_miot_live_backends", {}).values())
         await asyncio.gather(
             *(backend.aclose() for backend in backends), return_exceptions=True

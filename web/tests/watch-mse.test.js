@@ -3,6 +3,7 @@ import {
   createReadyJmuxer,
   feedFirstAccessUnitWhenReady,
   handleCurrentSocketTerminalClose,
+  shouldUseJpegCanvasFallback,
 } from "../public/watch-mse.js";
 
 let options;
@@ -328,5 +329,31 @@ describe("handleCurrentSocketTerminalClose", () => {
     expect(generation).toBe(9);
     expect(cleanupCalls).toBe(0);
     expect(status).toBe("new player active");
+  });
+});
+
+describe("shouldUseJpegCanvasFallback", () => {
+  it("uses JPEG canvas fallback for RTSP on LAN HTTP without WebCodecs", () => {
+    expect(shouldUseJpegCanvasFallback({
+      cameraId: "rtsp:camera",
+      isSecureContext: false,
+      hasVideoDecoder: false,
+    })).toBe(true);
+  });
+
+  it("keeps MIoT streams on the existing video path", () => {
+    expect(shouldUseJpegCanvasFallback({
+      cameraId: "miot-camera:ch0",
+      isSecureContext: false,
+      hasVideoDecoder: false,
+    })).toBe(false);
+  });
+
+  it("keeps RTSP on WebCodecs when the secure browser path is available", () => {
+    expect(shouldUseJpegCanvasFallback({
+      cameraId: "rtsp:camera",
+      isSecureContext: true,
+      hasVideoDecoder: true,
+    })).toBe(false);
   });
 });

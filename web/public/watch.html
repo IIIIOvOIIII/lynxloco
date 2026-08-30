@@ -69,6 +69,7 @@
 import { createReadyJmuxer } from "/watch-mse.js";
 import { feedFirstAccessUnitWhenReady } from "/watch-mse.js";
 import { handleCurrentSocketTerminalClose } from "/watch-mse.js";
+import { shouldUseJpegCanvasFallback } from "/watch-mse.js";
 
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
@@ -355,6 +356,9 @@ let mseSession = null;
 let playerGeneration = 0;
 let mseFpsRaf = null;
 let lastMseTs = 0;  // 上一帧 WS 时间戳(ms),用于算 jmuxer feed duration
+let useJpegCanvas = false;
+let jpegDecodeInFlight = false;
+let jpegPendingPayload = null;
 
 // ---------- NAL / SPS helpers ----------
 
@@ -443,6 +447,109 @@ function hideLoading() {
   $("loading")?.classList.add("hidden");
 }
 
+function noteDecodedFrame(width, height) {
+  hideLoading();
+  $("res").textContent = `${width}×${height}`;
+  stats.frames++;
+  stats.lastFrameLocalMs = Date.now();
+  const now = performance.now();
+  if (now - stats.lastSec >= 1000) {
+    $("fps").textContent = stats.frames.toFixed(0);
+    stats.frames = 0;
+    stats.lastSec = now;
+  }
+}
+
+async function drawJpegWithImage(blob, generation) {
+  const url = URL.createObjectURL(blob);
+  try {
+    await new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => {
+        try {
+          if (generation !== playerGeneration) { resolve(); return; }
+          const canvas = $("v");
+          const ctx = canvas.getContext("2d");
+          if (canvas.width !== image.naturalWidth || canvas.height !== image.naturalHeight) {
+            canvas.width = image.naturalWidth;
+            canvas.height = image.naturalHeight;
+          }
+          ctx.drawImage(image, 0, 0);
+          noteDecodedFrame(image.naturalWidth, image.naturalHeight);
+          configured = true;
+          setState(t("decoding"));
+          resolve();
+        } catch (error) {
+          reject(error);
+        }
+      };
+      image.onerror = () => reject(new Error("JPEG image decode failed"));
+      image.src = url;
+    });
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+async function drawJpegPayload(payload, generation) {
+  const blob = new Blob([payload], { type: "image/jpeg" });
+  if ("createImageBitmap" in window) {
+    const bitmap = await createImageBitmap(blob);
+    try {
+      if (generation !== playerGeneration) return;
+      const canvas = $("v");
+      const ctx = canvas.getContext("2d");
+      if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
+        canvas.width = bitmap.width;
+        canvas.height = bitmap.height;
+      }
+      ctx.drawImage(bitmap, 0, 0);
+      noteDecodedFrame(bitmap.width, bitmap.height);
+      configured = true;
+      setState(t("decoding"));
+    } finally {
+      bitmap.close?.();
+    }
+    return;
+  }
+  await drawJpegWithImage(blob, generation);
+}
+
+async function drainJpegPayloads(firstPayload, generation) {
+  jpegDecodeInFlight = true;
+  let payload = firstPayload;
+  try {
+    while (payload && generation === playerGeneration) {
+      jpegPendingPayload = null;
+      await drawJpegPayload(payload, generation);
+      payload = jpegPendingPayload;
+    }
+  } catch (error) {
+    if (generation === playerGeneration) {
+      console.error("jpeg decode error", error);
+      setState(t("decodeFailed", error.message || String(error)), true);
+    }
+  } finally {
+    jpegDecodeInFlight = false;
+    if (jpegPendingPayload && generation === playerGeneration) {
+      const pending = jpegPendingPayload;
+      jpegPendingPayload = null;
+      void drainJpegPayloads(pending, generation);
+    }
+  }
+}
+
+function handleJpegPayload(payload) {
+  $("codec").textContent = "jpeg / canvas";
+  setState(t("camConnectedWaiting"));
+  const generation = playerGeneration;
+  if (jpegDecodeInFlight) {
+    jpegPendingPayload = payload;
+    return;
+  }
+  void drainJpegPayloads(payload, generation);
+}
+
 function tearDown() {
   playerGeneration += 1;
   if (mseSession) {
@@ -455,6 +562,9 @@ function tearDown() {
   }
   configured = false;
   codecHint = "h264";
+  useJpegCanvas = false;
+  jpegDecodeInFlight = false;
+  jpegPendingPayload = null;
   serverWillClose = false;
   stats.lastFrameLocalMs = 0;
   stats.lastWsTs = 0;
@@ -513,7 +623,13 @@ function connect() {
   localStorage.setItem("miloco_camera_id", camId);
 
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  const url = `${proto}://${location.host}/api/cameras/${encodeURIComponent(camId)}/stream`;
+  useJpegCanvas = shouldUseJpegCanvasFallback({
+    cameraId: camId,
+    isSecureContext: window.isSecureContext === true,
+    hasVideoDecoder: "VideoDecoder" in window,
+  });
+  const streamFormat = useJpegCanvas ? "?format=jpeg" : "";
+  const url = `${proto}://${location.host}/api/cameras/${encodeURIComponent(camId)}/stream${streamFormat}`;
 
   setState(t("connecting"));
   ws = new WebSocket(url, [CAMERA_PROTOCOL, authProtocol(token)]);
@@ -578,7 +694,13 @@ function onMessage(ev) {
 
   if (typeof ev.data === "string") return;
 
-  const nalu = new Uint8Array(ev.data);
+  const payload = new Uint8Array(ev.data);
+  if (useJpegCanvas) {
+    if (payload.byteLength) handleJpegPayload(payload);
+    return;
+  }
+
+  const nalu = payload;
   if (!nalu.byteLength) return;
   const frameType = Array.from(iterNALUnits(nalu)).some(
     (nal) => nal.length > 0 && (nal[0] & 0x1f) === 5,

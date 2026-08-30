@@ -18,7 +18,7 @@ from pydantic import ValidationError
 
 from miloco.camera.schema import RtspSourceUpsert
 from miloco.camera.service import CameraNotFoundError, CameraService, CameraServiceError
-from miloco.camera.stream import LiveStreamHub
+from miloco.camera.stream import LiveJpegStreamHub, LiveStreamHub
 from miloco.config import get_settings
 from miloco.middleware import verify_token
 from miloco.perception.collect.rtsp_probe import RtspSourceError
@@ -59,6 +59,12 @@ def _get_live_stream_hub() -> LiveStreamHub:
     return get_manager().live_stream_hub
 
 
+def _get_live_jpeg_stream_hub() -> LiveJpegStreamHub:
+    from miloco.manager import get_manager
+
+    return get_manager().live_jpeg_stream_hub
+
+
 async def _parse_rtsp_upsert(request: Request) -> RtspSourceUpsert:
     """Validate without exposing FastAPI/Pydantic's input-bearing error details."""
     try:
@@ -77,6 +83,9 @@ async def _parse_rtsp_upsert(request: Request) -> RtspSourceUpsert:
 
 CameraServiceDependency = Annotated[CameraService, Depends(_get_camera_service)]
 LiveStreamHubDependency = Annotated[LiveStreamHub, Depends(_get_live_stream_hub)]
+LiveJpegStreamHubDependency = Annotated[
+    LiveJpegStreamHub, Depends(_get_live_jpeg_stream_hub)
+]
 RtspBody = Annotated[RtspSourceUpsert, Depends(_parse_rtsp_upsert)]
 
 
@@ -279,6 +288,7 @@ async def camera_stream_websocket(
     camera_id: str,
     service: CameraServiceDependency,
     hub: LiveStreamHubDependency,
+    jpeg_hub: LiveJpegStreamHubDependency,
 ) -> None:
     try:
         accepted_protocol = _verify_generic_websocket(websocket)
@@ -293,7 +303,9 @@ async def camera_stream_websocket(
         await websocket.close(code=code, reason=reason)
         return
 
-    stream = hub.subscribe(camera_id)
+    stream_format = websocket.query_params.get("format", "h264")
+    active_hub = jpeg_hub if stream_format == "jpeg" else hub
+    stream = active_hub.subscribe(camera_id)
     sender: asyncio.Task[None] | None = None
     receiver: asyncio.Task[None] | None = None
     close_code = 1000
@@ -311,7 +323,7 @@ async def camera_stream_websocket(
         )
         if sender in done:
             sender.result()
-            state = hub.state(camera_id)
+            state = active_hub.state(camera_id)
             if state.error_code is not None:
                 close_code, close_reason = _runtime_stream_close(state.error_code)
     except WebSocketDisconnect:
@@ -323,7 +335,7 @@ async def camera_stream_websocket(
     except Exception as error:  # noqa: BLE001
         logger.warning("Camera live stream failed (%s)", type(error).__name__)
         close_code, close_reason = _runtime_stream_close(
-            hub.state(camera_id).error_code
+            active_hub.state(camera_id).error_code
         )
     finally:
         for task in (sender, receiver):

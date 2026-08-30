@@ -30,6 +30,7 @@ with warnings.catch_warnings():
 
 from miloco.camera.router import (
     _get_camera_service,
+    _get_live_jpeg_stream_hub,
     _get_live_stream_hub,
     _watch_for_disconnect,
     camera_stream_websocket,
@@ -110,7 +111,17 @@ def hub() -> _Hub:
 
 
 @pytest.fixture
-def client(service: _Service, hub: _Hub, monkeypatch: pytest.MonkeyPatch) -> TestClient:
+def jpeg_hub() -> _Hub:
+    return _Hub(chunks=(b"\xff\xd8jpeg-frame\xff\xd9",))
+
+
+@pytest.fixture
+def client(
+    service: _Service,
+    hub: _Hub,
+    jpeg_hub: _Hub,
+    monkeypatch: pytest.MonkeyPatch,
+) -> TestClient:
     monkeypatch.setattr(
         "miloco.middleware.auth_middleware.get_settings",
         lambda: SimpleNamespace(server=SimpleNamespace(token="service-token")),
@@ -138,6 +149,7 @@ def client(service: _Service, hub: _Hub, monkeypatch: pytest.MonkeyPatch) -> Tes
     app.include_router(router, prefix="/api")
     app.dependency_overrides[_get_camera_service] = lambda: service
     app.dependency_overrides[_get_live_stream_hub] = lambda: hub
+    app.dependency_overrides[_get_live_jpeg_stream_hub] = lambda: jpeg_hub
     return TestClient(app)
 
 
@@ -153,6 +165,23 @@ def test_authenticated_rtsp_upgrade_sends_binary_annexb_and_detaches(
 
     assert hub.closed.is_set()
     assert hub.subscriptions == ["rtsp:camera"]
+
+
+def test_jpeg_format_upgrade_routes_to_canvas_fallback_hub(
+    client: TestClient,
+    hub: _Hub,
+    jpeg_hub: _Hub,
+) -> None:
+    with client.websocket_connect(
+        "/api/cameras/rtsp%3Acamera/stream?format=jpeg",
+        subprotocols=[_FIXED_PROTOCOL, _auth_protocol("service-token")],
+    ) as websocket:
+        assert websocket.accepted_subprotocol == _FIXED_PROTOCOL
+        assert websocket.receive_bytes().startswith(b"\xff\xd8")
+
+    assert hub.subscriptions == []
+    assert jpeg_hub.closed.is_set()
+    assert jpeg_hub.subscriptions == ["rtsp:camera"]
 
 
 def test_unauthenticated_upgrade_is_rejected(client: TestClient) -> None:
@@ -192,6 +221,7 @@ async def test_uvicorn_handshake_contract_and_access_logs_never_expose_token(
     app.include_router(router, prefix="/api")
     app.dependency_overrides[_get_camera_service] = lambda: service
     app.dependency_overrides[_get_live_stream_hub] = lambda: hub
+    app.dependency_overrides[_get_live_jpeg_stream_hub] = lambda: _Hub()
 
     access_log = io.StringIO()
     access_handler = logging.StreamHandler(access_log)
@@ -454,6 +484,7 @@ async def test_abrupt_client_disconnect_closes_the_stream_iterator(
 
     service = _Service()
     hub = _Hub(chunks=(b"\x00\x00\x00\x01\x65",))
+    jpeg_hub = _Hub(chunks=(b"\xff\xd8jpeg-frame\xff\xd9",))
     websocket = _DisconnectingWebSocket()
 
     await camera_stream_websocket(
@@ -461,6 +492,7 @@ async def test_abrupt_client_disconnect_closes_the_stream_iterator(
         "rtsp:camera",
         cast(Any, service),
         cast(Any, hub),
+        cast(Any, jpeg_hub),
     )
 
     assert websocket.accepted is True
