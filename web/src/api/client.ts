@@ -1,22 +1,20 @@
-/** fetch 包装：自动注入 Bearer token；统一错误。 */
+/** fetch 包装：使用 dashboard session cookie 并统一错误。 */
 
 import i18n from "@/i18n";
 
-declare global {
-  interface Window {
-    __MILOCO_TOKEN__?: string;
-  }
+let csrfToken = "";
+
+export function setCsrfToken(token: string | null): void {
+  csrfToken = token ?? "";
 }
 
-export function resolveToken(): string {
-  const injected = window.__MILOCO_TOKEN__;
-  // 未被 backend SPA handler 注入时还是占位字面量 "__MILOCO_INJECT_TOKEN_HERE__"，
-  // 走 guard 返空串避免把假 token 当真用（fetch 也就不带 Authorization 头）。
-  // 用宽前缀 "__MILOCO_" 而不是只挡 "__MILOCO_INJECT_"——backend token 是
-  // uuid.uuid4() 生成（hex+dash），永远不会以 __MILOCO_ 打头；多挡一层防止旧版
-  // 字面量 "__MILOCO_TOKEN__"（旧 placeholder）若意外残留也会被识别。
-  if (injected && !injected.startsWith("__MILOCO_")) return injected;
-  return "";
+export function getCsrfToken(): string {
+  return csrfToken;
+}
+
+function isUnsafeMethod(method?: string): boolean {
+  const normalized = (method ?? "GET").toUpperCase();
+  return normalized === "POST" || normalized === "PUT" || normalized === "PATCH" || normalized === "DELETE";
 }
 
 export class ApiError extends Error {
@@ -54,14 +52,15 @@ export async function apiFetch<T>(
   path: string,
   init?: RequestInit,
 ): Promise<T> {
-  const token = resolveToken();
   const headers = new Headers(init?.headers);
-  if (token) headers.set("Authorization", `Bearer ${token}`);
+  if (csrfToken && isUnsafeMethod(init?.method)) {
+    headers.set("X-Miloco-CSRF", csrfToken);
+  }
   if (init?.body && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
 
-  const resp = await fetch(path, { ...init, headers });
+  const resp = await fetch(path, { ...init, headers, credentials: "same-origin" });
   if (!resp.ok) {
     const fallback = `HTTP ${resp.status}`;
     let parsed: { message: string; code?: string } = { message: fallback };

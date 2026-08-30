@@ -86,13 +86,12 @@ const I18N = {
     refreshTitle: "刷新摄像头列表",
     loading: "拉流中…",
     ready: "就绪",
-    camLoadFailed: "无法加载摄像头列表（token 错或后端离线）",
+    camLoadFailed: "无法加载摄像头列表（登录状态失效或后端离线）",
     camNone: "暂无可观看的摄像头",
     loadingCamList: "正在加载摄像头列表…",
     foundCams: (n) => `已找到 ${n} 个可观看的摄像头`,
     noCams: "当前没有可观看的摄像头",
     pickCamFirst: "请先选择摄像头",
-    missingToken: "缺少授权：请从 Miloco 家庭面板打开",
     connecting: "连接中…",
     connectingCam: "正在连接摄像头…",
     disconnected: (code) => `已断开 (${code})`,
@@ -126,13 +125,12 @@ const I18N = {
     refreshTitle: "Refresh camera list",
     loading: "Streaming…",
     ready: "Ready",
-    camLoadFailed: "Couldn't load camera list (bad token or backend offline)",
+    camLoadFailed: "Couldn't load camera list (sign-in expired or backend offline)",
     camNone: "No viewable cameras",
     loadingCamList: "Loading camera list…",
     foundCams: (n) => `Found ${n} viewable camera(s)`,
     noCams: "No viewable cameras right now",
     pickCamFirst: "Please pick a camera first",
-    missingToken: "Missing authorization: open this page from Miloco",
     connecting: "Connecting…",
     connectingCam: "Connecting to camera…",
     disconnected: (code) => `Disconnected (${code})`,
@@ -170,73 +168,7 @@ $("refresh").title = t("refreshTitle");
 $("loading").textContent = t("loading");
 $("state").textContent = t("ready");
 
-// The compatibility MIoT handler may substitute this placeholder. The generic
-// route serves the asset unchanged and receives auth from its same-origin SPA
-// parent over a source-checked postMessage handshake.
-const INJECTED_TOKEN = "__MILOCO_TOKEN__";
-// **不能**用 `!== "__MILOCO_TOKEN__"` 这种严格相等比较 — backend 是全文 replace,
-// 比较右侧的 "__MILOCO_TOKEN__" 字符串字面量也会被替换成真 token,导致条件
-// 永远 false 让真注入态被误判为未注入。startsWith 判定里的 "__MILOCO_" 子串
-// **不含完整占位** `__MILOCO_TOKEN__`,replace 不动它,继续工作。
-const TOKEN_INJECTED = INJECTED_TOKEN && !INJECTED_TOKEN.startsWith("__MILOCO_");
-
-const AUTH_REQUEST = "miloco.camera.auth.request";
-const AUTH_RESPONSE = "miloco.camera.auth.response";
-let PARENT_TOKEN = "";
-
-// Token resolution priority: legacy handler injection, then the same-origin
-// parent's in-memory response. Never read credentials from URL or storage.
-function resolveToken() {
-  if (TOKEN_INJECTED) return INJECTED_TOKEN;
-  return PARENT_TOKEN;
-}
-
-function requestParentToken() {
-  if (TOKEN_INJECTED) return Promise.resolve(INJECTED_TOKEN);
-  if (window.parent === window) return Promise.resolve("");
-  return new Promise((resolve) => {
-    let settled = false;
-    let timeout;
-    let requestTimer;
-    const finish = (token) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      clearInterval(requestTimer);
-      window.removeEventListener("message", onMessage);
-      PARENT_TOKEN = token;
-      resolve(token);
-    };
-    const onMessage = (event) => {
-      if (event.origin !== location.origin) return;
-      if (event.source !== window.parent) return;
-      if (event.data?.type !== AUTH_RESPONSE || event.data?.version !== 1) return;
-      if (typeof event.data.token !== "string" || !event.data.token) return;
-      finish(event.data.token);
-    };
-    const request = () => window.parent.postMessage(
-      { type: AUTH_REQUEST, version: 1 },
-      location.origin,
-    );
-    timeout = setTimeout(() => finish(""), 3000);
-    requestTimer = setInterval(request, 250);
-    window.addEventListener("message", onMessage);
-    request();
-  });
-}
-
 const CAMERA_PROTOCOL = "miloco.camera.v1";
-
-function base64UrlToken(token) {
-  const bytes = new TextEncoder().encode(token);
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
-}
-
-function authProtocol(token) {
-  return `miloco.auth.${base64UrlToken(token)}`;
-}
 
 function cameraIdFromPath() {
   const match = location.pathname.match(/\/api\/cameras\/(.+)\/watch$/);
@@ -261,12 +193,8 @@ function availableCameraId(wanted, cameras) {
 // Unified camera list. Disabled sources stay visible in management but are not
 // offered by this viewer because the stream endpoint rejects them explicitly.
 async function loadCameras() {
-  const token = resolveToken();
-  if (!token) return null;
   try {
-    const resp = await fetch("/api/cameras", {
-      headers: { "Authorization": `Bearer ${token}` },
-    });
+    const resp = await fetch("/api/cameras", { credentials: "same-origin" });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const json = await resp.json();
     if (json.code !== 0) throw new Error(json.message || "Couldn't fetch");
@@ -618,9 +546,7 @@ function tearDown() {
 function connect() {
   tearDown();
   const camId = $("cam").value;
-  const token = resolveToken();
   if (!camId) { setState(t("pickCamFirst"), true); return; }
-  if (!token) { setState(t("missingToken"), true); return; }
   localStorage.setItem("miloco_camera_id", camId);
 
   const proto = location.protocol === "https:" ? "wss" : "ws";
@@ -633,7 +559,7 @@ function connect() {
   const url = `${proto}://${location.host}/api/cameras/${encodeURIComponent(camId)}/stream${streamFormat}`;
 
   setState(t("connecting"));
-  ws = new WebSocket(url, [CAMERA_PROTOCOL, authProtocol(token)]);
+  ws = new WebSocket(url, [CAMERA_PROTOCOL]);
   ws.binaryType = "arraybuffer";
   // 本次连接的 socket 引用 + 专属 AbortController。listener 都挂在 thisWs 上并带
   // signal,支持的浏览器上 tearDown abort 后一次性解绑。身份守卫 `thisWs !== ws` 不是
@@ -1028,11 +954,6 @@ setInterval(() => {
 
 // Page boot: load camera list, then auto-connect if a camera is selected.
 (async () => {
-  const token = resolveToken() || await requestParentToken();
-  if (!token) {
-    setState(t("missingToken"), true);
-    return;
-  }
   // wantedCam 来自 URL query,strip 控制字符防 setState/textContent 拼字符串
   // 显示乱码(住户复制错链接含 \r\n / \x00 等不可见字符);截 64 字符防恶意/误粘
   // 超长串撑爆 footer 横滚(米家 did 实际 ≤32 hex 字符)。

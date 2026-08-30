@@ -11,7 +11,6 @@ import { useTranslation } from "react-i18next";
 import { createPortal } from "react-dom";
 import { IconCamera, IconX } from "@/lib/icons";
 import { useEscClose } from "@/hooks/useEscClose";
-import { resolveToken } from "@/api/client";
 
 interface Props {
   cameraName: string;
@@ -38,7 +37,6 @@ export function LivePlayerPlaceholder({
   const [expanded, setExpanded] = useState(false);
   const [smallLoaded, setSmallLoaded] = useState(false);
   const modalSlotRef = useRef<HTMLDivElement>(null);
-  const iframeRef = useRef<HTMLIFrameElement>(null);
   const [rect, setRect] = useState<{
     top: number;
     left: number;
@@ -59,28 +57,7 @@ export function LivePlayerPlaceholder({
     setSmallLoaded(false);
   }, [refKey]);
 
-  // The generic watch asset is public but its list/stream calls are not. Give
-  // only this exact same-origin child window the SPA's already injected token,
-  // in memory, after the child explicitly asks. No URL or browser storage is used.
-  useLayoutEffect(() => {
-    const onAuthRequest = (event: MessageEvent) => {
-      if (
-        !isCameraAuthRequest(
-          event,
-          window.location.origin,
-          iframeRef.current?.contentWindow ?? null,
-        )
-      ) return;
-      const token = resolveToken();
-      if (!token || !iframeRef.current?.contentWindow) return;
-      iframeRef.current.contentWindow.postMessage(
-        { type: "miloco.camera.auth.response", version: 1, token },
-        window.location.origin,
-      );
-    };
-    window.addEventListener("message", onAuthRequest);
-    return () => window.removeEventListener("message", onAuthRequest);
-  }, []);
+  // Same-origin iframe and WebSocket requests authenticate with the dashboard session cookie.
 
   // expanded=true 时同步 modal 占位 div 的 boundingRect → iframe 用 fixed +
   // inline rect 浮上去。ResizeObserver 监听占位尺寸/位置变化(dimmedMessage chip
@@ -182,7 +159,6 @@ export function LivePlayerPlaceholder({
         ) : (
           <>
             <iframe
-              ref={iframeRef}
               src={src}
               title={t("devices.liveView", { name: cameraName })}
               aria-hidden={useFixed ? undefined : "true"}
@@ -268,15 +244,4 @@ export function LivePlayerPlaceholder({
 
 export function cameraWatchUrl(cameraId: string): string {
   return `/api/cameras/${encodeURIComponent(cameraId)}/watch?embedded=1`;
-}
-
-export function isCameraAuthRequest(
-  event: Pick<MessageEvent, "data" | "origin" | "source">,
-  expectedOrigin: string,
-  expectedSource: MessageEventSource | null,
-): boolean {
-  if (expectedSource === null) return false;
-  if (event.origin !== expectedOrigin) return false;
-  if (event.source !== expectedSource) return false;
-  return event.data?.type === "miloco.camera.auth.request" && event.data?.version === 1;
 }

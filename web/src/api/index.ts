@@ -396,7 +396,7 @@ export async function listActivity(
   return impl.realListActivity(opts);
 }
 
-/** 事件 clip mp4 URL,含 ?token=... query 鉴权(<video> 无法设 Authorization). */
+/** 事件 clip mp4 URL，由同源 dashboard session cookie 鉴权。 */
 export function eventClipUrl(event_id: string, device_id: string): string {
   return impl.realEventClipUrl(event_id, device_id);
 }

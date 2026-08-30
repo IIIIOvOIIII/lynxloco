@@ -14,31 +14,20 @@ describe("bundled camera viewer", () => {
     expect(page).not.toContain("?token=${encodeURIComponent(token)}");
   });
 
-  it("carries browser websocket auth in a non-secret echoed subprotocol", () => {
+  it("uses the same-origin dashboard session for its browser websocket", () => {
     expect(page).toContain('const CAMERA_PROTOCOL = "miloco.camera.v1"');
-    expect(page).toContain('`miloco.auth.${base64UrlToken(token)}`');
-    expect(page).toContain("new WebSocket(url, [CAMERA_PROTOCOL, authProtocol(token)])");
+    expect(page).toContain("new WebSocket(url, [CAMERA_PROTOCOL])");
+    expect(page).not.toContain("miloco.auth.");
   });
 
-  it("requests an in-memory token from the exact same-origin parent before boot", () => {
-    expect(page).toContain('const AUTH_REQUEST = "miloco.camera.auth.request"');
-    expect(page).toContain('const AUTH_RESPONSE = "miloco.camera.auth.response"');
-    expect(page).toContain("event.origin !== location.origin");
-    expect(page).toContain("event.source !== window.parent");
-    expect(page).toContain("window.parent === window");
-    expect(page).toContain("await requestParentToken()");
-    expect(page).toContain("window.parent.postMessage(");
-    expect(page).toContain("location.origin,");
+  it("does not receive or store a service token", () => {
+    expect(page).not.toContain("__MILOCO_TOKEN__");
+    expect(page).not.toContain("requestParentToken");
+    expect(page).not.toContain("postMessage(");
     expect(page).not.toContain("location.hash");
     expect(page).not.toContain('params.get("token")');
     expect(page).not.toContain('localStorage.getItem("miloco_token")');
     expect(page).not.toContain('sessionStorage.getItem("miloco_token")');
-  });
-
-  it("fails closed when neither legacy injection nor parent auth is available", () => {
-    expect(page).toContain("if (!token) {");
-    expect(page).toContain('setState(t("missingToken"), true)');
-    expect(page).toContain("return;");
   });
 
   it("contains no legacy MIoT stream path", () => {

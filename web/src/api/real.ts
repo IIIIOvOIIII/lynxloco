@@ -5,7 +5,7 @@
  * 与 mock 对齐返回类型（types.ts），让 src/api/index.ts 能透明切换。
  */
 
-import { ApiError, apiFetch, resolveToken } from "./client";
+import { ApiError, apiFetch } from "./client";
 import { authHeaders } from "./register";
 import i18n from "@/i18n";
 import type {
@@ -1887,9 +1887,7 @@ export async function realListOnDemandLogs(opts?: {
 }
 
 export function realOnDemandClipUrl(logId: string, deviceId: string): string {
-  const token = resolveToken();
-  const base = `/api/perception/on-demand-logs/${encodeURIComponent(logId)}/clip/${encodeURIComponent(deviceId)}`;
-  return token ? `${base}?token=${encodeURIComponent(token)}` : base;
+  return `/api/perception/on-demand-logs/${encodeURIComponent(logId)}/clip/${encodeURIComponent(deviceId)}`;
 }
 
 export async function realSubmitOnDemandFeedback(
@@ -1911,21 +1909,18 @@ export async function realSubmitOnDemandFeedback(
 }
 
 /**
- * 拼事件 clip mp4 URL,带 `?token=...` query 鉴权(<video> 无法设 Authorization header).
- * 后端 `verify_token_query_fallback` 支持 query token.
+ * 拼事件 clip mp4 URL. Same-origin media requests carry the dashboard session cookie.
  *
  * clip = omni 上传给 LLM 的字节级 mp4(零重编):
  * - 视频路径:含 H264 + AAC
  * - audio-only 路径:仅 AAC(浏览器 <video> 控件能 render audio-only track)
  */
 export function realEventClipUrl(event_id: string, device_id: string): string {
-  const token = resolveToken();
-  const base = `/api/events/${encodeURIComponent(event_id)}/clip/${encodeURIComponent(device_id)}`;
-  return token ? `${base}?token=${encodeURIComponent(token)}` : base;
+  return `/api/events/${encodeURIComponent(event_id)}/clip/${encodeURIComponent(device_id)}`;
 }
 
 /**
- * 拼事件全景参考帧 ref.jpg URL(同款 `?token=...` query 鉴权,<img> 也不能设 header).
+ * 拼事件全景参考帧 ref.jpg URL. Same-origin image requests carry the dashboard session cookie.
  *
  * 仅 Smart Crop 事件有:该模式下送 LLM 的是裁切放大的局部视频 + 这张整帧参考图.
  * 调用方应先看 `event.has_ref` 再请求;非 crop 事件后端返 410.
@@ -1934,9 +1929,7 @@ export function realEventRefUrl(
   event_id: string,
   device_id: string,
 ): string {
-  const token = resolveToken();
-  const base = `/api/events/${encodeURIComponent(event_id)}/ref/${encodeURIComponent(device_id)}`;
-  return token ? `${base}?token=${encodeURIComponent(token)}` : base;
+  return `/api/events/${encodeURIComponent(event_id)}/ref/${encodeURIComponent(device_id)}`;
 }
 
 /**
@@ -1971,7 +1964,7 @@ export async function realEventCropMeta(
  * 订阅 `/api/events/stream` SSE,新事件来时 callback `(ActivityEvent)`.
  * 返回 unsubscribe 函数.
  *
- * 注:EventSource 也无法设 Authorization header,用 `?token=...` 兜底.
+ * EventSource shares the same-origin dashboard session cookie.
  *
  * onOpen 可选:**仅在断线后重连成功时**触发(EventSource 'open' 事件首次也会 fire,
  * 我们用 firstOpenSkipped 旗标跳过初次连接).调用方典型用法是借此 reload 一次列表,
@@ -1984,11 +1977,7 @@ export function realSubscribeEvents(
   onEvent: (e: ActivityEvent) => void,
   onOpen?: () => void,
 ): () => void {
-  const token = resolveToken();
-  const url = token
-    ? `/api/events/stream?token=${encodeURIComponent(token)}`
-    : "/api/events/stream";
-  const es = new EventSource(url);
+  const es = new EventSource("/api/events/stream");
   let firstOpenSeen = false;
   if (onOpen) {
     es.addEventListener("open", () => {
@@ -2482,11 +2471,7 @@ export function realSubscribeOmniHealth(
   onHealth: (h: OmniHealth) => void,
   onOpen?: () => void,
 ): () => void {
-  const token = resolveToken();
-  const url = token
-    ? `/api/admin/omni-config/stream?token=${encodeURIComponent(token)}`
-    : "/api/admin/omni-config/stream";
-  const es = new EventSource(url);
+  const es = new EventSource("/api/admin/omni-config/stream");
   let firstOpenSeen = false;
   if (onOpen) {
     es.addEventListener("open", () => {

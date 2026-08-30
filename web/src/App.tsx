@@ -66,6 +66,9 @@ import { IconMoon, IconSun } from "./lib/icons";
 import { useTheme } from "./hooks/useTheme";
 import { useTranslation } from "react-i18next";
 import { LanguageSwitcher } from "./components/LanguageSwitcher";
+import { AuthGate } from "./components/AuthGate";
+import { DashboardUserMenu } from "./components/DashboardUserMenu";
+import type { AuthStatus } from "./lib/auth";
 import {
   cameraSummaryAvailability,
   createRtspRefreshCoordinator,
@@ -130,11 +133,31 @@ function PerfView() {
 /** 顶层切换器:debug mode 与主应用是两棵独立的 React 子树。
  *  这样切换时 hooks 序列不会发生数量变化,避免 Rules of Hooks 错误。 */
 export function App() {
-  const perfMode = usePerfMode();
-  return perfMode ? <PerfView /> : <MainApp />;
+  return (
+    <AuthGate>
+      {(auth, onLogout) => <DashboardApp auth={auth} onLogout={onLogout} />}
+    </AuthGate>
+  );
 }
 
-function MainApp() {
+function DashboardApp({
+  auth,
+  onLogout,
+}: {
+  auth: AuthStatus;
+  onLogout: () => Promise<void>;
+}) {
+  const perfMode = usePerfMode();
+  return perfMode ? <PerfView /> : <MainApp auth={auth} onLogout={onLogout} />;
+}
+
+function MainApp({
+  auth,
+  onLogout,
+}: {
+  auth: AuthStatus;
+  onLogout: () => Promise<void>;
+}) {
   const { t } = useTranslation();
   // ── 当前家 ────────────────────────────────────────
   // backend 多家庭未上线,前端 homeId 永远 "primary"。切家走 onSwitchHome 调
@@ -661,6 +684,8 @@ function MainApp() {
       <div className="flex-1 flex flex-col min-w-0 min-h-0">
         {/* 顶部 bar(shrink-0,跟随主区不滚动) */}
         <TopBar
+          auth={auth}
+          onLogout={onLogout}
           miotBound={status.data?.miot.bound}
           homes={scopeHomes.data ?? []}
           onSwitchHome={async (targetHomeId) => {
@@ -866,10 +891,14 @@ function MainApp() {
  * mobile 端简化版与 sidebar 互斥。
  */
 function TopBar({
+  auth,
+  onLogout,
   miotBound,
   homes,
   onSwitchHome,
 }: {
+  auth: AuthStatus;
+  onLogout: () => void | Promise<void>;
   miotBound: boolean | undefined;
   homes: { homeId: string; homeName: string; inUse: boolean }[];
   onSwitchHome: (homeId: string) => void;
@@ -905,6 +934,7 @@ function TopBar({
         )}
       </div>
       <div className="flex items-center gap-2 shrink-0">
+        <DashboardUserMenu auth={auth} onLogout={onLogout} />
         <LanguageSwitcher />
         <button
           type="button"

@@ -4,7 +4,6 @@ import { describe, expect, it } from "vitest";
 
 import {
   cameraWatchUrl,
-  isCameraAuthRequest,
 } from "@/components/LivePlayerPlaceholder";
 
 describe("unified camera watch URL", () => {
@@ -20,33 +19,16 @@ describe("unified camera watch URL", () => {
     expect(cameraWatchUrl("rtsp:source/1")).not.toContain("#");
   });
 
-  it("only sends the in-memory injected token to its own same-origin iframe", () => {
+  it("uses the same-origin dashboard session without an injected token exchange", () => {
     const component = readFileSync(
       fileURLToPath(new URL("../src/components/LivePlayerPlaceholder.tsx", import.meta.url)),
       "utf8",
     );
-    expect(component).toContain("event.origin !== expectedOrigin");
-    expect(component).toContain("event.source !== expectedSource");
-    expect(component).toContain('event.data?.type === "miloco.camera.auth.request"');
-    expect(component).toContain("iframeRef.current.contentWindow.postMessage(");
-    expect(component).toContain("window.location.origin,");
+    expect(component).toContain("dashboard session cookie");
+    expect(component).not.toContain("miloco.camera.auth.request");
+    expect(component).not.toContain("postMessage(");
+    expect(component).not.toContain("resolveToken");
     expect(component).not.toContain("localStorage.setItem");
     expect(component).not.toContain("sessionStorage.setItem");
-  });
-
-  it("rejects a wrong origin or source and accepts only the exact child", () => {
-    const source = {} as MessageEventSource;
-    const request = {
-      origin: "https://miloco.test",
-      source,
-      data: { type: "miloco.camera.auth.request", version: 1 },
-    };
-    expect(isCameraAuthRequest(request, "https://evil.test", source)).toBe(false);
-    expect(isCameraAuthRequest(request, request.origin, null)).toBe(false);
-    expect(isCameraAuthRequest(request, request.origin, {} as MessageEventSource)).toBe(false);
-    expect(isCameraAuthRequest(request, request.origin, source)).toBe(true);
-    expect(
-      isCameraAuthRequest({ ...request, data: { ...request.data, version: 2 } }, request.origin, source),
-    ).toBe(false);
   });
 });

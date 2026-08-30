@@ -290,28 +290,11 @@ describe("realGetPerceptionRuntimeSummary — /api/perception/runtime-summary �
 });
 
 describe("Smart Crop 参考帧契约 — realEventRefUrl / realEventCropMeta", () => {
-  // resolveToken 读 window.__MILOCO_TOKEN__(backend SPA handler 注入),用例间要还原,
-  // 否则带 token 的用例会污染后面断言"裸路径"的用例。
-  const originalToken = window.__MILOCO_TOKEN__;
-  afterEach(() => {
-    window.__MILOCO_TOKEN__ = originalToken;
-  });
-
-  it("无 token 时是裸路径(<img> 不能设 header,所以只能走 query)", () => {
-    window.__MILOCO_TOKEN__ = undefined;
+  it("是经过编码的同源裸路径，交由 dashboard session cookie 鉴权", () => {
     expect(realEventRefUrl("e1", "cam_1")).toBe("/api/events/e1/ref/cam_1");
-  });
-
-  it("有 token 时拼 ?token=,且 event/device/token 都过 encodeURIComponent", () => {
-    window.__MILOCO_TOKEN__ = "tok/en+1";
     expect(realEventRefUrl("e 1", "cam#1")).toBe(
-      "/api/events/e%201/ref/cam%231?token=tok%2Fen%2B1",
+      "/api/events/e%201/ref/cam%231",
     );
-  });
-
-  it("占位 token 未被注入时不当真 token 用(不拼 query)", () => {
-    window.__MILOCO_TOKEN__ = "__MILOCO_INJECT_TOKEN_HERE__";
-    expect(realEventRefUrl("e1", "cam_1")).toBe("/api/events/e1/ref/cam_1");
   });
 
   it("realEventCropMeta：解出 region / frame_size / crop 短边", async () => {

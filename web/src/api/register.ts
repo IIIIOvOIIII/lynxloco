@@ -8,14 +8,14 @@
  * 前端直接走主 backend。
  */
 
-import { resolveToken } from "./client";
 import i18n from "@/i18n";
+import { getCsrfToken } from "./client";
 
-// 生产 / dev 都通过主 backend 转发,token 经 vite proxy::attachAuth(dev)或前端
-// 显式带 Authorization(prod)抵达。两条路径都走 resolveToken。
 export function authHeaders(extra?: Record<string, string>): Record<string, string> {
-  const token = resolveToken();
-  return token ? { ...(extra ?? {}), Authorization: `Bearer ${token}` } : (extra ?? {});
+  const csrfToken = getCsrfToken();
+  return csrfToken
+    ? { ...(extra ?? {}), "X-Miloco-CSRF": csrfToken }
+    : (extra ?? {});
 }
 
 export interface ExtractCandidate {
