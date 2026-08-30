@@ -49,7 +49,7 @@ def repo(real_db):
 def _make_entry(ts_ms: int, desc: dict[str, str] | None = None) -> _LogEntry:
     return _LogEntry(
         timestamp=ts_ms,
-        descriptions=desc or {"cam1": f"scene at {ts_ms}"},
+        descriptions=desc if desc is not None else {"cam1": f"scene at {ts_ms}"},
     )
 
 
@@ -133,6 +133,47 @@ class TestPerceptionRepoQuery:
 
         logs, count = repo.query()
         assert count == 1
+
+    def test_append_stats_track_inference_insert_empty_and_dedup(self, repo):
+        first = _make_entry(1000, {})
+        second = _make_entry(2000, {})
+
+        assert repo.append(first) is True
+        assert repo.append(second) is False
+
+        stats = repo.runtime_stats()
+        assert stats.today_inference_count == 2
+        assert stats.today_insert_count == 1
+        assert stats.last_inference_ms == 2000
+        assert stats.last_insert_ms == 1000
+        assert stats.last_descriptions_empty is True
+        assert stats.last_append_inserted is False
+        assert stats.consecutive_empty_descriptions == 2
+        assert stats.consecutive_deduplicated == 1
+
+    def test_append_stats_reset_empty_and_dedup_streaks_on_new_description(
+        self, repo,
+    ):
+        assert repo.append(_make_entry(1000, {})) is True
+        assert repo.append(_make_entry(2000, {})) is False
+        assert repo.append(_make_entry(3000, {"厨房": "有人经过"})) is True
+
+        stats = repo.runtime_stats()
+        assert stats.today_inference_count == 3
+        assert stats.today_insert_count == 2
+        assert stats.last_inference_ms == 3000
+        assert stats.last_insert_ms == 3000
+        assert stats.last_descriptions_empty is False
+        assert stats.last_append_inserted is True
+        assert stats.consecutive_empty_descriptions == 0
+        assert stats.consecutive_deduplicated == 0
+
+    def test_count_since_and_latest_timestamp(self, repo):
+        repo.append(_make_entry(1000, {"客厅": "空"}))
+        repo.append(_make_entry(2000, {"客厅": "有人"}))
+
+        assert repo.count_since(1500) == 1
+        assert repo.latest_timestamp_ms() == 2000
 
     def test_delete_before_days(self, repo):
         old_ms = int(time.time() * 1000) - 40 * 86400_000

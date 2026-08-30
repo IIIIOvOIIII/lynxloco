@@ -8,7 +8,7 @@ perception log retrieval, and device listing.
 import logging
 from dataclasses import asdict
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
@@ -44,6 +44,18 @@ def _require_engine_ready():
 async def get_engine_status():
     status = manager.perception_service.engine_status()
     return NormalResponse(code=0, message="ok", data=status)
+
+
+@router.get(
+    "/runtime-summary",
+    summary="Summarize realtime perception runtime state",
+    dependencies=[Depends(verify_token)],
+)
+async def runtime_summary(request: Request):
+    data = manager.perception_service.runtime_summary(
+        obs_db_path=getattr(request.app.state, "obs_db_path", None),
+    )
+    return NormalResponse(code=0, message="ok", data=data)
 
 
 @router.post(
@@ -234,5 +246,4 @@ async def list_devices():
         message="ok",
         data=[asdict(d) for d in devices],
     )
-
 

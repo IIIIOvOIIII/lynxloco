@@ -16,6 +16,7 @@ import { ApiError } from "@/api/client";
 import {
   realListActivity,
   realListDevices,
+  realGetPerceptionRuntimeSummary,
   realGetUsageStats,
   realGetOmniConfig,
   realUpdateOmniConfig,
@@ -196,6 +197,95 @@ describe("realListActivity — /api/events 契约", () => {
     expect(calls[0]).toContain("before=1780999999999");
     expect(calls[0]).toContain("limit=100");
     expect(calls[0]).toContain("offset=50");
+  });
+});
+
+describe("realGetPerceptionRuntimeSummary — /api/perception/runtime-summary 契约", () => {
+  it("maps backend snake_case fields to frontend camelCase", async () => {
+    mockFetchByUrl({
+      "/api/perception/runtime-summary": {
+        code: 0,
+        message: "ok",
+        data: {
+          now_ms: 10,
+          engine: {
+            running: true,
+            ready: true,
+            status: "ready",
+            message: "",
+          },
+          sources: {
+            active_count: 2,
+            active_sources: [
+              {
+                did: "rtsp:living",
+                name: "客厅摄像头",
+                device_type: "camera",
+                modalities: ["video"],
+              },
+            ],
+          },
+          logs: {
+            today_inference_count: 12,
+            raw_total: 3,
+            raw_last_hour: 0,
+            last_inference_ms: 9,
+            last_insert_ms: null,
+            last_descriptions_empty: true,
+            last_append_inserted: false,
+            consecutive_empty_descriptions: 5,
+            consecutive_deduplicated: 4,
+            meaningful_total: 1,
+            meaningful_last_hour: 0,
+            last_meaningful_event_ms: null,
+          },
+          windows: [
+            {
+              minutes: 15,
+              cycle_count: 10,
+              skipped_count: 1,
+              video_pass_count: 4,
+              audio_pass_count: 0,
+              hold_pass_count: 2,
+              omni_call_count: 8,
+              omni_error_count: 1,
+              cycle_error_count: 0,
+              dropped_windows_count: 3,
+              overflow_count: 0,
+            },
+          ],
+          latest_omni: {
+            timestamp_ms: 8,
+            protocol: "openai_responses",
+            route: "realtime",
+            request: { image_block_count: 1 },
+            response: { classification: "semantic_empty" },
+            error_code: null,
+          },
+          semantic_state: "silent",
+          hints: ["semantic_output_empty"],
+        },
+      },
+    });
+
+    const summary = await realGetPerceptionRuntimeSummary();
+
+    expect(summary.nowMs).toBe(10);
+    expect(summary.sources.activeCount).toBe(2);
+    expect(summary.sources.activeSources[0]).toMatchObject({
+      did: "rtsp:living",
+      deviceType: "camera",
+    });
+    expect(summary.logs.todayInferenceCount).toBe(12);
+    expect(summary.logs.consecutiveEmptyDescriptions).toBe(5);
+    expect(summary.windows[0]).toMatchObject({
+      cycleCount: 10,
+      omniCallCount: 8,
+      omniErrorCount: 1,
+    });
+    expect(summary.latestOmni?.timestampMs).toBe(8);
+    expect(summary.latestOmni?.errorCode).toBeNull();
+    expect(summary.semanticState).toBe("silent");
   });
 });
 

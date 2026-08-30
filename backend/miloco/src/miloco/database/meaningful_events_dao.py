@@ -146,6 +146,39 @@ class MeaningfulEventDao:
             logger.error("Failed to query meaningful events: %s", e)
             return []
 
+    def count_since(self, since_ms: int) -> int:
+        """Count meaningful events since an absolute Unix ms timestamp."""
+        try:
+            sql = "SELECT COUNT(*) as count FROM meaningful_events WHERE timestamp >= ?"
+            rows = self.db_connector.execute_query(sql, (since_ms,))
+            return rows[0]["count"] if rows else 0
+        except Exception as e:
+            logger.error("Failed to count meaningful events since %s: %s", since_ms, e)
+            return 0
+
+    def count_all(self) -> int:
+        """Count all meaningful events."""
+        try:
+            sql = "SELECT COUNT(*) as count FROM meaningful_events"
+            rows = self.db_connector.execute_query(sql)
+            return rows[0]["count"] if rows else 0
+        except Exception as e:
+            logger.error("Failed to count meaningful events: %s", e)
+            return 0
+
+    def latest_timestamp_ms(self) -> int | None:
+        """Return the newest meaningful event timestamp, if any."""
+        try:
+            sql = "SELECT MAX(timestamp) as latest_timestamp FROM meaningful_events"
+            rows = self.db_connector.execute_query(sql)
+            if not rows:
+                return None
+            value = rows[0]["latest_timestamp"]
+            return int(value) if value is not None else None
+        except Exception as e:
+            logger.error("Failed to get latest meaningful event timestamp: %s", e)
+            return None
+
     def get_by_id(self, event_id: str) -> dict[str, Any] | None:
         """单行查询,主要给 events_service.locate_clip 用(验证 event 存在 + device_id 合法)."""
         try:

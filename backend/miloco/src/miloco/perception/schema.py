@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -449,6 +449,76 @@ class PerceptionEngineStatus(BaseModel):
         default=None,
         description="Last cycle latency breakdown in ms",
     )
+
+
+class RuntimeEngineSummary(BaseModel):
+    running: bool = False
+    ready: bool = False
+    status: str = "not_initialized"
+    message: str = ""
+
+
+class RuntimeSourceSummary(BaseModel):
+    active_count: int = 0
+    active_sources: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class RuntimeLogSummary(BaseModel):
+    today_inference_count: int = 0
+    raw_total: int = 0
+    raw_last_hour: int = 0
+    last_inference_ms: int | None = None
+    last_insert_ms: int | None = None
+    last_descriptions_empty: bool | None = None
+    last_append_inserted: bool | None = None
+    consecutive_empty_descriptions: int = 0
+    consecutive_deduplicated: int = 0
+    meaningful_total: int = 0
+    meaningful_last_hour: int = 0
+    last_meaningful_event_ms: int | None = None
+
+
+class RuntimeWindowSummary(BaseModel):
+    minutes: int
+    cycle_count: int = 0
+    skipped_count: int = 0
+    video_pass_count: int = 0
+    audio_pass_count: int = 0
+    hold_pass_count: int = 0
+    omni_call_count: int = 0
+    omni_error_count: int = 0
+    cycle_error_count: int = 0
+    dropped_windows_count: int = 0
+    overflow_count: int = 0
+
+
+class RuntimeOmniSummary(BaseModel):
+    timestamp_ms: int | None = None
+    protocol: str | None = None
+    route: str | None = None
+    request: dict[str, int] = Field(default_factory=dict)
+    response: dict[str, int | bool | str] = Field(default_factory=dict)
+    error_code: str | None = None
+
+
+class PerceptionRuntimeSummary(BaseModel):
+    now_ms: int
+    engine: RuntimeEngineSummary
+    sources: RuntimeSourceSummary
+    logs: RuntimeLogSummary
+    windows: list[RuntimeWindowSummary] = Field(default_factory=list)
+    latest_omni: RuntimeOmniSummary | None = None
+    semantic_state: Literal[
+        "inactive",
+        "not_ready",
+        "no_sources",
+        "collecting",
+        "eventing",
+        "describing",
+        "silent",
+        "degraded",
+    ] = "collecting"
+    hints: list[str] = Field(default_factory=list)
 
 
 class OnDemandPerceptionRequest(BaseModel):

@@ -22,6 +22,7 @@ import type {
   HomeEntryType,
   HomeId,
   HomeStatus,
+  PerceptionRuntimeSummary,
   ProcSeries,
   MemorySeries,
   MemorySnapshot,
@@ -95,6 +96,13 @@ export async function getHomeStatus(homeId?: HomeId): Promise<HomeStatus> {
     };
   }
   return impl.realHomeStatus();
+}
+
+export async function getPerceptionRuntimeSummary(
+  homeId?: HomeId,
+): Promise<PerceptionRuntimeSummary | null> {
+  if (!isPrimary(homeId)) return null;
+  return impl.realGetPerceptionRuntimeSummary();
 }
 
 // ── 家人 ──────────────────────────────────────────────────

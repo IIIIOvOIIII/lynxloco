@@ -172,10 +172,29 @@ def test_model_defaults_align_with_schema() -> None:
     assert s.model.omni.base_url == "https://api.xiaomimimo.com/v1"
     assert s.model.omni.api_key == ""
     assert s.model.omni.api_protocol == "openai_chat_completions"
+    assert s.model.omni.timeout == 120.0
+    assert s.perception.engine["omni"]["timeout"] == 120.0
     assert s.agent.webhook_url == "http://127.0.0.1:18789/miloco/webhook"
     assert s.agent.auth_bearer == ""
     assert s.server.python_bin == ""
     assert s.debug is False
+
+
+def test_model_omni_timeout_propagates_to_perception_engine() -> None:
+    settings = MilocoSettings(
+        model=ModelSettings(
+            omni=OmniModelSettings(
+                model="local-vlm",
+                base_url="http://127.0.0.1:8000/v1",
+                api_key="",
+                api_protocol="openai_responses",
+                timeout=120.0,
+            )
+        )
+    )
+
+    assert settings.model.omni.timeout == 120.0
+    assert settings.perception.engine["omni"]["timeout"] == 120.0
 
 
 def test_legacy_active_json_profile_keeps_protocol_missing_until_resolution(

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -22,6 +23,31 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class PerceptionLogRuntimeStats:
+    today_inference_count: int = 0
+    today_insert_count: int = 0
+    last_inference_ms: int | None = None
+    last_insert_ms: int | None = None
+    last_descriptions_empty: bool | None = None
+    last_append_inserted: bool | None = None
+    consecutive_empty_descriptions: int = 0
+    consecutive_deduplicated: int = 0
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+def _descriptions_empty(descriptions: dict[str, object]) -> bool:
+    for value in descriptions.values():
+        if isinstance(value, str):
+            if value.strip():
+                return False
+        elif value:
+            return False
+    return True
+
+
 class PerceptionLogRepo:
     """Data access object for the perception_log table."""
 
@@ -32,6 +58,7 @@ class PerceptionLogRepo:
         # Daily inference counter (resets on date boundary)
         self._today_date: str = ""
         self._today_inference_count: int = 0
+        self._runtime_stats = PerceptionLogRuntimeStats()
 
     def _check_date_boundary(self) -> None:
         """Reset daily inference counter if date has changed."""
@@ -39,10 +66,16 @@ class PerceptionLogRepo:
         if today != self._today_date:
             self._today_date = today
             self._today_inference_count = 0
+            self._runtime_stats = PerceptionLogRuntimeStats()
 
     def get_today_inference_count(self) -> int:
         self._check_date_boundary()
         return self._today_inference_count
+
+    def runtime_stats(self) -> PerceptionLogRuntimeStats:
+        self._check_date_boundary()
+        self._runtime_stats.today_inference_count = self._today_inference_count
+        return PerceptionLogRuntimeStats(**self._runtime_stats.to_dict())
 
     def append(self, entry: PerceptionLogEntry) -> bool:
         """Append a perception log entry.
@@ -55,6 +88,13 @@ class PerceptionLogRepo:
         """
         self._check_date_boundary()
         self._today_inference_count += 1
+        self._runtime_stats.today_inference_count = self._today_inference_count
+        self._runtime_stats.last_inference_ms = entry.timestamp
+        empty = _descriptions_empty(entry.descriptions)
+        self._runtime_stats.last_descriptions_empty = empty
+        self._runtime_stats.consecutive_empty_descriptions = (
+            self._runtime_stats.consecutive_empty_descriptions + 1 if empty else 0
+        )
 
         # Adjacent dedup: skip insert if descriptions unchanged
         if (
@@ -62,6 +102,8 @@ class PerceptionLogRepo:
             and entry.descriptions == self._last_descriptions
         ):
             logger.debug("Perception log deduplicated, skipping insert: %s", entry.id)
+            self._runtime_stats.last_append_inserted = False
+            self._runtime_stats.consecutive_deduplicated += 1
             return False
 
         self._last_descriptions = entry.descriptions.copy()
@@ -83,10 +125,15 @@ class PerceptionLogRepo:
                 conn.commit()
 
             logger.debug("Perception log inserted: %s", entry.id)
+            self._runtime_stats.last_insert_ms = entry.timestamp
+            self._runtime_stats.last_append_inserted = True
+            self._runtime_stats.today_insert_count += 1
+            self._runtime_stats.consecutive_deduplicated = 0
             return True
 
         except Exception as e:
             logger.error("Failed to insert perception log: %s", e)
+            self._runtime_stats.last_append_inserted = False
             return False
 
     def query(
@@ -169,6 +216,29 @@ class PerceptionLogRepo:
             logger.error("Failed to count perception logs: %s", e)
             return 0
 
+    def count_since(self, since_ms: int) -> int:
+        """Get count of perception log entries since an absolute Unix ms time."""
+        try:
+            sql = "SELECT COUNT(*) as count FROM perception_log WHERE timestamp >= ?"
+            results = self.db_connector.execute_query(sql, (since_ms,))
+            return results[0]["count"] if results else 0
+        except Exception as e:
+            logger.error("Failed to count perception logs since %s: %s", since_ms, e)
+            return 0
+
+    def latest_timestamp_ms(self) -> int | None:
+        """Return the latest persisted perception log timestamp, if any."""
+        try:
+            sql = "SELECT MAX(timestamp) as latest_timestamp FROM perception_log"
+            results = self.db_connector.execute_query(sql)
+            if not results:
+                return None
+            value = results[0]["latest_timestamp"]
+            return int(value) if value is not None else None
+        except Exception as e:
+            logger.error("Failed to get latest perception log timestamp: %s", e)
+            return None
+
     def delete_before_days(self, days: int) -> int:
         """Delete perception logs older than N days.
 
@@ -182,4 +252,3 @@ class PerceptionLogRepo:
         except Exception as e:
             logger.error("Failed to delete old perception logs: %s", e)
             return 0
-

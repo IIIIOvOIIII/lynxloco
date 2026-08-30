@@ -107,6 +107,11 @@
               ],
               "default": null,
               "description": "Omni API 协议；旧档案缺失时仅按模型名兼容推断，Base URL 不参与协议选择"
+            },
+            "timeout": {
+              "type": "number",
+              "default": 120.0,
+              "description": "多模态模型请求超时（秒）；本地/内网视觉模型可能需要更长推理时间。"
             }
           },
           "required": ["model", "base_url", "api_key"]

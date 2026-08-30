@@ -20,3 +20,10 @@
 - Expected result: The design and task plan make the new realtime/fused timeout and JSON-only model contract explicit before any worktree implementation starts.
 - Result: Achieved. The plan now requires effective realtime/fused Omni calls to use a 120-second model timeout, including default `OmniConfig`, `model.omni.timeout`, settings propagation, live config refresh, and fused HTTP client cache rebuild when timeout changes. The plan and spec now require OpenAI Responses visual/image-sequence calls to return one parseable structured JSON object matching Miloco's active route schema; prose outside JSON remains a parse/diagnostic failure rather than a successful perception result.
 - Next step: Execute the updated Task 7 after Phase 1 diagnostic visibility is in place, then use the runtime diagnostics to verify whether 120 seconds plus JSON-only contract produces usable realtime captions on real RTSP frames.
+
+## 2026-08-30 18:11 +08
+
+- Current work: Implemented the approved first and second phase changes directly on `main`.
+- Expected result: Miloco exposes enough runtime evidence to distinguish "service running", "raw perception logs being created", "meaningful events being generated", and "Omni returned parseable semantic content"; realtime/fused Omni calls use a 120-second timeout and ask for one structured JSON object.
+- Result: Achieved locally. Added backend runtime summary and sanitized Omni diagnostics, a frontend perception runtime card, `model.omni.timeout` propagation, fused HTTP client rebuild on timeout changes, and stricter JSON-only/caption prompt contract. Verification passed: backend targeted perception/settings suite `246 passed, 1 warning`; frontend targeted suite `36 passed`; frontend production build succeeded with only the existing large-chunk warning.
+- Next step: Commit the main-branch implementation, open an ITSM CO/PAM for `miloco.esxi`, deploy the exact commit, then validate production health and runtime-summary evidence without exposing secrets or raw camera/model data.

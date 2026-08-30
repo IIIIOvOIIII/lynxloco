@@ -33,6 +33,7 @@ from miloco.perception.engine.omni.provider import (
     messages_have_visual_input,
     resolve_api_protocol,
 )
+from miloco.perception.runtime_diagnostics import record_omni_http_diagnostic
 from miloco.perception.snapshot_context import push_omni_trace
 
 logger = logging.getLogger(__name__)
@@ -146,7 +147,7 @@ def resolve_api_key(config: OmniConfig) -> str:
 def resolve_live_omni_config(base: OmniConfig) -> OmniConfig:
     """Refresh user-configurable Omni fields from
     the current settings, keeping the engine snapshot's other fields
-    (max_completion_tokens / temperature / top_p / timeout / stream).
+    (max_completion_tokens / temperature / top_p / stream).
 
     感知引擎启动时把 OmniConfig 当快照持有,故 web 改配置默认要重启才生效。
     在每次 omni 调用前用本函数取一次当前 settings(``update_shared_config`` 写完已
@@ -177,6 +178,7 @@ def resolve_live_omni_config(base: OmniConfig) -> OmniConfig:
         base_url=o.base_url,
         api_key=api_key,
         api_protocol=o.api_protocol,
+        timeout=o.timeout,
     )
     _maybe_reset_breaker_on_config_change(resolved)
     return resolved
@@ -318,6 +320,13 @@ async def call_omni(
                 "top_p": config.top_p,
                 "max_tokens": config.max_completion_tokens,
             },
+        )
+        record_omni_http_diagnostic(
+            request_messages=messages,
+            response_raw=raw,
+            protocol=resolve_api_protocol(config.api_protocol, config.model),
+            route=type,
+            error_code=error.get("code") if error else None,
         )
 
 

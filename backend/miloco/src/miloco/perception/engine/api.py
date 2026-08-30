@@ -1275,4 +1275,9 @@ class PerceptionEngine(BasePerceptionEngine):
                     self._pending_speech.pop(did, None)
                     self._pending_speech_rounds.pop(did, None)
 
+        from miloco.perception.runtime_diagnostics import (
+            record_realtime_result_diagnostic,
+        )
+
+        record_realtime_result_diagnostic(result=merged)
         return merged

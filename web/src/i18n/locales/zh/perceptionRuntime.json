@@ -1,0 +1,39 @@
+{
+  "perceptionRuntime": {
+    "title": "感知运行状态",
+    "unknownTitle": "正在读取感知状态",
+    "inactiveTitle": "感知服务未运行",
+    "notReadyTitle": "感知服务还没准备好",
+    "noSourcesTitle": "没有启用的感知摄像头",
+    "collectingTitle": "正在看家，等待新线索",
+    "eventingTitle": "正在看家，最近有事件",
+    "describingTitle": "正在看家，最近有画面描述",
+    "silentTitle": "正在看家，但实时语义为空",
+    "degradedTitle": "感知链路不稳定",
+    "unknownDetail": "正在汇总引擎、摄像头和模型链路状态。",
+    "inactiveDetail": "服务已停止，不会采集画面或调用模型。",
+    "notReadyDetail": "服务进程在运行，但模型或采集链路还没有准备好。",
+    "noSourcesDetail": "请在摄像头列表里启用至少一个感知摄像头。",
+    "collectingDetail": "摄像头正在投喂画面，系统会等待足够的新变化再推理。",
+    "eventingDetail": "最近已经产生住户事件，感知链路正在工作。",
+    "describingDetail": "最近已经产生画面描述，但还没有形成住户事件。",
+    "silentDetail": "模型链路有运行迹象，但解析后的画面语义为空，需要继续看模型输出形态。",
+    "degradedDetail": "近期模型或处理错误偏高，感知结果可能不稳定。",
+    "summaryLine": "今日 {{inferences}} 次推理；近 1 小时 {{raw}} 条描述、{{events}} 条事件",
+    "modelLine": "近 {{minutes}} 分钟 {{calls}} 次模型调用，{{errors}} 次错误",
+    "modelLineEmpty": "暂无近期模型窗口统计",
+    "sourcesLine": "{{count}} 个摄像头在感知",
+    "classification": "最新模型诊断：{{state}}",
+    "reload": "刷新状态",
+    "loadFailed": "暂时看不到感知运行状态，可以稍后重试。",
+    "classifications": {
+      "provider_unreachable": "模型服务不可达",
+      "provider_timeout": "模型调用超时",
+      "provider_http_error": "模型服务返回错误",
+      "provider_http_ok_no_text": "模型返回成功但没有文本",
+      "provider_http_ok_but_parse_skipped": "模型有文本但不是结构化 JSON",
+      "semantic_empty": "结构化结果为空",
+      "semantic_non_empty": "结构化结果非空"
+    }
+  }
+}

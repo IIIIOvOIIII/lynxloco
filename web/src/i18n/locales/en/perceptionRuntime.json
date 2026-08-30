@@ -1,0 +1,39 @@
+{
+  "perceptionRuntime": {
+    "title": "Perception runtime",
+    "unknownTitle": "Reading perception status",
+    "inactiveTitle": "Perception service is stopped",
+    "notReadyTitle": "Perception service is not ready",
+    "noSourcesTitle": "No perception cameras are enabled",
+    "collectingTitle": "Watching and waiting for new signals",
+    "eventingTitle": "Watching with recent events",
+    "describingTitle": "Watching with recent scene descriptions",
+    "silentTitle": "Watching, but realtime semantics are empty",
+    "degradedTitle": "Perception pipeline is unstable",
+    "unknownDetail": "Summarizing engine, camera, and model-link status.",
+    "inactiveDetail": "The service is stopped and will not collect frames or call the model.",
+    "notReadyDetail": "The service is running, but model or capture readiness is not complete yet.",
+    "noSourcesDetail": "Enable at least one perception camera in the camera list.",
+    "collectingDetail": "Cameras are feeding frames; Miloco will wait for enough fresh signal before inference.",
+    "eventingDetail": "Resident-facing events were produced recently, so the perception link is working.",
+    "describingDetail": "Scene descriptions were produced recently, but no resident-facing event was formed yet.",
+    "silentDetail": "The model path shows activity, but parsed realtime semantics are empty.",
+    "degradedDetail": "Recent model or processing errors are elevated; perception output may be unstable.",
+    "summaryLine": "{{inferences}} inferences today; {{raw}} descriptions and {{events}} events in the last hour",
+    "modelLine": "{{calls}} model calls and {{errors}} errors in the last {{minutes}} minutes",
+    "modelLineEmpty": "No recent model-window stats yet",
+    "sourcesLine": "{{count}} cameras feeding perception",
+    "classification": "Latest model diagnostic: {{state}}",
+    "reload": "Refresh status",
+    "loadFailed": "Perception runtime status is unavailable. Try again later.",
+    "classifications": {
+      "provider_unreachable": "model service unreachable",
+      "provider_timeout": "model call timed out",
+      "provider_http_error": "model service returned an error",
+      "provider_http_ok_no_text": "model returned success with no text",
+      "provider_http_ok_but_parse_skipped": "model returned text that was not structured JSON",
+      "semantic_empty": "structured result was empty",
+      "semantic_non_empty": "structured result was non-empty"
+    }
+  }
+}

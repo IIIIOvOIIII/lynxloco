@@ -14,6 +14,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
+from collections.abc import Mapping
+from pathlib import Path
 from typing import Protocol
 
 from miloco.database.on_demand_log_repo import OnDemandLogRepo
@@ -27,6 +29,12 @@ from miloco.perception.schema import (
     OnDemandPerceptionRequest,
     OnDemandPerceptionResultItem,
     PerceptionEngineStatus,
+    PerceptionRuntimeSummary,
+    RuntimeEngineSummary,
+    RuntimeLogSummary,
+    RuntimeOmniSummary,
+    RuntimeSourceSummary,
+    RuntimeWindowSummary,
 )
 from miloco.perception.types import PerceptionDevice
 from miloco.utils.time_utils import ms_to_iso_local, now_ms
@@ -50,6 +58,64 @@ class _CameraSourceSynchronizer(Protocol):
 logger = logging.getLogger(__name__)
 
 
+def _zero_observability_window(minutes: int) -> dict[str, int]:
+    return {
+        "minutes": minutes,
+        "cycle_count": 0,
+        "skipped_count": 0,
+        "video_pass_count": 0,
+        "audio_pass_count": 0,
+        "hold_pass_count": 0,
+        "omni_call_count": 0,
+        "omni_error_count": 0,
+        "cycle_error_count": 0,
+        "dropped_windows_count": 0,
+        "overflow_count": 0,
+    }
+
+
+def classify_perception_runtime_state(
+    *,
+    running: bool,
+    ready: bool,
+    active_source_count: int,
+    raw_last_hour: int,
+    meaningful_last_hour: int,
+    consecutive_empty_descriptions: int,
+    recent_window: Mapping[str, int],
+) -> tuple[str, list[str]]:
+    if not running:
+        return "inactive", ["engine_stopped"]
+    if not ready:
+        return "not_ready", ["engine_not_ready"]
+    if active_source_count <= 0:
+        return "no_sources", ["no_active_sources"]
+
+    cycle_count = int(recent_window.get("cycle_count", 0))
+    omni_call_count = int(recent_window.get("omni_call_count", 0))
+    omni_error_count = int(recent_window.get("omni_error_count", 0))
+    cycle_error_count = int(recent_window.get("cycle_error_count", 0))
+    error_rate = omni_error_count / max(omni_call_count, 1)
+
+    if cycle_error_count > 0 or error_rate >= 0.25:
+        return "degraded", ["high_error_rate"]
+    if meaningful_last_hour > 0:
+        return "eventing", ["meaningful_events_recent"]
+    if raw_last_hour > 0:
+        return "describing", ["raw_descriptions_recent"]
+    if cycle_count > 0 and omni_call_count > 0 and consecutive_empty_descriptions >= 3:
+        return (
+            "silent",
+            [
+                "engine_active",
+                "recent_omni_calls",
+                "semantic_output_empty",
+                "raw_logs_deduplicated",
+            ],
+        )
+    return "collecting", ["engine_active"]
+
+
 class PerceptionService:
     """Service for all perception operations."""
 
@@ -60,6 +126,7 @@ class PerceptionService:
         perception_runner: PerceptionRunner,
         log_repo: PerceptionLogRepo,
         on_demand_log_repo: OnDemandLogRepo | None = None,
+        meaningful_events_dao: object | None = None,
         rtsp_camera_source: _RtspSettingsApplier | None = None,
         camera_adapter: _CameraSourceSynchronizer | None = None,
     ):
@@ -68,6 +135,7 @@ class PerceptionService:
         self._engine = perception_runner
         self._log_repo = log_repo
         self._od_log_repo = on_demand_log_repo or OnDemandLogRepo()
+        self._meaningful_events_dao = meaningful_events_dao
         self._rtsp_camera_source = rtsp_camera_source
         self._camera_adapter = camera_adapter
         # 串行化引擎生命周期操作(start/stop/重建/降级)。这些操作都含多个 await
@@ -395,6 +463,201 @@ class PerceptionService:
     def cleanup_logs(self, keep_days: int) -> int:
         """清理过期感知日志。"""
         return self._log_repo.delete_before_days(keep_days)
+
+    def runtime_summary(
+        self,
+        *,
+        obs_db_path: Path | str | None = None,
+        now_ms_value: int | None = None,
+    ) -> PerceptionRuntimeSummary:
+        """Return one safe, authenticated summary of the realtime perception state."""
+        current_ms = now_ms_value if now_ms_value is not None else now_ms()
+        status = self.engine_status()
+        log_stats = self._log_repo.runtime_stats()
+        meaningful_events_dao = self._get_meaningful_events_dao()
+
+        meaningful_total = meaningful_events_dao.count_all()
+        meaningful_last_hour = meaningful_events_dao.count_since(current_ms - 3_600_000)
+        raw_total = self._log_repo.count_all()
+        raw_last_hour = self._log_repo.count_since(current_ms - 3_600_000)
+        last_insert_ms = (
+            log_stats.last_insert_ms
+            if log_stats.last_insert_ms is not None
+            else self._log_repo.latest_timestamp_ms()
+        )
+        active_sources = list(status.active_sources or [])
+        windows = self._query_observability_windows(
+            obs_db_path=obs_db_path,
+            now_ms=current_ms,
+        )
+        recent_window = next(
+            (window for window in windows if window.get("minutes") == 15),
+            windows[0] if windows else {},
+        )
+        semantic_state, hints = classify_perception_runtime_state(
+            running=status.running,
+            ready=status.engine.ready,
+            active_source_count=len(active_sources),
+            raw_last_hour=raw_last_hour,
+            meaningful_last_hour=meaningful_last_hour,
+            consecutive_empty_descriptions=log_stats.consecutive_empty_descriptions,
+            recent_window=recent_window,
+        )
+
+        return PerceptionRuntimeSummary(
+            now_ms=current_ms,
+            engine=RuntimeEngineSummary(
+                running=status.running,
+                ready=status.engine.ready,
+                status=status.engine.status,
+                message=status.engine.message,
+            ),
+            sources=RuntimeSourceSummary(
+                active_count=len(active_sources),
+                active_sources=active_sources,
+            ),
+            logs=RuntimeLogSummary(
+                today_inference_count=log_stats.today_inference_count,
+                raw_total=raw_total,
+                raw_last_hour=raw_last_hour,
+                last_inference_ms=log_stats.last_inference_ms,
+                last_insert_ms=last_insert_ms,
+                last_descriptions_empty=log_stats.last_descriptions_empty,
+                last_append_inserted=log_stats.last_append_inserted,
+                consecutive_empty_descriptions=log_stats.consecutive_empty_descriptions,
+                consecutive_deduplicated=log_stats.consecutive_deduplicated,
+                meaningful_total=meaningful_total,
+                meaningful_last_hour=meaningful_last_hour,
+                last_meaningful_event_ms=meaningful_events_dao.latest_timestamp_ms(),
+            ),
+            windows=[RuntimeWindowSummary(**window) for window in windows],
+            latest_omni=self._latest_runtime_omni_summary(),
+            semantic_state=semantic_state,
+            hints=hints,
+        )
+
+    def _query_observability_windows(
+        self,
+        *,
+        obs_db_path: Path | str | None,
+        now_ms: int,
+        windows_minutes: tuple[int, ...] = (5, 15, 60),
+    ) -> list[dict[str, int]]:
+        """Aggregate safe perception trace counters for recent time windows."""
+        windows = [_zero_observability_window(minutes) for minutes in windows_minutes]
+        if obs_db_path is None:
+            return windows
+
+        try:
+            from miloco.observability.metrics_db import connect
+
+            with connect(obs_db_path) as conn:
+                for window in windows:
+                    since_ms = now_ms - int(window["minutes"]) * 60_000
+                    row = conn.execute(
+                        """
+                        SELECT
+                          COUNT(*) AS cycle_count,
+                          SUM(CASE WHEN skipped = 1 THEN 1 ELSE 0 END) AS skipped_count,
+                          SUM(CASE WHEN gate_video_pass = 1 THEN 1 ELSE 0 END) AS video_pass_count,
+                          SUM(CASE WHEN gate_audio_pass = 1 THEN 1 ELSE 0 END) AS audio_pass_count,
+                          SUM(CASE WHEN gate_hold_pass = 1 THEN 1 ELSE 0 END) AS hold_pass_count,
+                          COALESCE(SUM(omni_call_count), 0) AS omni_call_count,
+                          COALESCE(SUM(omni_error_count), 0) AS omni_error_count,
+                          SUM(CASE WHEN cycle_error_msg IS NOT NULL AND cycle_error_msg != '' THEN 1 ELSE 0 END) AS cycle_error_count,
+                          COALESCE(MAX(dropped_windows_total), 0) AS dropped_windows_count,
+                          COALESCE(MAX(overflow_count_total), 0) AS overflow_count
+                        FROM traces
+                        WHERE timestamp >= ?
+                        """,
+                        (since_ms,),
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    keys = [
+                        "cycle_count",
+                        "skipped_count",
+                        "video_pass_count",
+                        "audio_pass_count",
+                        "hold_pass_count",
+                        "omni_call_count",
+                        "omni_error_count",
+                        "cycle_error_count",
+                        "dropped_windows_count",
+                        "overflow_count",
+                    ]
+                    for idx, key in enumerate(keys):
+                        window[key] = int(row[idx] or 0)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "[service] failed to query observability runtime windows: %s",
+                type(e).__name__,
+            )
+        return windows
+
+    def _get_meaningful_events_dao(self):
+        dao = getattr(self, "_meaningful_events_dao", None)
+        if dao is not None:
+            return dao
+        from miloco.manager import get_manager
+
+        dao = get_manager().meaningful_events_dao
+        self._meaningful_events_dao = dao
+        return dao
+
+    def _latest_runtime_omni_summary(self) -> RuntimeOmniSummary | None:
+        try:
+            from miloco.perception.runtime_diagnostics import (
+                classify_omni_response_shape,
+                get_runtime_diagnostics,
+            )
+
+            sample = get_runtime_diagnostics().latest("realtime")
+            if sample is None:
+                return None
+            classification = classify_omni_response_shape(
+                error_code=sample.error_code,
+                response_text_length=sample.response_text_length,
+                response_json_like=sample.response_json_like,
+                parse_ok=sample.parse_ok,
+                skipped=sample.skipped,
+                caption_count=sample.caption_count,
+                matched_rule_count=sample.matched_rule_count,
+                suggestion_count=sample.suggestion_count,
+                speech_count=sample.speech_count,
+            )
+            return RuntimeOmniSummary(
+                timestamp_ms=sample.timestamp_ms,
+                protocol=sample.protocol,
+                route=sample.route,
+                request={
+                    "message_count": sample.message_count,
+                    "text_block_count": sample.text_block_count,
+                    "image_block_count": sample.image_block_count,
+                    "video_block_count": sample.video_block_count,
+                    "audio_block_count": sample.audio_block_count,
+                },
+                response={
+                    "text_length": sample.response_text_length,
+                    "json_like": sample.response_json_like,
+                    "parse_ok": sample.parse_ok,
+                    "skipped": sample.skipped,
+                    "caption_count": sample.caption_count,
+                    "matched_rule_count": sample.matched_rule_count,
+                    "suggestion_count": sample.suggestion_count,
+                    "speech_count": sample.speech_count,
+                    "complete_speech_count": sample.complete_speech_count,
+                    "needs_response_speech_count": sample.needs_response_speech_count,
+                    "classification": classification,
+                },
+                error_code=sample.error_code,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "[service] failed to read runtime omni diagnostics: %s",
+                type(e).__name__,
+            )
+            return None
 
     # ---- On-demand logs ----
 

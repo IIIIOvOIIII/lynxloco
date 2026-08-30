@@ -71,6 +71,7 @@ def _live_settings(
     base_url: str,
     api_key: str,
     api_protocol: str | None,
+    timeout: float = 120.0,
 ):
     class _Omni:
         pass
@@ -80,6 +81,7 @@ def _live_settings(
     current.base_url = base_url
     current.api_key = api_key
     current.api_protocol = api_protocol
+    current.timeout = timeout
 
     class _Model:
         omni = current
@@ -683,6 +685,55 @@ def test_explicit_current_key_always_overrides_snapshot_key(monkeypatch) -> None
     resolved = omni_client.resolve_live_omni_config(base)
 
     assert resolved.api_key == "NEW_KEY"
+
+
+def test_resolve_live_config_refreshes_runtime_timeout(monkeypatch) -> None:
+    base = OmniConfig(
+        model="local-vlm",
+        base_url="http://127.0.0.1:8000/v1",
+        api_key="",
+        api_protocol="openai_responses",
+        timeout=30.0,
+    )
+    monkeypatch.setattr(
+        "miloco.config.get_settings",
+        lambda: _live_settings(
+            model="local-vlm",
+            base_url="http://127.0.0.1:8000/v1",
+            api_key="",
+            api_protocol="openai_responses",
+            timeout=120.0,
+        ),
+    )
+
+    resolved = omni_client.resolve_live_omni_config(base)
+
+    assert resolved.timeout == 120.0
+
+
+@pytest.mark.asyncio
+async def test_fused_http_client_rebuilds_when_timeout_changes() -> None:
+    old_client = getattr(omni, "_fused_http_client", None)
+    old_loop = getattr(omni, "_fused_http_client_loop", None)
+    old_timeout = getattr(omni, "_fused_http_client_timeout", None)
+    omni._fused_http_client = None
+    omni._fused_http_client_loop = None
+    omni._fused_http_client_timeout = None
+
+    first = omni._get_fused_http_client(30.0)
+    second = omni._get_fused_http_client(120.0)
+
+    try:
+        assert second is not first
+        assert second.timeout.read == 120.0
+        assert second.timeout.connect == 10.0
+    finally:
+        await first.aclose()
+        if second is not first:
+            await second.aclose()
+        omni._fused_http_client = old_client
+        omni._fused_http_client_loop = old_loop
+        omni._fused_http_client_timeout = old_timeout
 
 
 @pytest.mark.asyncio

@@ -45,6 +45,7 @@ from miloco.perception.engine.omni.prompt_builder import (
 from miloco.perception.engine.omni.provider import (
     get_adapter,
     messages_have_visual_input,
+    resolve_api_protocol,
 )
 from miloco.perception.engine.omni.response_parser import (
     parse_identity_assignments,
@@ -55,6 +56,7 @@ from miloco.perception.engine.omni.response_parser import (
     try_extract_suggestions,
 )
 from miloco.perception.engine.types import IdentityPacket, OmniContext, OmniOutput
+from miloco.perception.runtime_diagnostics import record_omni_http_diagnostic
 from miloco.perception.snapshot_context import push_omni_trace
 from miloco.perception.types import MatchedRule, Speech, Suggestion
 
@@ -271,22 +273,26 @@ async def run_omni_fused(
 # omni_client.py 的 non-fused 路径暂不复用（改动面更大），后续可统一。
 _fused_http_client: "httpx.AsyncClient | None" = None
 _fused_http_client_loop: "asyncio.AbstractEventLoop | None" = None
+_fused_http_client_timeout: float | None = None
 
 
 def _get_fused_http_client(timeout: float) -> httpx.AsyncClient:
-    global _fused_http_client, _fused_http_client_loop
+    global _fused_http_client, _fused_http_client_loop, _fused_http_client_timeout
     loop = asyncio.get_running_loop()
     if (
         _fused_http_client is None
         or _fused_http_client_loop is not loop
+        or _fused_http_client_timeout != timeout
         or _fused_http_client.is_closed
     ):
-        # 旧 client 绑定的 loop 已不可用——丢弃（GC 自然回收），新 loop 重建。
+        # 旧 client 绑定的 loop 已不可用，或 timeout 热更新后旧 client
+        # 不再代表当前配置——丢弃（GC 自然回收），按当前 loop/timeout 重建。
         _fused_http_client = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout, connect=10.0),
             limits=httpx.Limits(max_keepalive_connections=4, max_connections=8),
         )
         _fused_http_client_loop = loop
+        _fused_http_client_timeout = timeout
     return _fused_http_client
 
 
@@ -421,6 +427,13 @@ async def _call_omni_messages(
                 "top_p": config.top_p,
                 "max_tokens": config.max_completion_tokens,
             },
+        )
+        record_omni_http_diagnostic(
+            request_messages=messages,
+            response_raw=raw,
+            protocol=resolve_api_protocol(config.api_protocol, config.model),
+            route=type,
+            error_code=error.get("code") if error else None,
         )
 
 

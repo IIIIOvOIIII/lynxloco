@@ -186,6 +186,25 @@ class TestBuildPrompt:
         assert "suggestions" in payload["system_prompt"]
         assert "caption" in payload["system_prompt"]
 
+    def test_system_prompt_requires_json_only_object(self):
+        """视觉 Responses 路径必须明确要求唯一 JSON 对象，不能把解释性 prose 当成功。"""
+        ep = _mock_edge_packet()
+        ctx = OmniContext()
+        payload = build_prompt(ep, ctx)
+        sp = payload["system_prompt"]
+
+        assert "只输出一个 JSON 对象" in sp
+        assert "不得输出 Markdown" in sp
+        assert "不得输出解释文字" in sp
+
+    def test_caption_spec_requires_non_empty_caption_for_usable_visual_input(self):
+        """有可用画面且看到实质内容时，caption 不能保持空字符串。"""
+        ep = _mock_edge_packet()
+        ctx = OmniContext()
+        payload = build_prompt(ep, ctx)
+
+        assert "画面可用且看到实质内容时，caption 不得为空" in payload["system_prompt"]
+
     def test_system_prompt_includes_home_profile(self):
         """home_profile_loader 返回内容时注入到 system prompt。"""
         with patch("miloco.perception.engine.omni.prompt_builder.get_home_profile_prefix",

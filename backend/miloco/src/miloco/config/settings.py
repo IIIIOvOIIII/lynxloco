@@ -183,6 +183,10 @@ class OmniModelSettings(BaseModel):
             "Omni API 协议；旧档案缺失时仅按模型名兼容推断，Base URL 不参与协议选择"
         ),
     )
+    timeout: float = Field(
+        default=120.0,
+        description="多模态模型请求超时（秒）；本地/内网视觉模型可能需要更长推理时间。",
+    )
 
 
 class ModelSettings(BaseModel):
@@ -977,6 +981,7 @@ class MilocoSettings(BaseSettings):
             "base_url": self.model.omni.base_url,
             "api_key": self.model.omni.api_key,
             "api_protocol": self.model.omni.api_protocol,
+            "timeout": self.model.omni.timeout,
         }
         if merged != existing:
             new_engine = {**self.perception.engine, "omni": merged}

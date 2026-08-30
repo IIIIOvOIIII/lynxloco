@@ -34,6 +34,74 @@ export interface HomeStatus {
   maxEnabledCameras: number;
 }
 
+export type PerceptionSemanticState =
+  | "inactive"
+  | "not_ready"
+  | "no_sources"
+  | "collecting"
+  | "eventing"
+  | "describing"
+  | "silent"
+  | "degraded";
+
+export interface PerceptionRuntimeWindow {
+  minutes: number;
+  cycleCount: number;
+  skippedCount: number;
+  videoPassCount: number;
+  audioPassCount: number;
+  holdPassCount: number;
+  omniCallCount: number;
+  omniErrorCount: number;
+  cycleErrorCount: number;
+  droppedWindowsCount: number;
+  overflowCount: number;
+}
+
+export interface PerceptionRuntimeSummary {
+  nowMs: number;
+  engine: {
+    running: boolean;
+    ready: boolean;
+    status: string;
+    message?: string;
+  };
+  sources: {
+    activeCount: number;
+    activeSources: Array<{
+      did: string;
+      name: string;
+      deviceType?: string;
+      modalities?: string[];
+    }>;
+  };
+  logs: {
+    todayInferenceCount: number;
+    rawTotal: number;
+    rawLastHour: number;
+    lastInferenceMs: number | null;
+    lastInsertMs: number | null;
+    lastDescriptionsEmpty: boolean | null;
+    lastAppendInserted: boolean | null;
+    consecutiveEmptyDescriptions: number;
+    consecutiveDeduplicated: number;
+    meaningfulTotal: number;
+    meaningfulLastHour: number;
+    lastMeaningfulEventMs: number | null;
+  };
+  windows: PerceptionRuntimeWindow[];
+  latestOmni: {
+    timestampMs: number | null;
+    protocol?: string | null;
+    route?: string | null;
+    request: Record<string, number>;
+    response: Record<string, number | boolean | string>;
+    errorCode?: string | null;
+  } | null;
+  semanticState: PerceptionSemanticState;
+  hints: string[];
+}
+
 // ── 家人 ────────────────────────────────────────────────────
 // TODO(miloco): 等 backend 暴露 person presence 接口后再加 last_seen / current_area
 //   等 backend 接通后替换

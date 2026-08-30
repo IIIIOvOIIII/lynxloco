@@ -19,6 +19,7 @@ import type {
   HomeEntrySource,
   HomeEntryType,
   HomeStatus,
+  PerceptionRuntimeSummary,
   Features,
   PerceptionCamera,
   Person,
@@ -143,6 +144,126 @@ interface PerceptionEngineStatus {
   interval_seconds: number;
   today_inference_count: number;
   active_sources: { did: string; name: string }[];
+}
+
+interface BackendRuntimeSource {
+  did: string;
+  name: string;
+  device_type?: string;
+  modalities?: string[];
+}
+
+interface BackendRuntimeWindow {
+  minutes: number;
+  cycle_count?: number;
+  skipped_count?: number;
+  video_pass_count?: number;
+  audio_pass_count?: number;
+  hold_pass_count?: number;
+  omni_call_count?: number;
+  omni_error_count?: number;
+  cycle_error_count?: number;
+  dropped_windows_count?: number;
+  overflow_count?: number;
+}
+
+interface BackendRuntimeSummary {
+  now_ms: number;
+  engine: {
+    running: boolean;
+    ready: boolean;
+    status: string;
+    message?: string;
+  };
+  sources: {
+    active_count: number;
+    active_sources?: BackendRuntimeSource[];
+  };
+  logs: {
+    today_inference_count: number;
+    raw_total: number;
+    raw_last_hour: number;
+    last_inference_ms: number | null;
+    last_insert_ms: number | null;
+    last_descriptions_empty: boolean | null;
+    last_append_inserted: boolean | null;
+    consecutive_empty_descriptions: number;
+    consecutive_deduplicated: number;
+    meaningful_total: number;
+    meaningful_last_hour: number;
+    last_meaningful_event_ms: number | null;
+  };
+  windows?: BackendRuntimeWindow[];
+  latest_omni?: {
+    timestamp_ms: number | null;
+    protocol?: string | null;
+    route?: string | null;
+    request?: Record<string, number>;
+    response?: Record<string, number | boolean | string>;
+    error_code?: string | null;
+  } | null;
+  semantic_state: PerceptionRuntimeSummary["semanticState"];
+  hints?: string[];
+}
+
+function mapRuntimeSummary(s: BackendRuntimeSummary): PerceptionRuntimeSummary {
+  return {
+    nowMs: s.now_ms,
+    engine: {
+      running: s.engine.running,
+      ready: s.engine.ready,
+      status: s.engine.status,
+      message: s.engine.message,
+    },
+    sources: {
+      activeCount: s.sources.active_count,
+      activeSources: (s.sources.active_sources ?? []).map((source) => ({
+        did: source.did,
+        name: source.name,
+        deviceType: source.device_type,
+        modalities: source.modalities,
+      })),
+    },
+    logs: {
+      todayInferenceCount: s.logs.today_inference_count,
+      rawTotal: s.logs.raw_total,
+      rawLastHour: s.logs.raw_last_hour,
+      lastInferenceMs: s.logs.last_inference_ms,
+      lastInsertMs: s.logs.last_insert_ms,
+      lastDescriptionsEmpty: s.logs.last_descriptions_empty,
+      lastAppendInserted: s.logs.last_append_inserted,
+      consecutiveEmptyDescriptions: s.logs.consecutive_empty_descriptions,
+      consecutiveDeduplicated: s.logs.consecutive_deduplicated,
+      meaningfulTotal: s.logs.meaningful_total,
+      meaningfulLastHour: s.logs.meaningful_last_hour,
+      lastMeaningfulEventMs: s.logs.last_meaningful_event_ms,
+    },
+    windows: (s.windows ?? []).map((window) => ({
+      minutes: window.minutes,
+      cycleCount: window.cycle_count ?? 0,
+      skippedCount: window.skipped_count ?? 0,
+      videoPassCount: window.video_pass_count ?? 0,
+      audioPassCount: window.audio_pass_count ?? 0,
+      holdPassCount: window.hold_pass_count ?? 0,
+      omniCallCount: window.omni_call_count ?? 0,
+      omniErrorCount: window.omni_error_count ?? 0,
+      cycleErrorCount: window.cycle_error_count ?? 0,
+      droppedWindowsCount: window.dropped_windows_count ?? 0,
+      overflowCount: window.overflow_count ?? 0,
+    })),
+    latestOmni: s.latest_omni
+      ? {
+          timestampMs: s.latest_omni.timestamp_ms,
+          protocol: s.latest_omni.protocol,
+          route: s.latest_omni.route,
+          request: s.latest_omni.request ?? {},
+          response: s.latest_omni.response ?? {},
+          errorCode: s.latest_omni.error_code ?? null,
+        }
+      : null,
+    semanticState: s.semantic_state,
+    hints: s.hints ?? [],
+  };
 }
 
 interface MiotHome {
@@ -382,6 +503,13 @@ export async function realHomeStatus(): Promise<HomeStatus> {
     // 后端 MAX_ENABLED_CAMERAS（唯一来源）；status 拿不到时兜底 4。
     maxEnabledCameras: miot?.data.max_enabled_cameras ?? 4,
   };
+}
+
+export async function realGetPerceptionRuntimeSummary(): Promise<PerceptionRuntimeSummary> {
+  const res = await apiFetch<Normal<BackendRuntimeSummary>>(
+    "/api/perception/runtime-summary",
+  );
+  return mapRuntimeSummary(res.data);
 }
 
 // ── 家人 ──────────────────────────────────────────────────

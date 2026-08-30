@@ -1028,6 +1028,45 @@ def test_merge_no_change_preserves_cached_time():
     assert engine._last_captions["书房"] == "人物坐在桌前看书"
 
 
+def test_merge_records_semantic_empty_runtime_diagnostic():
+    """成功解析但无语义字段时，必须留下 runtime diagnostic，便于区分“模型没调通”和“语义为空”。"""
+    from miloco.perception.runtime_diagnostics import (
+        classify_omni_response_shape,
+        get_runtime_diagnostics,
+    )
+
+    diagnostics = get_runtime_diagnostics()
+    diagnostics.reset_for_tests()
+
+    engine = PerceptionEngine()
+    result = _make_batch_result("书房", description="")
+    merged = engine._merge_results(result)
+
+    latest = diagnostics.latest("realtime")
+    assert latest is not None
+    assert merged.caption == []
+    assert latest.parse_ok is True
+    assert latest.skipped is False
+    assert latest.caption_count == 0
+    assert latest.matched_rule_count == 0
+    assert latest.suggestion_count == 0
+    assert latest.speech_count == 0
+    assert (
+        classify_omni_response_shape(
+            error_code=latest.error_code,
+            response_text_length=latest.response_text_length,
+            response_json_like=latest.response_json_like,
+            parse_ok=latest.parse_ok,
+            skipped=latest.skipped,
+            caption_count=latest.caption_count,
+            matched_rule_count=latest.matched_rule_count,
+            suggestion_count=latest.suggestion_count,
+            speech_count=latest.speech_count,
+        )
+        == "semantic_empty"
+    )
+
+
 def test_merge_echoes_injected_time():
     """传了 contexts 且 ctx.current_time 非空 → merged.time 回显该注入时间。"""
     engine = PerceptionEngine()

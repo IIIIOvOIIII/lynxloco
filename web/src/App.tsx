@@ -6,6 +6,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   getFeatures,
   getHomeStatus,
+  getPerceptionRuntimeSummary,
   listActivity,
   listOnDemandLogs,
   listCameras,
@@ -39,6 +40,7 @@ import { Sidebar, MobileTabBar, type TabKey } from "./components/Sidebar";
 import { SettingsDrawer } from "./components/SettingsDrawer";
 import { HomeSwitcher } from "./components/HomeSwitcher";
 import { OmniHealthBanner } from "./components/OmniHealthBanner";
+import { PerceptionRuntimeCard } from "./components/PerceptionRuntimeCard";
 import { StatusRibbon } from "./components/StatusRibbon";
 import UpgradeNotice from "./components/UpgradeNotice";
 import { HeroNow } from "./components/HeroNow";
@@ -143,6 +145,11 @@ function MainApp() {
   const status = useAsync(() => getHomeStatus(homeId), [homeId], {
     errorLabel: t("app.loadHomeStatusFail"),
   });
+  const perceptionRuntime = useAsync(
+    () => getPerceptionRuntimeSummary(homeId),
+    [homeId],
+    { errorLabel: t("app.loadPerceptionRuntimeFail") },
+  );
   const persons = useAsync(() => listPersons(homeId), [homeId], {
     errorLabel: t("app.loadPersonsFail"),
   });
@@ -203,6 +210,14 @@ function MainApp() {
   // 已不展示时间；HeroNow 的 cam card 内部各自维护 1min 时钟。)
 
   const [activeTab, setActiveTab] = useState<TabKey>("now");
+  useEffect(() => {
+    if (activeTab !== "now") return;
+    const id = window.setInterval(() => {
+      void perceptionRuntime.reload();
+    }, 30_000);
+    return () => window.clearInterval(id);
+  }, [activeTab, perceptionRuntime.reload]);
+
   // 活动 tab 现为单流(事件 + 动作合并);筛选 checkbox 在 ActivityFeed 内部,不占 App state。
   const [editingPerson, setEditingPerson] = useState<Person | null | undefined>(
     undefined,
@@ -747,6 +762,15 @@ function MainApp() {
               }
               status.reload();
             }}
+          />
+        )}
+
+        {activeTab === "now" && (
+          <PerceptionRuntimeCard
+            summary={perceptionRuntime.data}
+            loading={perceptionRuntime.loading}
+            error={perceptionRuntime.error}
+            onReload={perceptionRuntime.reload}
           />
         )}
 

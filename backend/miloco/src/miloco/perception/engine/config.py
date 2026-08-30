@@ -397,7 +397,7 @@ class OmniConfig:
     max_completion_tokens: int = 512
     temperature: float = 0.1  # 低温更利于结构化感知判定：实测 grounded prompt 下温度越低误报/坏 JSON 越少
     top_p: float = 0.95
-    timeout: float = 30.0
+    timeout: float = 120.0
     stream: bool = False
 
 
