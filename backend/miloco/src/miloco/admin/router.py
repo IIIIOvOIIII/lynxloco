@@ -1516,7 +1516,8 @@ async def retry_omni_probe(current_user: str = Depends(verify_token)):
 )
 async def omni_health_stream():
     """复用 pipeline._sse_subscribers 广播通道;generator 过滤 event_type=='omni_health'。
-    鉴权支持 Authorization header 或 ?token=... query(EventSource 无法传 header)。
+    鉴权支持 dashboard session cookie、Authorization header 或 ?token=... query；
+    同源 EventSource 会自动携带 session cookie。
     """
     pipeline = manager.perception_service._pipeline
     q = pipeline.subscribe_sse()

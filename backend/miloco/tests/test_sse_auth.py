@@ -10,7 +10,7 @@
 """
 
 import pytest
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.testclient import TestClient
 
 # ─── 单元测试 verify_token_query_fallback ─────────────────
@@ -183,3 +183,48 @@ class TestSSEEndpointAuth:
             "/api/events", headers={"Authorization": "Bearer secret-123"}
         )
         assert resp.status_code == 200
+
+    def test_session_cookie_can_authorize_query_fallback_dependency(
+        self, tmp_path, monkeypatch
+    ):
+        """SSE/media dependencies accept a same-origin dashboard session."""
+        from miloco.auth.router import router as auth_router
+        from miloco.database.connector import init_database
+
+        monkeypatch.setenv("MILOCO_HOME", str(tmp_path))
+        monkeypatch.setenv("MILOCO_DATABASE__PATH", str(tmp_path / "miloco.db"))
+        monkeypatch.setenv("MILOCO_SERVER__TOKEN", "secret-123")
+        import miloco.database.connector as connector_module
+        from miloco.config import reset_settings
+
+        connector_module.db_connector = None
+        reset_settings()
+        init_database()
+        app = FastAPI()
+        app.include_router(auth_router, prefix="/api")
+
+        from miloco.middleware import verify_token_query_fallback
+
+        @app.get(
+            "/api/sse-auth",
+            dependencies=[Depends(verify_token_query_fallback)],
+        )
+        def sse_auth_probe():
+            return {"ok": True}
+
+        client = TestClient(app)
+        setup = client.post(
+            "/api/auth/setup",
+            json={
+                "username": "lynx",
+                "display_name": "Lynx",
+                "password": "correct horse battery",
+                "password_confirm": "correct horse battery",
+            },
+        )
+        assert setup.status_code == 200
+
+        # The concrete /events/stream generator is intentionally not opened here:
+        # it has no terminating event under TestClient. This finite endpoint
+        # exercises the identical SSE/media dependency without a query token.
+        assert client.get("/api/sse-auth").status_code == 200

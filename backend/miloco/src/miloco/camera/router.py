@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
-import hmac
 import logging
 from dataclasses import asdict
 from pathlib import Path
@@ -16,11 +15,16 @@ from fastapi.responses import HTMLResponse, Response
 from fastapi.websockets import WebSocketDisconnect
 from pydantic import ValidationError
 
+from miloco.auth.dependencies import (
+    valid_service_token,
+    verify_websocket_dashboard_or_service,
+)
 from miloco.camera.schema import RtspSourceUpsert
 from miloco.camera.service import CameraNotFoundError, CameraService, CameraServiceError
 from miloco.camera.stream import LiveJpegStreamHub, LiveStreamHub
 from miloco.config import get_settings
 from miloco.middleware import verify_token
+from miloco.middleware.exceptions import AuthenticationException
 from miloco.perception.collect.rtsp_probe import RtspSourceError
 from miloco.schema.common_schema import NormalResponse
 
@@ -194,13 +198,6 @@ def _runtime_stream_close(error_code: str | None) -> tuple[int, str]:
     return _RUNTIME_CLOSES.get(error_code, (WS_STREAM_FAILED, "stream_failed"))
 
 
-def _bearer_token(websocket: WebSocket) -> str | None:
-    authorization = websocket.headers.get("Authorization")
-    if authorization and authorization.startswith("Bearer "):
-        return authorization.removeprefix("Bearer ")
-    return None
-
-
 def _protocol_token(websocket: WebSocket) -> tuple[str | None, bool]:
     protocols = {
         protocol.strip()
@@ -228,16 +225,14 @@ def _protocol_token(websocket: WebSocket) -> tuple[str | None, bool]:
 
 
 def _verify_generic_websocket(websocket: WebSocket) -> str | None:
-    expected = get_settings().server.token
-    if not expected:
-        return None
-    header_token = _bearer_token(websocket)
     protocol_token, offered_camera_protocol = _protocol_token(websocket)
-    supplied = header_token or protocol_token
-    if supplied is None or not hmac.compare_digest(
-        supplied.encode("utf-8"), expected.encode("utf-8")
-    ):
-        raise PermissionError
+    try:
+        verify_websocket_dashboard_or_service(websocket)
+    except AuthenticationException:
+        # Keep the existing camera subprotocol credential for machine callers;
+        # dashboard browsers use their same-origin session cookie above.
+        if not valid_service_token(protocol_token):
+            raise PermissionError from None
     return WS_CAMERA_PROTOCOL if offered_camera_protocol else None
 
 

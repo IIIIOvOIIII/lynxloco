@@ -71,7 +71,6 @@ from miloco.schedule.router import router as schedule_router
 from miloco.schedule.runner import get_runner as get_schedule_runner
 from miloco.task.router import router as task_router
 from miloco.task_record.router import router as task_record_router
-from miloco.utils.common import escape_for_js_string
 from miloco.utils.paths import miloco_home
 
 load_dotenv()
@@ -626,32 +625,22 @@ async def spa_handler(full_path: str, request: Request):
     优先级：
       1. /api/* /health → 不归 SPA 管，返 404（让正常 API 路由处理）
       2. static_dir/<full_path> 是真实文件（如 /assets/main.js、/fonts/*.woff2）→ 返
-      3. 否则视为 SPA 前端路由 → 返 index.html，并把字面量
-         ``__MILOCO_INJECT_TOKEN_HERE__`` 替换为真 ``server.token``（生产期 token
-         注入入口；浏览器 fetch 时从 ``window.__MILOCO_TOKEN__`` 读出加 Bearer）
+      3. 根路径或 /index.html → 返 index.html，并清除遗留的 token 占位符。
 
-    Trust model（重要）：
-      本端点把 server.token 嵌进 HTML body 公开返回 —— 等价于"凡是能 GET / 的
-      网络位置，都能拿到 token 后调任意 /api/* 端点（增删 rule、解绑米家、读全部
-      perception_logs）"。settings 默认 ``host=127.0.0.1`` 仅本机可达；住户若改
-      成 ``0.0.0.0`` 暴露 LAN，应自行评估 LAN 是否可信：
-        · 私网 + 单管理员 → 默认信任（miloco 的目标场景）
-        · 共享网络 / 公司宿舍 / 路由器穿透 → 应通过反代（带 TLS + 认证）对外暴露
-
-      跟 watch.html 的 query-token 暴露面同口径（miot/router.py 上有对应注释），
-      只是触达概率不同：watch.html 需要主动访问 watch URL，spa_handler 是 SPA 根
-      路径 —— 住户开浏览器就会触发，因此把 trust 边界写在这里提醒运维。
+    Trust model: HTML is a public shell. Dashboard data and media are protected
+    by the dashboard session or service-token route; this handler never exposes
+    the long-lived service token to a browser.
     """
     # 规范化后判定:trailing slash / 大小写 / URL 编码 都不能让 /health/ /HEALTH /api%20
-    # 等变体绕过短路 fallthrough 到 SPA token 注入分支,健康探针拿 200 + token-injected
-    # HTML 误判服务正常。startswith 只在 norm 跟 norm + "/" 边界判,防 /apiX 误命中 api 分支。
+    # 等变体绕过短路落进 SPA，健康探针不能把 HTML 误判为服务正常。startswith
+    # 只在 norm 跟 norm + "/" 边界判,防 /apiX 误命中 api 分支。
     norm = full_path.rstrip("/").lower()
     if norm == "api" or norm.startswith("api/") or norm == "health":
         return Response(status_code=404, content="404 Not Found")
 
     # backend 自带模板 HTML watch.html 单独走重定向:
-    # · watch.html 的 __MILOCO_TOKEN__ 占位必须由 /api/miot/watch 路由替换后才能用,
-    #   否则浏览器拿到字面量字符串接 WS 会被拒。直链 /watch.html 重定向到正路由。
+    # · watch.html 的遗留占位由 /api/miot/watch 清除；直链 /watch.html
+    #   重定向到受认证的正路由。
     # case-insensitive + trailing-slash 处理：
     # · macOS / 默认 NTFS 等 case-insensitive FS 上 `Watch.html` 会绕过精确匹配
     # · `/watch.html/` trailing slash 在 (static_dir / "watch.html/").resolve()
@@ -659,8 +648,8 @@ async def spa_handler(full_path: str, request: Request):
     #   占位的 raw HTML
     # 跟下面 SPA fallback 的 rstrip("/") 同口径。
     # NFC 归一化兜 macOS APFS 边界——攻击者构造 NFD 路径(组合重音 vs 预组合)
-    # 经 .lower() 比较失败走真文件分支,APFS 文件系统会归一化命中 index.html 返
-    # 带 __MILOCO_INJECT_TOKEN_HERE__ 占位的 raw HTML,前端拿到无 token 全 401。
+    # 经 .lower() 比较失败走真文件分支。index.html 仍由专用分支处理，保证遗留
+    # 占位不会直接作为静态文件返回。
     full_path_ci = unicodedata.normalize("NFC", full_path).lower().rstrip("/")
     if full_path_ci == "watch.html":
         # GET-only：catch-all 是 @app.get，POST /watch.html 自动 405 Allow: GET。
@@ -672,23 +661,18 @@ async def spa_handler(full_path: str, request: Request):
         target = "/api/miot/watch"
         if request.url.query:
             # 白名单透传:camera_id / channel / embedded 是 watch.html 主消费路径;
-            # token 给 watch.html resolveToken() 兜底用(backend 没注入时 dev 链接 /
-            # 老链接走 query token),verify_token 中间件不读 query token,所以不会
-            # 把 query token 当 backend 鉴权用,但 watch.html JS 自己仍 fallback 读它。
+            # token 只为兼容旧机器调用方的 URL 保留，不由 SPA 注入。
             allow = {"camera_id", "channel", "embedded", "token"}
             kept = [(k, v) for k, v in parse_qsl(request.url.query) if k in allow]
             if kept:
                 target = f"{target}?{urlencode(kept)}"
         return RedirectResponse(url=target, status_code=302)
     static_dir, static_root = _resolved_static_dirs()
-    # /index.html 直链也得走 token 注入路径——若把它当真文件 FileResponse 出去，
-    # 浏览器拿到的是带占位 __MILOCO_INJECT_TOKEN_HERE__ 的版本，apiFetch 会无 token。
-    # 同理 / 由于 full_path="" 自然不会命中真文件分支，这里只需补 index.html。
+    # /index.html 直链也走专用 HTML 路径，保证遗留占位被清除。/ 由于
+    # full_path="" 自然不会命中真文件分支。
     # 用 .lower().rstrip("/") 处理：
-    # · macOS / 默认 NTFS 等 case-insensitive FS 上 `/INDEX.html` 命中 index.html
-    #   的真文件分支会返带 __MILOCO_INJECT_TOKEN_HERE__ 占位的 raw HTML（前端
-    #   resolveToken 兜回空串，所有 fetch 401 → 整页打不开）。跟 watch.html
-    #   case-insensitive 防御同口径。
+    # · macOS / 默认 NTFS 等 case-insensitive FS 上 `/INDEX.html` 也必须走
+    #   专用 HTML 路径。跟 watch.html case-insensitive 防御同口径。
     # · `/index.html/` 末尾斜杠：starlette 不规范化，Path("index.html/").resolve()
     #   退回 index.html → is_file() 命中 → 同样返未替换 token 的版本。
     if full_path and full_path_ci != "index.html":
@@ -720,7 +704,7 @@ async def spa_handler(full_path: str, request: Request):
         # 路径合法但不是真文件 → 同样 404，不 fallthrough。
         # 本应用不用 url-based routing（family-ui 是 tab state 单页，URL 始终 /），
         # 因此除 / 和 /index.html 外的"任意子路径"都是噪声（扫描器探测 /admin/login
-        # /wp-admin /.env 等）。返 404 让扫描器不能稳拿 token-injected HTML。
+        # /wp-admin /.env 等）。返 404 不让扫描器稳定获得 SPA shell。
         # 未来若需要 react-router 等 url 路由，需把已知前端 path 加白名单分支。
         return Response(status_code=404, content="404 Not Found")
 
@@ -728,28 +712,10 @@ async def spa_handler(full_path: str, request: Request):
     if not index_file.exists():
         return Response(status_code=404, content="404 Not Found")
 
-    # token 空兜底:跟 miot/router.py::watch_page 同口径,返 503 + 中文错误,而不是
-    # 返一个含空 token 占位的 SPA — 后者前端拿到的 __MILOCO_INJECT_TOKEN_HERE__
-    # 替换为空串,所有 apiFetch 静默 401 死循环,运维更难定位"是 token 没配"。
-    token = get_settings().server.token
-    if not token:
-        return HTMLResponse(
-            content="<h1>503: server.token 未配置,无法启动 web 页</h1>",
-            status_code=503,
-        )
-
     template = index_file.read_text(encoding="utf-8")
-    # 用 unique placeholder __MILOCO_INJECT_TOKEN_HERE__ 而不是 __MILOCO_TOKEN__：
-    # 后者在 index.html 注释 / 变量名里也会出现，粗暴 string-replace 会破坏 JS。
-    # token 走 escape_for_js_string(JSON encode + </script> 防御),共享 helper 跟
-    # miot/router.py::watch_page 同口径。watch.html 同名占位也走它。
-    template = template.replace(
-        "__MILOCO_INJECT_TOKEN_HERE__", escape_for_js_string(token)
-    )
-    # Cache-Control: no-store —— HTML body 里嵌着明文 server.token，不能被浏览器
-    # disk cache / 反代 / CDN 缓存。token 长期不轮转，缓存把"知道访问 / 才能拿
-    # token"的窗口扩到"任何能读 cache 的人"（共用电脑 / 浏览器 history-cache 等）。
-    # FileResponse 的 hashed asset 不动，那些不含 token，强 cache 是想要的。
+    template = template.replace("__MILOCO_INJECT_TOKEN_HERE__", "")
+    # Keep HTML out of caches because it is the login/session bootstrap shell.
+    # Hashed static assets do not carry credentials and retain their cache policy.
     return HTMLResponse(template, headers={"Cache-Control": "no-store"})
 
 

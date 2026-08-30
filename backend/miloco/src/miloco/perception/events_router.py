@@ -202,7 +202,8 @@ async def get_event_crop_meta(
 async def events_stream():
     """SSE 实时推送新事件.复用 pipeline.subscribe_sse / _publish 三件套.
 
-    鉴权:支持 Authorization header 或 ?token=... query 参数(EventSource 无法传 header).
+    鉴权:支持 dashboard session cookie、Authorization header 或 ?token=... query
+    参数；同源 EventSource 会自动携带 session cookie。
     Generator 内过滤 event_type == "meaningful_event"(避免 metric / preview 污染本路).
     客户端断开时 CancelledError + finally unsubscribe 清理.
 

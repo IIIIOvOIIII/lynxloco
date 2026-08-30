@@ -39,7 +39,6 @@ from miloco.miot.ws import (
     miot_video_stream_manager,
 )
 from miloco.schema.common_schema import NormalResponse
-from miloco.utils.common import escape_for_js_string
 
 logger = logging.getLogger(name=__name__)
 
@@ -664,35 +663,23 @@ async def record_clip(
     )
 
 
-@router.get("/watch", summary="Live camera view (browser)")
+@router.get(
+    "/watch",
+    summary="Live camera view (browser)",
+    dependencies=[Depends(verify_token)],
+)
 async def watch_page():
     """Serve the standalone live-view page.
 
-    The page itself is unauthenticated (browsers can't set custom headers
-    on the native WebSocket API, so auth is enforced at the WS level via
-    ``?token=…``). To remove the friction of users having to paste the
-    token into the URL, we substitute ``__MILOCO_TOKEN__`` in the template
-    with the live ``server.token`` so the page can boot self-sufficiently.
-
-    Trust note: anyone who can reach this URL effectively obtains the
-    backend bearer token. That matches the existing trust model — the
-    backend listens on 0.0.0.0 and trusts whoever holds ``server.token``.
-    Don't expose this endpoint to untrusted networks.
+    The combined dashboard-or-service dependency protects the page. Native
+    browser WebSockets then carry the same-origin dashboard session cookie,
+    while machine callers retain their service-token compatibility.
     """
     settings = get_settings()
-    token = settings.server.token or ""
-    if not token:
-        # token 真空(配置加载失败 / 运维清空)时返 503 比返一个连不上的 watch.html
-        # 友好,住户看到错误页知道"配置出问题"而不是"摄像头连不上重试无效"。
-        return HTMLResponse(
-            content="<h1>503: server.token 未配置,无法启动 watch 页</h1>",
-            status_code=503,
-        )
     template = (settings.directories.static_dir / "watch.html").read_text(
         encoding="utf-8"
     )
-    # 跟 main.py spa_handler 共用 escape_for_js_string 同 helper,改一边即同步两边。
-    html = template.replace("__MILOCO_TOKEN__", escape_for_js_string(token))
+    html = template.replace("__MILOCO_TOKEN__", "")
     return HTMLResponse(
         content=html,
         headers={"Cache-Control": "no-store"},
