@@ -31,14 +31,17 @@ _RESPONSES_VISUAL_MAX_OUTPUT_TOKENS = 256
 _RESPONSES_STRUCTURED_MAX_OUTPUT_TOKENS = 1024
 _RESPONSES_VISUAL_MAX_ATTEMPTS = 2
 _ALLOWED_SCHEMES = ("http", "https")
-_VISUAL_PROBE_SIZE = (32, 32)
+_VISUAL_PROBE_SIZE = (64, 64)
 _RESPONSES_VISUAL_PROBES = (
     ("red", (255, 0, 0)),
     ("blue", (0, 0, 255)),
 )
 _VISUAL_PROBE_PROMPT = (
-    "What is the dominant color of this image? "
-    "Reply with exactly one English color word and no other text."
+    "Look at the image. Return only this JSON object schema: "
+    '{"dominant_color":"red_or_blue"}. The value must be exactly red or blue.'
+)
+_VISUAL_PROBE_FINAL_PROMPT = (
+    "Output JSON now, no markdown, no explanation."
 )
 _STRUCTURED_PROBE_IMAGES = (
     (255, 0, 0),
@@ -252,9 +255,24 @@ def _visual_answer_is_red(value: Any) -> bool:
 
 
 def _visual_answer_is(value: Any, expected: str) -> bool:
+    if not isinstance(value, str):
+        return False
+    text = value.casefold().strip().rstrip(".")
+    if text == expected.casefold():
+        return True
+
+    try:
+        from miloco.perception.engine.omni.response_parser import extract_json
+
+        parsed = json.loads(extract_json(value))
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    color = parsed.get("dominant_color")
     return (
-        isinstance(value, str)
-        and value.casefold().strip().rstrip(".") == expected.casefold()
+        isinstance(color, str)
+        and color.casefold().strip().rstrip(".") == expected.casefold()
     )
 
 
@@ -519,7 +537,7 @@ def _visual_probe_messages(rgb: tuple[int, int, int] = (255, 0, 0)) -> list[dict
     return [
         {
             "role": "system",
-            "content": "Answer with one short visual fact only.",
+            "content": "You are Miloco vision preflight. Return compact JSON only.",
         },
         {
             "role": "user",
@@ -531,6 +549,7 @@ def _visual_probe_messages(rgb: tuple[int, int, int] = (255, 0, 0)) -> list[dict
                         "url": _visual_probe_data_url(rgb),
                     },
                 },
+                {"type": "text", "text": _VISUAL_PROBE_FINAL_PROMPT},
             ],
         },
     ]

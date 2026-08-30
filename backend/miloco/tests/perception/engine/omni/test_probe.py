@@ -1030,15 +1030,20 @@ async def test_responses_visual_probe_without_key_sends_valid_red_jpeg(monkeypat
     assert "temperature" not in body
     assert "top_p" not in body
     content = body["input"][0]["content"]
-    assert [block["type"] for block in content] == ["input_text", "input_image"]
-    assert "dominant color" in content[0]["text"].lower()
+    assert [block["type"] for block in content] == [
+        "input_text",
+        "input_image",
+        "input_text",
+    ]
+    assert "dominant_color" in content[0]["text"]
+    assert "json" in content[-1]["text"].lower()
     data_url = content[1]["image_url"]
     assert data_url.startswith("data:image/jpeg;base64,")
     image_bytes = base64.b64decode(data_url.partition(",")[2], validate=True)
     with Image.open(io.BytesIO(image_bytes)) as image:
         image.load()
         assert image.format == "JPEG"
-        assert image.size == (32, 32)
+        assert image.size == (64, 64)
         pixel = image.convert("RGB").resize((1, 1)).getpixel((0, 0))
         assert isinstance(pixel, tuple)
         red, green, blue = pixel
@@ -1167,6 +1172,36 @@ async def test_responses_structured_probe_empty_text_reports_actionable_reason(
     assert result["ok"] is False
     assert result["code"] == "bad_response"
     assert result["message"] == "Responses 结构化预检返回空文本"
+
+
+async def test_responses_visual_probe_accepts_json_color_answers(monkeypatch):
+    """Grok-like Responses models may obey JSON better than exact free text."""
+    calls: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_async_client_post_sequence(
+            get_resp=_FakeResp(404),
+            post_resps=[
+                _FakeResp(200, _responses_output('{"dominant_color":"red"}')),
+                _FakeResp(200, _responses_output('{"dominant_color":"blue"}')),
+                _FakeResp(200, _responses_structured_output()),
+            ],
+            calls=calls,
+        ),
+    )
+
+    result = await probe.probe_omni(
+        "grok-4.6",
+        "https://vlm.example/v1",
+        "sk-x",
+        api_protocol="openai_responses",
+    )
+
+    assert result["ok"] is True
+    assert result["code"] == "ok"
+    visual_body = calls[1][2]["json"]
+    assert "dominant_color" in visual_body["input"][0]["content"][0]["text"]
 
 
 async def test_responses_visual_probe_rejects_model_that_always_answers_red(
