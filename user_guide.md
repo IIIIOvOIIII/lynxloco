@@ -161,7 +161,8 @@ This project is for non-commercial use only. Without written authorization from 
 
 ## 5.2 Resources
 
-- Code repository: [github.com/XiaoMi/xiaomi-miloco](https://github.com/XiaoMi/xiaomi-miloco)
+- Code repository: [github.com/IIIIOvOIIII/lynxloco](https://github.com/IIIIOvOIIII/lynxloco)
+- Upstream project: [github.com/XiaoMi/xiaomi-miloco](https://github.com/XiaoMi/xiaomi-miloco)
 - OpenClaw website: [openclaw.ai](https://openclaw.ai)
 - MiMo model platform: [platform.xiaomimimo.com](https://platform.xiaomimimo.com)
 
