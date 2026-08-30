@@ -1010,7 +1010,7 @@ def test_put_hot_reload_visible_to_resolve_live(client):
     live = resolve_live_omni_config(base)
     assert live.model == "hot-model"
     assert live.base_url == "https://hot.example/v1"
-    assert live.timeout == 123.0  # 非用户字段保持快照
+    assert live.timeout == 120.0  # timeout 跟随当前 runtime 配置热刷新
 
 
 # ─── 测试连接 / 列模型(mock httpx) ─────────────────────────────────────────
@@ -1495,6 +1495,87 @@ def test_test_no_key_responses_ignores_generic_env_and_clears_breaker(
         )
     ]
     assert get_omni_circuit_breaker().snapshot().state == "ok"
+
+
+def test_test_connection_responses_visual_probe_waits_120_seconds(
+    client, monkeypatch, real_probe
+):
+    """新增模型测试不能在慢视觉 Responses 推理完成前取消请求。
+
+    这个用例要抓的 bug:把 Responses 图片/结构化 probe 的 read timeout 留在
+    30/45 秒，会让模型后端看到 context canceled，而 UI 误报 Base URL 不可达。
+    """
+    from miloco.perception.engine.omni import probe
+
+    responses = [
+        _FakeResp(
+            200,
+            {
+                "output": [{"content": [{"type": "output_text", "text": "red"}]}],
+                "usage": {},
+            },
+        ),
+        _FakeResp(
+            200,
+            {
+                "output": [{"content": [{"type": "output_text", "text": "blue"}]}],
+                "usage": {},
+            },
+        ),
+        _FakeResp(
+            200,
+            {
+                "output": [
+                    {
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": (
+                                    '{"caption":"red and blue test cards",'
+                                    '"matched_rules":[],"suggestions":[]}'
+                                ),
+                            }
+                        ]
+                    }
+                ],
+                "usage": {},
+            },
+        ),
+    ]
+    post_timeouts = []
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, *args, **kwargs):
+            return _FakeResp(200, {"data": [{"id": "local-vlm"}]})
+
+        async def post(self, *args, **kwargs):
+            timeout = kwargs.get("timeout")
+            post_timeouts.append((timeout.read, timeout.connect))
+            return responses.pop(0)
+
+    monkeypatch.setattr(probe.httpx, "AsyncClient", _Client)
+
+    data = client.post(
+        "/api/admin/omni-config/test",
+        json={
+            "model": "local-vlm",
+            "base_url": "https://responses.example/v1",
+            "api_protocol": "openai_responses",
+            "api_key": "responses-key",
+        },
+    ).json()["data"]
+
+    assert data["ok"] is True
+    assert post_timeouts == [(120.0, 10.0), (120.0, 10.0), (120.0, 10.0)]
 
 
 def test_test_keyed_responses_matching_active_clears_breaker(client):

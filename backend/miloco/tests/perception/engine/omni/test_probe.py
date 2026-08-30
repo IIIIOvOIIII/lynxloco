@@ -1440,10 +1440,10 @@ async def test_responses_visual_probe_classifies_response_timeout(monkeypatch):
     assert "slow" not in result["message"]
 
 
-async def test_responses_visual_probe_accepts_15_5_second_response_with_30_second_timeout(
+async def test_responses_visual_probe_accepts_slow_response_with_120_second_timeout(
     monkeypatch,
 ):
-    """A valid 15.5s visual response must not inherit the shared 15s read budget."""
+    """A slow valid visual response must not inherit the shared 15s read budget."""
     effective_timeouts: list[httpx.Timeout] = []
 
     class _LatencyAwareAsyncClient:
@@ -1491,7 +1491,7 @@ async def test_responses_visual_probe_accepts_15_5_second_response_with_30_secon
         f"connect_timeout={effective_timeout.connect}"
     )
     assert result["ok"] is True
-    assert effective_timeout.read == 30.0
+    assert effective_timeout.read == 120.0
     assert effective_timeout.connect == 10.0
 
 

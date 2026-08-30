@@ -25,8 +25,8 @@ if TYPE_CHECKING:
     from miloco.perception.engine.omni.provider import OmniProviderAdapter
 
 _TIMEOUT = httpx.Timeout(15.0, connect=10.0)
-_RESPONSES_VISUAL_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
-_RESPONSES_STRUCTURED_TIMEOUT = httpx.Timeout(45.0, connect=10.0)
+_RESPONSES_VISUAL_TIMEOUT = httpx.Timeout(120.0, connect=10.0)
+_RESPONSES_STRUCTURED_TIMEOUT = httpx.Timeout(120.0, connect=10.0)
 _RESPONSES_VISUAL_MAX_OUTPUT_TOKENS = 256
 _RESPONSES_STRUCTURED_MAX_OUTPUT_TOKENS = 512
 _ALLOWED_SCHEMES = ("http", "https")

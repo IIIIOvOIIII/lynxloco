@@ -269,6 +269,7 @@ async def test_resolve_live_config_change_resets_breaker(monkeypatch):
         base_url = "https://x/v1"
         api_key = "sk-NEW"
         api_protocol = "openai_responses"
+        timeout = 120.0
 
     class _M:
         omni = _Mo()
@@ -311,6 +312,7 @@ async def test_resolve_live_protocol_change_resets_breaker(monkeypatch):
         base_url = "https://same/v1"
         api_key = "sk-same"
         api_protocol = "openai_responses"
+        timeout = 120.0
 
     class _M:
         omni = _Mo()
