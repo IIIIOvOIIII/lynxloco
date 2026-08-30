@@ -47,6 +47,46 @@ def test_auth_setup_sends_password_in_body_not_argv(monkeypatch) -> None:
     assert "correct horse battery" not in result.output
 
 
+def test_auth_setup_does_not_print_csrf_token(monkeypatch) -> None:
+    csrf_token = "csrf-token-that-must-not-reach-cli-output"
+
+    def fake_post(path, body=None, **kwargs):
+        assert path == "/api/auth/setup"
+        return {
+            "code": 0,
+            "message": "ok",
+            "data": {
+                "needs_setup": False,
+                "authenticated": True,
+                "user": {
+                    "id": "user-123",
+                    "username": "lynx",
+                    "display_name": "Lynx",
+                    "role": "admin",
+                    "enabled": True,
+                    "created_at": 1,
+                    "updated_at": 1,
+                    "last_login_at": 1,
+                },
+                "csrf_token": csrf_token,
+            },
+        }
+
+    monkeypatch.setattr("miloco_cli.commands.auth.api_post", fake_post)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        ["auth", "setup", "--username", "lynx", "--password-stdin"],
+        input="correct horse battery\n",
+    )
+
+    assert result.exit_code == 0
+    assert csrf_token not in result.stdout
+    assert csrf_token not in result.stderr
+    assert "csrf_token" not in result.stdout
+
+
 def test_auth_status_prints_backend_response(monkeypatch) -> None:
     response = {"code": 0, "message": "ok", "data": {"needs_setup": True}}
     monkeypatch.setattr("miloco_cli.commands.auth.api_get", lambda path: response)

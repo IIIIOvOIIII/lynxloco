@@ -24,6 +24,17 @@ def _read_password_from_stdin(password_stdin: bool) -> str:
     return password
 
 
+def _setup_success_summary(result: dict) -> dict:
+    """Keep the setup response useful without exposing its browser CSRF secret."""
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return result
+    return {
+        **result,
+        "data": {key: value for key, value in data.items() if key != "csrf_token"},
+    }
+
+
 @auth_group.command("status")
 @click.option("--pretty", is_flag=True)
 def auth_status(pretty: bool) -> None:
@@ -52,7 +63,7 @@ def auth_setup(
         safe_errors=True,
         sensitive_values=(password,),
     )
-    print_result(result, pretty)
+    print_result(_setup_success_summary(result), pretty)
 
 
 def _find_user_id(username: str) -> str:
