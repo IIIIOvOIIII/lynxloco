@@ -632,6 +632,7 @@ class Installer:
             ("install", self._step_install),
             ("download", self._step_download),
             ("service", self._step_init_service),
+            ("dashboard_auth", self._step_dashboard_auth),
             ("account", self._step_account),
             ("model", self._step_configure),
             ("plugin", self._step_plugin),
@@ -986,6 +987,93 @@ class Installer:
         return len(members)  # 仅本次归档内的模型成员数
 
     # ── Account ───────────────────────────────────────────
+
+    def _step_dashboard_auth(self) -> None:
+        self._step_header("dashboard_auth.title", "dashboard_auth.subtitle")
+
+        if not self._service_started:
+            self.ui.step_skip(self.ui.i18n.t("dashboard_auth.service_start_failed"))
+            return
+
+        try:
+            result = subprocess.run(
+                ["miloco-cli", "auth", "status"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            status_data = json.loads(result.stdout)
+            needs_setup = bool(status_data.get("data", {}).get("needs_setup"))
+        except Exception:
+            self.ui.step_fail(self.ui.i18n.t("dashboard_auth.status_failed"))
+            return
+
+        if not needs_setup:
+            self.ui.step_ok(self.ui.i18n.t("dashboard_auth.already_configured"))
+            return
+
+        if not self.platform.is_interactive:
+            self.ui.step_skip(self.ui.i18n.t("dashboard_auth.open_browser_to_setup"))
+            return
+
+        create_label = self.ui.i18n.t("dashboard_auth.create_now")
+        browser_label = self.ui.i18n.t("dashboard_auth.create_in_browser")
+        choice = self.ui.prompt_select(
+            self.ui.i18n.t("dashboard_auth.setup_ask"),
+            choices=[create_label, browser_label],
+        )
+        if choice != create_label:
+            self.ui.step_skip(self.ui.i18n.t("dashboard_auth.open_browser_to_setup"))
+            return
+
+        username = self.ui.prompt_input(
+            self.ui.i18n.t("dashboard_auth.username"),
+            validate=lambda value: (
+                True
+                if value.strip()
+                else self.ui.i18n.t("dashboard_auth.username_required")
+            ),
+        )
+        display_name = self.ui.prompt_input(
+            self.ui.i18n.t("dashboard_auth.display_name"), default=username
+        )
+        password = self.ui.prompt_input(
+            self.ui.i18n.t("dashboard_auth.password"),
+            password=True,
+            validate=lambda value: (
+                True
+                if len(value) >= 8
+                else self.ui.i18n.t("dashboard_auth.password_too_short")
+            ),
+        )
+        self.ui.prompt_input(
+            self.ui.i18n.t("dashboard_auth.password_confirm"),
+            password=True,
+            validate=lambda value: (
+                True
+                if value == password
+                else self.ui.i18n.t("dashboard_auth.password_mismatch")
+            ),
+        )
+        result = subprocess.run(
+            [
+                "miloco-cli",
+                "auth",
+                "setup",
+                "--username",
+                username,
+                "--display-name",
+                display_name,
+                "--password-stdin",
+            ],
+            input=f"{password}\n",
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            self.ui.step_ok(self.ui.i18n.t("dashboard_auth.created"))
+        else:
+            self.ui.step_fail(self.ui.i18n.t("dashboard_auth.create_failed"))
 
     def _step_account(self) -> None:
         self._step_header("account.title", "account.subtitle")
@@ -1580,6 +1668,7 @@ class Installer:
         self._steps = [
             ("download", self._step_download),
             ("service", self._step_init_service),
+            ("dashboard_auth", self._step_dashboard_auth),
             ("account", self._step_account),
             ("model", self._agent_step_configure_model),
             ("plugin", self._step_plugin),

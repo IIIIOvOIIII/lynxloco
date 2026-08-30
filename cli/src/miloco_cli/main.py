@@ -16,6 +16,7 @@ import click
 from miloco_cli.commands.account import account_group
 from miloco_cli.commands.actions import actions_group
 from miloco_cli.commands.admin import admin_group
+from miloco_cli.commands.auth import auth_group
 from miloco_cli.commands.camera import camera_group
 from miloco_cli.commands.config import config_group
 from miloco_cli.commands.cron import cron_group
@@ -80,6 +81,7 @@ def cli():
 cli.add_command(device_group)
 cli.add_command(actions_group)
 cli.add_command(account_group)
+cli.add_command(auth_group)
 cli.add_command(scene_group)
 cli.add_command(perceive_group)
 cli.add_command(rule_group)
