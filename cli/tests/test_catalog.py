@@ -217,7 +217,7 @@ def test_build_catalog_merges_same_skeleton_devices():
     assert "brightness|wr|uint8|[1,100;1]|%" in text
     # catalog 头部应自带格式说明，不再依赖 SKILL.md
     assert "# 数据格式：" in text
-    assert "did|device_name|room|category|status" in text
+    assert "did|source|device_name|room|category|status|control" in text
     # # models 注释已移除（用户反馈不需要）
     assert "# models" not in text
 

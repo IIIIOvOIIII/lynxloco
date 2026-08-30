@@ -14,7 +14,7 @@ def _fetch(*, refresh: bool = False, timeout: float | None = None) -> dict:
     """从后端拉取 home_info 并返回。refresh=True 触发后端刷新云端数据。"""
     from miloco_cli.client import api_get
 
-    path = "/api/miot/home"
+    path = "/api/devices/home"
     if refresh:
         path += "?refresh=true"
     resp = api_get(path, timeout=timeout)

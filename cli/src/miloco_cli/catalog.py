@@ -137,10 +137,12 @@ class SpecLine:
 @dataclass
 class DeviceCatalogEntry:
     did: str
+    source: str
     name: str
     room: str
     category: str
     online: bool
+    control: str
     model: str
     spec_lines: list[SpecLine] = field(default_factory=list)
     # 冷骨架：whitelist 过滤后按 spec 原序取 top-capacity，不走 LRU。
@@ -526,10 +528,12 @@ def _pretty_render_group(
         out_lines.append(
             "|".join([
                 _escape(device.did),
+                _escape(device.source),
                 _escape(device.name),
                 _escape(device.room),
                 _escape(device.category),
                 "online" if device.online else "offline",
+                device.control,
             ])
         )
         for line in sorted(device.spec_lines, key=lambda sl: sl.key):
@@ -563,7 +567,7 @@ _TOKEN_BUDGET = 5000  # spec-injection-plan §1.2 / §5.5
 # Catalog 自描述格式说明，注入到目录头部，让模型不必去 SKILL.md 翻文档。
 _FORMAT_LEGEND = [
     "# 数据格式：",
-    "#   did|device_name|room|category|status     // 设备信息行",
+    "#   did|source|device_name|room|category|status|control  // 设备信息行",
     "#     + prop/action                          // 当前设备独有的 prop/action，以 '  + ' 前缀表示",
     "#   ...",
     "#   ---                                      // 分隔线，下方是整组共享属性",
@@ -573,8 +577,10 @@ _FORMAT_LEGEND = [
     "#   (空两行)                                 // 组分隔：组与组之间空两行；拥有共享属性的设备归为一组，空行下方是新组，重复以上结构",
     "#",
     "# 字段解释：",
+    "#   source：设备来源，miot 或 home_assistant",
     "#   category：设备类别，如 light / air-conditioner",
     "#   status：设备状态，只有 online / offline 两种",
+    "#   control：enabled 可控制；read_only 只能查询/描述，不能 control/action",
     "#   spec_name：prop / action 的名字，作为 miloco-cli device (control / props / action) 第二个参数；",
     "#     形如 on / brightness / play-text；同名冲突时自动带 @<子设备描述> 后缀消歧，如 on@左键",
     "#   行尾 ``  # 注释``（如有）：人类可读的中文说明，传入 cli 时忽略",
@@ -637,10 +643,14 @@ def _build_with_capacity(
         spec_lines = _build_lines_for_device(spec, valid_keys, iid_to_key)
         catalog_entry = DeviceCatalogEntry(
             did=device.get("did", ""),
+            source=device.get("source") or "miot",
             name=device.get("name", "") or "",
             room=device.get("room") or "",
             category=device.get("category") or "",
             online=bool(device.get("online")),
+            control="enabled"
+            if device.get("control_enabled", True)
+            else "read_only",
             model=device.get("model") or "",
             spec_lines=spec_lines,
             cold_spec_lines=cold_spec_lines,

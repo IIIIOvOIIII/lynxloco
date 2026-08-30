@@ -2,6 +2,7 @@
 
 import json
 import sys
+from urllib.parse import quote
 
 import click
 
@@ -120,7 +121,7 @@ def device_group():
 def device_list(room, category, online):
     """列出设备（每次从后端拉取最新数据）。
 
-    顶部单行 # home=xxx 声明家庭名，后跟 TSV：did|device_name|room|category|online
+    顶部单行 # home=xxx 声明家庭名，后跟 TSV：did|source|device_name|room|category|online|control
     """
     from miloco_cli.home_info import get_home_info
 
@@ -136,13 +137,13 @@ def device_list(room, category, online):
     home = info.get("home_name") or ""
     if home:
         click.echo(f"# home={home}")
-    click.echo("# did|device_name|room|category|online")
+    click.echo("# did|source|device_name|room|category|online|control")
     for d in devices:
         click.echo(_render_device_row(d))
 
 
 def _render_device_row(d: dict) -> str:
-    """同 catalog 的设备行格式：did|device_name|room|category|online。
+    """同 catalog 的设备行格式：did|source|device_name|room|category|online|control。
 
     每个字段都需转义 ``|``——与 catalog._escape 统一。米家 app 房间名 / 别名
     用户可改，含 ``|`` 不是不可能（如 "客厅|主卧"）。
@@ -151,10 +152,12 @@ def _render_device_row(d: dict) -> str:
 
     return "|".join([
         _escape(d.get("did")),
+        _escape(d.get("source") or "miot"),
         _escape(d.get("name")),
         _escape(d.get("room")),
         _escape(d.get("category")),
         "online" if d.get("online") else "offline",
+        "enabled" if d.get("control_enabled", True) else "read_only",
     ])
 
 
@@ -177,7 +180,7 @@ def device_spec(dids):
 
     blocks: list[str] = []
     for did in dids:
-        resp = api_get(f"/api/miot/devices/{did}/spec")
+        resp = api_get(f"/api/devices/{quote(did, safe='')}/spec")
         data = resp.get("data", {})
         if not data or not data.get("spec"):
             # 单条错误打到 stderr，不中断其余 did（批量时部分失败仍返回成功的）
@@ -417,7 +420,8 @@ def _do_control(did: str, properties: list[dict], pretty: bool) -> None:
     else:
         body = {"type": "set_properties", "properties": resolved_properties}
 
-    data = api_post(f"/api/miot/devices/{did}/control", body)
+    data = api_post(f"/api/devices/{quote(did, safe='')}/control", body)
+    _lift_unified_action_payload(data)
     # 后端返回体不含 did；并发批量控制（&+wait）时多行输出交错，补 did 让结果可归属
     if isinstance(data.get("data"), dict):
         data["data"]["did"] = did
@@ -457,7 +461,7 @@ def device_status(did, iids, pretty):
             sys.exit(1)
         params["iid"] = ",".join(resolved_iids)
 
-    data = api_get(f"/api/miot/devices/{did}/status", params or None)
+    data = api_get(f"/api/devices/{quote(did, safe='')}/status", params or None)
     if isinstance(data.get("data"), dict):
         # 后端返回体不含 did；并发批量查询（&+wait）时输出交错，补 did 让结果可归属
         data["data"]["did"] = did
@@ -505,15 +509,34 @@ def device_action(did, iid, params, pretty):
         sys.exit(1)
 
     data = api_post(
-        f"/api/miot/devices/{did}/control",
+        f"/api/devices/{quote(did, safe='')}/control",
         {
             "type": "call_action",
             "iid": resolved_iid,
             "params": [infer_value(p) for p in params],
         },
     )
+    _lift_unified_action_payload(data)
     # 后端返回体不含 did；并发批量 action（&+wait）时多行输出交错，补 did 让结果可归属
     if isinstance(data.get("data"), dict):
         data["data"]["did"] = did
     _annotate_result_codes(data)
     print_result(data, pretty)
+
+
+def _lift_unified_action_payload(data: dict) -> None:
+    """Expose nested unified action payload to legacy CLI annotations.
+
+    `/api/devices/*/control` returns a source-aware wrapper.  The MIoT command
+    annotations historically inspect `data.results` / `data.result`, so copy
+    nested provider payload fields up without dropping the source-aware wrapper.
+    """
+    outer = data.get("data")
+    if not isinstance(outer, dict):
+        return
+    inner = outer.get("data")
+    if not isinstance(inner, dict):
+        return
+    for key in ("results", "properties", "result"):
+        if key in inner and key not in outer:
+            outer[key] = inner[key]
