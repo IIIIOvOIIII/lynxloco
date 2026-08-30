@@ -146,7 +146,7 @@ def test_dashboard_auth_skips_existing_administrator(
 
 
 def test_dashboard_auth_interactive_setup_passes_password_only_through_stdin(
-    installer_module, monkeypatch, tmp_path
+    installer_module, monkeypatch, tmp_path, capsys
 ) -> None:
     password = "installer-secret-not-an-argument"
     csrf_token = "csrf-token-not-an-installer-message"
@@ -183,9 +183,16 @@ def test_dashboard_auth_interactive_setup_passes_password_only_through_stdin(
     setup_command, setup_kwargs = calls[1]
     assert password not in setup_command
     assert setup_kwargs["input"] == f"{password}\n"
+    assert setup_kwargs["capture_output"] is True
+    assert setup_kwargs["text"] is True
     emitted = "\n".join(message for _, message in ui.events)
     assert password not in emitted
     assert csrf_token not in emitted
+    captured = capsys.readouterr()
+    assert password not in captured.out
+    assert password not in captured.err
+    assert csrf_token not in captured.out
+    assert csrf_token not in captured.err
     assert ("ok", "dashboard_auth.created ") in ui.events
 
 
