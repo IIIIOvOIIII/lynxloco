@@ -203,6 +203,7 @@ async def test_visual_preflight_tolerates_missing_models_endpoint() -> None:
         ("GET", "/v1/models"),
         ("POST", "/v1/responses"),
         ("POST", "/v1/responses"),
+        ("POST", "/v1/responses"),
     ]
     assert fixture.requests[1].image_count == 1
     assert fixture.requests[2].image_count == 1
@@ -287,6 +288,7 @@ async def test_persisted_keyless_responses_ignores_generic_env_across_all_paths(
     assert query["choices"][0]["message"]["content"]
     assert [(request.method, request.path) for request in fixture.requests] == [
         ("GET", "/v1/models"),
+        ("POST", "/v1/responses"),
         ("POST", "/v1/responses"),
         ("POST", "/v1/responses"),
         ("POST", "/v1/responses"),
@@ -570,6 +572,7 @@ def test_smoke_runs_visual_preflight_then_synthetic_perception_without_leaks() -
         ("POST", "/v1/responses"),
         ("POST", "/v1/responses"),
         ("POST", "/v1/responses"),
+        ("POST", "/v1/responses"),
     ]
 
 
@@ -599,6 +602,7 @@ def test_smoke_does_not_inherit_generic_omni_key_for_no_key_responses() -> None:
     assert completed.stderr == ""
     assert [(request.method, request.path) for request in fixture.requests] == [
         ("GET", "/v1/models"),
+        ("POST", "/v1/responses"),
         ("POST", "/v1/responses"),
         ("POST", "/v1/responses"),
         ("POST", "/v1/responses"),

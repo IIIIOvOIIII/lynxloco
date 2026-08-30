@@ -26,7 +26,9 @@ if TYPE_CHECKING:
 
 _TIMEOUT = httpx.Timeout(15.0, connect=10.0)
 _RESPONSES_VISUAL_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
+_RESPONSES_STRUCTURED_TIMEOUT = httpx.Timeout(45.0, connect=10.0)
 _RESPONSES_VISUAL_MAX_OUTPUT_TOKENS = 256
+_RESPONSES_STRUCTURED_MAX_OUTPUT_TOKENS = 512
 _ALLOWED_SCHEMES = ("http", "https")
 _VISUAL_PROBE_SIZE = (32, 32)
 _RESPONSES_VISUAL_PROBES = (
@@ -37,6 +39,15 @@ _VISUAL_PROBE_PROMPT = (
     "What is the dominant color of this image? "
     "Reply with exactly one English color word and no other text."
 )
+_STRUCTURED_PROBE_IMAGES = (
+    (255, 0, 0),
+    (0, 0, 255),
+    (127, 127, 127),
+    (127, 127, 127),
+    (127, 127, 127),
+    (127, 127, 127),
+)
+_STRUCTURED_PROBE_MESSAGE = "Responses 服务未通过结构化输出验证"
 
 
 def _normalize_base_url(base_url: str) -> tuple[str | None, str | None]:
@@ -522,6 +533,112 @@ def _visual_probe_messages(rgb: tuple[int, int, int] = (255, 0, 0)) -> list[dict
     ]
 
 
+def _structured_probe_messages() -> list[dict[str, Any]]:
+    """Build a lightweight Miloco-like structured probe for Responses endpoints.
+
+    A color-only probe can prove image ingestion but still miss qwen-like models
+    that spend the whole output budget on reasoning for the real Miloco schema.
+    This probe deliberately keeps the same bounded JPEG input shape and a small
+    subset of the runtime output schema, then requires parseable visible text.
+    """
+    from miloco.perception.engine.omni.field_registry import (
+        SceneDescriptor,
+        render_field_spec,
+        render_schema,
+    )
+
+    scene = SceneDescriptor(
+        route="video",
+        has_identity=False,
+        stream=False,
+        has_audio=False,
+        has_speech=False,
+        has_pets=False,
+    )
+    text = (
+        "Miloco runtime compatibility probe. Return only a JSON object, "
+        "no markdown.\n"
+        "The image sequence contains a red test card, a blue test card, "
+        "and gray neutral frames.\n"
+        "Use this exact schema and field meanings from the real Miloco "
+        "runtime.\n"
+        f"# 输出格式\n{render_schema(scene)}\n\n"
+        f"# 字段说明\n{render_field_spec(scene)}\n\n"
+        "Required facts: caption must mention red and blue test cards; "
+        "matched_rules must be []; suggestions must be []."
+    )
+    content: list[dict[str, Any]] = [{"type": "text", "text": text}]
+    content.extend(
+        {"type": "image_url", "image_url": {"url": _visual_probe_data_url(rgb)}}
+        for rgb in _STRUCTURED_PROBE_IMAGES
+    )
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are Miloco preflight. Produce concise "
+                "machine-readable perception JSON only."
+            ),
+        },
+        {"role": "user", "content": content},
+    ]
+
+
+def _bad_responses_probe(message: str, latency_ms: int) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "code": "bad_response",
+        "status": 200,
+        "latency_ms": latency_ms,
+        "message": message,
+    }
+
+
+def _responses_output_text(
+    adapter: "OmniProviderAdapter",
+    response: Any,
+    latency_ms: int,
+    *,
+    bad_response_message: str,
+) -> tuple[str | None, dict[str, Any] | None, bool]:
+    try:
+        raw = response.json()
+    except Exception:  # noqa: BLE001
+        raw = None
+    if not isinstance(raw, dict):
+        return None, _bad_responses_probe(bad_response_message, latency_ms), False
+
+    usage_warning = raw.get("usage") is None
+    try:
+        normalized = adapter.parse_response(raw)
+    except ValueError:
+        without_usage = dict(raw)
+        without_usage["usage"] = None
+        try:
+            normalized = adapter.parse_response(without_usage)
+        except ValueError:
+            return None, _bad_responses_probe(bad_response_message, latency_ms), False
+        usage_warning = True
+
+    return normalized["choices"][0]["message"]["content"], None, usage_warning
+
+
+def _structured_output_is_valid(output_text: str) -> bool:
+    from miloco.perception.engine.omni.response_parser import extract_json
+
+    try:
+        parsed = json.loads(extract_json(output_text))
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    return (
+        isinstance(parsed.get("caption"), str)
+        and isinstance(parsed.get("matched_rules"), list)
+        and isinstance(parsed.get("suggestions"), list)
+    )
+
+
 async def _probe_responses(
     model: str,
     base: str,
@@ -532,6 +649,7 @@ async def _probe_responses(
     adapter = OpenAIResponsesAdapter()
     auth_headers = adapter.auth_headers(api_key)
     t0 = time.monotonic()
+    usage_warning = False
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             models_response = await client.get(
@@ -548,7 +666,6 @@ async def _probe_responses(
                     visual_request=False,
                 )
 
-            responses: list[tuple[str, Any]] = []
             for expected_color, rgb in _RESPONSES_VISUAL_PROBES:
                 body = adapter.build_request_body(
                     _visual_probe_messages(rgb),
@@ -564,9 +681,66 @@ async def _probe_responses(
                     json=body,
                     timeout=_RESPONSES_VISUAL_TIMEOUT,
                 )
-                responses.append((expected_color, response))
                 if response.status_code != 200:
-                    break
+                    return _probe_http_failure(
+                        response,
+                        round((time.monotonic() - t0) * 1000),
+                        visual_request=True,
+                    )
+
+                output_text, error, warn = _responses_output_text(
+                    adapter,
+                    response,
+                    round((time.monotonic() - t0) * 1000),
+                    bad_response_message="Responses 视觉预检响应格式异常",
+                )
+                if error is not None:
+                    return error
+                assert output_text is not None
+                usage_warning = usage_warning or warn
+
+                if not _visual_answer_is(output_text, expected_color):
+                    return {
+                        "ok": False,
+                        "code": "bad_response",
+                        "status": 200,
+                        "latency_ms": round((time.monotonic() - t0) * 1000),
+                        "message": "Responses 服务未通过图片颜色验证",
+                    }
+
+            body = adapter.build_request_body(
+                _structured_probe_messages(),
+                model=model,
+                max_tokens=_RESPONSES_STRUCTURED_MAX_OUTPUT_TOKENS,
+                temperature=0.0,
+                top_p=1.0,
+                stream=False,
+            )
+            structured_response = await client.post(
+                adapter.endpoint(base, model, stream=False),
+                headers={**auth_headers, "Content-Type": "application/json"},
+                json=body,
+                timeout=_RESPONSES_STRUCTURED_TIMEOUT,
+            )
+            latency_ms = round((time.monotonic() - t0) * 1000)
+            if structured_response.status_code != 200:
+                return _probe_http_failure(
+                    structured_response,
+                    latency_ms,
+                    visual_request=True,
+                )
+            output_text, error, warn = _responses_output_text(
+                adapter,
+                structured_response,
+                latency_ms,
+                bad_response_message=_STRUCTURED_PROBE_MESSAGE,
+            )
+            if error is not None:
+                return error
+            assert output_text is not None
+            usage_warning = usage_warning or warn
+            if not _structured_output_is_valid(output_text):
+                return _bad_responses_probe(_STRUCTURED_PROBE_MESSAGE, latency_ms)
     except Exception as exc:  # noqa: BLE001
         return {
             "ok": False,
@@ -575,57 +749,12 @@ async def _probe_responses(
         }
 
     latency_ms = round((time.monotonic() - t0) * 1000)
-    usage_warning = False
-    for expected_color, response in responses:
-        if response.status_code != 200:
-            return _probe_http_failure(response, latency_ms, visual_request=True)
-
-        try:
-            raw = response.json()
-        except Exception:  # noqa: BLE001
-            raw = None
-        if not isinstance(raw, dict):
-            return {
-                "ok": False,
-                "code": "bad_response",
-                "status": 200,
-                "latency_ms": latency_ms,
-                "message": "Responses 视觉预检响应格式异常",
-            }
-        usage_warning = usage_warning or raw.get("usage") is None
-        try:
-            normalized = adapter.parse_response(raw)
-        except ValueError:
-            without_usage = dict(raw)
-            without_usage["usage"] = None
-            try:
-                normalized = adapter.parse_response(without_usage)
-            except ValueError:
-                return {
-                    "ok": False,
-                    "code": "bad_response",
-                    "status": 200,
-                    "latency_ms": latency_ms,
-                    "message": "Responses 视觉预检响应格式异常",
-                }
-            usage_warning = True
-
-        output_text = normalized["choices"][0]["message"]["content"]
-        if not _visual_answer_is(output_text, expected_color):
-            return {
-                "ok": False,
-                "code": "bad_response",
-                "status": 200,
-                "latency_ms": latency_ms,
-                "message": "Responses 服务未通过图片颜色验证",
-            }
-
     result: dict[str, Any] = {
         "ok": True,
         "code": "ok",
         "status": 200,
         "latency_ms": latency_ms,
-        "message": "视觉预检通过",
+        "message": "视觉与结构化输出预检通过",
     }
     if usage_warning:
         result["warning"] = "usage_unavailable"

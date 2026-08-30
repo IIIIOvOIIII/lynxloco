@@ -970,6 +970,21 @@ def _responses_output(text: str, usage: object = ...):
     return payload
 
 
+def _responses_structured_output(text: str | None = None, usage: object = ...):
+    return _responses_output(
+        text
+        or json.dumps(
+            {
+                "caption": "red and blue test cards are visible",
+                "matched_rules": [],
+                "suggestions": [],
+            },
+            ensure_ascii=False,
+        ),
+        usage=usage,
+    )
+
+
 async def test_responses_visual_probe_without_key_sends_valid_red_jpeg(monkeypatch):
     """缺失 Responses 视觉分支会让显式协议无法调用 /responses。"""
     calls: list[tuple[str, str, dict]] = []
@@ -981,6 +996,7 @@ async def test_responses_visual_probe_without_key_sends_valid_red_jpeg(monkeypat
             post_resps=[
                 _FakeResp(200, _responses_output("RED")),
                 _FakeResp(200, _responses_output("blue")),
+                _FakeResp(200, _responses_structured_output()),
             ],
             calls=calls,
         ),
@@ -1000,10 +1016,12 @@ async def test_responses_visual_probe_without_key_sends_valid_red_jpeg(monkeypat
         ("GET", "http://127.0.0.1:8000/v1/models"),
         ("POST", "http://127.0.0.1:8000/v1/responses"),
         ("POST", "http://127.0.0.1:8000/v1/responses"),
+        ("POST", "http://127.0.0.1:8000/v1/responses"),
     ]
     assert "Authorization" not in calls[0][2]["headers"]
     assert "Authorization" not in calls[1][2]["headers"]
     assert "Authorization" not in calls[2][2]["headers"]
+    assert "Authorization" not in calls[3][2]["headers"]
 
     body = calls[1][2]["json"]
     assert body["model"] == "local-vlm"
@@ -1036,6 +1054,58 @@ async def test_responses_visual_probe_without_key_sends_valid_red_jpeg(monkeypat
         assert isinstance(pixel, tuple)
         red, green, blue = pixel
     assert blue > 240 and red < 20 and green < 20
+
+
+async def test_responses_visual_probe_rejects_structured_runtime_without_output_text(
+    monkeypatch,
+):
+    """颜色题通过但真实 schema 产不出 output_text 时必须拒绝，避免运行时假阳性。"""
+    calls: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_async_client_post_sequence(
+            get_resp=_FakeResp(200, {"data": [{"id": "local-vlm"}]}),
+            post_resps=[
+                _FakeResp(200, _responses_output("red")),
+                _FakeResp(200, _responses_output("blue")),
+                _FakeResp(
+                    200,
+                    {
+                        "status": "completed",
+                        "output": [
+                            {"type": "reasoning", "summary": []},
+                            {
+                                "type": "message",
+                                "content": [
+                                    {"type": "output_text", "text": ""},
+                                ],
+                            },
+                        ],
+                        "usage": {
+                            "input_tokens": 110,
+                            "output_tokens": 512,
+                            "total_tokens": 622,
+                            "input_tokens_details": {"cached_tokens": 0},
+                        },
+                    },
+                ),
+            ],
+            calls=calls,
+        ),
+    )
+
+    result = await probe.probe_omni(
+        "qwen3.5:2b-mlx",
+        "http://127.0.0.1:11434/v1",
+        "",
+        api_protocol="openai_responses",
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "bad_response"
+    assert "结构化" in result["message"]
+    assert [call[0] for call in calls] == ["GET", "POST", "POST", "POST"]
 
 
 async def test_responses_visual_probe_rejects_model_that_always_answers_red(
@@ -1111,7 +1181,11 @@ async def test_responses_visual_probe_budget_allows_reasoning_before_text(monkey
                         },
                     },
                 )
-            return _FakeResp(200, _responses_output("red" if len(calls) == 2 else "blue"))
+            if len(calls) == 2:
+                return _FakeResp(200, _responses_output("red"))
+            if len(calls) == 3:
+                return _FakeResp(200, _responses_output("blue"))
+            return _FakeResp(200, _responses_structured_output())
 
     monkeypatch.setattr(probe.httpx, "AsyncClient", _ReasoningBudgetClient)
 
@@ -1123,8 +1197,10 @@ async def test_responses_visual_probe_budget_allows_reasoning_before_text(monkey
     )
 
     assert result["ok"] is True
-    post_body = calls[1][2]["json"]
-    assert post_body["max_output_tokens"] == 256
+    visual_body = calls[1][2]["json"]
+    structured_body = calls[3][2]["json"]
+    assert visual_body["max_output_tokens"] == 256
+    assert structured_body["max_output_tokens"] == 512
 
 
 async def test_responses_visual_probe_sends_bearer_key(monkeypatch):
@@ -1137,6 +1213,7 @@ async def test_responses_visual_probe_sends_bearer_key(monkeypatch):
             post_resps=[
                 _FakeResp(200, _responses_output("red")),
                 _FakeResp(200, _responses_output("blue")),
+                _FakeResp(200, _responses_structured_output()),
             ],
             calls=calls,
         ),
@@ -1153,6 +1230,7 @@ async def test_responses_visual_probe_sends_bearer_key(monkeypatch):
     assert calls[0][2]["headers"]["Authorization"] == "Bearer sk-secret"
     assert calls[1][2]["headers"]["Authorization"] == "Bearer sk-secret"
     assert calls[2][2]["headers"]["Authorization"] == "Bearer sk-secret"
+    assert calls[3][2]["headers"]["Authorization"] == "Bearer sk-secret"
 
 
 async def test_responses_visual_probe_models_not_supported_still_proves_vision(
@@ -1168,6 +1246,7 @@ async def test_responses_visual_probe_models_not_supported_still_proves_vision(
                 post_resps=[
                     _FakeResp(200, _responses_output("red.")),
                     _FakeResp(200, _responses_output("blue.")),
+                    _FakeResp(200, _responses_structured_output()),
                 ],
                 calls=calls,
             ),
@@ -1181,7 +1260,7 @@ async def test_responses_visual_probe_models_not_supported_still_proves_vision(
         )
 
         assert result["ok"] is True
-        assert [call[0] for call in calls] == ["GET", "POST", "POST"]
+        assert [call[0] for call in calls] == ["GET", "POST", "POST", "POST"]
 
 
 @pytest.mark.parametrize(
@@ -1227,11 +1306,12 @@ async def test_responses_visual_probe_accepts_exact_color_answers(monkeypatch, a
         "AsyncClient",
         _fake_async_client_post_sequence(
             get_resp=_FakeResp(405),
-            post_resps=[
-                _FakeResp(200, _responses_output(answer)),
-                _FakeResp(200, _responses_output(" blue.\n")),
-            ],
-        ),
+                post_resps=[
+                    _FakeResp(200, _responses_output(answer)),
+                    _FakeResp(200, _responses_output(" blue.\n")),
+                    _FakeResp(200, _responses_structured_output()),
+                ],
+            ),
     )
 
     result = await probe.probe_omni(
@@ -1275,11 +1355,12 @@ async def test_responses_visual_probe_warns_when_usage_is_missing(monkeypatch):
         "AsyncClient",
         _fake_async_client_post_sequence(
             get_resp=_FakeResp(404),
-            post_resps=[
-                _FakeResp(200, _responses_output("red", usage=None)),
-                _FakeResp(200, _responses_output("blue")),
-            ],
-        ),
+                post_resps=[
+                    _FakeResp(200, _responses_output("red", usage=None)),
+                    _FakeResp(200, _responses_output("blue")),
+                    _FakeResp(200, _responses_structured_output()),
+                ],
+            ),
     )
 
     result = await probe.probe_omni(
@@ -1299,11 +1380,12 @@ async def test_responses_visual_probe_warns_when_usage_is_malformed(monkeypatch)
         "AsyncClient",
         _fake_async_client_post_sequence(
             get_resp=_FakeResp(404),
-            post_resps=[
-                _FakeResp(200, _responses_output("red", usage="not-an-object")),
-                _FakeResp(200, _responses_output("blue")),
-            ],
-        ),
+                post_resps=[
+                    _FakeResp(200, _responses_output("red", usage="not-an-object")),
+                    _FakeResp(200, _responses_output("blue")),
+                    _FakeResp(200, _responses_structured_output()),
+                ],
+            ),
     )
 
     result = await probe.probe_omni(
@@ -1384,7 +1466,13 @@ async def test_responses_visual_probe_accepts_15_5_second_response_with_30_secon
                 raise httpx.ReadTimeout("simulated 15.5 second response")
             return _FakeResp(
                 200,
-                _responses_output("red" if len(effective_timeouts) == 1 else "blue"),
+                _responses_output("red")
+                if len(effective_timeouts) == 1
+                else (
+                    _responses_output("blue")
+                    if len(effective_timeouts) == 2
+                    else _responses_structured_output()
+                ),
             )
 
     monkeypatch.setattr(probe.httpx, "AsyncClient", _LatencyAwareAsyncClient)
@@ -1531,6 +1619,7 @@ async def test_explicit_responses_protocol_never_falls_back_by_model_name(monkey
                 post_resps=[
                     _FakeResp(200, _responses_output("red")),
                     _FakeResp(200, _responses_output("blue")),
+                    _FakeResp(200, _responses_structured_output()),
                 ],
                 calls=calls,
             ),
@@ -1548,6 +1637,8 @@ async def test_explicit_responses_protocol_never_falls_back_by_model_name(monkey
         assert calls[1][2]["json"]["stream"] is False
         assert calls[2][1] == "https://vlm.example/v1/responses"
         assert calls[2][2]["json"]["stream"] is False
+        assert calls[3][1] == "https://vlm.example/v1/responses"
+        assert calls[3][2]["json"]["stream"] is False
 
 
 async def test_explicit_gemini_probe_protocol_overrides_model_name(monkeypatch):
