@@ -8,6 +8,7 @@ import {
   omniProtocolSelection,
   omniProtocolFormPolicy,
   omniSavedProfileTestLabelKey,
+  omniTestReason,
 } from "@/components/UsageOmniConfig";
 import { hasConfiguredOmni } from "@/components/PetAutoGenFlow";
 import type { OmniConfigState, OmniHealth } from "@/lib/types";
@@ -187,6 +188,35 @@ describe("Saved profile visual preflight action", () => {
     expect(omniSavedProfileTestLabelKey("active", "active")).toBe(
       "usage.testing",
     );
+  });
+});
+
+describe("Omni test result copy", () => {
+  it("keeps backend bad_response detail instead of flattening it", () => {
+    expect(
+      omniTestReason(
+        {
+          ok: false,
+          code: "bad_response",
+          message: "Responses 结构化预检返回空文本",
+          latency_ms: 26754,
+        },
+        (key) => `translated:${key}`,
+      ),
+    ).toBe("Responses 结构化预检返回空文本");
+  });
+
+  it("still localizes stable non-diagnostic codes", () => {
+    expect(
+      omniTestReason(
+        {
+          ok: false,
+          code: "bad_key",
+          message: "provider-specific key failure",
+        },
+        (key) => `translated:${key}`,
+      ),
+    ).toBe("translated:usage.testBadKey");
   });
 });
 

@@ -28,7 +28,7 @@ _TIMEOUT = httpx.Timeout(15.0, connect=10.0)
 _RESPONSES_VISUAL_TIMEOUT = httpx.Timeout(120.0, connect=10.0)
 _RESPONSES_STRUCTURED_TIMEOUT = httpx.Timeout(120.0, connect=10.0)
 _RESPONSES_VISUAL_MAX_OUTPUT_TOKENS = 256
-_RESPONSES_STRUCTURED_MAX_OUTPUT_TOKENS = 512
+_RESPONSES_STRUCTURED_MAX_OUTPUT_TOKENS = 1024
 _ALLOWED_SCHEMES = ("http", "https")
 _VISUAL_PROBE_SIZE = (32, 32)
 _RESPONSES_VISUAL_PROBES = (
@@ -48,6 +48,8 @@ _STRUCTURED_PROBE_IMAGES = (
     (127, 127, 127),
 )
 _STRUCTURED_PROBE_MESSAGE = "Responses 服务未通过结构化输出验证"
+_STRUCTURED_PROBE_EMPTY_MESSAGE = "Responses 结构化预检返回空文本"
+_VISUAL_PROBE_EMPTY_MESSAGE = "Responses 视觉预检返回空文本"
 
 
 def _normalize_base_url(base_url: str) -> tuple[str | None, str | None]:
@@ -572,6 +574,15 @@ def _structured_probe_messages() -> list[dict[str, Any]]:
         {"type": "image_url", "image_url": {"url": _visual_probe_data_url(rgb)}}
         for rgb in _STRUCTURED_PROBE_IMAGES
     )
+    content.append(
+        {
+            "type": "text",
+            "text": (
+                "Final instruction after the image inputs: output only one "
+                "compact JSON object now, with no markdown or reasoning text."
+            ),
+        }
+    )
     return [
         {
             "role": "system",
@@ -594,12 +605,37 @@ def _bad_responses_probe(message: str, latency_ms: int) -> dict[str, Any]:
     }
 
 
+def _responses_has_blank_output_text(raw: dict[str, Any]) -> bool:
+    """Return True when Responses carried output_text parts but all were blank."""
+    output = raw.get("output")
+    if not isinstance(output, list):
+        return False
+
+    found_output_text = False
+    text_parts: list[str] = []
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict) or part.get("type") != "output_text":
+                continue
+            found_output_text = True
+            text = part.get("text")
+            if isinstance(text, str):
+                text_parts.append(text)
+    return found_output_text and not "".join(text_parts).strip()
+
+
 def _responses_output_text(
     adapter: "OmniProviderAdapter",
     response: Any,
     latency_ms: int,
     *,
     bad_response_message: str,
+    blank_output_message: str | None = None,
 ) -> tuple[str | None, dict[str, Any] | None, bool]:
     try:
         raw = response.json()
@@ -617,7 +653,12 @@ def _responses_output_text(
         try:
             normalized = adapter.parse_response(without_usage)
         except ValueError:
-            return None, _bad_responses_probe(bad_response_message, latency_ms), False
+            message = (
+                blank_output_message
+                if blank_output_message and _responses_has_blank_output_text(raw)
+                else bad_response_message
+            )
+            return None, _bad_responses_probe(message, latency_ms), False
         usage_warning = True
 
     return normalized["choices"][0]["message"]["content"], None, usage_warning
@@ -693,6 +734,7 @@ async def _probe_responses(
                     response,
                     round((time.monotonic() - t0) * 1000),
                     bad_response_message="Responses 视觉预检响应格式异常",
+                    blank_output_message=_VISUAL_PROBE_EMPTY_MESSAGE,
                 )
                 if error is not None:
                     return error
@@ -734,6 +776,7 @@ async def _probe_responses(
                 structured_response,
                 latency_ms,
                 bad_response_message=_STRUCTURED_PROBE_MESSAGE,
+                blank_output_message=_STRUCTURED_PROBE_EMPTY_MESSAGE,
             )
             if error is not None:
                 return error

@@ -1108,6 +1108,67 @@ async def test_responses_visual_probe_rejects_structured_runtime_without_output_
     assert [call[0] for call in calls] == ["GET", "POST", "POST", "POST"]
 
 
+def test_responses_structured_probe_repeats_json_instruction_after_images():
+    """Some Responses VLMs attend best to the final text block after image inputs."""
+    from miloco.perception.engine.omni.provider import OpenAIResponsesAdapter
+
+    messages = probe._structured_probe_messages()
+    content = messages[1]["content"]
+
+    assert content[0]["type"] == "text"
+    assert content[-1]["type"] == "text"
+    assert "JSON" in content[-1]["text"]
+    assert [block["type"] for block in content[1:-1]] == [
+        "image_url",
+        "image_url",
+        "image_url",
+        "image_url",
+        "image_url",
+        "image_url",
+    ]
+
+    body = OpenAIResponsesAdapter().build_request_body(
+        messages,
+        model="local-vlm",
+        max_tokens=1024,
+        temperature=0.0,
+        top_p=1.0,
+        stream=False,
+    )
+    converted = body["input"][0]["content"]
+    assert converted[0]["type"] == "input_text"
+    assert converted[-1]["type"] == "input_text"
+    assert [block["type"] for block in converted[1:-1]] == ["input_image"] * 6
+
+
+async def test_responses_structured_probe_empty_text_reports_actionable_reason(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_async_client_post_sequence(
+            get_resp=_FakeResp(404),
+            post_resps=[
+                _FakeResp(200, _responses_output("red")),
+                _FakeResp(200, _responses_output("blue")),
+                _FakeResp(200, _responses_output("")),
+            ],
+        ),
+    )
+
+    result = await probe.probe_omni(
+        "qwen3.5:2b-mlx",
+        "http://127.0.0.1:11434/v1",
+        "",
+        api_protocol="openai_responses",
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "bad_response"
+    assert result["message"] == "Responses 结构化预检返回空文本"
+
+
 async def test_responses_visual_probe_rejects_model_that_always_answers_red(
     monkeypatch,
 ):
@@ -1200,7 +1261,7 @@ async def test_responses_visual_probe_budget_allows_reasoning_before_text(monkey
     visual_body = calls[1][2]["json"]
     structured_body = calls[3][2]["json"]
     assert visual_body["max_output_tokens"] == 256
-    assert structured_body["max_output_tokens"] == 512
+    assert structured_body["max_output_tokens"] == 1024
 
 
 async def test_responses_visual_probe_sends_bearer_key(monkeypatch):

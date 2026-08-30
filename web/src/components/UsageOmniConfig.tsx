@@ -138,6 +138,15 @@ const OMNI_CODE_KEY: Record<string, string> = {
   cancelled: "usage.testCancelled",
 };
 
+export function omniTestReason(
+  res: OmniTestResult,
+  translate: (key: string) => string,
+): string {
+  if (res.code === "bad_response" && res.message.trim()) return res.message;
+  const k = res.code ? OMNI_CODE_KEY[res.code] : undefined;
+  return k ? translate(k) : res.message;
+}
+
 // 测试结果三档语义:连接正常(✓ 绿,chat 调通)/ 鉴权过但探测被拒(⚠ 黄,rejected_authed)/ 失败(✗ 红)。
 const TEST_WARN_CODES = new Set(["rejected_authed"]);
 type Severity = "ok" | "warn" | "error";
@@ -604,8 +613,7 @@ export function UsageOmniConfig() {
 
   // 测试结果的本地化文案(无图标/延迟);供「不可启用」toast 与状态列共用。
   function testReason(res: OmniTestResult): string {
-    const k = res.code ? OMNI_CODE_KEY[res.code] : undefined;
-    return k ? t(k) : res.message;
+    return omniTestReason(res, t);
   }
 
   // 测试结果统一展示文案(✓/⚠/✗ + 本地化 + 延迟);行内状态列与表单底部共用,避免两处渲染漂移。
