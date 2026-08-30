@@ -20,6 +20,7 @@ from urllib.parse import parse_qsl, urlencode
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -523,6 +524,13 @@ app = FastAPI(
     version=_settings.app.version,
     lifespan=lifespan,
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    return handle_exception(request, exc)
 
 
 @app.middleware("http")

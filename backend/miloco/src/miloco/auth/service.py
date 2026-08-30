@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import secrets
+import threading
+import time
+from collections import deque
+from collections.abc import Callable
 
 from fastapi import Request, Response, status
 
@@ -31,10 +36,73 @@ SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000
 _DUMMY_PASSWORD_HASH = (
     "$argon2id$v=19$m=65536,t=3,p=4$LHdr2q4abf/Wzh2Y0gd/qQ$1rPUk/6L/nUe/j0J6BVejxbsKRSFJxnjnFEwkYe4OxI"
 )
+_CSRF_DERIVATION_CONTEXT = b"miloco-dashboard-csrf-v1"
+_GENERIC_LOGIN_FAILURE = "Invalid username or password"
+
+
+class LoginAttemptThrottle:
+    def __init__(
+        self,
+        *,
+        account_limit: int = 8,
+        source_limit: int = 60,
+        window_seconds: float = 300,
+        max_keys: int = 4096,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.account_limit = account_limit
+        self.source_limit = source_limit
+        self.window_seconds = window_seconds
+        self.max_keys = max_keys
+        self.clock = clock
+        self._account_attempts: dict[str, deque[float]] = {}
+        self._source_attempts: dict[str, deque[float]] = {}
+        self._lock = threading.Lock()
+
+    def _prune(self, attempts: dict[str, deque[float]], key: str, now: float) -> deque[float]:
+        cutoff = now - self.window_seconds
+        values = attempts.get(key)
+        if values is None:
+            if len(attempts) >= self.max_keys:
+                attempts.pop(next(iter(attempts)))
+            values = deque()
+            attempts[key] = values
+        while values and values[0] <= cutoff:
+            values.popleft()
+        return values
+
+    def allow_attempt(self, source: str, account: str) -> bool:
+        now = self.clock()
+        with self._lock:
+            source_attempts = self._prune(self._source_attempts, source, now)
+            account_attempts = self._prune(self._account_attempts, account, now)
+            if (
+                len(source_attempts) >= self.source_limit
+                or len(account_attempts) >= self.account_limit
+            ):
+                return False
+            source_attempts.append(now)
+            account_attempts.append(now)
+            return True
+
+    def record_success(self, account: str) -> None:
+        with self._lock:
+            self._account_attempts.pop(account, None)
+
+
+_LOGIN_ATTEMPT_THROTTLE = LoginAttemptThrottle()
 
 
 def hash_secret(secret: str) -> str:
     return hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+
+def _csrf_for_session_token(session_token: str) -> str:
+    return hmac.new(
+        session_token.encode("utf-8"),
+        _CSRF_DERIVATION_CONTEXT,
+        hashlib.sha256,
+    ).hexdigest()
 
 
 def _client_ip_hint(request: Request) -> str | None:
@@ -74,8 +142,13 @@ def _conflict(message: str) -> None:
 
 
 class AuthService:
-    def __init__(self, repo: DashboardAuthRepo | None = None) -> None:
+    def __init__(
+        self,
+        repo: DashboardAuthRepo | None = None,
+        login_throttle: LoginAttemptThrottle | None = None,
+    ) -> None:
         self.repo = repo or DashboardAuthRepo()
+        self.login_throttle = login_throttle or _LOGIN_ATTEMPT_THROTTLE
 
     def _issue_session(
         self,
@@ -84,7 +157,7 @@ class AuthService:
         response: Response,
     ) -> str:
         session_token = secrets.token_urlsafe(48)
-        csrf_token = secrets.token_urlsafe(32)
+        csrf_token = _csrf_for_session_token(session_token)
         timestamp = now_ms()
         self.repo.create_session(
             user_id=user.id,
@@ -119,22 +192,27 @@ class AuthService:
             return None
         return self.authenticate_session_token_hash(hash_secret(token))
 
-    def rotate_csrf(self, request: Request) -> tuple[DashboardUserPublic, str] | None:
-        authenticated = self.authenticate_request_session(request)
+    def recover_csrf(self, request: Request) -> tuple[DashboardUserPublic, str] | None:
+        session_token = request.cookies.get(SESSION_COOKIE_NAME)
+        if not session_token:
+            return None
+        authenticated = self.authenticate_session_token_hash(hash_secret(session_token))
         if authenticated is None:
             return None
         user, session = authenticated
-        csrf_token = secrets.token_urlsafe(32)
-        self.repo.update_session_csrf(session.id, hash_secret(csrf_token), now_ms())
+        csrf_token = _csrf_for_session_token(session_token)
+        csrf_hash = hash_secret(csrf_token)
+        if not hmac.compare_digest(csrf_hash, session.csrf_hash):
+            self.repo.update_session_csrf(session.id, csrf_hash, now_ms())
         return user, csrf_token
 
     def status(self, request: Request) -> AuthStatusData:
-        rotated = self.rotate_csrf(request)
+        authenticated = self.recover_csrf(request)
         return AuthStatusData(
             needs_setup=not self.repo.any_enabled_user(),
-            authenticated=rotated is not None,
-            user=rotated[0] if rotated else None,
-            csrf_token=rotated[1] if rotated else None,
+            authenticated=authenticated is not None,
+            user=authenticated[0] if authenticated else None,
+            csrf_token=authenticated[1] if authenticated else None,
         )
 
     def setup_first_admin(
@@ -143,6 +221,8 @@ class AuthService:
         request: Request,
         response: Response,
     ) -> AuthStatusData:
+        if self.repo.any_user_exists():
+            _conflict("Dashboard setup already completed")
         if body.password != body.password_confirm:
             raise BadRequestException("Passwords do not match")
         try:
@@ -174,13 +254,18 @@ class AuthService:
         request: Request,
         response: Response,
     ) -> AuthStatusData:
+        account_key = body.username.strip().casefold()
+        source_key = _client_ip_hint(request) or "unknown"
+        if not self.login_throttle.allow_attempt(source_key, account_key):
+            raise AuthenticationException(_GENERIC_LOGIN_FAILURE)
         user = self.repo.get_user_by_username(body.username)
         password_hash = (
             user.password_hash if user is not None and user.enabled else _DUMMY_PASSWORD_HASH
         )
         password_valid = verify_password(body.password, password_hash)
         if user is None or not user.enabled or not password_valid:
-            raise AuthenticationException("Invalid username or password")
+            raise AuthenticationException(_GENERIC_LOGIN_FAILURE)
+        self.login_throttle.record_success(account_key)
         public_user = user.to_public()
         csrf_token = self._issue_session(public_user, request, response)
         return AuthStatusData(

@@ -3,6 +3,7 @@
 import i18n from "@/i18n";
 
 let csrfToken = "";
+const sessionExpiredListeners = new Set<() => void>();
 
 export function setCsrfToken(token: string | null): void {
   csrfToken = token ?? "";
@@ -10,6 +11,22 @@ export function setCsrfToken(token: string | null): void {
 
 export function getCsrfToken(): string {
   return csrfToken;
+}
+
+export function subscribeSessionExpired(listener: () => void): () => void {
+  sessionExpiredListeners.add(listener);
+  return () => sessionExpiredListeners.delete(listener);
+}
+
+function notifySessionExpired(): void {
+  setCsrfToken(null);
+  for (const listener of sessionExpiredListeners) {
+    try {
+      listener();
+    } catch {
+      // A stale UI listener must not hide the original authentication failure.
+    }
+  }
 }
 
 function isUnsafeMethod(method?: string): boolean {
@@ -62,6 +79,9 @@ export async function apiFetch<T>(
 
   const resp = await fetch(path, { ...init, headers, credentials: "same-origin" });
   if (!resp.ok) {
+    if (resp.status === 401) {
+      notifySessionExpired();
+    }
     const fallback = `HTTP ${resp.status}`;
     let parsed: { message: string; code?: string } = { message: fallback };
     try {

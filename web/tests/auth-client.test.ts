@@ -1,5 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { apiFetch, setCsrfToken } from "@/api/client";
+import {
+  apiFetch,
+  getCsrfToken,
+  setCsrfToken,
+  subscribeSessionExpired,
+} from "@/api/client";
 import { authHeaders, extractCandidates } from "@/api/register";
 
 describe("auth-aware apiFetch", () => {
@@ -64,5 +69,26 @@ describe("auth-aware apiFetch", () => {
     expect(headers.get("X-Miloco-CSRF")).toBe("csrf-token");
     expect(headers.has("Authorization")).toBe(false);
     expect(headers.has("Content-Type")).toBe(false);
+  });
+
+  it("clears auth state and notifies the gate when any API request returns 401", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(
+        JSON.stringify({ code: 1003, message: "Authentication required" }),
+        { status: 401 },
+      )),
+    );
+    setCsrfToken("csrf-token");
+    let expiredCount = 0;
+    const unsubscribe = subscribeSessionExpired(() => {
+      expiredCount += 1;
+    });
+
+    await expect(apiFetch("/api/users")).rejects.toMatchObject({ status: 401 });
+
+    expect(getCsrfToken()).toBe("");
+    expect(expiredCount).toBe(1);
+    unsubscribe();
   });
 });

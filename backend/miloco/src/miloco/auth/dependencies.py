@@ -23,7 +23,6 @@ PUBLIC_AUTH_PATHS = {
     "/api/auth/status",
     "/api/auth/setup",
     "/api/auth/login",
-    "/api/auth/logout",
 }
 
 

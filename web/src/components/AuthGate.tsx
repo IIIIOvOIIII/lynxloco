@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { getAuthStatus, logout } from "@/api/auth";
+import { subscribeSessionExpired } from "@/api/client";
 import { chooseAuthView, type AuthStatus } from "@/lib/auth";
 import { LoginPage } from "./LoginPage";
 import { SetupAdminPage } from "./SetupAdminPage";
@@ -16,6 +17,12 @@ export function AuthGate({
 
   useEffect(() => {
     let active = true;
+    const unsubscribe = subscribeSessionExpired(() => {
+      if (active) {
+        setStatusFailed(false);
+        setStatus({ needsSetup: false, authenticated: false, user: null, csrfToken: null });
+      }
+    });
     getAuthStatus()
       .then((next) => {
         if (active) {
@@ -31,6 +38,7 @@ export function AuthGate({
       });
     return () => {
       active = false;
+      unsubscribe();
     };
   }, []);
 

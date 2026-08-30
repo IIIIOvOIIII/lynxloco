@@ -82,12 +82,16 @@ def handle_exception(request: Request, exc: Exception) -> JSONResponse:
     """
     # 1. Special handling for RequestValidationError (Pydantic validation errors)
     if isinstance(exc, RequestValidationError):
-        logger.warning("Request validation failed: %s", exc)
+        logger.warning("Request validation failed for %s", request.url.path)
+        errors = [
+            {key: value for key, value in error.items() if key != "input"}
+            for error in exc.errors()
+        ]
         return _create_error_response(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             code=1002,  # Parameter validation failure error code, consistent with ValidationException
             message="Request parameter validation failed",
-            data=exc.errors(),
+            data=errors,
         )
 
     # 2. Handle other custom API exceptions

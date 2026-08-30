@@ -4,6 +4,10 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+MAX_USERNAME_LENGTH = 128
+MAX_DISPLAY_NAME_LENGTH = 256
+MAX_PASSWORD_LENGTH = 256
+
 
 class DashboardUserPublic(BaseModel):
     id: str
@@ -46,10 +50,10 @@ class DashboardSessionRecord(BaseModel):
 
 
 class SetupRequest(BaseModel):
-    username: str = Field(min_length=1)
-    display_name: str = ""
-    password: str = Field(min_length=1)
-    password_confirm: str = Field(min_length=1)
+    username: str = Field(min_length=1, max_length=MAX_USERNAME_LENGTH)
+    display_name: str = Field(default="", max_length=MAX_DISPLAY_NAME_LENGTH)
+    password: str = Field(min_length=1, max_length=MAX_PASSWORD_LENGTH)
+    password_confirm: str = Field(min_length=1, max_length=MAX_PASSWORD_LENGTH)
 
     @field_validator("username")
     @classmethod
@@ -61,8 +65,8 @@ class SetupRequest(BaseModel):
 
 
 class LoginRequest(BaseModel):
-    username: str = Field(min_length=1)
-    password: str = Field(min_length=1)
+    username: str = Field(min_length=1, max_length=MAX_USERNAME_LENGTH)
+    password: str = Field(min_length=1, max_length=MAX_PASSWORD_LENGTH)
 
 
 class UserCreateRequest(SetupRequest):
@@ -70,14 +74,14 @@ class UserCreateRequest(SetupRequest):
 
 
 class UserUpdateRequest(BaseModel):
-    username: str | None = None
-    display_name: str | None = None
+    username: str | None = Field(default=None, max_length=MAX_USERNAME_LENGTH)
+    display_name: str | None = Field(default=None, max_length=MAX_DISPLAY_NAME_LENGTH)
     enabled: bool | None = None
 
 
 class PasswordChangeRequest(BaseModel):
-    password: str = Field(min_length=1)
-    password_confirm: str = Field(min_length=1)
+    password: str = Field(min_length=1, max_length=MAX_PASSWORD_LENGTH)
+    password_confirm: str = Field(min_length=1, max_length=MAX_PASSWORD_LENGTH)
 
 
 class AuthStatusData(BaseModel):
