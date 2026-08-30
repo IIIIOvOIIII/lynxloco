@@ -28,6 +28,9 @@ from miloco.utils.time_utils import now_ms
 SESSION_COOKIE_NAME = "miloco_dashboard_session"
 CSRF_HEADER_NAME = "X-Miloco-CSRF"
 SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000
+_DUMMY_PASSWORD_HASH = (
+    "$argon2id$v=19$m=65536,t=3,p=4$LHdr2q4abf/Wzh2Y0gd/qQ$1rPUk/6L/nUe/j0J6BVejxbsKRSFJxnjnFEwkYe4OxI"
+)
 
 
 def hash_secret(secret: str) -> str:
@@ -140,19 +143,22 @@ class AuthService:
         request: Request,
         response: Response,
     ) -> AuthStatusData:
-        if self.repo.any_user_exists():
-            _conflict("Dashboard setup already completed")
         if body.password != body.password_confirm:
             raise BadRequestException("Passwords do not match")
         try:
             password_hash = hash_password(body.password)
         except PasswordPolicyError as exc:
             raise BadRequestException(str(exc)) from exc
-        user = self.repo.create_user(
-            username=body.username,
-            display_name=body.display_name,
-            password_hash=password_hash,
-        )
+        try:
+            user = self.repo.create_first_admin(
+                username=body.username,
+                display_name=body.display_name,
+                password_hash=password_hash,
+            )
+        except ValueError as exc:
+            if str(exc) == "setup_completed":
+                _conflict("Dashboard setup already completed")
+            raise BadRequestException(str(exc)) from exc
         public_user = user.to_public()
         csrf_token = self._issue_session(public_user, request, response)
         return AuthStatusData(
@@ -169,11 +175,11 @@ class AuthService:
         response: Response,
     ) -> AuthStatusData:
         user = self.repo.get_user_by_username(body.username)
-        if (
-            user is None
-            or not user.enabled
-            or not verify_password(body.password, user.password_hash)
-        ):
+        password_hash = (
+            user.password_hash if user is not None and user.enabled else _DUMMY_PASSWORD_HASH
+        )
+        password_valid = verify_password(body.password, password_hash)
+        if user is None or not user.enabled or not password_valid:
             raise AuthenticationException("Invalid username or password")
         public_user = user.to_public()
         csrf_token = self._issue_session(public_user, request, response)
@@ -218,23 +224,29 @@ class AuthService:
         body: UserUpdateRequest,
         current_session_user_id: str | None,
     ) -> DashboardUserPublic:
-        if body.enabled is False and self.repo.count_enabled_admins(user_id) == 0:
-            _conflict("Last administrator cannot be disabled")
         try:
-            user = self.repo.update_user(
-                user_id,
-                username=body.username,
-                display_name=body.display_name,
-                enabled=body.enabled,
-            )
+            if body.enabled is False:
+                user = self.repo.update_user_guarded(
+                    user_id,
+                    username=body.username,
+                    display_name=body.display_name,
+                    enabled=False,
+                )
+            else:
+                user = self.repo.update_user(
+                    user_id,
+                    username=body.username,
+                    display_name=body.display_name,
+                    enabled=body.enabled,
+                )
         except ValueError as exc:
             if str(exc) == "username_exists":
                 _conflict("Username already exists")
+            if str(exc) == "last_admin":
+                _conflict("Last administrator cannot be disabled")
             if str(exc) == "user_not_found":
                 raise ResourceNotFoundException("Dashboard user not found") from exc
             raise BadRequestException(str(exc)) from exc
-        if body.enabled is False:
-            self.repo.delete_sessions_for_user(user_id)
         return user.to_public()
 
     def change_password(
@@ -243,7 +255,9 @@ class AuthService:
         if body.password != body.password_confirm:
             raise BadRequestException("Passwords do not match")
         try:
-            user = self.repo.update_password(user_id, hash_password(body.password))
+            user = self.repo.update_password_and_revoke_sessions(
+                user_id, hash_password(body.password)
+            )
         except PasswordPolicyError as exc:
             raise BadRequestException(str(exc)) from exc
         except ValueError as exc:
@@ -255,9 +269,11 @@ class AuthService:
     def delete_user(self, user_id: str, current_session_user_id: str | None) -> None:
         if current_session_user_id == user_id:
             _conflict("Current user cannot be deleted")
-        if self.repo.count_enabled_admins(user_id) == 0:
-            _conflict("Last administrator cannot be deleted")
-        if self.repo.get_user_by_id(user_id) is None:
-            raise ResourceNotFoundException("Dashboard user not found")
-        self.repo.delete_sessions_for_user(user_id)
-        self.repo.delete_user(user_id)
+        try:
+            self.repo.delete_user_guarded(user_id)
+        except ValueError as exc:
+            if str(exc) == "last_admin":
+                _conflict("Last administrator cannot be deleted")
+            if str(exc) == "user_not_found":
+                raise ResourceNotFoundException("Dashboard user not found") from exc
+            raise BadRequestException(str(exc)) from exc

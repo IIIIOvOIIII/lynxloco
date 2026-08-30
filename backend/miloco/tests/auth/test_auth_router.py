@@ -105,6 +105,23 @@ def test_logout_clears_session_cookie_and_is_idempotent(tmp_path, monkeypatch) -
     assert second.status_code == 200
 
 
+def test_password_change_revokes_existing_dashboard_session(tmp_path, monkeypatch) -> None:
+    dashboard_client = _client(tmp_path, monkeypatch)
+    setup_data = _setup(dashboard_client)
+
+    changed = _service_client().post(
+        f"/api/users/{setup_data['user']['id']}/password",
+        json={
+            "password": "new correct horse battery",
+            "password_confirm": "new correct horse battery",
+        },
+    )
+    old_session = dashboard_client.get("/api/auth/me")
+
+    assert changed.status_code == 200
+    assert old_session.status_code == 401
+
+
 def test_authenticated_me_rotates_csrf_without_sensitive_fields(
     tmp_path, monkeypatch
 ) -> None:

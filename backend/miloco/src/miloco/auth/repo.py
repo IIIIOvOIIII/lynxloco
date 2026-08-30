@@ -36,6 +36,57 @@ class DashboardAuthRepo:
     def _row_to_session(row: dict[str, Any]) -> DashboardSessionRecord:
         return DashboardSessionRecord(**row)
 
+    @staticmethod
+    def _user_from_connection(conn: sqlite3.Connection, user_id: str) -> DashboardUserRecord | None:
+        row = conn.execute(
+            "SELECT * FROM dashboard_user WHERE id = ?", (user_id,)
+        ).fetchone()
+        return DashboardAuthRepo._row_to_user(dict(row)) if row is not None else None
+
+    @staticmethod
+    def _insert_user(
+        conn: sqlite3.Connection,
+        username: str,
+        display_name: str,
+        password_hash: str,
+        role: str = "admin",
+        enabled: bool = True,
+    ) -> DashboardUserRecord:
+        username_clean = username.strip()
+        username_norm = normalize_username(username)
+        if not username_norm:
+            raise ValueError("username_required")
+        if role != "admin":
+            raise ValueError("role_not_supported")
+
+        timestamp = now_ms()
+        user_id = uuid.uuid4().hex
+        try:
+            conn.execute(
+                """
+                INSERT INTO dashboard_user
+                  (id, username, username_norm, display_name, password_hash,
+                   role, enabled, created_at, updated_at, last_login_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    user_id,
+                    username_clean,
+                    username_norm,
+                    display_name.strip(),
+                    password_hash,
+                    role,
+                    int(enabled),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("username_exists") from exc
+        user = DashboardAuthRepo._user_from_connection(conn, user_id)
+        assert user is not None
+        return user
+
     def any_user_exists(self) -> bool:
         rows = self.db.execute_query("SELECT COUNT(*) AS n FROM dashboard_user")
         return bool(rows and rows[0]["n"] > 0)
@@ -103,6 +154,21 @@ class DashboardAuthRepo:
         assert user is not None
         return user
 
+    def create_first_admin(
+        self, username: str, display_name: str, password_hash: str
+    ) -> DashboardUserRecord:
+        with self.db.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                if conn.execute("SELECT 1 FROM dashboard_user LIMIT 1").fetchone():
+                    raise ValueError("setup_completed")
+                user = self._insert_user(conn, username, display_name, password_hash)
+                conn.commit()
+                return user
+            except Exception:
+                conn.rollback()
+                raise
+
     def get_user_by_id(self, user_id: str) -> DashboardUserRecord | None:
         rows = self.db.execute_query(
             "SELECT * FROM dashboard_user WHERE id = ?", (user_id,)
@@ -167,6 +233,64 @@ class DashboardAuthRepo:
         assert user is not None
         return user
 
+    def update_user_guarded(
+        self,
+        user_id: str,
+        *,
+        username: str | None = None,
+        display_name: str | None = None,
+        enabled: bool | None = None,
+    ) -> DashboardUserRecord:
+        with self.db.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self._user_from_connection(conn, user_id)
+                if existing is None:
+                    raise ValueError("user_not_found")
+                if enabled is False and existing.enabled:
+                    count = conn.execute(
+                        "SELECT COUNT(*) FROM dashboard_user "
+                        "WHERE enabled = 1 AND role = 'admin' AND id != ?",
+                        (user_id,),
+                    ).fetchone()[0]
+                    if count == 0:
+                        raise ValueError("last_admin")
+
+                assignments: list[str] = []
+                params: list[Any] = []
+                if username is not None:
+                    username_clean = username.strip()
+                    username_norm = normalize_username(username)
+                    if not username_norm:
+                        raise ValueError("username_required")
+                    assignments.extend(("username = ?", "username_norm = ?"))
+                    params.extend((username_clean, username_norm))
+                if display_name is not None:
+                    assignments.append("display_name = ?")
+                    params.append(display_name.strip())
+                if enabled is not None:
+                    assignments.append("enabled = ?")
+                    params.append(int(enabled))
+                if assignments:
+                    assignments.append("updated_at = ?")
+                    params.extend((now_ms(), user_id))
+                    try:
+                        conn.execute(
+                            f"UPDATE dashboard_user SET {', '.join(assignments)} WHERE id = ?",
+                            tuple(params),
+                        )
+                    except sqlite3.IntegrityError as exc:
+                        raise ValueError("username_exists") from exc
+                if enabled is False:
+                    conn.execute("DELETE FROM dashboard_session WHERE user_id = ?", (user_id,))
+                user = self._user_from_connection(conn, user_id)
+                assert user is not None
+                conn.commit()
+                return user
+            except Exception:
+                conn.rollback()
+                raise
+
     def update_password(self, user_id: str, password_hash: str) -> DashboardUserRecord:
         changed = self.db.execute_update(
             "UPDATE dashboard_user SET password_hash = ?, updated_at = ? WHERE id = ?",
@@ -178,10 +302,53 @@ class DashboardAuthRepo:
         assert user is not None
         return user
 
+    def update_password_and_revoke_sessions(
+        self, user_id: str, password_hash: str
+    ) -> DashboardUserRecord:
+        with self.db.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                changed = conn.execute(
+                    "UPDATE dashboard_user SET password_hash = ?, updated_at = ? WHERE id = ?",
+                    (password_hash, now_ms(), user_id),
+                ).rowcount
+                if changed == 0:
+                    raise ValueError("user_not_found")
+                conn.execute("DELETE FROM dashboard_session WHERE user_id = ?", (user_id,))
+                user = self._user_from_connection(conn, user_id)
+                assert user is not None
+                conn.commit()
+                return user
+            except Exception:
+                conn.rollback()
+                raise
+
     def delete_user(self, user_id: str) -> bool:
         return self.db.execute_update(
             "DELETE FROM dashboard_user WHERE id = ?", (user_id,)
         ) > 0
+
+    def delete_user_guarded(self, user_id: str) -> None:
+        with self.db.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                user = self._user_from_connection(conn, user_id)
+                if user is None:
+                    raise ValueError("user_not_found")
+                if user.enabled:
+                    count = conn.execute(
+                        "SELECT COUNT(*) FROM dashboard_user "
+                        "WHERE enabled = 1 AND role = 'admin' AND id != ?",
+                        (user_id,),
+                    ).fetchone()[0]
+                    if count == 0:
+                        raise ValueError("last_admin")
+                conn.execute("DELETE FROM dashboard_session WHERE user_id = ?", (user_id,))
+                conn.execute("DELETE FROM dashboard_user WHERE id = ?", (user_id,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
 
     def create_session(
         self,

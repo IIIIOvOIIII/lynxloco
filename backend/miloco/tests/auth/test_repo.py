@@ -1,3 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+
 import pytest
 from miloco.auth.passwords import hash_password
 from miloco.auth.repo import DashboardAuthRepo
@@ -88,3 +91,62 @@ def test_create_user_rejects_non_admin_role_without_persisting_it(
         )
 
     assert repo.any_user_exists() is False
+
+
+def test_create_first_admin_is_single_winner_across_concurrent_requests(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("MILOCO_HOME", str(tmp_path))
+    monkeypatch.setenv("MILOCO_DATABASE__PATH", str(tmp_path / "miloco.db"))
+    _reset_database_connector()
+    reset_settings()
+    init_database()
+    repo = DashboardAuthRepo()
+    password_hash = hash_password("correct horse battery")
+    start = Barrier(2)
+
+    def _create(username: str) -> str:
+        start.wait()
+        try:
+            return repo.create_first_admin(username, username, password_hash).username
+        except ValueError as exc:
+            return str(exc)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(_create, ("lynx", "other")))
+
+    assert sorted(results) in (["lynx", "setup_completed"], ["other", "setup_completed"])
+    assert len(repo.list_users()) == 1
+
+
+@pytest.mark.parametrize("operation", ["disable", "delete"])
+def test_concurrent_last_admin_operations_leave_one_enabled_admin(
+    tmp_path, monkeypatch, operation: str
+) -> None:
+    monkeypatch.setenv("MILOCO_HOME", str(tmp_path))
+    monkeypatch.setenv("MILOCO_DATABASE__PATH", str(tmp_path / "miloco.db"))
+    _reset_database_connector()
+    reset_settings()
+    init_database()
+    repo = DashboardAuthRepo()
+    password_hash = hash_password("correct horse battery")
+    first = repo.create_user("first", "First", password_hash)
+    second = repo.create_user("second", "Second", password_hash)
+    start = Barrier(2)
+
+    def _operate(user_id: str) -> str:
+        start.wait()
+        try:
+            if operation == "disable":
+                repo.update_user_guarded(user_id, enabled=False)
+            else:
+                repo.delete_user_guarded(user_id)
+            return "ok"
+        except ValueError as exc:
+            return str(exc)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(_operate, (first.id, second.id)))
+
+    assert sorted(results) == ["last_admin", "ok"]
+    assert repo.count_enabled_admins() == 1
