@@ -40,7 +40,9 @@ if TYPE_CHECKING:
 from miot.types import MIoTActionParam, MIoTGetPropertyParam, MIoTSetPropertyParam
 
 from miloco.database.rule_repo import RuleLogRepo
+from miloco.devices.schema import UnifiedDeviceControlRequest
 from miloco.dispatch import dispatch_event
+from miloco.home_assistant.schema import HomeAssistantError
 from miloco.miot.client import MiotProxy
 from miloco.node_monitor import NodeName, get_monitor
 from miloco.observability.metrics_client import get_metrics_client
@@ -192,6 +194,7 @@ class RuleRunner:
         rule_log_repo: RuleLogRepo,
         sample_interval_seconds: float = 3.0,
         task_record_service: "TaskRecordService | None" = None,
+        devices_service: object | None = None,
     ):
         self._rules: dict[str, Rule] = {r.id: r for r in rules if r.id}
         self._miot_proxy = miot_proxy
@@ -201,6 +204,7 @@ class RuleRunner:
 
             task_record_service = TaskRecordService()
         self._task_record_service = task_record_service
+        self._devices_service = devices_service
 
         # Per-rule runtime state. 取代原先散落的 12 个分散字段：所有 per-(rule,
         # source) 抗抖位、OR 聚合状态、duration 滑窗、target timer、action
@@ -217,6 +221,13 @@ class RuleRunner:
         self._sample_interval = sample_interval_seconds
 
         logger.info("RuleRunner init, rules: %d", len(self._rules))
+
+    def _get_devices_service(self):
+        if self._devices_service is None:
+            from miloco.manager import get_manager
+
+            self._devices_service = get_manager().devices_service
+        return self._devices_service
 
     # ---- Legacy field views (test / rule_tester compatibility) ----
     #
@@ -1388,6 +1399,77 @@ class RuleRunner:
             (action.did, action.iid)
         ] = time.time()
 
+    @staticmethod
+    def _is_home_assistant_action(action: RuleAction) -> bool:
+        return action.source == "home_assistant" or action.did.startswith("ha:")
+
+    async def _execute_home_assistant_action(
+        self, rule_id: str, action: RuleAction
+    ) -> RuleActionExecuteResult:
+        """Execute a Home Assistant action through the unified devices service."""
+        if action.iid in {"activate", "trigger"}:
+            if action.idempotent or (action.cooldown_minutes or 0) < 1:
+                return RuleActionExecuteResult(
+                    action=action,
+                    result=False,
+                    error=(
+                        "Home Assistant trigger action requires "
+                        "idempotent=false and cooldown_minutes >= 1"
+                    ),
+                )
+
+        if self._in_cooldown(rule_id, action):
+            return RuleActionExecuteResult(action=action, result=True, skipped=True)
+
+        iid = "activate" if action.iid in {"trigger", SCENE_IID} else action.iid
+        request_type = (
+            "call_action"
+            if action.params is not None or iid in {"activate", "open", "close", "stop"}
+            else "set_property"
+        )
+        request = UnifiedDeviceControlRequest(
+            type=request_type,
+            iid=iid,
+            value=action.value,
+            params=action.params,
+        )
+
+        try:
+            result = await self._get_devices_service().control(action.did, request)
+        except HomeAssistantError as e:
+            logger.error(
+                "Failed to execute Home Assistant action %s %s: %s",
+                action.did,
+                action.iid,
+                e,
+            )
+            return RuleActionExecuteResult(
+                action=action,
+                result=False,
+                error=f"{e.code.value}: {e}",
+            )
+        except Exception as e:
+            logger.error(
+                "Failed to execute Home Assistant action %s %s: %s",
+                action.did,
+                action.iid,
+                e,
+            )
+            return RuleActionExecuteResult(
+                action=action,
+                result=False,
+                error=f"exception: {e}",
+            )
+
+        success = bool(getattr(result, "success", False))
+        if success:
+            self._mark_cooldown(rule_id, action)
+        return RuleActionExecuteResult(
+            action=action,
+            result=success,
+            error=None if success else getattr(result, "message", "ha_failed"),
+        )
+
     async def _execute_scene_action(
         self, rule_id: str, action: RuleAction
     ) -> RuleActionExecuteResult:
@@ -1462,6 +1544,9 @@ class RuleRunner:
 
         Cooldown state: ``self._state[rule_id].action_cooldown[(did, iid)]``.
         """
+        if self._is_home_assistant_action(action):
+            return await self._execute_home_assistant_action(rule_id, action)
+
         # 场景没有 siid/aiid 可拆，必须在 iid 解析之前分流。
         if action.iid == SCENE_IID:
             return await self._execute_scene_action(rule_id, action)

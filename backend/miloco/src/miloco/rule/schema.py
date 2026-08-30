@@ -24,7 +24,7 @@ validation.
 
 from collections.abc import Iterable
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -161,6 +161,10 @@ class RuleAction(BaseModel):
     are not blocked when only one is sent.
     """
 
+    source: Literal["miot", "home_assistant"] | None = Field(
+        None,
+        description="Action target source. Omitted legacy actions are treated as MIoT.",
+    )
     did: str = Field(
         ..., description="Device ID; scene_id when iid is 'scene'"
     )

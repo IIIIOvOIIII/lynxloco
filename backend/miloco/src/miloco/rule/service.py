@@ -35,6 +35,7 @@ from miloco.rule.runner import RuleRunner
 from miloco.rule.schema import (
     SCENE_IID,
     Rule,
+    RuleAction,
     RuleExecuteResult,
     RuleLifecycle,
     RuleLog,
@@ -68,6 +69,12 @@ _FORBIDDEN_QUERY_PREFIXES = (
     "已确认",
     "发现了",
 )
+
+_HA_NON_IDEMPOTENT_IIDS = {"activate", "trigger"}
+
+
+def _is_home_assistant_action(action: RuleAction) -> bool:
+    return action.source == "home_assistant" or action.did.startswith("ha:")
 
 
 def _validate_query_phrasing(query: str) -> None:
@@ -152,10 +159,11 @@ def _validate_rule_consistency(rule: Rule) -> None:
         ("on_exit_actions", rule.on_exit_actions),
     ):
         for i, a in enumerate(slot_actions):
+            is_ha = _is_home_assistant_action(a)
             # 与 runner._execute_action 同口径:三种形态之外一律拒。少了这道,
             # `scene.1.2` / `prop.2` 这类写法能建成功,运行期每次 fire 只在
             # rule_log 里留一条 invalid_iid,规则永远是哑的。
-            if a.iid != SCENE_IID and parse_device_iid(a.iid) is None:
+            if not is_ha and a.iid != SCENE_IID and parse_device_iid(a.iid) is None:
                 raise ValidationException(
                     f"{slot_name}[{i}] (did={a.did}, iid={a.iid}): iid must be "
                     f"'{SCENE_IID}', 'prop.<siid>.<piid>' or "
@@ -173,6 +181,16 @@ def _validate_rule_consistency(rule: Rule) -> None:
                 raise ValidationException(
                     f"{slot_name}[{i}] (did={a.did}, iid={a.iid}): "
                     f"iid={SCENE_IID} requires cooldown_minutes >= 1"
+                )
+            if is_ha and a.iid in _HA_NON_IDEMPOTENT_IIDS and a.idempotent:
+                raise ValidationException(
+                    f"{slot_name}[{i}] (did={a.did}, iid={a.iid}): "
+                    "Home Assistant trigger actions require idempotent=false"
+                )
+            if is_ha and a.iid in _HA_NON_IDEMPOTENT_IIDS and (a.cooldown_minutes or 0) < 1:
+                raise ValidationException(
+                    f"{slot_name}[{i}] (did={a.did}, iid={a.iid}): "
+                    "Home Assistant trigger actions require cooldown_minutes >= 1"
                 )
             if not a.idempotent and a.cooldown_minutes is None:
                 raise ValidationException(
@@ -295,7 +313,7 @@ class RuleService:
             a.did
             for slot in (rule.actions, rule.on_enter_actions, rule.on_exit_actions)
             for a in slot
-            if a.iid == SCENE_IID
+            if a.iid == SCENE_IID and not _is_home_assistant_action(a)
         }
         if not wanted:
             return
