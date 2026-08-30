@@ -8,7 +8,7 @@
 
 **单端口模型**：backend 永远 HTTP（跨网加密走反代+真证书），住户访问 `http://<host>:1810/` 直接拿到 SPA。`vite build` 先写 `web/dist/`；正式构建的 `scripts/build.sh` 再把它复制进 `../backend/miloco/src/miloco/static/` 并打包到 backend wheel。backend `spa_handler` 路由：真文件命中（如 `/assets/*.js`、`/fonts/*.woff2`）→ `FileResponse`；根 `/` 与 `/index.html` → 不缓存的 SPA 登录/会话启动壳；其它非根路径未命中真文件 → 404（避免扫描器 `/admin/login`、`/.env` 等都拿到面板 HTML）。
 
-旧的 vite dev server 5173 + proxy::attachAuth 模式已退役，**没有 `pnpm dev`**——开发期照样跑 `pnpm build:watch` 让产物落地，浏览器直开 `http://<host>:1810/`。
+`pnpm dev` 不再作为支持的开发入口。开发期运行 `pnpm build:watch` 让产物落到 `web/dist/`，再通过正式构建流程复制到 backend static；浏览器仍应直开 `http://<host>:1810/`，验证与生产相同的登录、cookie 和 CSRF 行为。
 
 ## 启动
 
@@ -29,7 +29,7 @@ cd ../backend && uv run miloco-backend
 
 ```bash
 pnpm install              # 首次
-pnpm build                # 产物落到 ../backend/miloco/src/miloco/static/（含 tsc -b 类型检查）
+pnpm build                # 产物落到 web/dist/（含 tsc -b 类型检查）
 # 或开发期 watch 模式（**只跑 vite，不跑 tsc -b**——type 错不会阻止重建。
 # 需要类型检查时另开窗口跑 `pnpm typecheck`）
 pnpm build:watch     # 改文件自动重建，浏览器手刷
@@ -58,7 +58,7 @@ HttpOnly 本地会话登录。前端请求使用同源 cookie，写操作带 CSR
 ## 其它命令
 
 ```bash
-pnpm build       # 构建产物 → ../backend/miloco/src/miloco/static/
+pnpm build       # 构建产物 → web/dist/；scripts/build.sh 会复制进 backend static 供打包
 pnpm typecheck   # 仅类型检查
 pnpm test        # vitest 单测
 ```

@@ -1,49 +1,17 @@
 import react from "@vitejs/plugin-react";
 import { execSync } from "node:child_process";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 // 用 vitest/config 的 defineConfig，让 `test` 字段类型可识别
 import { defineConfig } from "vitest/config";
 
-/**
- * Dev-only: 启动时从本机 ~/.openclaw/miloco/config.json 读出 backend 的
- * server.token，proxy 转发 /api & /health 时自动加 Authorization header。
- * 当前默认入口走 backend 1810 SPA handler(README 已声明 vite dev server 退役),
- * `pnpm scripts` 也不暴露 dev mode;本函数 + attachAuth + server.proxy 仅留作
- * 临时 `vite serve`(恢复 _mock 假数据通道时)兜底。
- *
- * 安全：token 只在 vite dev 进程内部使用，不进 HTML、不进浏览器全局变量，
- * 浏览器和前端代码都看不到。生产构建用 backend SPA handler 自带的注入逻辑。
- */
-function readBackendToken(): string {
-  if (process.env.MILOCO_TOKEN) return process.env.MILOCO_TOKEN;
-  const cfgPath = path.join(os.homedir(), ".openclaw", "miloco", "config.json");
-  try {
-    const raw = fs.readFileSync(cfgPath, "utf-8");
-    return JSON.parse(raw)?.server?.token ?? "";
-  } catch {
-    return "";
-  }
-}
-
 // 开发期把 /api /health 代理到 backend;env 可覆盖。backend 永远 HTTP(跨网
-// 加密走反代+真证书),不再有 self-signed cert 路径。secure:true 是默认。
+// 加密走反代+真证书),不再有 self-signed cert 路径。代理保留浏览器的 cookie
+// 和 CSRF 头，绝不代表浏览器附加 machine service token。
 const BACKEND = process.env.VITE_BACKEND_URL ?? "http://127.0.0.1:1810";
 
 // 注:身份注册路由(/api/identity/*)已迁移到主 backend(miloco.person.router),
 // 不再依赖独立的 register_server(8765)。前端直接走 /api/* 即可。
-
-const DEV_TOKEN = readBackendToken();
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function attachAuth(proxy: any) {
-  if (!DEV_TOKEN) return;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  proxy.on("proxyReq", (proxyReq: any) => {
-    proxyReq.setHeader("Authorization", `Bearer ${DEV_TOKEN}`);
-  });
-}
 
 // build 时注入界面版本；dev 用 git describe。用 vite 的 command 判别 build/serve——不能用
 // process.env.NODE_ENV，vite 执行本配置文件时不会把它设成 "production"，build 下会误走 git 分支。
@@ -79,19 +47,17 @@ export default defineConfig(({ command }) => ({
   },
   server: {
     port: 5173,
-    host: "0.0.0.0",
-    allowedHosts: true,
+    host: "127.0.0.1",
+    allowedHosts: ["localhost", "127.0.0.1"],
     proxy: {
       "/api": {
         target: BACKEND,
         changeOrigin: true,
         ws: true,
-        configure: attachAuth,
       },
       "/health": {
         target: BACKEND,
         changeOrigin: true,
-        configure: attachAuth,
       },
     },
   },

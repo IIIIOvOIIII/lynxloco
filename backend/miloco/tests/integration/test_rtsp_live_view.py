@@ -305,7 +305,7 @@ async def test_fixture_perception_and_uvicorn_live_view_share_one_rtsp_session(
     )
     monkeypatch.setattr(session_module.av, "open", opener)
     monkeypatch.setattr(
-        "miloco.camera.router.get_settings",
+        "miloco.auth.dependencies.get_settings",
         lambda: SimpleNamespace(server=SimpleNamespace(token=token)),
     )
 

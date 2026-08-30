@@ -102,7 +102,7 @@ def service() -> _Service:
 @pytest.fixture
 def client(service: _Service, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
-        "miloco.middleware.auth_middleware.get_settings",
+        "miloco.auth.dependencies.get_settings",
         lambda: SimpleNamespace(server=SimpleNamespace(token="service-token")),
     )
     app = FastAPI()

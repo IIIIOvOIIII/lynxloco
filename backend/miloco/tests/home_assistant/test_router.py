@@ -17,6 +17,7 @@ from miloco.manager import get_manager
 @pytest.fixture(autouse=True)
 def _isolated_home(tmp_path, monkeypatch):
     monkeypatch.setenv("MILOCO_HOME", str(tmp_path))
+    monkeypatch.setenv("MILOCO_SERVER__TOKEN", "test-token")
     reset_settings()
     yield
     reset_settings()

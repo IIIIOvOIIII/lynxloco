@@ -55,7 +55,9 @@ run_backend_tests() {
     cd "$REPO_ROOT/backend"
     # 关键: 隔离本地 config.json（含 token），与 CI 干净环境对齐
     export MILOCO_CONFIG_SEARCH_PATH=/tmp/miloco-nonexistent-ci
-    export MILOCO_SERVER__TOKEN=''
+    # Protected-route tests use this synthetic process-local service credential.
+    # It is not loaded from a user config or sent outside the TestClient process.
+    export MILOCO_SERVER__TOKEN='local-ci-service-token'
     # 跳过需要额外运行环境的大集成测试
     local ignore_dirs=(
         miloco/tests/e2e
@@ -91,7 +93,7 @@ run_backend_quick() {
     info "backend 快速测试 (改动相关模块)…"
     cd "$REPO_ROOT/backend"
     export MILOCO_CONFIG_SEARCH_PATH=/tmp/miloco-nonexistent-ci
-    export MILOCO_SERVER__TOKEN=''
+    export MILOCO_SERVER__TOKEN='local-ci-service-token'
     if uv run pytest -q --tb=short \
         miloco/tests/utils/ \
         miloco/tests/agent_platform/ \
