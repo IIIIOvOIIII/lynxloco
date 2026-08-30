@@ -6,7 +6,7 @@
 
 ## 部署架构
 
-**单端口模型**：backend 永远 HTTP（跨网加密走反代+真证书），住户访问 `http://<host>:1810/` 直接拿到 SPA。`vite build` 把产物写到 `../backend/miloco/src/miloco/static/`，backend `spa_handler` 路由：真文件命中（如 `/assets/*.js`、`/fonts/*.woff2`）→ `FileResponse`；根 `/` 与 `/index.html` → SPA `index.html` + 把 `__MILOCO_INJECT_TOKEN_HERE__` 占位替换成真 `server.token`（浏览器从 `window.__MILOCO_TOKEN__` 读出加 Authorization Bearer）；其它非根路径未命中真文件 → 404（避免扫描器 `/admin/login`、`/.env` 等都拿 token-injected HTML）。
+**单端口模型**：backend 永远 HTTP（跨网加密走反代+真证书），住户访问 `http://<host>:1810/` 直接拿到 SPA。`vite build` 先写 `web/dist/`；正式构建的 `scripts/build.sh` 再把它复制进 `../backend/miloco/src/miloco/static/` 并打包到 backend wheel。backend `spa_handler` 路由：真文件命中（如 `/assets/*.js`、`/fonts/*.woff2`）→ `FileResponse`；根 `/` 与 `/index.html` → 不缓存的 SPA 登录/会话启动壳；其它非根路径未命中真文件 → 404（避免扫描器 `/admin/login`、`/.env` 等都拿到面板 HTML）。
 
 旧的 vite dev server 5173 + proxy::attachAuth 模式已退役，**没有 `pnpm dev`**——开发期照样跑 `pnpm build:watch` 让产物落地，浏览器直开 `http://<host>:1810/`。
 
@@ -37,23 +37,23 @@ pnpm build:watch     # 改文件自动重建，浏览器手刷
 
 **身份注册服务**：已迁移到主 backend——前端「让它认识 X」走 `/api/identity/persons/{id}/extract`
 （图片 / 视频 multipart）+ `/api/identity/persons/{id}/samples/batch`（JSON 批量落样本），
-跟主 backend 同进程同 token，**无需手动启额外服务**。
+跟主 backend 同进程、同源会话，**无需手动启额外服务**。
 
 历史上自动抽帧能力由独立的离线注册服务(8765 端口)提供、需手跑,现已退役并移除——前端走主
 backend `/api/identity/persons` 同源相对路径,LAN 手机 / 平板访问家庭面板录家人功能正常可用。
 
 **浏览器**：直接打开 `http://<host>:1810/`（本机 = `http://127.0.0.1:1810/`，
-LAN = `http://192.168.x.x:1810/`）。SPA 启动时从注入的 `window.__MILOCO_TOKEN__`
-读 token，所有 fetch 自动带 Authorization Bearer。
+LAN = `http://192.168.x.x:1810/`）。首次使用创建第一个管理员；之后浏览器通过
+HttpOnly 本地会话登录。前端请求使用同源 cookie，写操作带 CSRF 头，不读取也不
+携带 `server.token`。
 
 > **LAN 访问**：默认仅绑定 `127.0.0.1`，局域网其它设备无法访问。
 > 需在 `~/.openclaw/miloco/config.json` 中将 `host` 改为 `"0.0.0.0"` 并重启服务：
 > ```json
 > { "server": { "host": "0.0.0.0" } }
 > ```
-> 注意：开启后 token 将对 LAN 可见，请确认局域网可信（私网 + 单管理员 OK，
-> 共享网络 / 路由器穿透应走反代 + TLS + 认证）。详见 `settings.py` 中
-> `ServerSettings.host` 的说明。
+> 注意：开启后面板可被 LAN 设备访问，但每个浏览器仍必须登录。共享网络或路由器
+> 穿透仍应配置反代、TLS 和访问控制。详见 `settings.py` 中 `ServerSettings.host` 的说明。
 
 ## 其它命令
 
@@ -74,9 +74,13 @@ pnpm test        # vitest 单测
 
 仍然用占位的少数能力（backend 还没接口暴露）以代码内 TODO 注释为准。
 
-## Token 解析
+## 鉴权边界
 
-backend `spa_handler` 把 `index.html` 里的 `__MILOCO_INJECT_TOKEN_HERE__` 字符串替换成 `json.dumps(server.token)[1:-1]`（JS-string-escape，处理 token 含双引号 / 反斜杠等特殊字符的边界）。前端 `src/api/client.ts::resolveToken` 读 `window.__MILOCO_TOKEN__`，未注入时占位仍在 → 退化为空串语义。
+浏览器与机器调用使用不同凭据。住户在面板创建账号或登录后，浏览器只保留
+HttpOnly 会话 cookie；前端不会把长期服务 token 写进 HTML、JavaScript 或 URL。
+`miloco-cli`、OpenClaw、Hermes 和服务器自动化仍从 `config.json` 读取
+`server.token`，并通过 `Authorization: Bearer` 调用 API。不要把该 token 交给
+浏览器或人。
 
 ## 视觉对齐
 

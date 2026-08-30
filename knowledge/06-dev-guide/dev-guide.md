@@ -329,6 +329,21 @@ miloco-cli identity register from-cluster --cluster-id <id> [--member-id <id> | 
 
 CLI 会读取 `$MILOCO_HOME/config.json` 中的 `server.url`（后端 HTTP Base URL）和 `server.token`，向后端发 HTTP 请求。鉴权通过 `Authorization: Bearer <token>` 头传递。
 
+### Dashboard login and service-token boundary
+
+The dashboard has a separate local-user authentication lane. A fresh dashboard
+opens a first-admin setup screen; after setup, browser users authenticate with
+an HttpOnly `miloco_dashboard_session` cookie. Browser writes also send the
+CSRF value returned by the auth API in `X-Miloco-CSRF`. The SPA must use
+same-origin cookie requests and must never receive, render, store, or append
+`server.token` to a URL.
+
+`server.token` remains the machine credential for the CLI, OpenClaw, Hermes,
+scripts, and API troubleshooting. It is not a dashboard login credential and
+must not be shared with browser users. Keep the two lanes separate when adding
+new routes: accepted browser sessions or a valid service Bearer token may
+authorize protected APIs; only browser-session writes require CSRF.
+
 #### 开发新 Skill 的快速入门
 
 1. 在 `plugins/skills/` 下新建目录，命名为 `miloco-<name>`

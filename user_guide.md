@@ -73,7 +73,24 @@ Besides conversation, Miloco offers a Web dashboard you can view and operate dir
 - **Method 1**: Once the backend service is running, open `http://127.0.0.1:1810/` in a browser (on the host machine); from other devices on the same Wi-Fi, visit `http://<host-IP>:1810/`.
 - **Method 2**: Run `miloco-cli dashboard` in your terminal to open the dashboard in your browser automatically — no need to type the address.
 
-## 3.2 What the Dashboard Offers
+## 3.2 Dashboard Login
+
+Miloco protects the dashboard with local login accounts. On a fresh install,
+the first page asks you to create the first administrator. Once that account
+exists, every browser must sign in before it can view or operate cameras,
+devices, model settings, Home Assistant, or logs.
+
+Use the **Users** tab to add administrators, reset passwords, disable an
+account, or remove an account. Miloco prevents removing or disabling the last
+enabled administrator and prevents deleting the account currently signed in to
+that browser.
+
+Dashboard login is for people. The local `server.token` in `config.json` is a
+separate machine credential for `miloco-cli`, OpenClaw, Hermes, and trusted
+automation. Do not paste, send, or expose that token in a browser; a browser
+uses its own local session after login.
+
+## 3.3 What the Dashboard Offers
 
 - **Overview**: Watch live "right now at home" feeds from online cameras with one click; works across browsers on every platform.
 

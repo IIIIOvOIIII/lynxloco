@@ -556,16 +556,17 @@ def test_device_list_default_tsv(runner, fake_home_info):
     # home banner
     assert lines[0] == "# home=我的家"
     # 表头
-    assert lines[1] == "# did|device_name|room|category|online"
+    assert lines[1] == "# did|source|device_name|room|category|online|control"
     rows = [r for r in lines if not r.startswith("#")]
     assert len(rows) == 1
     parts = rows[0].split("|")
-    assert len(parts) == 5
+    assert len(parts) == 7
     assert parts[0] == "lamp_001"
-    assert parts[1] == "台灯"
-    assert parts[2] == "客厅"
-    assert parts[3] == "light"
-    assert parts[4] in ("online", "offline")
+    assert parts[1] == "miot"
+    assert parts[2] == "台灯"
+    assert parts[3] == "客厅"
+    assert parts[4] == "light"
+    assert parts[5] in ("online", "offline")
 
 
 def test_device_list_home_banner_from_top_level(runner, fake_home_info):
@@ -582,8 +583,8 @@ def test_device_list_filter_room(runner, fake_home_info):
     rows = [r for r in result.output.splitlines() if r and not r.startswith("#")]
     assert rows  # 至少匹配一台
     for row in rows:
-        # did|device_name|room|category|online
-        assert row.split("|")[2] == "客厅"
+        # did|source|device_name|room|category|online|control
+        assert row.split("|")[3] == "客厅"
 
 
 def test_device_control_single(runner, fake_home_info):
@@ -594,7 +595,7 @@ def test_device_control_single(runner, fake_home_info):
         )
     assert result.exit_code == 0
     mock.assert_called_once_with(
-        "/api/miot/devices/lamp_001/control",
+        "/api/devices/lamp_001/control",
         {"type": "set_property", "iid": "prop.2.1", "value": True},
     )
 
@@ -804,7 +805,7 @@ def test_device_spec_default_table(runner, fake_home_info):
     assert "room=客厅" in text
     assert "[service 2]" in text  # 按 service 分组的标题行
     assert "prop.2.1" in text
-    mock.assert_called_once_with("/api/miot/devices/lamp_001/spec")
+    mock.assert_called_once_with("/api/devices/lamp_001/spec")
 
 
 def test_device_spec_multiple_dids(runner, fake_home_info):

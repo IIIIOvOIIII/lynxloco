@@ -644,12 +644,11 @@ async def spa_handler(full_path: str, request: Request):
     # case-insensitive + trailing-slash 处理：
     # · macOS / 默认 NTFS 等 case-insensitive FS 上 `Watch.html` 会绕过精确匹配
     # · `/watch.html/` trailing slash 在 (static_dir / "watch.html/").resolve()
-    #   会退回 watch.html，is_file() 返 True → 真文件分支吐出带 __MILOCO_TOKEN__
-    #   占位的 raw HTML
+    #   会退回 watch.html，is_file() 返 True → 真文件分支直接吐出原始模板
     # 跟下面 SPA fallback 的 rstrip("/") 同口径。
     # NFC 归一化兜 macOS APFS 边界——攻击者构造 NFD 路径(组合重音 vs 预组合)
-    # 经 .lower() 比较失败走真文件分支。index.html 仍由专用分支处理，保证遗留
-    # 占位不会直接作为静态文件返回。
+    # 经 .lower() 比较失败走真文件分支。index.html 仍由专用分支处理，保证
+    # 登录/会话启动壳始终采用 no-store 缓存策略。
     full_path_ci = unicodedata.normalize("NFC", full_path).lower().rstrip("/")
     if full_path_ci == "watch.html":
         # GET-only：catch-all 是 @app.get，POST /watch.html 自动 405 Allow: GET。
@@ -668,13 +667,13 @@ async def spa_handler(full_path: str, request: Request):
                 target = f"{target}?{urlencode(kept)}"
         return RedirectResponse(url=target, status_code=302)
     static_dir, static_root = _resolved_static_dirs()
-    # /index.html 直链也走专用 HTML 路径，保证遗留占位被清除。/ 由于
-    # full_path="" 自然不会命中真文件分支。
+    # /index.html 直链也走专用 HTML 路径。/ 由于 full_path="" 自然不会命中
+    # 真文件分支。
     # 用 .lower().rstrip("/") 处理：
     # · macOS / 默认 NTFS 等 case-insensitive FS 上 `/INDEX.html` 也必须走
     #   专用 HTML 路径。跟 watch.html case-insensitive 防御同口径。
     # · `/index.html/` 末尾斜杠：starlette 不规范化，Path("index.html/").resolve()
-    #   退回 index.html → is_file() 命中 → 同样返未替换 token 的版本。
+    #   退回 index.html → is_file() 命中 → 同样由本分支返回登录启动页。
     if full_path and full_path_ci != "index.html":
         # 防 path traversal：starlette 不会 normalize URL-encoded `..%2F`，
         # 直接 (static_dir / "../etc/passwd") + is_file() 会越界读宿主任意文件。
@@ -712,10 +711,12 @@ async def spa_handler(full_path: str, request: Request):
     if not index_file.exists():
         return Response(status_code=404, content="404 Not Found")
 
-    template = index_file.read_text(encoding="utf-8")
-    template = template.replace("__MILOCO_INJECT_TOKEN_HERE__", "")
     # Keep HTML out of caches because it is the login/session bootstrap shell.
     # Hashed static assets do not carry credentials and retain their cache policy.
+    template = index_file.read_text(encoding="utf-8")
+    # Keep stale pre-auth static bundles harmless during an upgrade; this never
+    # inserts a credential and current builds contain no such marker.
+    template = template.replace("__MILOCO_INJECT_TOKEN_HERE__", "")
     return HTMLResponse(template, headers={"Cache-Control": "no-store"})
 
 

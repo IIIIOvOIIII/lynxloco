@@ -121,6 +121,19 @@ Then open the home dashboard to complete the initial setup:
 miloco-cli dashboard   # open the home dashboard in your browser (or visit http://<host>:1810/ directly)
 ```
 
+### Dashboard login
+
+Miloco protects the web dashboard with local login accounts. On a fresh install,
+open the dashboard and create the first administrator. After that, every browser
+must sign in before it can see or operate cameras, devices, model settings, Home
+Assistant, or logs. Administrators can add, disable, reset, or remove dashboard
+users from the **Users** tab; at least one enabled administrator must remain.
+
+The dashboard login is separate from the local service token in `config.json`.
+CLI, OpenClaw, Hermes, and other automation continue to use that service token
+for machine-to-machine API access. Do not give the service token to a browser or
+share it with people; the browser uses its own local session after login.
+
 Get started from the dashboard:
 
 1. **Configure the model** — On the "Models" page, enter your MiMo `api_key`, or add an OpenAI-compatible profile by filling in the Base URL, model name, protocol, and API key if needed.

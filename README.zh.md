@@ -121,6 +121,17 @@ openclaw gateway restart
 miloco-cli dashboard   # 在浏览器打开家庭面板（或直接访问 http://<host>:1810/）
 ```
 
+### Dashboard 登录
+
+Miloco 现在会保护网页控制台。首次安装后，打开 dashboard 创建第一个管理员；
+之后每个浏览器都需要先登录，才能查看或操作摄像头、设备、模型设置、Home
+Assistant 和日志。管理员可在「用户」页新增、停用、重置密码或删除 dashboard
+用户，系统始终会保留至少一个已启用的管理员。
+
+Dashboard 登录与 `config.json` 里的本机服务 token 是两条独立通道。CLI、OpenClaw、
+Hermes 和自动化脚本仍用服务 token 进行机器间 API 调用；不要把它交给浏览器或
+分享给其他人。浏览器登录后只使用自己的本地会话。
+
 在面板中按下面几步上手：
 
 1. **配置模型** — 在「模型」页填入 MiMo 的 api_key；或者新增一套 OpenAI 兼容模型配置，填 Base URL、模型名、协议和 API Key（如需要）。

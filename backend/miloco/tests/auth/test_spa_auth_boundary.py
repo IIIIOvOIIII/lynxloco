@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 from miloco.config import reset_settings
 from miloco.database.connector import init_database
@@ -8,6 +10,16 @@ def _reset_database_connector() -> None:
     import miloco.database.connector as connector_module
 
     connector_module.db_connector = None
+
+
+def test_shipped_spa_template_has_no_token_injection_marker() -> None:
+    """The browser bundle itself must not retain the retired token hook."""
+    template = (Path(__file__).resolve().parents[4] / "web" / "index.html").read_text(
+        encoding="utf-8"
+    )
+
+    assert "__MILOCO_INJECT_TOKEN_HERE__" not in template
+    assert "window.__MILOCO_TOKEN__" not in template
 
 
 def test_spa_html_never_injects_service_token(tmp_path, monkeypatch) -> None:

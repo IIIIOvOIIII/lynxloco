@@ -11,6 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from miloco.config import reset_settings
+import miloco.devices.router as devices_router_module
 from miloco.home_assistant.schema import HaErrorCode, HomeAssistantError
 from miloco.main import app
 from miloco.manager import get_manager
@@ -77,6 +78,7 @@ def _isolated_backend(tmp_path, monkeypatch):
     monkeypatch.setenv("MILOCO_SERVER__TOKEN", "test-token")
     reset_settings()
     manager = get_manager()
+    monkeypatch.setattr(devices_router_module, "manager", manager)
     monkeypatch.setattr(manager, "_miot_service", _FakeMiotService(), raising=False)
     monkeypatch.setattr(
         manager,

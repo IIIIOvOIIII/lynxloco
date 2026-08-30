@@ -1,10 +1,10 @@
 # Copyright (C) 2025 Xiaomi Corporation
 # This software may be used and distributed according to the terms of the Xiaomi Miloco License Agreement.
 
-"""v1→v2 schema 迁移测试.
+"""v1→v3 schema 迁移测试.
 
 覆盖:
-- fresh-build 直接落 v2 形态 (rule NOT NULL + FK, cron 表存在, 无 task_link)
+- fresh-build 直接落 v3 形态 (rule NOT NULL + FK, cron 与 dashboard auth 表存在, 无 task_link)
 - 迁移 A/B/C/D/E 五型 orphan 各自的处置策略 (D 取 task_link 侧, A/E 删+log)
 - cron 行迁移 + cron dangling 跳过+log (不阻塞启动)
 - 迁移后三重不变量
@@ -144,12 +144,12 @@ def _read_rule(conn, rule_id: str) -> sqlite3.Row | None:
 # ── fresh-build ───────────────────────────────────────────────────────
 
 
-def test_fresh_build_is_v2_form(fresh_db):
+def test_fresh_build_is_v3_form(fresh_db):
     from miloco.database.connector import get_db_connector
 
     with get_db_connector().get_connection() as conn:
-        # user_version = 2
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        # user_version = 3
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
         # task_link 表不存在
         tables = {
             row["name"]
@@ -160,6 +160,8 @@ def test_fresh_build_is_v2_form(fresh_db):
         assert "task_link" not in tables
         # cron 表存在
         assert "cron" in tables
+        assert "dashboard_user" in tables
+        assert "dashboard_session" in tables
         # rule 表 DDL 含 NOT NULL + FK
         rule_ddl = conn.execute(
             "SELECT sql FROM sqlite_master WHERE name='rule'"
@@ -447,7 +449,7 @@ def test_migrate_cron_dangling_skipped_with_log(v1_db, caplog):
 
 
 def test_migrate_final_invariants(v1_db):
-    """迁移完成后: user_version=2, task_link DROP, FK 干净, rule.task_id 无 NULL."""
+    """迁移完成后: user_version=3, task_link DROP, auth 表存在, FK 干净, rule.task_id 无 NULL."""
     conn = sqlite3.connect(str(v1_db))
     cursor = conn.cursor()
     _insert_task(cursor, "task-1")
@@ -464,7 +466,7 @@ def test_migrate_final_invariants(v1_db):
     from miloco.database.connector import get_db_connector
 
     with get_db_connector().get_connection() as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
         tables = {
             r["name"]
             for r in conn.execute(
@@ -473,6 +475,8 @@ def test_migrate_final_invariants(v1_db):
         }
         assert "task_link" not in tables
         assert "cron" in tables
+        assert "dashboard_user" in tables
+        assert "dashboard_session" in tables
         # FK 检查空
         assert conn.execute("PRAGMA foreign_key_check(rule)").fetchall() == []
         assert conn.execute("PRAGMA foreign_key_check(cron)").fetchall() == []
@@ -485,8 +489,8 @@ def test_migrate_final_invariants(v1_db):
         )
 
 
-def test_migrate_is_skipped_on_v2_db(fresh_db):
-    """已经是 v2 (fresh-build) 的库再次 init 不重跑迁移, 数据无变化."""
+def test_migrate_is_skipped_on_current_db(fresh_db):
+    """已经是 v3 (fresh-build) 的库再次 init 不重跑迁移, 数据无变化."""
     from miloco.database.connector import get_db_connector
 
     with get_db_connector().get_connection() as conn:
@@ -506,7 +510,7 @@ def test_migrate_is_skipped_on_v2_db(fresh_db):
             ).fetchone()[0]
             == 1
         )
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
 
 
 # ── rollback ──────────────────────────────────────────────────────────

@@ -234,7 +234,13 @@ function UserDialog({
         await onSaved("auth.userUpdated");
       }
     } catch {
-      setError(t(isPassword ? "auth.passwordChangeFailed" : "auth.userUpdateFailed"));
+      setError(t(
+        isCreate
+          ? "auth.userCreateFailed"
+          : isPassword
+            ? "auth.passwordChangeFailed"
+            : "auth.userUpdateFailed",
+      ));
     } finally {
       setSubmitting(false);
     }
