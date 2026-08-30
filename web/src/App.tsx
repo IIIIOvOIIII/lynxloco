@@ -59,6 +59,7 @@ import { MiotBindDialog } from "./components/MiotBindDialog";
 import { RtspCameraDialog } from "./components/RtspCameraDialog";
 import { ToastHost, toast } from "./components/Toast";
 import { UsagePage } from "./components/UsagePage";
+import { UsersPage } from "./components/UsersPage";
 import type { HomeId } from "./lib/types";
 import { hasActivePerceptionCamera } from "./lib/perceptionActivity";
 import { PerfPage } from "./components/PerfPage";
@@ -665,6 +666,8 @@ function MainApp({
       }
       case "usage":
         return <UsagePage />;
+      case "users":
+        return <UsersPage currentUserId={auth.user?.id ?? null} />;
     }
   };
 

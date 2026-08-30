@@ -34,3 +34,23 @@ export function validatePasswordPair(
   if (password !== confirm) return "passwordMismatch";
   return null;
 }
+
+export function enabledAdminCount(users: DashboardUser[]): number {
+  return users.filter((user) => user.enabled && user.role === "admin").length;
+}
+
+export function canDeleteUser(
+  user: DashboardUser,
+  currentUserId: string | null,
+  users: DashboardUser[],
+): boolean {
+  if (user.id === currentUserId) return false;
+  if (user.enabled && user.role === "admin" && enabledAdminCount(users) <= 1) return false;
+  return true;
+}
+
+export function canDisableUser(user: DashboardUser, users: DashboardUser[]): boolean {
+  if (!user.enabled) return true;
+  if (user.role === "admin" && enabledAdminCount(users) <= 1) return false;
+  return true;
+}

@@ -15,6 +15,8 @@
     "activityHint": "Review what happened",
     "usage": "Models",
     "usageHint": "Model & token usage",
+    "users": "Users",
+    "usersHint": "Manage dashboard accounts",
     "loginMiot": "Tap to sign in to Xiaomi Home",
     "bound": "Connected"
   }

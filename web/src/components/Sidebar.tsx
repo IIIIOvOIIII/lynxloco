@@ -38,7 +38,8 @@ export type TabKey =
   | "family"
   | "tasks"
   | "activity"
-  | "usage";
+  | "usage"
+  | "users";
 
 type NavIcon = ComponentType<SVGProps<SVGSVGElement> & { active?: boolean }>;
 
@@ -104,6 +105,12 @@ export const TABS: TabDef[] = [
     labelKey: "nav.usage",
     hintKey: "nav.usageHint",
     Icon: IconUsage,
+  },
+  {
+    key: "users",
+    labelKey: "nav.users",
+    hintKey: "nav.usersHint",
+    Icon: IconFamily,
   },
   // 性能 tab 不再列入主导航 — 改为通过 URL hash "#perf" 进入独立调试视图,
   // 普通用户看不到入口。详见 App.tsx 的 PerfView。

@@ -15,6 +15,8 @@
     "activityHint": "回看发生过的事",
     "usage": "模型",
     "usageHint": "看模型和 Token 开销",
+    "users": "用户",
+    "usersHint": "管理登录账号",
     "loginMiot": "点击登录米家",
     "bound": "已绑定"
   }
