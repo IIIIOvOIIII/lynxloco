@@ -1,0 +1,17 @@
+{
+  "description": "Deploy Miloco RTSP preview stability and codec handling fix to miloco.esxi.",
+  "implementation_plan": "Implement Miloco RTSP preview/runtime repair on `miloco.esxi` from exact local Git commit `ed6fdff96eab101684d7e27eb87c6548ad3f7170`.\n\n1. Confirm this Change Order is in `Implement` state and PAM is active for `miloco.esxi/root` before any remote mutation.\n2. Confirm the local repository is at commit `ed6fdff96eab101684d7e27eb87c6548ad3f7170` with no uncommitted tracked source changes.\n3. Build the release artifacts locally with the existing project build flow, including web static assets, Miloco backend wheel, Miloco CLI wheel, MIoT wheel, and OpenClaw plugin package.\n4. Use `scripts/sync-to-remote.sh --local-build` to copy only `dist/` and `scripts/` to `miloco.esxi` and install the selected artifacts with `uv tool install` / `openclaw plugins install --force`.\n5. Restart only the existing Miloco/OpenClaw managed services through the installer/sync flow; do not alter saved RTSP camera definitions, Xiaomi account state, model API keys, database content, or host networking.\n6. Verify `miloco.esxi` health, Miloco CLI service status, OpenClaw gateway/plugin status, and the served application version.\n7. Verify the kitchen RTSP camera no longer reports `unsupported_video_codec`, the living-room RTSP source keeps advancing frame timestamps across a bounded sample window, and the dashboard/watch static asset contains the less aggressive reconnect watchdog.\n\nSecrets and privacy boundary: do not print, persist, or copy RTSP URLs, usernames, passwords, service tokens, Xiaomi tokens, model API keys, raw camera frames, or raw model responses. API calls may use the service token only inside the remote shell as a transient header.",
+  "impacted_service": "Miloco",
+  "change_items": "miloco.esxi",
+  "change_category": "Software",
+  "is_emergency": false,
+  "rollback_plan": "Rollback Miloco RTSP preview/runtime repair on `miloco.esxi` if deployment or validation fails.\n\n1. Stop the rollout immediately if Miloco health, OpenClaw gateway/plugin health, API authentication, or camera status worsens after installation.\n2. Reinstall the prior deployed Miloco release from exact Git commit `0ed57bebd763b002cfadfecb66bb4ebd28c19609` by building that commit in an isolated local worktree and running the same `scripts/sync-to-remote.sh --local-build` install flow against `miloco.esxi`.\n3. Restart only the existing Miloco/OpenClaw managed services needed to restore the prior package set.\n4. Do not restore or overwrite the persistent Miloco configuration, Xiaomi account state, RTSP camera definitions, model API keys, or database unless separate evidence proves the deployment changed them.\n5. Re-run the same post-rollback checks: Miloco `/health`, Miloco CLI service status, OpenClaw gateway/plugin status, and safe camera status sampling.\n\nSecrets and privacy boundary: do not print, persist, or copy RTSP URLs, usernames, passwords, service tokens, Xiaomi tokens, model API keys, raw camera frames, or raw model responses during rollback.",
+  "maintenance_window_hours": 1.0,
+  "pam_request": {
+    "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEQt1SqzUH1tYJmAw7DvaXHMkQwAUfzKF9D2+zk/X/is openclaw-co@mac-mini",
+    "target_hosts": [
+      "miloco.esxi"
+    ],
+    "target_user": "root"
+  }
+}
