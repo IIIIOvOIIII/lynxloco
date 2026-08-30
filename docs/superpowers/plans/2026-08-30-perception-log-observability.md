@@ -10,6 +10,32 @@
 
 **Spec:** `docs/superpowers/specs/2026-08-30-perception-log-observability-design.md`
 
+## Pre-Development Evidence Update
+
+Read-only production verification under `CHG260830029` tested the user's hypothesis that the current Omni LLM endpoint might not be participating at all.
+
+Result:
+
+- `miloco.esxi` was running Miloco on port `1810`.
+- The living-room RTSP source was enabled, connected, and active in perception.
+- A real living-room frame was decoded successfully with shape `[2160, 3840, 3]`.
+- Current Omni config used `openai_responses`, model `grok-chat-auto`, and the configured `http://ai.esxi:18090/v1` base URL.
+- A non-fused single-frame visual Responses request included one image block and returned HTTP 200 in 14.366s with token usage and response text.
+- Miloco structured parsing marked that response skipped because the model text was not valid structured perception JSON.
+- A production fused-shape single-frame request included one image block and five text blocks, then timed out at the configured 30s timeout.
+
+Implementation implication:
+
+- Do not treat the next work as "wire the LLM endpoint from scratch".
+- Keep Phase 1 runtime visibility.
+- In Phase 2, explicitly distinguish:
+  - provider not reachable;
+  - provider HTTP success but no output text;
+  - provider HTTP success with non-JSON text;
+  - parser fallback/skipped;
+  - fused-shape timeout;
+  - valid JSON with all semantic fields empty.
+
 ## Global Constraints
 
 - Work only inside the dedicated worktree `/Users/nicholasliao/clawd/xiaomi-miloco/.worktrees/perception-log-observability` on branch `feature/perception-log-observability`.
@@ -364,6 +390,7 @@ class RealtimeOmniDiagnostic:
     video_block_count: int
     audio_block_count: int
     response_text_length: int
+    response_json_like: bool
     parse_ok: bool
     skipped: bool
     caption_count: int
@@ -431,9 +458,9 @@ def test_summarize_omni_messages_counts_blocks_without_content():
 ```py
 def test_runtime_diagnostics_is_bounded_and_returns_latest():
     diag = RuntimeDiagnostics(maxlen=2)
-    diag.record(RealtimeOmniDiagnostic(timestamp_ms=1, protocol="openai_responses", route="realtime", message_count=1, text_block_count=1, image_block_count=0, video_block_count=0, audio_block_count=0, response_text_length=0, parse_ok=True, skipped=False, caption_count=0, matched_rule_count=0, suggestion_count=0, speech_count=0, complete_speech_count=0, needs_response_speech_count=0))
-    diag.record(RealtimeOmniDiagnostic(timestamp_ms=2, protocol="openai_responses", route="on_demand", message_count=1, text_block_count=1, image_block_count=1, video_block_count=0, audio_block_count=0, response_text_length=42, parse_ok=True, skipped=False, caption_count=1, matched_rule_count=0, suggestion_count=0, speech_count=0, complete_speech_count=0, needs_response_speech_count=0))
-    diag.record(RealtimeOmniDiagnostic(timestamp_ms=3, protocol="openai_responses", route="realtime", message_count=1, text_block_count=1, image_block_count=1, video_block_count=0, audio_block_count=0, response_text_length=20, parse_ok=True, skipped=False, caption_count=0, matched_rule_count=0, suggestion_count=0, speech_count=0, complete_speech_count=0, needs_response_speech_count=0))
+    diag.record(RealtimeOmniDiagnostic(timestamp_ms=1, protocol="openai_responses", route="realtime", message_count=1, text_block_count=1, image_block_count=0, video_block_count=0, audio_block_count=0, response_text_length=0, response_json_like=False, parse_ok=True, skipped=False, caption_count=0, matched_rule_count=0, suggestion_count=0, speech_count=0, complete_speech_count=0, needs_response_speech_count=0))
+    diag.record(RealtimeOmniDiagnostic(timestamp_ms=2, protocol="openai_responses", route="on_demand", message_count=1, text_block_count=1, image_block_count=1, video_block_count=0, audio_block_count=0, response_text_length=42, response_json_like=True, parse_ok=True, skipped=False, caption_count=1, matched_rule_count=0, suggestion_count=0, speech_count=0, complete_speech_count=0, needs_response_speech_count=0))
+    diag.record(RealtimeOmniDiagnostic(timestamp_ms=3, protocol="openai_responses", route="realtime", message_count=1, text_block_count=1, image_block_count=1, video_block_count=0, audio_block_count=0, response_text_length=20, response_json_like=False, parse_ok=True, skipped=False, caption_count=0, matched_rule_count=0, suggestion_count=0, speech_count=0, complete_speech_count=0, needs_response_speech_count=0))
 
     assert [s.timestamp_ms for s in diag.snapshot()] == [2, 3]
     assert diag.latest("realtime").timestamp_ms == 3
@@ -451,6 +478,16 @@ Use two lightweight integration points:
 2. In `engine/api.py`, after `_merge_results(...)`, record a `route="realtime"` semantic sample with field counts from the merged `RealtimePerceptionResult`.
 
 The second record can update the latest unknown sample or simply add a realtime semantic sample. Prefer the simpler additive record first; the runtime summary can display the latest realtime semantic sample.
+
+The diagnostic classification must distinguish these cases:
+
+- `provider_unreachable`: no provider HTTP response.
+- `provider_timeout`: timeout or `ReadTimeout`.
+- `provider_http_error`: non-2xx provider response.
+- `provider_http_ok_no_text`: 2xx response but no output text after adapter normalization.
+- `provider_http_ok_but_parse_skipped`: 2xx response has text, but the text is not parseable structured perception JSON.
+- `semantic_empty`: valid parse with all semantic fields empty.
+- `semantic_non_empty`: valid parse with at least one semantic field populated.
 
 - [ ] Step 4: Verify.
 
@@ -974,7 +1011,7 @@ Expected: tests and build pass.
 
 ### Task 7: Tighten Realtime Caption Contract
 
-**Purpose:** Repair the current failure mode where valid realtime calls can return empty semantic fields for usable RTSP frames, while preserving strictness for rule hits, suggestions, and actions.
+**Purpose:** Repair the current failure mode where a reachable visual endpoint returns non-JSON text or times out under the production fused-shape prompt, while preserving strictness for rule hits, suggestions, and actions.
 
 **Files:**
 
@@ -985,6 +1022,7 @@ Expected: tests and build pass.
 **Policy:**
 
 - For video/image routes with usable visible content, `caption` should be non-empty.
+- For Responses image-sequence routes, the prompt must make JSON-only output explicit in the system instruction and field contract; natural-language prose outside the JSON object is a parser failure.
 - For unusable visual input, model may leave caption empty or use the existing safe degraded wording if parser already supports it.
 - Keep audio-only routes free of `caption`.
 - Do not instruct the model to invent events, suggestions, rule hits, or actions.
@@ -995,8 +1033,7 @@ Append tests near existing caption/schema tests:
 
 ```py
 def test_video_caption_spec_requires_non_empty_caption_for_usable_visual_window():
-    from miloco.perception.engine.omni.field_registry import render_field_spec
-    from miloco.perception.engine.types import SceneDescriptor
+    from miloco.perception.engine.omni.field_registry import SceneDescriptor, render_field_spec
 
     spec = render_field_spec(SceneDescriptor(route="video", has_audio=False))
 
@@ -1007,9 +1044,20 @@ def test_video_caption_spec_requires_non_empty_caption_for_usable_visual_window(
 ```
 
 ```py
+def test_video_system_prompt_requires_json_only_output_for_responses_image_sequence():
+    from miloco.perception.engine.omni.prompt_builder import build_system_prompt
+    from miloco.perception.engine.omni.field_registry import SceneDescriptor
+
+    prompt = build_system_prompt(SceneDescriptor(route="video", has_audio=False))
+
+    assert "JSON" in prompt
+    assert "不要输出 JSON 外的解释" in prompt or "仅输出 JSON" in prompt
+```
+
+```py
 def test_audio_only_route_still_omits_caption_contract():
+    from miloco.perception.engine.omni.field_registry import SceneDescriptor
     from miloco.perception.engine.omni.prompt_builder import render_schema
-    from miloco.perception.engine.types import SceneDescriptor
 
     schema = render_schema(SceneDescriptor(route="audio", has_audio=True))
     assert '"caption"' not in schema
@@ -1025,6 +1073,8 @@ Add one early bullet under `## caption`:
 
 Do not edit `MATCHED_RULES`, `SUGGESTIONS`, or action instructions unless a test demonstrates a direct contradiction.
 
+Also strengthen the JSON-only instruction in the centralized prompt constants if the existing output-mode wording is insufficient for the new test. Keep this change limited to output format wording; do not alter business meaning.
+
 - [ ] Step 3: Verify targeted prompt tests.
 
 ```bash
@@ -1038,7 +1088,7 @@ Expected: pass.
 
 ### Task 8: Add Runtime Empty-Semantics Acceptance Tests
 
-**Purpose:** Guard against the specific regression: realtime output is syntactically successful but semantically empty forever.
+**Purpose:** Guard against the specific regressions now proven in production: HTTP success with non-JSON text, fused-shape timeout, and syntactically successful but semantically empty realtime output.
 
 **Files:**
 
@@ -1048,6 +1098,8 @@ Expected: pass.
 **Acceptance Invariant:**
 
 When a realtime result contains no captions/rules/suggestions/speeches, the runtime diagnostics and summary must make that visible as `silent` after repeated cycles.
+
+When a provider call returns text that is not JSON, diagnostics must classify it separately from "no LLM response". When the fused-shape call times out, diagnostics must classify it as timeout/degraded rather than empty semantics.
 
 - [ ] Step 1: Add an engine-level diagnostic test.
 
@@ -1084,7 +1136,37 @@ assert state == "silent"
 assert "semantic_output_empty" in hints
 ```
 
-- [ ] Step 3: Verify.
+- [ ] Step 3: Add parse-skipped diagnostic classification test.
+
+```py
+def test_runtime_diagnostic_distinguishes_non_json_text_from_no_response():
+    sample = classify_omni_response_shape(
+        http_status=200,
+        response_text_length=23,
+        response_json_like=False,
+        parser_skipped=True,
+        error_code=None,
+    )
+
+    assert sample == "provider_http_ok_but_parse_skipped"
+```
+
+- [ ] Step 4: Add fused timeout diagnostic classification test.
+
+```py
+def test_runtime_diagnostic_distinguishes_timeout_from_empty_semantics():
+    sample = classify_omni_response_shape(
+        http_status=None,
+        response_text_length=0,
+        response_json_like=False,
+        parser_skipped=False,
+        error_code="ReadTimeout",
+    )
+
+    assert sample == "provider_timeout"
+```
+
+- [ ] Step 5: Verify.
 
 ```bash
 cd backend/miloco

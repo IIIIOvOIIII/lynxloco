@@ -18,6 +18,25 @@ The user-facing problem is therefore not simply "service down". It is a visibili
 2. The realtime path needs a safe diagnostic surface to separate camera/gate/model/prompt/parser/dedup causes.
 3. Once the cause is isolated, the realtime prompt/runtime policy should be tightened so normal visible frames produce a non-empty `caption` without relaxing event/action strictness.
 
+## Pre-Development One-Frame Verification
+
+Before implementation started, a read-only production verification was run under `CHG260830029` on `miloco.esxi` using the configured living-room RTSP source and current Omni profile:
+
+- Living-room RTSP source was enabled, connected, and part of active perception.
+- One real living-room frame was decoded successfully with shape `[2160, 3840, 3]`.
+- The current Omni profile used `openai_responses`, model `grok-chat-auto`, and the configured `http://ai.esxi:18090/v1` base URL.
+- A non-fused, single-frame visual Responses request included one image block and returned HTTP 200 in 14.366s with input/output token usage and response text.
+- Miloco's structured parser still marked that response as skipped because the returned text was not valid structured perception JSON.
+- A production fused-shape single-frame request included one image block and five text blocks, then timed out at the configured 30s timeout.
+
+This refutes the "no LLM participates at all" hypothesis. The current evidence points to a prompt/response-contract and latency problem in the realtime/fused path:
+
+1. The endpoint can receive a visual request and produce text.
+2. The simpler prompt can receive non-JSON text that Miloco cannot parse into semantic fields.
+3. The production fused-shape prompt can exceed the current timeout before a usable response is returned.
+
+The implementation should therefore prioritize visibility for `provider_http_ok_but_parse_skipped` and `fused_shape_timeout` separately from pure endpoint reachability.
+
 ## Goals
 
 ### Phase 1 — Runtime Transparency
@@ -45,6 +64,7 @@ Add bounded, credential-safe diagnostics for realtime Omni calls and then repair
 - Capture structural request summaries, not raw prompts, raw model responses, images, audio, RTSP URLs, API keys, Xiaomi tokens, or session cookies.
 - Capture field counts after parse: caption count, matched rule count, suggestion count, complete speech count, incomplete speech count, skipped flag, parser fallback flag, and error code.
 - Compare realtime output structure with on-demand/probe behavior.
+- Distinguish HTTP success with non-JSON text from provider timeout in production fused-shape requests.
 - Tighten the visual caption contract so a normal visible video/image window should return a non-empty `caption`.
 - Keep strict filtering for rules, suggestions, actions, and voice responses.
 
@@ -309,6 +329,7 @@ class RealtimeOmniDiagnostic:
     video_block_count: int
     audio_block_count: int
     response_text_length: int
+    response_json_like: bool
     parse_ok: bool
     skipped: bool
     caption_count: int
@@ -334,6 +355,7 @@ The diagnostic ring answers:
 
 - Did the realtime request include visual input blocks?
 - Did the model return any response text?
+- Did the response text look like a JSON object/array before parser fallback?
 - Did parser succeed?
 - Did parsed semantic fields all end up empty?
 
@@ -397,6 +419,7 @@ Add tests in the existing prompt-builder suite to ensure:
 - video route keeps `caption`;
 - audio-only route does not include `caption`;
 - caption spec says a usable visible window should return a non-empty description;
+- structured-output instructions remain explicit enough for Responses-style image-sequence requests;
 - strict `matched_rules` and `suggestions` instructions remain unchanged.
 
 ## Testing Strategy
@@ -447,4 +470,3 @@ Production deployment is not part of this document. When implementation is compl
 8. If the prompt repair succeeds, confirm recent runtime summaries show non-empty captions or raw log inserts when cameras have usable visible frames.
 
 Do not print or store secrets in CO notes, shell logs, memory files, screenshots, or final summaries.
-
