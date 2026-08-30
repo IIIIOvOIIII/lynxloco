@@ -126,6 +126,35 @@ def _fake_async_client(
     return _C
 
 
+def _fake_async_client_post_sequence(
+    *,
+    get_resp: _FakeResp,
+    post_resps: list[_FakeResp],
+    calls: list[tuple[str, str, dict]] | None = None,
+):
+    class _C:
+        def __init__(self, *a, **k):
+            self._post_resps = list(post_resps)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, *a, **k):
+            if calls is not None:
+                calls.append(("GET", a[0], k))
+            return get_resp
+
+        async def post(self, *a, **k):
+            if calls is not None:
+                calls.append(("POST", a[0], k))
+            return self._post_resps.pop(0)
+
+    return _C
+
+
 # ─── probe_reachable ────────────────────────────────────────────────────────
 
 
@@ -947,9 +976,12 @@ async def test_responses_visual_probe_without_key_sends_valid_red_jpeg(monkeypat
     monkeypatch.setattr(
         probe.httpx,
         "AsyncClient",
-        _fake_async_client(
+        _fake_async_client_post_sequence(
             get_resp=_FakeResp(200, {"data": [{"id": "local-vlm"}]}),
-            post_resp=_FakeResp(200, _responses_output("RED")),
+            post_resps=[
+                _FakeResp(200, _responses_output("RED")),
+                _FakeResp(200, _responses_output("blue")),
+            ],
             calls=calls,
         ),
     )
@@ -967,9 +999,11 @@ async def test_responses_visual_probe_without_key_sends_valid_red_jpeg(monkeypat
     assert [call[:2] for call in calls] == [
         ("GET", "http://127.0.0.1:8000/v1/models"),
         ("POST", "http://127.0.0.1:8000/v1/responses"),
+        ("POST", "http://127.0.0.1:8000/v1/responses"),
     ]
     assert "Authorization" not in calls[0][2]["headers"]
     assert "Authorization" not in calls[1][2]["headers"]
+    assert "Authorization" not in calls[2][2]["headers"]
 
     body = calls[1][2]["json"]
     assert body["model"] == "local-vlm"
@@ -991,6 +1025,47 @@ async def test_responses_visual_probe_without_key_sends_valid_red_jpeg(monkeypat
         assert isinstance(pixel, tuple)
         red, green, blue = pixel
     assert red > 240 and green < 20 and blue < 20
+
+    body = calls[2][2]["json"]
+    content = body["input"][0]["content"]
+    data_url = content[1]["image_url"]
+    image_bytes = base64.b64decode(data_url.partition(",")[2], validate=True)
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        image.load()
+        pixel = image.convert("RGB").resize((1, 1)).getpixel((0, 0))
+        assert isinstance(pixel, tuple)
+        red, green, blue = pixel
+    assert blue > 240 and red < 20 and green < 20
+
+
+async def test_responses_visual_probe_rejects_model_that_always_answers_red(
+    monkeypatch,
+):
+    """固定红图预检会让不看图、总答 red 的 provider 假阳性通过。"""
+    calls: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_async_client_post_sequence(
+            get_resp=_FakeResp(404),
+            post_resps=[
+                _FakeResp(200, _responses_output("red")),
+                _FakeResp(200, _responses_output("red")),
+            ],
+            calls=calls,
+        ),
+    )
+
+    result = await probe.probe_omni(
+        "local-vlm",
+        "https://vlm.example/v1",
+        "",
+        api_protocol="openai_responses",
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "bad_response"
+    assert [call[0] for call in calls] == ["GET", "POST", "POST"]
 
 
 async def test_responses_visual_probe_budget_allows_reasoning_before_text(monkeypatch):
@@ -1036,7 +1111,7 @@ async def test_responses_visual_probe_budget_allows_reasoning_before_text(monkey
                         },
                     },
                 )
-            return _FakeResp(200, _responses_output("red"))
+            return _FakeResp(200, _responses_output("red" if len(calls) == 2 else "blue"))
 
     monkeypatch.setattr(probe.httpx, "AsyncClient", _ReasoningBudgetClient)
 
@@ -1057,9 +1132,12 @@ async def test_responses_visual_probe_sends_bearer_key(monkeypatch):
     monkeypatch.setattr(
         probe.httpx,
         "AsyncClient",
-        _fake_async_client(
+        _fake_async_client_post_sequence(
             get_resp=_FakeResp(200, {"data": []}),
-            post_resp=_FakeResp(200, _responses_output("red")),
+            post_resps=[
+                _FakeResp(200, _responses_output("red")),
+                _FakeResp(200, _responses_output("blue")),
+            ],
             calls=calls,
         ),
     )
@@ -1074,6 +1152,7 @@ async def test_responses_visual_probe_sends_bearer_key(monkeypatch):
     assert result["ok"] is True
     assert calls[0][2]["headers"]["Authorization"] == "Bearer sk-secret"
     assert calls[1][2]["headers"]["Authorization"] == "Bearer sk-secret"
+    assert calls[2][2]["headers"]["Authorization"] == "Bearer sk-secret"
 
 
 async def test_responses_visual_probe_models_not_supported_still_proves_vision(
@@ -1084,9 +1163,12 @@ async def test_responses_visual_probe_models_not_supported_still_proves_vision(
         monkeypatch.setattr(
             probe.httpx,
             "AsyncClient",
-            _fake_async_client(
+            _fake_async_client_post_sequence(
                 get_resp=_FakeResp(status),
-                post_resp=_FakeResp(200, _responses_output("red.")),
+                post_resps=[
+                    _FakeResp(200, _responses_output("red.")),
+                    _FakeResp(200, _responses_output("blue.")),
+                ],
                 calls=calls,
             ),
         )
@@ -1099,7 +1181,7 @@ async def test_responses_visual_probe_models_not_supported_still_proves_vision(
         )
 
         assert result["ok"] is True
-        assert [call[0] for call in calls] == ["GET", "POST"]
+        assert [call[0] for call in calls] == ["GET", "POST", "POST"]
 
 
 @pytest.mark.parametrize(
@@ -1139,13 +1221,16 @@ async def test_responses_visual_probe_rejects_non_exact_color_answer(
 
 
 @pytest.mark.parametrize("answer", ["red", "RED", "  red\n", "red.", " RED. "])
-async def test_responses_visual_probe_accepts_exact_red_answer(monkeypatch, answer):
+async def test_responses_visual_probe_accepts_exact_color_answers(monkeypatch, answer):
     monkeypatch.setattr(
         probe.httpx,
         "AsyncClient",
-        _fake_async_client(
+        _fake_async_client_post_sequence(
             get_resp=_FakeResp(405),
-            post_resp=_FakeResp(200, _responses_output(answer)),
+            post_resps=[
+                _FakeResp(200, _responses_output(answer)),
+                _FakeResp(200, _responses_output(" blue.\n")),
+            ],
         ),
     )
 
@@ -1188,9 +1273,12 @@ async def test_responses_visual_probe_warns_when_usage_is_missing(monkeypatch):
     monkeypatch.setattr(
         probe.httpx,
         "AsyncClient",
-        _fake_async_client(
+        _fake_async_client_post_sequence(
             get_resp=_FakeResp(404),
-            post_resp=_FakeResp(200, _responses_output("red", usage=None)),
+            post_resps=[
+                _FakeResp(200, _responses_output("red", usage=None)),
+                _FakeResp(200, _responses_output("blue")),
+            ],
         ),
     )
 
@@ -1209,9 +1297,12 @@ async def test_responses_visual_probe_warns_when_usage_is_malformed(monkeypatch)
     monkeypatch.setattr(
         probe.httpx,
         "AsyncClient",
-        _fake_async_client(
+        _fake_async_client_post_sequence(
             get_resp=_FakeResp(404),
-            post_resp=_FakeResp(200, _responses_output("red", usage="not-an-object")),
+            post_resps=[
+                _FakeResp(200, _responses_output("red", usage="not-an-object")),
+                _FakeResp(200, _responses_output("blue")),
+            ],
         ),
     )
 
@@ -1291,7 +1382,10 @@ async def test_responses_visual_probe_accepts_15_5_second_response_with_30_secon
             effective_timeouts.append(effective_timeout)
             if effective_timeout.read <= 15.5:
                 raise httpx.ReadTimeout("simulated 15.5 second response")
-            return _FakeResp(200, _responses_output("red"))
+            return _FakeResp(
+                200,
+                _responses_output("red" if len(effective_timeouts) == 1 else "blue"),
+            )
 
     monkeypatch.setattr(probe.httpx, "AsyncClient", _LatencyAwareAsyncClient)
 
@@ -1432,9 +1526,12 @@ async def test_explicit_responses_protocol_never_falls_back_by_model_name(monkey
         monkeypatch.setattr(
             probe.httpx,
             "AsyncClient",
-            _fake_async_client(
+            _fake_async_client_post_sequence(
                 get_resp=_FakeResp(404),
-                post_resp=_FakeResp(200, _responses_output("red")),
+                post_resps=[
+                    _FakeResp(200, _responses_output("red")),
+                    _FakeResp(200, _responses_output("blue")),
+                ],
                 calls=calls,
             ),
         )
@@ -1449,6 +1546,8 @@ async def test_explicit_responses_protocol_never_falls_back_by_model_name(monkey
         assert result["ok"] is True
         assert calls[1][1] == "https://vlm.example/v1/responses"
         assert calls[1][2]["json"]["stream"] is False
+        assert calls[2][1] == "https://vlm.example/v1/responses"
+        assert calls[2][2]["json"]["stream"] is False
 
 
 async def test_explicit_gemini_probe_protocol_overrides_model_name(monkeypatch):

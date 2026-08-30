@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import io
 import json
 import threading
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from miloco.perception.engine.omni.probe import _RESPONSES_VISUAL_MAX_OUTPUT_TOKENS
+from PIL import Image, UnidentifiedImageError
 
 
 @dataclass(frozen=True)
@@ -149,7 +151,7 @@ class _ResponsesHandler(BaseHTTPRequestHandler):
             return
 
         output_text = (
-            "red"
+            _visual_probe_answer(body)
             if is_visual_probe
             else json.dumps(
                 {
@@ -289,6 +291,27 @@ def _validate_request(body: dict[str, Any]) -> tuple[int, bool] | str:
     if image_count > 12:
         return "too_many_images"
     return image_count, body["stream"]
+
+
+def _visual_probe_answer(body: dict[str, Any]) -> str:
+    user = body["input"][0]
+    for block in user["content"]:
+        if not isinstance(block, dict) or block.get("type") != "input_image":
+            continue
+        image_url = block["image_url"]
+        raw = base64.b64decode(image_url.split(",", 1)[1], validate=True)
+        try:
+            with Image.open(io.BytesIO(raw)) as image:
+                pixel = image.convert("RGB").resize((1, 1)).getpixel((0, 0))
+        except (OSError, UnidentifiedImageError):
+            return "unknown"
+        red, green, blue = pixel
+        if red >= green and red >= blue:
+            return "red"
+        if blue >= red and blue >= green:
+            return "blue"
+        return "green"
+    return "unknown"
 
 
 def _usage() -> dict[str, Any]:

@@ -9,13 +9,14 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import time
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 import httpx
+from PIL import Image
 
 from miloco.perception.engine.omni.error_classifier import safe_provider_config_code
 
@@ -27,7 +28,11 @@ _TIMEOUT = httpx.Timeout(15.0, connect=10.0)
 _RESPONSES_VISUAL_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 _RESPONSES_VISUAL_MAX_OUTPUT_TOKENS = 256
 _ALLOWED_SCHEMES = ("http", "https")
-_VISUAL_PROBE_IMAGE = Path(__file__).with_name("assets") / "visual_probe_red.jpg"
+_VISUAL_PROBE_SIZE = (32, 32)
+_RESPONSES_VISUAL_PROBES = (
+    ("red", (255, 0, 0)),
+    ("blue", (0, 0, 255)),
+)
 _VISUAL_PROBE_PROMPT = (
     "What is the dominant color of this image? "
     "Reply with exactly one English color word and no other text."
@@ -229,7 +234,14 @@ async def _probe_stream_chat(
 
 
 def _visual_answer_is_red(value: Any) -> bool:
-    return isinstance(value, str) and value.casefold().strip() in {"red", "red."}
+    return _visual_answer_is(value, "red")
+
+
+def _visual_answer_is(value: Any, expected: str) -> bool:
+    return (
+        isinstance(value, str)
+        and value.casefold().strip().rstrip(".") == expected.casefold()
+    )
 
 
 async def probe_chat(
@@ -482,8 +494,14 @@ def _probe_http_failure(
     }
 
 
-def _visual_probe_messages() -> list[dict[str, Any]]:
-    image_data = base64.b64encode(_VISUAL_PROBE_IMAGE.read_bytes()).decode("ascii")
+def _visual_probe_data_url(rgb: tuple[int, int, int]) -> str:
+    buffer = io.BytesIO()
+    Image.new("RGB", _VISUAL_PROBE_SIZE, rgb).save(buffer, format="JPEG", quality=95)
+    image_data = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/jpeg;base64,{image_data}"
+
+
+def _visual_probe_messages(rgb: tuple[int, int, int] = (255, 0, 0)) -> list[dict[str, Any]]:
     return [
         {
             "role": "system",
@@ -496,7 +514,7 @@ def _visual_probe_messages() -> list[dict[str, Any]]:
                 {
                     "type": "image_url",
                     "image_url": {
-                        "url": f"data:image/jpeg;base64,{image_data}",
+                        "url": _visual_probe_data_url(rgb),
                     },
                 },
             ],
@@ -530,20 +548,25 @@ async def _probe_responses(
                     visual_request=False,
                 )
 
-            body = adapter.build_request_body(
-                _visual_probe_messages(),
-                model=model,
-                max_tokens=_RESPONSES_VISUAL_MAX_OUTPUT_TOKENS,
-                temperature=0.0,
-                top_p=1.0,
-                stream=False,
-            )
-            response = await client.post(
-                adapter.endpoint(base, model, stream=False),
-                headers={**auth_headers, "Content-Type": "application/json"},
-                json=body,
-                timeout=_RESPONSES_VISUAL_TIMEOUT,
-            )
+            responses: list[tuple[str, Any]] = []
+            for expected_color, rgb in _RESPONSES_VISUAL_PROBES:
+                body = adapter.build_request_body(
+                    _visual_probe_messages(rgb),
+                    model=model,
+                    max_tokens=_RESPONSES_VISUAL_MAX_OUTPUT_TOKENS,
+                    temperature=0.0,
+                    top_p=1.0,
+                    stream=False,
+                )
+                response = await client.post(
+                    adapter.endpoint(base, model, stream=False),
+                    headers={**auth_headers, "Content-Type": "application/json"},
+                    json=body,
+                    timeout=_RESPONSES_VISUAL_TIMEOUT,
+                )
+                responses.append((expected_color, response))
+                if response.status_code != 200:
+                    break
     except Exception as exc:  # noqa: BLE001
         return {
             "ok": False,
@@ -552,31 +575,16 @@ async def _probe_responses(
         }
 
     latency_ms = round((time.monotonic() - t0) * 1000)
-    if response.status_code != 200:
-        return _probe_http_failure(response, latency_ms, visual_request=True)
+    usage_warning = False
+    for expected_color, response in responses:
+        if response.status_code != 200:
+            return _probe_http_failure(response, latency_ms, visual_request=True)
 
-    try:
-        raw = response.json()
-    except Exception:  # noqa: BLE001
-        raw = None
-    if not isinstance(raw, dict):
-        return {
-            "ok": False,
-            "code": "bad_response",
-            "status": 200,
-            "latency_ms": latency_ms,
-            "message": "Responses 视觉预检响应格式异常",
-        }
-
-    usage_warning = raw.get("usage") is None
-    try:
-        normalized = adapter.parse_response(raw)
-    except ValueError:
-        without_usage = dict(raw)
-        without_usage["usage"] = None
         try:
-            normalized = adapter.parse_response(without_usage)
-        except ValueError:
+            raw = response.json()
+        except Exception:  # noqa: BLE001
+            raw = None
+        if not isinstance(raw, dict):
             return {
                 "ok": False,
                 "code": "bad_response",
@@ -584,17 +592,33 @@ async def _probe_responses(
                 "latency_ms": latency_ms,
                 "message": "Responses 视觉预检响应格式异常",
             }
-        usage_warning = True
+        usage_warning = usage_warning or raw.get("usage") is None
+        try:
+            normalized = adapter.parse_response(raw)
+        except ValueError:
+            without_usage = dict(raw)
+            without_usage["usage"] = None
+            try:
+                normalized = adapter.parse_response(without_usage)
+            except ValueError:
+                return {
+                    "ok": False,
+                    "code": "bad_response",
+                    "status": 200,
+                    "latency_ms": latency_ms,
+                    "message": "Responses 视觉预检响应格式异常",
+                }
+            usage_warning = True
 
-    output_text = normalized["choices"][0]["message"]["content"]
-    if not _visual_answer_is_red(output_text):
-        return {
-            "ok": False,
-            "code": "bad_response",
-            "status": 200,
-            "latency_ms": latency_ms,
-            "message": "Responses 服务未通过图片颜色验证",
-        }
+        output_text = normalized["choices"][0]["message"]["content"]
+        if not _visual_answer_is(output_text, expected_color):
+            return {
+                "ok": False,
+                "code": "bad_response",
+                "status": 200,
+                "latency_ms": latency_ms,
+                "message": "Responses 服务未通过图片颜色验证",
+            }
 
     result: dict[str, Any] = {
         "ok": True,
