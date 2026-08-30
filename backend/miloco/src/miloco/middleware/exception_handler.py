@@ -10,6 +10,7 @@ Provides exception handling mechanisms:
 """
 
 import logging
+from typing import Any
 
 from fastapi import Request, status
 from fastapi.exceptions import HTTPException as FastAPIHTTPException
@@ -23,6 +24,27 @@ logger = logging.getLogger(__name__)
 
 
 SYSTEM_ERROR_CODE = 9000
+_OMIT_VALIDATION_VALUE = object()
+
+
+def _json_safe_validation_value(value: Any) -> Any:
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for key, nested in value.items():
+            safe_nested = _json_safe_validation_value(nested)
+            if safe_nested is not _OMIT_VALIDATION_VALUE:
+                sanitized[str(key)] = safe_nested
+        return sanitized
+    if isinstance(value, list | tuple):
+        sanitized_items = []
+        for item in value:
+            safe_item = _json_safe_validation_value(item)
+            if safe_item is not _OMIT_VALIDATION_VALUE:
+                sanitized_items.append(safe_item)
+        return sanitized_items
+    return _OMIT_VALIDATION_VALUE
 
 
 def _create_error_response(
@@ -83,10 +105,13 @@ def handle_exception(request: Request, exc: Exception) -> JSONResponse:
     # 1. Special handling for RequestValidationError (Pydantic validation errors)
     if isinstance(exc, RequestValidationError):
         logger.warning("Request validation failed for %s", request.url.path)
-        errors = [
-            {key: value for key, value in error.items() if key != "input"}
-            for error in exc.errors()
-        ]
+        errors = []
+        for error in exc.errors():
+            sanitized_error = _json_safe_validation_value(
+                {key: value for key, value in error.items() if key != "input"}
+            )
+            if sanitized_error is not _OMIT_VALIDATION_VALUE:
+                errors.append(sanitized_error)
         return _create_error_response(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             code=1002,  # Parameter validation failure error code, consistent with ValidationException

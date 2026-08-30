@@ -138,6 +138,26 @@ def test_public_auth_rejects_oversized_credentials_without_echoing_password(
     assert oversized_password not in caplog.text
 
 
+def test_custom_validator_error_returns_redacted_json_422(tmp_path, monkeypatch) -> None:
+    client = _client(tmp_path, monkeypatch)
+    raw_username = "   "
+
+    response = client.post(
+        "/api/auth/setup",
+        json={
+            "username": raw_username,
+            "display_name": "Lynx",
+            "password": "correct horse battery",
+            "password_confirm": "correct horse battery",
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json()["code"] == 1002
+    assert raw_username not in response.text
+
+
 def test_logout_requires_csrf_for_valid_session_then_remains_anonymous_idempotent(
     tmp_path, monkeypatch
 ) -> None:

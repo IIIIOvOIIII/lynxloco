@@ -116,3 +116,38 @@ because no centralized session-expiry subscriber existed.
   main bundle exceeding 500 kB; this fix did not change that boundary.
 - Production remains unmodified. Deployment still requires the controller's
   approved CO/PAM flow and a pre-deploy data backup.
+
+## Extra targeted fix
+
+The validation-error sanitizer was tightened after a scoped re-review found
+that custom Pydantic validators can place live exception objects in `ctx`.
+Removing only the top-level `input` value was not enough to make the error
+details safe for `JSONResponse`.
+
+The sanitizer now recursively retains JSON-safe primitives, lists, tuples, and
+dictionaries while omitting non-serializable nested objects. Raw validation
+input remains removed. This preserves useful fields such as error type,
+location, message, URL, and primitive constraint context without weakening the
+schema or changing authentication behavior.
+
+### Extra targeted RED
+
+Command:
+
+```text
+cd backend && uv run pytest miloco/tests/auth/test_auth_router.py::test_custom_validator_error_returns_redacted_json_422 -q
+```
+
+Observed before the sanitizer change: 1 failed. A whitespace-only setup
+username returned HTTP 500 instead of 422 because the nested `ValueError` was
+not JSON serializable.
+
+### Extra targeted GREEN
+
+- Focused whitespace-validator regression: 1 passed.
+- Backend auth suite: 40 passed.
+- Scoped Ruff for sanitizer and regression test: passed.
+- Full local release gate `./scripts/local-ci.sh --tests`: all 6 gate items
+  passed, including the full backend gate and 187 Hermes tests with 2 expected
+  skips.
+- `git diff --check`: passed.
