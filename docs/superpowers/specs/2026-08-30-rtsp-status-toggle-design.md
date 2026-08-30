@@ -51,12 +51,15 @@ The RTSP switch follows existing RTSP mutation behavior:
 
 ## Testing
 
-Add frontend tests for the behavior that failed in production:
+Add frontend tests for the behavior that failed in production. The existing web
+test environment is Node-based Vitest without jsdom/React Testing Library, so
+the implementation should expose small pure helpers or hook-free components
+that can be tested without adding new dependencies:
 
-1. When the engine is running/ready, all MIoT scope cameras are off, and an RTSP camera summary is enabled and connected, the status ribbon receives `allCamerasOff=false` and shows `在看家`.
-2. When the engine is running/ready and all MIoT cameras plus all RTSP cameras are inactive or disconnected, the status ribbon shows `待机中`.
-3. RTSP cards expose a perception switch whose checked state follows `camera.enabled`.
-4. Clicking the RTSP switch calls the existing RTSP toggle callback with the camera and target enabled state.
+1. A pure status helper returns `hasActivePerceptionCamera=true` when all MIoT scope cameras are off and an RTSP camera summary is enabled and connected.
+2. The same helper returns false when all MIoT cameras plus all RTSP cameras are inactive or disconnected.
+3. A hook-free RTSP perception switch component exposes `role="switch"` and `aria-checked` from `camera.enabled`.
+4. Calling the switch `onClick` path invokes the existing RTSP toggle callback with the camera and target enabled state.
 
 Tests should assert rendered behavior and callback contracts, not internal implementation text. No tests should contain RTSP URLs, API keys, tokens, or camera images.
 
