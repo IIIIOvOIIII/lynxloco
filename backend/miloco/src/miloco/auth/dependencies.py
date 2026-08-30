@@ -41,9 +41,9 @@ def extract_bearer_token(authorization: str | None) -> str | None:
 
 def valid_service_token(token: str | None) -> bool:
     expected = get_settings().server.token
-    if not expected:
+    if not expected or token is None:
         return False
-    return token is not None and hmac.compare_digest(token, expected)
+    return hmac.compare_digest(token.encode("utf-8"), expected.encode("utf-8"))
 
 
 def verify_service_token(request: Request) -> AuthContext:

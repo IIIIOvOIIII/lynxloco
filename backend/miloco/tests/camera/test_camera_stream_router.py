@@ -123,13 +123,12 @@ def client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> TestClient:
     monkeypatch.setattr(
-        "miloco.middleware.auth_middleware.get_settings",
+        "miloco.auth.dependencies.get_settings",
         lambda: SimpleNamespace(server=SimpleNamespace(token="service-token")),
     )
     monkeypatch.setattr(
         "miloco.camera.router.get_settings",
         lambda: SimpleNamespace(
-            server=SimpleNamespace(token="service-token"),
             directories=SimpleNamespace(
                 static_dir=(
                     __import__("pathlib").Path(__file__).parents[4] / "web" / "public"
@@ -190,12 +189,11 @@ def test_unauthenticated_upgrade_is_rejected(client: TestClient) -> None:
             pass
 
 
-def test_generic_upgrade_rejects_legacy_query_token(client: TestClient) -> None:
-    with pytest.raises(WebSocketDisconnect):
-        with client.websocket_connect(
-            "/api/cameras/rtsp%3Acamera/stream?token=service-token"
-        ):
-            pass
+def test_generic_upgrade_accepts_service_query_token(client: TestClient) -> None:
+    with client.websocket_connect(
+        "/api/cameras/rtsp%3Acamera/stream?token=service-token"
+    ) as websocket:
+        assert websocket.receive_bytes() == b"\x00\x00\x00\x01\x65"
 
 
 @pytest.mark.asyncio
@@ -205,15 +203,8 @@ async def test_uvicorn_handshake_contract_and_access_logs_never_expose_token(
     special_token = "sp ace/+?汉字-secret"
     rejected_token = f"{special_token}-wrong"
     monkeypatch.setattr(
-        "miloco.camera.router.get_settings",
-        lambda: SimpleNamespace(
-            server=SimpleNamespace(token=special_token),
-            directories=SimpleNamespace(
-                static_dir=(
-                    __import__("pathlib").Path(__file__).parents[4] / "web" / "public"
-                )
-            ),
-        ),
+        "miloco.auth.dependencies.get_settings",
+        lambda: SimpleNamespace(server=SimpleNamespace(token=special_token)),
     )
     service = _Service()
     hub = _Hub()
@@ -458,13 +449,14 @@ async def test_abrupt_client_disconnect_closes_the_stream_iterator(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "miloco.camera.router.get_settings",
+        "miloco.auth.dependencies.get_settings",
         lambda: SimpleNamespace(server=SimpleNamespace(token="service-token")),
     )
 
     class _DisconnectingWebSocket:
         headers = {"Authorization": "Bearer service-token"}
         query_params: dict[str, str] = {}
+        cookies: dict[str, str] = {}
 
         def __init__(self) -> None:
             self.accepted = False

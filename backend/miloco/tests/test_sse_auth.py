@@ -9,8 +9,11 @@
 3. /api/events 普通 endpoint 仍只接受 header(F4 修复不影响其他 endpoint)
 """
 
+import asyncio
+from types import SimpleNamespace
+
 import pytest
-from fastapi import Depends, FastAPI, Request
+from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
 # ─── 单元测试 verify_token_query_fallback ─────────────────
@@ -184,12 +187,13 @@ class TestSSEEndpointAuth:
         )
         assert resp.status_code == 200
 
-    def test_session_cookie_can_authorize_query_fallback_dependency(
+    def test_session_cookie_can_open_events_stream_without_query_token(
         self, tmp_path, monkeypatch
     ):
-        """SSE/media dependencies accept a same-origin dashboard session."""
+        """The concrete events SSE route accepts a same-origin session cookie."""
         from miloco.auth.router import router as auth_router
         from miloco.database.connector import init_database
+        from miloco.perception import events_router as events_router_module
 
         monkeypatch.setenv("MILOCO_HOME", str(tmp_path))
         monkeypatch.setenv("MILOCO_DATABASE__PATH", str(tmp_path / "miloco.db"))
@@ -202,15 +206,30 @@ class TestSSEEndpointAuth:
         init_database()
         app = FastAPI()
         app.include_router(auth_router, prefix="/api")
+        app.include_router(events_router_module.router, prefix="/api")
 
-        from miloco.middleware import verify_token_query_fallback
+        class _BoundedPipeline:
+            def __init__(self) -> None:
+                self.unsubscribed = False
 
-        @app.get(
-            "/api/sse-auth",
-            dependencies=[Depends(verify_token_query_fallback)],
+            def subscribe_sse(self):
+                return self
+
+            async def get(self):
+                raise asyncio.CancelledError
+
+            def unsubscribe_sse(self, queue) -> None:
+                assert queue is self
+                self.unsubscribed = True
+
+        pipeline = _BoundedPipeline()
+        monkeypatch.setattr(
+            events_router_module,
+            "get_manager",
+            lambda: SimpleNamespace(
+                perception_service=SimpleNamespace(_pipeline=pipeline)
+            ),
         )
-        def sse_auth_probe():
-            return {"ok": True}
 
         client = TestClient(app)
         setup = client.post(
@@ -224,7 +243,7 @@ class TestSSEEndpointAuth:
         )
         assert setup.status_code == 200
 
-        # The concrete /events/stream generator is intentionally not opened here:
-        # it has no terminating event under TestClient. This finite endpoint
-        # exercises the identical SSE/media dependency without a query token.
-        assert client.get("/api/sse-auth").status_code == 200
+        response = client.get("/api/events/stream")
+
+        assert response.status_code == 200
+        assert pipeline.unsubscribed is True
