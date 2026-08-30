@@ -568,9 +568,7 @@ class RtspSession:
 
             stream_type = getattr(packet.stream, "type", None)
             if self._listeners and stream_type == "video":
-                self._enqueue_packet_from_thread(
-                    self._snapshot_video_packet(packet), loop
-                )
+                self._try_enqueue_packet_snapshot(packet, loop)
             if stream_type == "audio" and not self._source.audio_enabled:
                 continue
             if stream_type not in {"video", "audio"}:
@@ -707,6 +705,17 @@ class RtspSession:
                 schedule_drain = True
         if schedule_drain:
             loop.call_soon_threadsafe(self._wake_packet_consumer)
+
+    def _try_enqueue_packet_snapshot(
+        self, packet: object, loop: asyncio.AbstractEventLoop
+    ) -> None:
+        try:
+            snapshot = self._snapshot_video_packet(packet)
+        except Exception:
+            with self._ingress_lock:
+                self._dropped_packets += 1
+            return
+        self._enqueue_packet_from_thread(snapshot, loop)
 
     def _wake_media_consumer(self) -> None:
         if self._media_ready is not None:

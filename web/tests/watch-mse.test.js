@@ -3,6 +3,7 @@ import {
   createReadyJmuxer,
   feedFirstAccessUnitWhenReady,
   handleCurrentSocketTerminalClose,
+  shouldReconnectLiveSocket,
   shouldUseJpegCanvasFallback,
 } from "../public/watch-mse.js";
 
@@ -355,5 +356,27 @@ describe("shouldUseJpegCanvasFallback", () => {
       isSecureContext: true,
       hasVideoDecoder: true,
     })).toBe(false);
+  });
+});
+
+describe("shouldReconnectLiveSocket", () => {
+  it("keeps an open socket through a short decoded-frame stall", () => {
+    expect(shouldReconnectLiveSocket({
+      nowMs: 20_000,
+      socketOpen: true,
+      configured: true,
+      lastWsTs: 12_000,
+      lastFrameLocalMs: 11_500,
+    })).toEqual({ reconnect: false, reason: null });
+  });
+
+  it("reconnects an open socket after a sustained quiet period", () => {
+    expect(shouldReconnectLiveSocket({
+      nowMs: 60_500,
+      socketOpen: true,
+      configured: true,
+      lastWsTs: 15_000,
+      lastFrameLocalMs: 15_000,
+    })).toEqual({ reconnect: true, reason: "ws_quiet" });
   });
 });

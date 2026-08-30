@@ -143,6 +143,11 @@ class _Packet:
         return bytes(self._data)
 
 
+class _PacketWithBrokenSnapshot(_Packet):
+    def __bytes__(self) -> bytes:
+        raise av.error.InvalidDataError(1, "packet snapshot failed")
+
+
 class _Container:
     def __init__(
         self,
@@ -1491,6 +1496,43 @@ async def test_packet_snapshot_and_decode_share_one_open_session(
     assert snapshots[0].data == b"immutable-packet"
     await session.stop()
     assert opener.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_packet_snapshot_failure_does_not_stop_perception_decode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_module = _rtsp_session()
+    packet = _PacketWithBrokenSnapshot(_stream("video", "h264"), [_VideoFrame(11)])
+    container = _YieldThenBlockContainer(packet)
+    opener = _SequenceOpener(container)
+    monkeypatch.setattr(session_module.av, "open", opener)
+    monkeypatch.setattr(session_module, "reconnect_delay", lambda *_a, **_kw: 0.0)
+    session = session_module.RtspSession(_source())
+    packet_snapshots: list[EncodedVideoPacket] = []
+    received: list[int] = []
+    video_done = asyncio.Event()
+
+    session.add_packet_listener(packet_snapshots.append)
+
+    async def video_cb(
+        _did: str,
+        image: np.ndarray,
+        *_args: object,
+    ) -> None:
+        received.append(int(image[0, 0, 0]))
+        video_done.set()
+
+    await session.start(video_cb, _unused_audio_cb)
+    await asyncio.wait_for(video_done.wait(), timeout=1.0)
+    assert container.blocked.wait(timeout=0.5)
+
+    assert received == [11]
+    assert packet.decode_calls == 1
+    assert packet_snapshots == []
+    assert session.is_terminal() is False
+    assert session.state().error_code is None
+    await session.stop()
 
 
 @pytest.mark.asyncio

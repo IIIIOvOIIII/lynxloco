@@ -69,6 +69,7 @@
 import { createReadyJmuxer } from "/watch-mse.js";
 import { feedFirstAccessUnitWhenReady } from "/watch-mse.js";
 import { handleCurrentSocketTerminalClose } from "/watch-mse.js";
+import { shouldReconnectLiveSocket } from "/watch-mse.js";
 import { shouldUseJpegCanvasFallback } from "/watch-mse.js";
 
 const $ = (id) => document.getElementById(id);
@@ -998,20 +999,28 @@ $("refresh").addEventListener("click", refreshCameraList);
 // requiring the user to also press 重连.
 $("cam").addEventListener("change", connect);
 
-// Stale-stream watchdog: WS quiet for 15 s OR decoded video stalled for 8 s
-// while WS still flowing → reconnect. Using `lastWsTs` (any inbound message)
-// instead of `lastFrameTs` keeps us patient through the camera's first-IDR
-// wait, which can be a few seconds on IPC streams with sparse keyframes.
+// Stale-stream watchdog: keep an already-open preview steady through short
+// frame gaps. Reconnect only after sustained quiet/stall, otherwise LAN HTTP
+// JPEG fallback can amplify a small hiccup into a visible "connecting camera"
+// flicker on every embedded card.
 setInterval(() => {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   const now = Date.now();
-  const wsAge = stats.lastWsTs ? now - stats.lastWsTs : 0;
-  if (wsAge > 15000) {
+  const reconnect = shouldReconnectLiveSocket({
+    nowMs: now,
+    socketOpen: true,
+    configured,
+    lastWsTs: stats.lastWsTs,
+    lastFrameLocalMs: stats.lastFrameLocalMs,
+  });
+  if (!reconnect.reconnect) return;
+  if (reconnect.reason === "ws_quiet") {
+    const wsAge = stats.lastWsTs ? now - stats.lastWsTs : 0;
     setState(t("wsQuiet", (wsAge/1000).toFixed(0)), true);
     connect();
     return;
   }
-  if (configured && stats.lastFrameLocalMs && now - stats.lastFrameLocalMs > 8000) {
+  if (reconnect.reason === "decode_stalled") {
     setState(t("decodeStalled"), true);
     connect();
   }

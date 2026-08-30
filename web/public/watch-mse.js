@@ -115,3 +115,24 @@ export function shouldUseJpegCanvasFallback({
     && (!isSecureContext || !hasVideoDecoder)
   );
 }
+
+export function shouldReconnectLiveSocket({
+  nowMs,
+  socketOpen,
+  configured,
+  lastWsTs,
+  lastFrameLocalMs,
+  wsQuietTimeoutMs = 45_000,
+  decodedStallTimeoutMs = 30_000,
+}) {
+  if (!socketOpen) return { reconnect: false, reason: null };
+  const wsAge = lastWsTs > 0 ? nowMs - lastWsTs : 0;
+  if (wsAge > wsQuietTimeoutMs) {
+    return { reconnect: true, reason: "ws_quiet" };
+  }
+  const frameAge = lastFrameLocalMs > 0 ? nowMs - lastFrameLocalMs : 0;
+  if (configured && frameAge > decodedStallTimeoutMs) {
+    return { reconnect: true, reason: "decode_stalled" };
+  }
+  return { reconnect: false, reason: null };
+}
