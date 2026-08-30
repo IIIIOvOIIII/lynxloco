@@ -5,6 +5,8 @@
     "homeHint": "A glance at home",
     "devices": "Devices",
     "devicesHint": "Manage Xiaomi Home devices",
+    "homeAssistant": "Home Assistant",
+    "homeAssistantHint": "Manage HA devices",
     "family": "Family",
     "familyHint": "Manage family members",
     "tasks": "Tasks",

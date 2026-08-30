@@ -12,6 +12,12 @@ import type {
   ActivityEvent,
   Device,
   EventCropMeta,
+  HomeAssistantConfigUpdate,
+  HomeAssistantEntity,
+  HomeAssistantEntityPolicyUpdate,
+  HomeAssistantPublicConfig,
+  HomeAssistantStatus,
+  HomeAssistantTestResult,
   HomeEntries,
   HomeEntryType,
   HomeId,
@@ -325,6 +331,42 @@ export async function controlDeviceProp(
   value: number | string | boolean,
 ): Promise<void> {
   return impl.realControlDeviceProp(did, iid, value);
+}
+
+// ── Home Assistant ─────────────────────────────────────────
+export async function getHomeAssistantStatus(): Promise<HomeAssistantStatus> {
+  return impl.realGetHomeAssistantStatus();
+}
+
+export async function getHomeAssistantConfig(): Promise<HomeAssistantPublicConfig> {
+  return impl.realGetHomeAssistantConfig();
+}
+
+export async function testHomeAssistantConfig(
+  input: HomeAssistantConfigUpdate,
+): Promise<HomeAssistantTestResult> {
+  return impl.realTestHomeAssistantConfig(input);
+}
+
+export async function saveHomeAssistantConfig(
+  input: HomeAssistantConfigUpdate,
+): Promise<HomeAssistantPublicConfig> {
+  return impl.realSaveHomeAssistantConfig(input);
+}
+
+export async function listHomeAssistantEntities(): Promise<HomeAssistantEntity[]> {
+  return impl.realListHomeAssistantEntities();
+}
+
+export async function refreshHomeAssistantEntities(): Promise<HomeAssistantEntity[]> {
+  return impl.realRefreshHomeAssistantEntities();
+}
+
+export async function updateHomeAssistantEntityPolicy(
+  entityId: string,
+  patch: HomeAssistantEntityPolicyUpdate,
+): Promise<HomeAssistantEntity> {
+  return impl.realUpdateHomeAssistantEntityPolicy(entityId, patch);
 }
 
 // ── 场景 ──────────────────────────────────────────────────

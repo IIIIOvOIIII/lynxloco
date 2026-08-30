@@ -113,6 +113,9 @@ export type DeviceCategory =
   | "camera"
   | "other";
 
+export type DeviceSource = "miot" | "home_assistant";
+export type DeviceControlPolicy = "enabled" | "read_only";
+
 export interface DeviceProperty {
   iid: string; // 内部用，UI 不展示
   label: string; // 翻译后的中文标签（"温度" / "档位"）
@@ -128,6 +131,8 @@ export interface DeviceProperty {
 
 export interface Device {
   did: string;
+  source: DeviceSource;
+  sourceLabel: string;
   name: string;
   category: DeviceCategory;
   room: string;
@@ -138,6 +143,11 @@ export interface Device {
   statusKind: "offline" | "locked" | "unlocked" | "on" | "off" | "connected";
   // 是否危险设备（门锁/燃气/烟雾），需要二次确认
   dangerous: boolean;
+  included: boolean;
+  controlEnabled: boolean;
+  controlAvailable: boolean;
+  controlPolicy: DeviceControlPolicy;
+  readOnlyReason: string | null;
   // 主开关 prop（单按钮直控；为 null 时只能从 sheet 进）
   mainSwitch?: { iid: string; current: boolean };
   // 完整属性（QuickSheet 用）
@@ -147,6 +157,59 @@ export interface Device {
 export interface Scene {
   id: string;
   name: string;
+}
+
+export interface HomeAssistantPublicConfig {
+  enabled: boolean;
+  baseUrl: string;
+  instanceKey: string;
+  verifyTls: boolean;
+  tokenConfigured: boolean;
+  tokenMask: string;
+}
+
+export interface HomeAssistantStatus {
+  config: HomeAssistantPublicConfig;
+  configured: boolean;
+  enabled: boolean;
+  connected: boolean;
+  errorCode: string | null;
+  message: string;
+}
+
+export interface HomeAssistantTestResult {
+  ok: boolean;
+  connected: boolean;
+  errorCode: string | null;
+  message: string;
+}
+
+export interface HomeAssistantEntity {
+  entityId: string;
+  name: string;
+  domain: string;
+  state: string;
+  room?: string | null;
+  included: boolean;
+  controlEnabled: boolean;
+  controlSupported: boolean;
+  controlBlockedReason: string | null;
+  lastSeenAt: number | null;
+  lastControlAt: number | null;
+  lastError: string | null;
+}
+
+export interface HomeAssistantConfigUpdate {
+  enabled: boolean;
+  baseUrl: string;
+  token?: string | null;
+  preserveToken?: boolean;
+  verifyTls: boolean;
+}
+
+export interface HomeAssistantEntityPolicyUpdate {
+  included?: boolean;
+  controlEnabled?: boolean;
 }
 
 // ── 活动事件(meaningful_events)─────────────────────────────

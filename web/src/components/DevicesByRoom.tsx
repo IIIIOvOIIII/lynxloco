@@ -191,6 +191,7 @@ interface RowProps {
 }
 
 function DeviceRow({ device }: RowProps) {
+  const { t } = useTranslation();
   const Icon = CATEGORY_ICON[device.category] ?? IconPlug;
   const offline = !device.online;
   const ms = device.mainSwitch;
@@ -237,6 +238,17 @@ function DeviceRow({ device }: RowProps) {
       <span className="text-body truncate text-text-primary flex-1">
         {device.name}
       </span>
+      <span className="shrink-0 text-caption border border-border rounded px-1.5 py-0.5 text-text-tertiary">
+        {device.sourceLabel}
+      </span>
+      {!device.controlAvailable && (
+        <span
+          className="shrink-0 text-caption border border-border rounded px-1.5 py-0.5 text-text-tertiary"
+          title={device.readOnlyReason ?? undefined}
+        >
+          {t("devices.readOnly")}
+        </span>
+      )}
       <span className="shrink-0 inline-flex items-center gap-1.5 pr-2">
         <span
           aria-hidden

@@ -28,6 +28,12 @@ import type {
   ScopeCamera,
   ScopeHome,
   CameraSummary,
+  HomeAssistantConfigUpdate,
+  HomeAssistantEntity,
+  HomeAssistantEntityPolicyUpdate,
+  HomeAssistantPublicConfig,
+  HomeAssistantStatus,
+  HomeAssistantTestResult,
   RtspProbeResult,
   RtspSourceInput,
   Task,
@@ -150,6 +156,13 @@ interface MiotHome {
   persons: BackendPerson[];
 }
 
+interface UnifiedHome {
+  home_name?: string | null;
+  devices: BackendDevice[];
+  areas: { name: string }[];
+  scenes: BackendScene[];
+}
+
 // 首屏 useAsync 会并行触发 realHomeStatus / realListDevices / realListScenes，
 // 三者底下都打 /api/miot/home。加一个 5s TTL 的请求级缓存避免重复打 backend
 // （后者会再去打小米云 MiOT API，慢 + 浪费配额）。
@@ -192,15 +205,51 @@ function invalidateMiotHomeCache(): void {
   });
 }
 
+function isNotFound(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 404;
+}
+
+async function fetchDevicesHome(): Promise<Normal<UnifiedHome>> {
+  try {
+    return await apiFetch<Normal<UnifiedHome>>("/api/devices/home");
+  } catch (error) {
+    if (!isNotFound(error)) throw error;
+    return fetchMiotHome() as Promise<Normal<UnifiedHome>>;
+  }
+}
+
+async function fetchDeviceStatusProperties(
+  did: string,
+): Promise<BackendDeviceStatus["properties"]> {
+  const encodedDid = encodeURIComponent(did);
+  try {
+    const status = await apiFetch<Normal<BackendDeviceStatus>>(
+      `/api/devices/${encodedDid}/status`,
+    );
+    return Array.isArray(status.data?.properties) ? status.data.properties : [];
+  } catch (error) {
+    if (!isNotFound(error)) throw error;
+    const status = await apiFetch<Normal<BackendDeviceStatus>>(
+      `/api/miot/devices/${encodedDid}/status`,
+    );
+    return Array.isArray(status.data?.properties) ? status.data.properties : [];
+  }
+}
+
 interface BackendDevice {
   did: string;
+  source?: "miot" | "home_assistant";
+  source_label?: string;
   name: string;
   online: boolean;
-  model: string;
-  room?: string;
-  category?: string;
+  model?: string | null;
+  room?: string | null;
+  category?: string | null;
   spec?: Record<string, BackendPropSpec>;
   sub_devices?: unknown;
+  included?: boolean;
+  control_enabled?: boolean;
+  read_only_reason?: string | null;
 }
 
 interface BackendPropSpec {
@@ -213,12 +262,61 @@ interface BackendPropSpec {
   service_type_name?: string;
   service_description?: string;
   unit?: string;
-  value_list?: { name: string; value: number | string }[];
+  value_list?: { name?: string; description?: string; value: number | string }[];
   value_range?: number[];
 }
 
 interface BackendDeviceStatus {
   properties: { iid: string; value: unknown; code: number }[];
+}
+
+interface BackendScene {
+  scene_id: string;
+  scene_name: string;
+  source?: "miot" | "home_assistant";
+  source_label?: string;
+  executable?: boolean;
+}
+
+interface BackendHomeAssistantPublicConfig {
+  enabled: boolean;
+  base_url: string;
+  instance_key: string;
+  verify_tls: boolean;
+  token_configured: boolean;
+  token_mask?: string;
+}
+
+interface BackendHomeAssistantStatus {
+  config: BackendHomeAssistantPublicConfig;
+  configured: boolean;
+  enabled: boolean;
+  connected: boolean;
+  error_code?: string | null;
+  message?: string;
+}
+
+interface BackendHomeAssistantTestResult {
+  ok: boolean;
+  connected: boolean;
+  error_code?: string | null;
+  message?: string;
+}
+
+interface BackendHomeAssistantEntity {
+  entity_id: string;
+  name?: string;
+  friendly_name?: string;
+  domain: string;
+  state: string;
+  room?: string | null;
+  included: boolean;
+  control_enabled: boolean;
+  control_supported: boolean;
+  control_blocked_reason?: string | null;
+  last_seen_at?: number | null;
+  last_control_at?: number | null;
+  last_error?: string | null;
 }
 
 interface BackendPerson {
@@ -755,10 +853,12 @@ const CATEGORY_MAP: Record<string, DeviceCategory> = {
   "ceiling-light": "light",
   "wall-switch": "light",
   "air-conditioner": "aircond",
+  climate: "aircond",
   "air-purifier": "purifier",
   fan: "fan",
   "smart-curtain": "curtain",
   curtain: "curtain",
+  cover: "curtain",
   lock: "lock",
   "smart-lock": "lock",
   tv: "tv",
@@ -767,13 +867,13 @@ const CATEGORY_MAP: Record<string, DeviceCategory> = {
   camera: "camera",
 };
 
-function mapCategory(raw: string | undefined): DeviceCategory {
+function mapCategory(raw: string | null | undefined): DeviceCategory {
   if (!raw) return "other";
   return CATEGORY_MAP[raw] ?? "other";
 }
 
 // backend 偶尔把 home_id（纯数字字符串）当 room 返回，把这种归到"未分配"
-function cleanRoom(raw: string | undefined): string {
+function cleanRoom(raw: string | null | undefined): string {
   const unassigned = i18n.t("miot.unassigned");
   if (!raw) return unassigned;
   if (/^\d+$/.test(raw)) return unassigned;
@@ -937,7 +1037,7 @@ async function batchWithConcurrency<T>(
 }
 
 export async function realListDevices(): Promise<Device[]> {
-  const r = await fetchMiotHome();
+  const r = await fetchDevicesHome();
   const devices = r.data.devices;
 
   // 拉每个设备的属性 status；单个 2.5s 超时——超了就当空属性。
@@ -948,11 +1048,9 @@ export async function realListDevices(): Promise<Device[]> {
     devices.map(
       (d) => () =>
         withTimeout(
-          apiFetch<Normal<BackendDeviceStatus>>(
-            `/api/miot/devices/${d.did}/status`,
-          )
-            .then((s) => s.data.properties)
-            .catch(() => [] as BackendDeviceStatus["properties"]),
+          fetchDeviceStatusProperties(d.did).catch(
+            () => [] as BackendDeviceStatus["properties"],
+          ),
           2500,
           [] as BackendDeviceStatus["properties"],
         ),
@@ -966,13 +1064,14 @@ export async function realListDevices(): Promise<Device[]> {
     const cat = mapCategory(d.category);
     const dangerous = DANGEROUS_CATEGORIES.has(d.category ?? "");
 
-    // mainSwitch：约定 prop.2.1（开关）；只在它真的存在且 readable 时使用
-    const mainSwitchSpec = d.spec?.["prop.2.1"];
+    // mainSwitch：米家约定 prop.2.1，HA 统一模型约定 on。
+    const mainSwitchIid = d.spec?.["prop.2.1"] ? "prop.2.1" : d.spec?.on ? "on" : null;
+    const mainSwitchSpec = mainSwitchIid ? d.spec?.[mainSwitchIid] : undefined;
     const mainSwitch =
       mainSwitchSpec && mainSwitchSpec.format === "bool"
         ? {
-            iid: "prop.2.1",
-            current: Boolean(valueByIid.get("prop.2.1") ?? false),
+            iid: mainSwitchIid!,
+            current: Boolean(valueByIid.get(mainSwitchIid!) ?? false),
           }
         : undefined;
 
@@ -980,9 +1079,15 @@ export async function realListDevices(): Promise<Device[]> {
       .filter(([iid]) => iid.startsWith("prop."))
       .map(([iid, spec]) => mapProp(iid, spec, valueByIid.get(iid)));
     const statusKind = deviceStatusKind(d, mainSwitch?.current, valueByIid);
+    const controlAvailable = (d.control_enabled ?? true) && !d.read_only_reason;
+    const controlPolicy: Device["controlPolicy"] = controlAvailable
+      ? "enabled"
+      : "read_only";
 
     return {
       did: d.did,
+      source: d.source ?? "miot",
+      sourceLabel: d.source_label ?? (d.source === "home_assistant" ? "Home Assistant" : "Xiaomi"),
       name: cleanDeviceName(d.name),
       category: cat,
       room: cleanRoom(d.room),
@@ -990,6 +1095,11 @@ export async function realListDevices(): Promise<Device[]> {
       statusText: humanDeviceStatus(d, valueByIid, statusKind),
       statusKind,
       dangerous,
+      included: d.included ?? true,
+      controlEnabled: d.control_enabled ?? true,
+      controlAvailable,
+      controlPolicy,
+      readOnlyReason: d.read_only_reason ?? null,
       mainSwitch,
       props: allProps,
     };
@@ -1036,7 +1146,7 @@ function mapProp(
       type: "enum",
       value: (value as string | number) ?? spec.value_list[0]?.value,
       options: spec.value_list.map((v) => ({
-        label: zhEnumValue(v.name),
+        label: zhEnumValue(v.name ?? v.description ?? String(v.value)),
         value: v.value,
       })),
     };
@@ -1171,14 +1281,160 @@ export async function realControlDeviceProp(
 
 // ── 场景 ──────────────────────────────────────────────────
 export async function realListScenes(): Promise<Scene[]> {
-  const r = await fetchMiotHome();
+  const r = await fetchDevicesHome();
   return r.data.scenes.map((s) => ({ id: s.scene_id, name: s.scene_name }));
 }
 
 export async function realTriggerScene(id: string): Promise<void> {
-  await apiFetch<Normal<unknown>>(`/api/miot/scenes/${id}/trigger`, {
-    method: "POST",
-  });
+  try {
+    await apiFetch<Normal<unknown>>(
+      `/api/devices/scenes/${encodeURIComponent(id)}/trigger`,
+      { method: "POST" },
+    );
+  } catch (error) {
+    if (!isNotFound(error)) throw error;
+    await apiFetch<Normal<unknown>>(`/api/miot/scenes/${id}/trigger`, {
+      method: "POST",
+    });
+  }
+}
+
+// ── Home Assistant ─────────────────────────────────────────
+function mapHomeAssistantPublicConfig(
+  config: BackendHomeAssistantPublicConfig,
+): HomeAssistantPublicConfig {
+  return {
+    enabled: config.enabled,
+    baseUrl: config.base_url,
+    instanceKey: config.instance_key,
+    verifyTls: config.verify_tls,
+    tokenConfigured: config.token_configured,
+    tokenMask: config.token_mask ?? (config.token_configured ? "••••••••" : ""),
+  };
+}
+
+function homeAssistantConfigPayload(input: HomeAssistantConfigUpdate) {
+  return {
+    enabled: input.enabled,
+    base_url: input.baseUrl,
+    token: input.token ?? null,
+    preserve_token: input.preserveToken ?? false,
+    verify_tls: input.verifyTls,
+  };
+}
+
+function mapHomeAssistantStatus(
+  status: BackendHomeAssistantStatus,
+): HomeAssistantStatus {
+  return {
+    config: mapHomeAssistantPublicConfig(status.config),
+    configured: status.configured,
+    enabled: status.enabled,
+    connected: status.connected,
+    errorCode: status.error_code ?? null,
+    message: status.message ?? "",
+  };
+}
+
+function mapHomeAssistantTestResult(
+  result: BackendHomeAssistantTestResult,
+): HomeAssistantTestResult {
+  return {
+    ok: result.ok,
+    connected: result.connected,
+    errorCode: result.error_code ?? null,
+    message: result.message ?? "",
+  };
+}
+
+function mapHomeAssistantEntity(
+  entity: BackendHomeAssistantEntity,
+): HomeAssistantEntity {
+  return {
+    entityId: entity.entity_id,
+    name: entity.name ?? entity.friendly_name ?? entity.entity_id,
+    domain: entity.domain,
+    state: entity.state,
+    room: entity.room ?? null,
+    included: entity.included,
+    controlEnabled: entity.control_enabled,
+    controlSupported: entity.control_supported,
+    controlBlockedReason: entity.control_blocked_reason ?? null,
+    lastSeenAt: entity.last_seen_at ?? null,
+    lastControlAt: entity.last_control_at ?? null,
+    lastError: entity.last_error ?? null,
+  };
+}
+
+export async function realGetHomeAssistantStatus(): Promise<HomeAssistantStatus> {
+  const res = await apiFetch<Normal<BackendHomeAssistantStatus>>(
+    "/api/home-assistant/status",
+  );
+  return mapHomeAssistantStatus(res.data);
+}
+
+export async function realGetHomeAssistantConfig(): Promise<HomeAssistantPublicConfig> {
+  const res = await apiFetch<Normal<BackendHomeAssistantPublicConfig>>(
+    "/api/home-assistant/config",
+  );
+  return mapHomeAssistantPublicConfig(res.data);
+}
+
+export async function realTestHomeAssistantConfig(
+  input: HomeAssistantConfigUpdate,
+): Promise<HomeAssistantTestResult> {
+  const res = await apiFetch<Normal<BackendHomeAssistantTestResult>>(
+    "/api/home-assistant/test",
+    {
+      method: "POST",
+      body: JSON.stringify(homeAssistantConfigPayload(input)),
+    },
+  );
+  return mapHomeAssistantTestResult(res.data);
+}
+
+export async function realSaveHomeAssistantConfig(
+  input: HomeAssistantConfigUpdate,
+): Promise<HomeAssistantPublicConfig> {
+  const res = await apiFetch<Normal<BackendHomeAssistantPublicConfig>>(
+    "/api/home-assistant/config",
+    {
+      method: "POST",
+      body: JSON.stringify(homeAssistantConfigPayload(input)),
+    },
+  );
+  return mapHomeAssistantPublicConfig(res.data);
+}
+
+export async function realListHomeAssistantEntities(): Promise<HomeAssistantEntity[]> {
+  const res = await apiFetch<Normal<BackendHomeAssistantEntity[]>>(
+    "/api/home-assistant/entities",
+  );
+  return res.data.map(mapHomeAssistantEntity);
+}
+
+export async function realRefreshHomeAssistantEntities(): Promise<HomeAssistantEntity[]> {
+  const res = await apiFetch<Normal<BackendHomeAssistantEntity[]>>(
+    "/api/home-assistant/entities?refresh=true",
+  );
+  return res.data.map(mapHomeAssistantEntity);
+}
+
+export async function realUpdateHomeAssistantEntityPolicy(
+  entityId: string,
+  patch: HomeAssistantEntityPolicyUpdate,
+): Promise<HomeAssistantEntity> {
+  const res = await apiFetch<Normal<BackendHomeAssistantEntity>>(
+    `/api/home-assistant/entities/${encodeURIComponent(entityId)}/policy`,
+    {
+      method: "PUT",
+      body: JSON.stringify({
+        included: patch.included,
+        control_enabled: patch.controlEnabled,
+      }),
+    },
+  );
+  return mapHomeAssistantEntity(res.data);
 }
 
 // ── 摄像头 ────────────────────────────────────────────────

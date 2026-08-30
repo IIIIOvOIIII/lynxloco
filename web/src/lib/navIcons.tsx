@@ -167,6 +167,51 @@ export const IconDevices = ({ active, ...p }: Props) =>
     </svg>
   );
 
+/** Home Assistant — 房子 + 接入节点 */
+export const IconHomeAssistant = ({ active, ...p }: Props) =>
+  active ? (
+    <svg {...baseSvg(p)}>
+      <path
+        d="M6 21L24 7L42 21V42H6V21Z"
+        fill="currentColor"
+        stroke="currentColor"
+        strokeWidth="4"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <circle cx="17" cy="27" r="3" fill="#fff" />
+      <circle cx="31" cy="27" r="3" fill="#fff" />
+      <circle cx="24" cy="35" r="3" fill="#fff" />
+      <path
+        d="M20 29L24 33L28 29"
+        stroke="#fff"
+        strokeWidth="3"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  ) : (
+    <svg {...baseSvg(p)}>
+      <path
+        d="M6 21L24 7L42 21V42H6V21Z"
+        stroke="currentColor"
+        strokeWidth="4"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <circle cx="17" cy="27" r="3" stroke="currentColor" strokeWidth="3" />
+      <circle cx="31" cy="27" r="3" stroke="currentColor" strokeWidth="3" />
+      <circle cx="24" cy="35" r="3" stroke="currentColor" strokeWidth="3" />
+      <path
+        d="M20 29L24 33L28 29"
+        stroke="currentColor"
+        strokeWidth="3"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+
 /** 家人 — 双人 */
 export const IconFamily = ({ active, ...p }: Props) =>
   active ? (

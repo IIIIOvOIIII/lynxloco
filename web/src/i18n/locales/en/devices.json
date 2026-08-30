@@ -9,6 +9,7 @@
     "scenesHeading": "Scenes · One tap",
     "sceneTriggered": "Triggered \"{{name}}\"",
     "sceneTriggerFailed": "Couldn't trigger scene",
+    "readOnly": "Read-only",
     "watchCamera": "Watch {{name}}",
     "liveView": "{{name}} live view",
     "loadingStream": "Loading stream…",

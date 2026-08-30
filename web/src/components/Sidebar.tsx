@@ -24,6 +24,7 @@ import { MiotAccountButton } from "./MiotAccountButton";
 import {
   IconNow,
   IconDevices,
+  IconHomeAssistant,
   IconFamily,
   IconTasks,
   IconActivity,
@@ -33,6 +34,7 @@ import {
 export type TabKey =
   | "now"
   | "devices"
+  | "homeAssistant"
   | "family"
   | "tasks"
   | "activity"
@@ -72,6 +74,12 @@ export const TABS: TabDef[] = [
     labelKey: "nav.devices",
     hintKey: "nav.devicesHint",
     Icon: IconDevices,
+  },
+  {
+    key: "homeAssistant",
+    labelKey: "nav.homeAssistant",
+    hintKey: "nav.homeAssistantHint",
+    Icon: IconHomeAssistant,
   },
   {
     key: "family",

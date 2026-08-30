@@ -9,6 +9,7 @@
     "scenesHeading": "场景 · 一键",
     "sceneTriggered": "已触发\"{{name}}\"",
     "sceneTriggerFailed": "场景触发失败",
+    "readOnly": "只读",
     "watchCamera": "看 {{name}}",
     "liveView": "{{name}} 实时画面",
     "loadingStream": "拉流中…",

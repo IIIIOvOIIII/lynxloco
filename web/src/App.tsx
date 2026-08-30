@@ -43,6 +43,7 @@ import { StatusRibbon } from "./components/StatusRibbon";
 import UpgradeNotice from "./components/UpgradeNotice";
 import { HeroNow } from "./components/HeroNow";
 import { DevicesByRoom } from "./components/DevicesByRoom";
+import { HomeAssistantPage } from "./components/HomeAssistantPage";
 import { ActivityFeed } from "./components/ActivityFeed";
 import { FamilyStrip } from "./components/FamilyStrip";
 import { PersonDrawer } from "./components/PersonDrawer";
@@ -483,6 +484,15 @@ function MainApp() {
           </div>
         );
       }
+      case "homeAssistant":
+        return (
+          <HomeAssistantPage
+            onDevicesChanged={() => {
+              devices.reload();
+              scenes.reload();
+            }}
+          />
+        );
       case "family": {
         if (persons.error) {
           return (
