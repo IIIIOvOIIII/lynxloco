@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 # 当前 schema 版本。fresh-build 直接落到此值; 老库启动时按 _SCHEMA_MIGRATIONS
 # 步进跑到此值。历史基线 v1 (cron 挪出 task_link + rule 加 FK CASCADE 前)。
-_DB_SCHEMA_VERSION = 2
+_DB_SCHEMA_VERSION = 3
 
 
 def incremental_vacuum(
@@ -81,6 +81,52 @@ def incremental_vacuum(
             remaining -= n
 
 
+def _create_dashboard_user_table_on(conn: sqlite3.Connection) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS dashboard_user (
+            id TEXT PRIMARY KEY,
+            username TEXT NOT NULL,
+            username_norm TEXT NOT NULL UNIQUE,
+            display_name TEXT NOT NULL DEFAULT '',
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'admin',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            last_login_at INTEGER
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_dashboard_user_enabled "
+        "ON dashboard_user(enabled)"
+    )
+
+
+def _create_dashboard_session_table_on(conn: sqlite3.Connection) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS dashboard_session (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            session_hash TEXT NOT NULL UNIQUE,
+            csrf_hash TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            last_seen_at INTEGER NOT NULL,
+            user_agent_hash TEXT NOT NULL,
+            client_ip_hint TEXT,
+            FOREIGN KEY(user_id) REFERENCES dashboard_user(id) ON DELETE CASCADE
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_dashboard_session_user "
+        "ON dashboard_session(user_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_dashboard_session_expires "
+        "ON dashboard_session(expires_at)"
+    )
+
+
 class SQLiteConnector:
     """SQLite database connector class"""
 
@@ -139,6 +185,16 @@ class SQLiteConnector:
                         logger.info("KV table not found, creating...")
                         self._create_kv_table(conn)
                         tables_created.append("kv")
+
+                    if "dashboard_user" not in existing_tables:
+                        logger.info("dashboard_user table not found, creating...")
+                        self._create_dashboard_user_table(conn)
+                        tables_created.append("dashboard_user")
+
+                    if "dashboard_session" not in existing_tables:
+                        logger.info("dashboard_session table not found, creating...")
+                        self._create_dashboard_session_table(conn)
+                        tables_created.append("dashboard_session")
 
                     if "person" not in existing_tables:
                         logger.info("Person table not found, creating...")
@@ -244,8 +300,8 @@ class SQLiteConnector:
                         conn.commit()
                         logger.info("All required tables already exist")
 
-                    # PRAGMA user_version 步进迁移: v1 老库跑一次 _migrate_v1_to_v2
-                    # 到 v2, 未来 v3 时补 {3: _migrate_v2_to_v3}。函数内部
+                    # PRAGMA user_version 步进迁移: v1 老库跑 _migrate_v1_to_v2,
+                    # v2 老库跑 _migrate_v2_to_v3。函数内部
                     # 单事务原子 (业务 DML + PRAGMA user_version 同 COMMIT),
                     # 抛异常 → backend fail-fast, 运维介入。
                     current_version = cursor.execute(
@@ -300,6 +356,8 @@ class SQLiteConnector:
         conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
         conn.execute("PRAGMA journal_mode=WAL")
         self._create_kv_table(conn)
+        self._create_dashboard_user_table(conn)
+        self._create_dashboard_session_table(conn)
         self._create_person_table(conn)
         self._create_biometric_table(conn)
         self._create_perception_log_table(conn)
@@ -340,6 +398,12 @@ class SQLiteConnector:
         # Create index to improve query performance
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_kv_key ON kv(key)")
         logger.info("KV table created successfully")
+
+    def _create_dashboard_user_table(self, conn: sqlite3.Connection) -> None:
+        _create_dashboard_user_table_on(conn)
+
+    def _create_dashboard_session_table(self, conn: sqlite3.Connection) -> None:
+        _create_dashboard_session_table_on(conn)
 
     def _create_person_table(self, conn: sqlite3.Connection) -> None:
         """Create person table"""
@@ -1244,9 +1308,24 @@ def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
         cursor.execute("PRAGMA foreign_keys=ON")
 
 
-# schema 步进迁移登记表; 未来加 v3 时新增 {3: _migrate_v2_to_v3} 条目
+def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
+    """Add dashboard authentication tables to existing v2 databases."""
+    cursor = conn.cursor()
+    cursor.execute("BEGIN IMMEDIATE")
+    try:
+        _create_dashboard_user_table_on(conn)
+        _create_dashboard_session_table_on(conn)
+        cursor.execute("PRAGMA user_version = 3")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+# schema 步进迁移登记表
 _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     2: _migrate_v1_to_v2,
+    3: _migrate_v2_to_v3,
 }
 
 
