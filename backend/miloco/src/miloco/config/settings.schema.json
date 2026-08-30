@@ -114,6 +114,53 @@
       },
       "required": ["omni"]
     },
+    "home_assistant": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Home Assistant 接入参数（长期访问令牌、本地实例地址、实体导入与控制授权）",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "是否启用 Home Assistant 集成"
+        },
+        "base_url": {
+          "type": "string",
+          "default": "",
+          "description": "Home Assistant Base URL，例如 http://homeassistant.local:8123"
+        },
+        "token": {
+          "type": "string",
+          "default": "",
+          "description": "Home Assistant 长期访问令牌；读回配置时必须脱敏"
+        },
+        "instance_key": {
+          "type": "string",
+          "default": "primary",
+          "description": "单实例 MVP 的本地稳定实例标识"
+        },
+        "verify_tls": {
+          "type": "boolean",
+          "default": true,
+          "description": "访问 https Home Assistant 地址时是否校验证书"
+        },
+        "timeout_seconds": {
+          "type": "number",
+          "default": 8.0,
+          "description": "Home Assistant HTTP 请求超时秒数"
+        },
+        "state_cache_ttl_seconds": {
+          "type": "integer",
+          "default": 10,
+          "description": "Home Assistant 状态与服务发现缓存 TTL 秒数"
+        },
+        "entities": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "按 HA entity_id 保存的 Miloco 导入与控制授权策略"
+        }
+      }
+    },
     "features": {
       "type": "object",
       "additionalProperties": true,

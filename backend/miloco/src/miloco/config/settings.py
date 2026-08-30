@@ -15,6 +15,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import re
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, ClassVar, Literal
@@ -260,6 +261,105 @@ class MiotSettings(BaseModel):
     cloud_server: str = Field(
         default="cn", description="MIoT 云区域（cn/de/i2/ru/sg/us）"
     )
+
+
+class HomeAssistantEntityPolicy(BaseModel):
+    """Home Assistant entity import and control policy."""
+
+    entity_id: str = Field(..., min_length=1, description="Home Assistant entity_id")
+    included: bool = Field(
+        default=False,
+        description="Whether this HA entity is imported into Miloco devices",
+    )
+    control_enabled: bool = Field(
+        default=False,
+        description="Whether Miloco may expose write/action specs and call services",
+    )
+    last_seen_at: int | None = Field(
+        default=None, description="Last discovery timestamp in Unix milliseconds"
+    )
+    last_control_at: int | None = Field(
+        default=None, description="Last control attempt timestamp in Unix milliseconds"
+    )
+    last_error: str | None = Field(
+        default=None, description="Last HA control/discovery error code"
+    )
+
+
+class HomeAssistantSettings(BaseModel):
+    """Home Assistant integration settings.
+
+    The long-lived access token is local configuration and must never be echoed
+    in validation errors, logs, or readback responses.
+    """
+
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    enabled: bool = Field(
+        default=False, description="Whether Home Assistant integration is enabled"
+    )
+    base_url: str = Field(
+        default="",
+        description="Home Assistant base URL, e.g. http://homeassistant.local:8123",
+    )
+    token: str = Field(
+        default="",
+        repr=False,
+        description="Home Assistant long-lived access token",
+    )
+    instance_key: str = Field(
+        default="primary",
+        description="Stable local key for the single MVP Home Assistant instance",
+    )
+    verify_tls: bool = Field(
+        default=True,
+        description="Whether to verify TLS certificates for https Home Assistant URLs",
+    )
+    timeout_seconds: float = Field(
+        default=8.0,
+        gt=0,
+        description="Home Assistant HTTP request timeout in seconds",
+    )
+    state_cache_ttl_seconds: int = Field(
+        default=10,
+        ge=0,
+        description="Home Assistant state/services cache TTL in seconds",
+    )
+    entities: dict[str, HomeAssistantEntityPolicy] = Field(
+        default_factory=dict,
+        description="Per-entity Miloco import/control policy keyed by HA entity_id",
+    )
+
+    @field_validator("base_url")
+    @classmethod
+    def _normalize_base_url(cls, value: str) -> str:
+        if any(ord(character) < 32 or ord(character) == 127 for character in value):
+            raise ValueError("Home Assistant base_url must not contain control characters")
+        value = value.strip().rstrip("/")
+        if value == "":
+            return ""
+        try:
+            parts = urlsplit(value)
+        except ValueError as exc:
+            raise ValueError("Home Assistant base_url is invalid") from exc
+        if parts.scheme not in {"http", "https"}:
+            raise ValueError("Home Assistant base_url scheme must be http or https")
+        if parts.hostname is None:
+            raise ValueError("Home Assistant base_url must include a host")
+        if parts.username is not None or parts.password is not None:
+            raise ValueError("Home Assistant base_url must not include userinfo")
+        if "#" in value:
+            raise ValueError("Home Assistant base_url must not include a fragment")
+        return value
+
+    @field_validator("instance_key")
+    @classmethod
+    def _validate_instance_key(cls, value: str) -> str:
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", value):
+            raise ValueError(
+                "Home Assistant instance_key must match [a-z][a-z0-9_-]{0,31}"
+            )
+        return value
 
 
 class NotifySettings(BaseModel):
@@ -802,6 +902,10 @@ class MilocoSettings(BaseSettings):
     miot: MiotSettings = Field(
         default_factory=MiotSettings,
         description="MIoT 云接入参数",
+    )
+    home_assistant: HomeAssistantSettings = Field(
+        default_factory=HomeAssistantSettings,
+        description="Home Assistant 接入参数",
     )
     notify: NotifySettings = Field(
         default_factory=NotifySettings,

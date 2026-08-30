@@ -56,6 +56,17 @@ app:
 miot:
   cloud_server: "cn"
 
+# Home Assistant 接入参数（默认关闭；token 只写用户 config.json / 环境变量）
+home_assistant:
+  enabled: false
+  base_url: ""
+  token: ""
+  instance_key: "primary"
+  verify_tls: true
+  timeout_seconds: 8.0
+  state_cache_ttl_seconds: 10
+  entities: {}
+
 # 通知发送运行参数
 notify:
   dedup_window_sec: 60   # 相同通知文案在此窗口(秒)内只发一次；<=0 关闭去重
