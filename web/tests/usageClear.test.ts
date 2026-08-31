@@ -11,6 +11,7 @@
 
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { realClearUsageData } from "@/api/real";
+import { dailyCaveatApplies } from "@/lib/usageTokens";
 
 const originalFetch = globalThis.fetch;
 
@@ -104,5 +105,35 @@ describe("realClearUsageData 请求体", () => {
     const calls = captureFetch();
     await realClearUsageData({ sinceMs: null, fromDate: "2026-08-24" });
     expect(calls[0].body.from_date).toBeNull();
+  });
+});
+
+describe("「连带删除某天」这句提示的成立条件", () => {
+  // 日表按 `date >= from_date` 整天删，但只有那天真的已经滚进日表才谈得上「连带」。
+  // 滚存截止天对齐且只搬更早的行，所以日表最新日期比今天早好几天。
+  it("边界日晚于日表最新日期（近 24 小时那一档）→ 不说", () => {
+    // 今天 8-28 点「近 24 小时」，边界日 8-27；日表最新只到 8-24
+    expect(dailyCaveatApplies("2026-08-27", "2026-08-24")).toBe(false);
+  });
+
+  it("边界日正好是日表最新那天 → 要说（那天会被整天删掉）", () => {
+    expect(dailyCaveatApplies("2026-08-24", "2026-08-24")).toBe(true);
+  });
+
+  it("边界日早于日表最新日期（近 7 天那一档）→ 要说", () => {
+    expect(dailyCaveatApplies("2026-08-22", "2026-08-24")).toBe(true);
+  });
+
+  it("日表为空 / 接口没给 → 不说，宁可不说也不说错", () => {
+    expect(dailyCaveatApplies("2026-08-22", null)).toBe(false);
+  });
+
+  it("全清档没有边界日 → 不说", () => {
+    expect(dailyCaveatApplies(null, "2026-08-24")).toBe(false);
+  });
+
+  it("跨月跨年按字典序比较仍成立（等宽零填充）", () => {
+    expect(dailyCaveatApplies("2026-09-01", "2026-08-31")).toBe(false);
+    expect(dailyCaveatApplies("2025-12-31", "2026-01-01")).toBe(true);
   });
 });

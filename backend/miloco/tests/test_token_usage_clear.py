@@ -355,3 +355,37 @@ def test_from_date_combines_with_target(repo):
     assert out["token_usage_daily"] == 1
     _, daily = _left(repo)
     assert sorted(daily) == [("m1", "https://a/v1"), ("m1", "https://b/v1")]
+
+
+def test_latest_daily_date_reports_table_max(repo):
+    """latest_daily_date 就是日表里的最大日期；空表为 None。
+
+    界面据此决定「清到某一天会不会连带删掉那天更早的记录」这句提示说不说。
+    """
+    assert repo.latest_daily_date() is None  # 空表：界面一律不说
+
+    today = date.today()
+    _daily(repo, today - timedelta(days=9))
+    _daily(repo, today - timedelta(days=4), model="m2")
+    _daily(repo, today - timedelta(days=7), model="m3")
+    assert repo.latest_daily_date() == (today - timedelta(days=4)).isoformat()
+
+
+def test_rollup_keeps_daily_table_behind_yesterday(repo):
+    """滚存后日表的最新日期必然早于昨天——「近 24 小时」那档的边界日不可能在表里。
+
+    这是确认窗那句提示能被条件化的前提：滚存截止是天对齐的 today-_RETENTION_DAYS，
+    且只搬 timestamp < cutoff 的行，所以最新能进日表的是 today-_RETENTION_DAYS-1。
+    若哪天把 cutoff 改成非天对齐、或改成 <=，这条会红。
+    """
+    today = date.today()
+    # 一条足够老的事件（会被滚走）+ 一条今天的（必须留在实时表）
+    _raw(repo, _ts_ms(today - timedelta(days=9)))
+    _raw(repo, _ts_ms(today))
+    repo.insert("m1", "https://a/v1", {"input_tokens": 1, "output_tokens": 1}, "realtime")
+
+    latest = repo.latest_daily_date()
+    assert latest is not None, "老事件应已滚进日表"
+    assert latest < (today - timedelta(days=1)).isoformat(), (
+        f"日表最新日期 {latest} 不该晚于前天——否则近 24 小时档的提示又会恒为真"
+    )

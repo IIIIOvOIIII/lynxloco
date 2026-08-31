@@ -393,6 +393,13 @@ export interface UsageStats {
    * week=7 天，month=30 天。ts 是 ISO 8601。
    */
   timeline: UsageTimelinePoint[];
+  /**
+   * 日聚合表里已有的最新日期（YYYY-MM-DD）；表为空或接口未给时为 null。
+   *
+   * 清除确认窗据此判断「清到某一天会不会连带删掉那天更早的记录」——日表按整天删，
+   * 但只有那天真的已经滚进日表才谈得上连带。见 usageTokens.dailyCaveatApplies。
+   */
+  daily_latest_date: string | null;
 }
 
 /**

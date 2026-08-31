@@ -245,6 +245,24 @@ class TokenUsageRepo:
             rows = rows[:limit]
         return [dict(r) for r in rows], truncated
 
+    def latest_daily_date(self) -> str | None:
+        """日聚合表里已有的最新日期（YYYY-MM-DD）；表为空时 None。
+
+        给界面用来判断「清到某一天会不会连带删掉那天更早的记录」。日表只有天粒度,
+        所以清除会按 `date >= from_date` 整天删——但只有当那一天**真的已经滚进日表**
+        时才谈得上「连带」。滚存的截止是天对齐的 `today - _RETENTION_DAYS` 且只搬更早
+        的行,故日表里的最新日期比今天早好几天,近 24 小时那种边界日根本不在表里。
+
+        为什么给「表里的最新日期」这个事实,而不是给 `_RETENTION_DAYS` 让界面自己推算:
+        推算要用「今天」,而界面的今天是浏览器时区、日表的 date 按本机时区写入,两者能
+        差一天——那正是 from_date 闸门要处理的分歧,不该在这里再引入一次。
+        """
+        with self.db.get_connection() as conn:
+            row = conn.execute(
+                "SELECT MAX(date) FROM token_usage_daily"
+            ).fetchone()
+        return row[0] if row and row[0] else None
+
     def aggregate_buckets(
         self,
         since_ms: int | None = None,

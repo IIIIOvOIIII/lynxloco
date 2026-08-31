@@ -17,3 +17,26 @@
 export function textResidual(input: number, video: number, audio: number): number {
   return Math.max(input - video - audio, 0);
 }
+
+/**
+ * 清到某一天时，那句「日聚合只按天存，故当天更早的记录会被连带删除」是否成立。
+ *
+ * 日表按 `date >= from_date` 整天删，所以只有当边界那天**真的已经滚进日表**时才谈得上
+ * 「连带」。滚存截止是天对齐、且只搬更早的行，日表里的最新日期因此比今天早好几天——
+ * 「近 24 小时」那种边界日根本不在表里，那次删除恒命中 0 行。对这一档仍旧无条件说
+ * 「会被连带删除」有两个后果：想只清今天的人被吓退，而信了的人清完发现数据还在，
+ * 与一个不可逆操作的确认窗自相矛盾。
+ *
+ * 判据取「日表当前最新日期」这个事实而不是拿保留天数推算：推算要用「今天」，而界面的
+ * 今天是浏览器时区、日表的 date 按本机时区写入，两者能差一天。
+ *
+ * 拿不到 latest（接口没给 / 日表为空）时返回 false——宁可不说，也不说错。
+ * 两个参数都是 YYYY-MM-DD，等宽零填充，故可直接字典序比较。
+ */
+export function dailyCaveatApplies(
+  boundaryDate: string | null,
+  dailyLatestDate: string | null,
+): boolean {
+  if (!boundaryDate || !dailyLatestDate) return false;
+  return boundaryDate <= dailyLatestDate;
+}

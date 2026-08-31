@@ -1768,6 +1768,7 @@ function unitsToStats(
   period: UsagePeriod,
   units: UsageUnit[],
   timeline: UsageTimelinePoint[],
+  dailyLatestDate: string | null = null,
 ): UsageStats {
   const totals = emptyBreakdown();
   let calls = 0;
@@ -1860,6 +1861,7 @@ function unitsToStats(
     by_type: [...byType.values()].sort((a, b) => b.tokens - a.tokens),
     rows,
     timeline,
+    daily_latest_date: dailyLatestDate,
   };
 }
 
@@ -2118,7 +2120,9 @@ async function fetchUsageStats(
     const start = new Date();
     start.setHours(0, 0, 0, 0);
     const startMs = start.getTime();
-    const r = await apiFetch<Normal<{ rows: BucketRow[]; total: number }>>(
+    const r = await apiFetch<
+      Normal<{ rows: BucketRow[]; total: number; daily_latest_date?: string | null }>
+    >(
       `/api/admin/token-usage/buckets?bin=${binMinutes}` +
         `&since=${startMs}&until=${startMs + ONE_DAY_MS}`,
     );
@@ -2127,6 +2131,7 @@ async function fetchUsageStats(
       period,
       rows.map(bucketToUnit),
       bucketTimeline(rows, binMinutes),
+      r.data.daily_latest_date ?? null,
     );
   }
 
@@ -2137,11 +2142,16 @@ async function fetchUsageStats(
   const since = new Date(until);
   since.setDate(since.getDate() - (days - 1)); // 走日历，见 dailyTimeline 的说明
   const qs = `since=${localDateStr(since)}&until=${localDateStr(until)}`;
-  const r = await apiFetch<Normal<{ rows: DailyRow[]; total: number }>>(
-    `/api/admin/token-usage/daily?${qs}`,
-  );
+  const r = await apiFetch<
+    Normal<{ rows: DailyRow[]; total: number; daily_latest_date?: string | null }>
+  >(`/api/admin/token-usage/daily?${qs}`);
   const rows = r.data.rows ?? [];
-  return unitsToStats(period, rows.map(rowToUnit), dailyTimeline(rows, days));
+  return unitsToStats(
+    period,
+    rows.map(rowToUnit),
+    dailyTimeline(rows, days),
+    r.data.daily_latest_date ?? null,
+  );
 }
 
 // ── 任务（task）─────────────────────────────────────────────

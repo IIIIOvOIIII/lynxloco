@@ -622,8 +622,19 @@ async def get_token_usage_daily(
 
     模型身份是「模型名 + base_url」：同一个模型名挂在两个 endpoint 上会各返回一行。
     """
-    rows = get_token_usage_repo().aggregate_daily(since, until)
-    return NormalResponse(code=0, message="ok", data={"rows": rows, "total": len(rows)})
+    repo = get_token_usage_repo()
+    rows = repo.aggregate_daily(since, until)
+    return NormalResponse(
+        code=0,
+        message="ok",
+        data={
+            "rows": rows,
+            "total": len(rows),
+            # 界面据此判断「清到某一天」会不会真的连带删掉日表里那一整天,
+            # 见 TokenUsageRepo.latest_daily_date 的说明。
+            "daily_latest_date": repo.latest_daily_date(),
+        },
+    )
 
 
 @router.get(
@@ -643,8 +654,17 @@ async def get_token_usage_buckets(
     count, so it never hits the raw-event cap regardless of activity — preferred
     over /token-usage for the today timeline.
     """
-    rows = get_token_usage_repo().aggregate_buckets(since, until, bin_minutes)
-    return NormalResponse(code=0, message="ok", data={"rows": rows, "total": len(rows)})
+    repo = get_token_usage_repo()
+    rows = repo.aggregate_buckets(since, until, bin_minutes)
+    return NormalResponse(
+        code=0,
+        message="ok",
+        data={
+            "rows": rows,
+            "total": len(rows),
+            "daily_latest_date": repo.latest_daily_date(),
+        },
+    )
 
 
 class ClearTokenUsageBody(BaseModel):

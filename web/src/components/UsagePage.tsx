@@ -236,6 +236,7 @@ export function UsagePage() {
       {clearScope && (
         <UsageClearDialog
           scope={clearScope}
+          dailyLatestDate={stats?.daily_latest_date ?? null}
           onClose={() => setClearScope(null)}
           onCleared={() => {
             setClearScope(null);
