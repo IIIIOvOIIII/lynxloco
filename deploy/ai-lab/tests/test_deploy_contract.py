@@ -47,7 +47,7 @@ EXPECTED_RUNTIME_ENV = {
 
 EXPECTED_COMMANDS = {"build", "preflight", "deploy", "verify", "status", "rollback"}
 LAB_HOSTS = {"ai-lab01.esxi", "ai-lab02.esxi"}
-PRODUCTION_HOST = "miloco.esxi"
+PRODUCTION_HOST = "docker.esxi"
 ALLOWED_HOSTS = LAB_HOSTS | {PRODUCTION_HOST}
 FORBIDDEN_PARTS = {".git", ".env", "config.json", ".venv", "node_modules", "__pycache__"}
 EXTERNAL_COMMANDS = (
@@ -1352,13 +1352,11 @@ def test_preflight_and_transfer_are_bounded_to_the_approved_targets() -> None:
     assert set(re.findall(r"ai-lab0[12]\.esxi", controller)) == LAB_HOSTS
     assert PRODUCTION_HOST in controller
     assert PRODUCTION_HOST in remote
-    assert "docker.esxi" not in controller
-    assert "docker.esxi" not in remote
     assert "Docker >= 26" in remote
     assert "Compose >= 2.26" in remote
     assert "linux/amd64" in remote
     assert "1810" in remote
-    assert "1811" not in remote
+    assert "1811" in remote
     assert str(5 * 1024 * 1024) in remote
     assert 'LAB_ROOT="/opt/miloco-lab"' in remote
     assert 'LAB_ROOT="/opt/miloco"' in remote
@@ -1418,7 +1416,7 @@ def test_remote_checksum_and_acceptance_precede_activation() -> None:
     assert re.search(r"ai-lab01\.esxi\).*?cpu_limit=\"3\.0\".*?memory_limit=\"3072m\"", remote, re.S)
     assert re.search(r"ai-lab02\.esxi\).*?cpu_limit=\"1\.25\".*?memory_limit=\"1536m\"", remote, re.S)
     assert re.search(
-        r"miloco\.esxi\).*?SERVICE_PORT=\"1810\".*?cpu_limit=\"2\.0\".*?memory_limit=\"4096m\"",
+        r"docker\.esxi\).*?SERVICE_PORT=\"1811\".*?cpu_limit=\"2\.0\".*?memory_limit=\"4096m\"",
         remote,
         re.S,
     )
@@ -1562,8 +1560,8 @@ def test_deploy_streams_one_archive_through_stubbed_ssh(tmp_path: Path) -> None:
     assert (tmp_path / "ssh-stdin-3").read_bytes() == archive.read_bytes()
 
 
-def test_deploy_streams_archive_to_miloco_esxi_with_production_profile(tmp_path: Path) -> None:
-    """Catches production deploys falling back to the old host, lab roots, or broad transfer tools."""
+def test_deploy_streams_archive_to_docker_esxi_with_production_profile(tmp_path: Path) -> None:
+    """Catches production deploys falling back to lab roots or broad transfer tools."""
     sha = "abcdef0123456789abcdef0123456789abcdef01"
     repository = tmp_path / "repo"
     controller = repository / "deploy.sh"
@@ -2150,10 +2148,10 @@ def test_all_compose_calls_use_one_resource_and_timeout_wrapper(tmp_path: Path) 
     )
 
 
-def test_remote_miloco_esxi_profile_uses_port_1810_and_production_names(
+def test_remote_docker_esxi_profile_uses_port_1811_and_production_names(
     tmp_path: Path,
 ) -> None:
-    """Catches miloco.esxi accidentally reusing lab root, old port, project, or image tags."""
+    """Catches docker.esxi accidentally reusing lab root, port, project, or image tags."""
     sha = "4" * 40
     source = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8").rsplit(
         '\nmain "$@"', maxsplit=1
@@ -2188,7 +2186,7 @@ def test_remote_miloco_esxi_profile_uses_port_1810_and_production_names(
     assert result.stdout.strip() == "new"
     assert wrapper_log.read_text(encoding="utf-8").startswith(
         f"sha={sha} cpu=2.0 memory=4096m image=miloco state=/opt/miloco/state "
-        "port=1810 url=http://127.0.0.1:1810 args=--signal=KILL 7s docker compose "
+        "port=1811 url=http://127.0.0.1:1811 args=--signal=KILL 7s docker compose "
         f"-p miloco -f /opt/miloco/releases/{sha}/compose.yaml ps -q miloco"
     )
     assert image_log.read_text(encoding="utf-8").splitlines() == [

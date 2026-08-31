@@ -4,7 +4,7 @@ set -euo pipefail
 
 readonly ALLOWED_HOST_1="ai-lab01.esxi"
 readonly ALLOWED_HOST_2="ai-lab02.esxi"
-readonly ALLOWED_HOST_3="miloco.esxi"
+readonly ALLOWED_HOST_3="docker.esxi"
 
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 case "$SCRIPT_PATH" in

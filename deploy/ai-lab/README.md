@@ -1,9 +1,8 @@
 # Miloco AI-lab release contract
 
 This directory defines the release payload and operator contract for the
-isolated AI-lab deployment and the current standalone production VM. The
-permitted targets are `ai-lab01.esxi`, `ai-lab02.esxi`, and `miloco.esxi`;
-deployments must not be directed at another host.
+isolated AI-lab deployment. The only permitted targets are `ai-lab01.esxi` and
+`ai-lab02.esxi`; deployments must not be directed at another host.
 
 `artifact-files.txt` is the sole release-payload allowlist. A release is built
 from the current clean Git `HEAD`, with its exact SHA recorded in
@@ -27,10 +26,8 @@ MILOCO_SSH_IDENTITY=/absolute/path/to/lab-identity ./deploy.sh rollback ai-lab01
 ```
 
 Use the same positional command shape with `ai-lab02.esxi`, or the equivalent
-`--host ai-lab02.esxi` form. For production, use `miloco.esxi`; it runs under
-`/opt/miloco`, listens on port `1810`, and uses the `4096m` memory profile.
-`build` refuses a dirty worktree and does not need an SSH identity. Every
-remote command requires `MILOCO_SSH_IDENTITY`: an
+`--host ai-lab02.esxi` form. `build` refuses a dirty worktree and does not need
+an SSH identity. Every remote command requires `MILOCO_SSH_IDENTITY`: an
 absolute regular file, not a symlink, owned by the current user, with no group
 or other permission bits. The controller passes that path using SSH
 `IdentitiesOnly=yes`; it never reads or prints its contents.
@@ -89,15 +86,12 @@ maintenance design, explicit authorization, dedicated tests, and review.
 
 ## Runtime and read-only boundaries
 
-AI-lab persistent application state is `/opt/miloco-lab/state`; deployment
-state is `/opt/miloco-lab/deploy-state/current` and
-`/opt/miloco-lab/deploy-state/previous`. Production persistent application
-state is `/opt/miloco/state`; deployment state is
-`/opt/miloco/deploy-state/current` and `/opt/miloco/deploy-state/previous`.
-The service is exposed on port `1810`. `ai-lab01.esxi` uses 3.0 CPUs and
-3072m; `ai-lab02.esxi` uses 1.25 CPUs and 1536m; `miloco.esxi` uses 2.0 CPUs
-and 4096m. `compose.yaml` declares the CPU, memory, and process limits that
-release validation checks after rendering.
+Persistent application state is `/opt/miloco-lab/state`; deployment state is
+`/opt/miloco-lab/deploy-state/current` and
+`/opt/miloco-lab/deploy-state/previous`. The service is exposed only on port
+`1810`. `ai-lab01.esxi` uses 3.0 CPUs and 3072m; `ai-lab02.esxi` uses 1.25
+CPUs and 1536m. `compose.yaml` declares the CPU, memory, and process limits
+that release validation checks after rendering.
 
 The deployment root and every control, incoming, release, artifact, acceptance,
 state, and lock path must be non-symlinked, root-owned, and within

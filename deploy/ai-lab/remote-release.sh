@@ -44,7 +44,7 @@ die() {
 
 validate_host() {
     case "$1" in
-        ai-lab01.esxi|ai-lab02.esxi|miloco.esxi) ;;
+        ai-lab01.esxi|ai-lab02.esxi|docker.esxi) ;;
         *) die 2 "host is not an approved Miloco deployment target" ;;
     esac
 }
@@ -97,10 +97,10 @@ configure_host_profile() {
             cpu_limit="1.25"
             memory_limit="1536m"
             ;;
-        miloco.esxi)
+        docker.esxi)
             LAB_ROOT="/opt/miloco"
-            SERVICE_PORT="1810"
-            SERVER_URL="http://127.0.0.1:1810"
+            SERVICE_PORT="1811"
+            SERVER_URL="http://127.0.0.1:1811"
             COMPOSE_PROJECT="miloco"
             RUNTIME_IMAGE_NAME="miloco"
             ACCEPTANCE_IMAGE_NAME="miloco-acceptance"
