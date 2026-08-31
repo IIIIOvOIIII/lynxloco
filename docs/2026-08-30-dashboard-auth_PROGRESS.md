@@ -48,3 +48,10 @@
 - Expected result: Pydantic validation errors remain JSON-serializable, raw request inputs stay redacted, the whitespace-only setup username case returns HTTP 422 instead of HTTP 500, and the branch is ready for merge/push preparation.
 - Result: Achieved. Commit `c9aea50f4a94147565d04e4698b704e473f55c56` recursively sanitizes validation error details, omits non-serializable nested objects such as `ctx.error`, preserves raw `input` redaction, and adds a focused regression for whitespace-only setup usernames. The implementer reported the focused regression, backend auth suite, scoped Ruff, full `./scripts/local-ci.sh --tests`, and `git diff --check` all green. Scoped re-review confirmed the sanitizer finding is addressed and found no new Critical/Important breakage.
 - Next step: Prepare the branch for merge/push publication. Production deployment to `miloco.esxi` remains a separate CO/PAM-gated action with pre-deploy data backup and browser/CLI smoke verification.
+
+## 2026-08-31 09:35 +08
+
+- Current work: Corrected the production deployment path decision before opening the dashboard-auth CO.
+- Expected result: Deploy the dashboard-auth release to the existing `miloco.esxi` official OpenClaw/Miloco installation without moving runtime state into the older Docker release-controller layout.
+- Result: Achieved locally. Main was first pushed with the dashboard-auth release and a temporary Docker-controller target correction, but review of the current production shape showed `miloco.esxi` is the official installer-based deployment with existing configuration under the OpenClaw Miloco home. The Docker controller would use `/opt/miloco/state` and is not the safe path for this deployment. Commit `c87d956` reverts that controller change without force-pushing history.
+- Next step: Build official installer artifacts from the final pushed main commit, open the CO for `miloco.esxi/root`, back up the existing Miloco/OpenClaw configuration before mutation, deploy via the installer/sync artifact flow, and verify existing Xiaomi/RTSP/model/Home Assistant configuration remains present after the dashboard first-admin setup gate appears.
