@@ -22,21 +22,33 @@ export function textResidual(input: number, video: number, audio: number): numbe
  * 清到某一天时，那句「日聚合只按天存，故当天更早的记录会被连带删除」是否成立。
  *
  * 日表按 `date >= from_date` 整天删，所以只有当边界那天**真的已经滚进日表**时才谈得上
- * 「连带」。滚存截止是天对齐、且只搬更早的行，日表里的最新日期因此比今天早好几天——
- * 「近 24 小时」那种边界日根本不在表里，那次删除恒命中 0 行。对这一档仍旧无条件说
- * 「会被连带删除」有两个后果：想只清今天的人被吓退，而信了的人清完发现数据还在，
- * 与一个不可逆操作的确认窗自相矛盾。
+ * 「连带」。判据卡日表日期区间的**两头**，各挡一类落空：
  *
- * 判据取「日表当前最新日期」这个事实而不是拿保留天数推算：推算要用「今天」，而界面的
+ * - **上界**（边界日 ≤ 最新日）：滚存截止天对齐、只搬更早的行，日表里的最新日期比今天
+ *   早好几天，「近 24 小时」那种边界日根本不在表里，那次删除恒命中 0 行。
+ * - **下界**（边界日 ≥ 最早日）：盒子运行天数短于所选范围时（刚装机、刚升级），边界日
+ *   早于表里最早的一天，`date >= 边界日` 删掉的都是本就落在所选范围内的整天，不存在
+ *   任何超出预期的删除。
+ *
+ * 说错的代价是双向的：只想清近期的人被吓退，而信了的人清完发现数据还在——一个不可逆
+ * 操作的确认窗最不该这样。
+ *
+ * **残留的不充分性**：区间只保证边界日落在「有数据的那段时间」里，不保证**那一天**有行
+ * ——日表按天落行，边界日当天零用量就没有行，此时提示仍会落空。要彻底判准得按天查存在
+ * 性（多一次带 from_date 的往返，或把日期集合整个传下来），代价与收益不成比例：区间挡
+ * 掉的是「必然落空」的两类，剩下的只在「边界日恰好整天没有用量」时出现。
+ *
+ * 判据取「日表的日期区间」这个事实，而不是拿保留天数推算：推算要用「今天」，而界面的
  * 今天是浏览器时区、日表的 date 按本机时区写入，两者能差一天。
  *
- * 拿不到 latest（接口没给 / 日表为空）时返回 false——宁可不说，也不说错。
- * 两个参数都是 YYYY-MM-DD，等宽零填充，故可直接字典序比较。
+ * 任一端拿不到（接口没给 / 日表为空）时返回 false——宁可不说，也不说错。
+ * 三个参数都是 YYYY-MM-DD，等宽零填充，故可直接字典序比较。
  */
 export function dailyCaveatApplies(
   boundaryDate: string | null,
   dailyLatestDate: string | null,
+  dailyEarliestDate: string | null = null,
 ): boolean {
-  if (!boundaryDate || !dailyLatestDate) return false;
-  return boundaryDate <= dailyLatestDate;
+  if (!boundaryDate || !dailyLatestDate || !dailyEarliestDate) return false;
+  return boundaryDate >= dailyEarliestDate && boundaryDate <= dailyLatestDate;
 }

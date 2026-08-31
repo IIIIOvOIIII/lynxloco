@@ -624,15 +624,17 @@ async def get_token_usage_daily(
     """
     repo = get_token_usage_repo()
     rows = repo.aggregate_daily(since, until)
+    earliest, latest = repo.daily_date_range()
     return NormalResponse(
         code=0,
         message="ok",
         data={
             "rows": rows,
             "total": len(rows),
-            # 界面据此判断「清到某一天」会不会真的连带删掉日表里那一整天,
-            # 见 TokenUsageRepo.latest_daily_date 的说明。
-            "daily_latest_date": repo.latest_daily_date(),
+            # 界面据此判断「清到某一天」会不会真的连带删掉日表里那一整天。
+            # 两头都要:见 TokenUsageRepo.daily_date_range 的说明。
+            "daily_earliest_date": earliest,
+            "daily_latest_date": latest,
         },
     )
 
@@ -656,13 +658,15 @@ async def get_token_usage_buckets(
     """
     repo = get_token_usage_repo()
     rows = repo.aggregate_buckets(since, until, bin_minutes)
+    earliest, latest = repo.daily_date_range()
     return NormalResponse(
         code=0,
         message="ok",
         data={
             "rows": rows,
             "total": len(rows),
-            "daily_latest_date": repo.latest_daily_date(),
+            "daily_earliest_date": earliest,
+            "daily_latest_date": latest,
         },
     )
 

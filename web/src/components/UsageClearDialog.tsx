@@ -18,6 +18,7 @@ import type { ClearScope } from "./UsageClearMenu";
 
 export function UsageClearDialog({
   scope,
+  dailyEarliestDate,
   dailyLatestDate,
   clear,
   onCleared,
@@ -26,9 +27,10 @@ export function UsageClearDialog({
   /** 要清的作用域（时间范围 × 目标），决定弹窗复述的是「全部」「某个时段」还是某一项。 */
   scope: ClearScope;
   /**
-   * 日聚合表里已有的最新日期（YYYY-MM-DD），null = 表为空或接口未给。
+   * 日聚合表里已有的最早 / 最新日期（YYYY-MM-DD），null = 表为空或接口未给。
    * 只用来决定那句「连带删除某天」要不要说——见 dailyCaveatApplies。
    */
+  dailyEarliestDate: string | null;
   dailyLatestDate: string | null;
   /**
    * fromDate 是本弹窗**已经写给用户看**的那一天（YYYY-MM-DD），要原样发给后端：
@@ -149,11 +151,13 @@ export function UsageClearDialog({
         {/* 日聚合表只有天粒度：跨天范围会连带删掉边界当天更早的记录。这是日聚合的
             固有精度损失，必须说出来——否则就是悄悄多删。
 
-            但只在边界那天**真的已经在日表里**时才说：日表按 `date >= from_date` 整天
-            删，而滚存截止是天对齐、只搬更早的行，所以「近 24 小时」那种边界日根本不在
-            表里、那次删除恒命中 0 行。对它照样说「会被连带删除」，一边吓退只想清今天
-            的人，一边让信了的人清完发现数据还在——一个不可逆操作的确认窗最不该这样。 */}
-        {boundary && dailyCaveatApplies(boundary.iso, dailyLatestDate) && (
+            但只在边界那天**落在日表已有的日期区间里**时才说。两头各挡一类落空：滚存
+            截止天对齐、只搬更早的行，所以「近 24 小时」那种边界日不在表里（上界）；盒子
+            运行天数短于所选范围时，边界日早于表里最早那天，删掉的都是本就在范围内的整天
+            （下界）。说错的代价是双向的——一边吓退只想清近期的人，一边让信了的人清完发现
+            数据还在，而这是个不可逆操作的确认窗。残留的不充分性见 dailyCaveatApplies。 */}
+        {boundary &&
+          dailyCaveatApplies(boundary.iso, dailyLatestDate, dailyEarliestDate) && (
           <p className="text-caption text-text-secondary mt-2">
             {t(scope.target ? "usage.clearDailyCaveatTarget" : "usage.clearDailyCaveat", {
               date: boundary.label,

@@ -1769,6 +1769,7 @@ function unitsToStats(
   units: UsageUnit[],
   timeline: UsageTimelinePoint[],
   dailyLatestDate: string | null = null,
+  dailyEarliestDate: string | null = null,
 ): UsageStats {
   const totals = emptyBreakdown();
   let calls = 0;
@@ -1861,6 +1862,7 @@ function unitsToStats(
     by_type: [...byType.values()].sort((a, b) => b.tokens - a.tokens),
     rows,
     timeline,
+    daily_earliest_date: dailyEarliestDate,
     daily_latest_date: dailyLatestDate,
   };
 }
@@ -2121,7 +2123,12 @@ async function fetchUsageStats(
     start.setHours(0, 0, 0, 0);
     const startMs = start.getTime();
     const r = await apiFetch<
-      Normal<{ rows: BucketRow[]; total: number; daily_latest_date?: string | null }>
+      Normal<{
+        rows: BucketRow[];
+        total: number;
+        daily_earliest_date?: string | null;
+        daily_latest_date?: string | null;
+      }>
     >(
       `/api/admin/token-usage/buckets?bin=${binMinutes}` +
         `&since=${startMs}&until=${startMs + ONE_DAY_MS}`,
@@ -2132,6 +2139,7 @@ async function fetchUsageStats(
       rows.map(bucketToUnit),
       bucketTimeline(rows, binMinutes),
       r.data.daily_latest_date ?? null,
+      r.data.daily_earliest_date ?? null,
     );
   }
 
@@ -2143,7 +2151,12 @@ async function fetchUsageStats(
   since.setDate(since.getDate() - (days - 1)); // 走日历，见 dailyTimeline 的说明
   const qs = `since=${localDateStr(since)}&until=${localDateStr(until)}`;
   const r = await apiFetch<
-    Normal<{ rows: DailyRow[]; total: number; daily_latest_date?: string | null }>
+    Normal<{
+      rows: DailyRow[];
+      total: number;
+      daily_earliest_date?: string | null;
+      daily_latest_date?: string | null;
+    }>
   >(`/api/admin/token-usage/daily?${qs}`);
   const rows = r.data.rows ?? [];
   return unitsToStats(
@@ -2151,6 +2164,7 @@ async function fetchUsageStats(
     rows.map(rowToUnit),
     dailyTimeline(rows, days),
     r.data.daily_latest_date ?? null,
+    r.data.daily_earliest_date ?? null,
   );
 }
 

@@ -245,23 +245,29 @@ class TokenUsageRepo:
             rows = rows[:limit]
         return [dict(r) for r in rows], truncated
 
-    def latest_daily_date(self) -> str | None:
-        """日聚合表里已有的最新日期（YYYY-MM-DD）；表为空时 None。
+    def daily_date_range(self) -> tuple[str | None, str | None]:
+        """日聚合表里已有的最早 / 最新日期（YYYY-MM-DD）；表为空时 (None, None)。
 
         给界面用来判断「清到某一天会不会连带删掉那天更早的记录」。日表只有天粒度,
         所以清除会按 `date >= from_date` 整天删——但只有当那一天**真的已经滚进日表**
-        时才谈得上「连带」。滚存的截止是天对齐的 `today - _RETENTION_DAYS` 且只搬更早
-        的行,故日表里的最新日期比今天早好几天,近 24 小时那种边界日根本不在表里。
+        时才谈得上「连带」。
 
-        为什么给「表里的最新日期」这个事实,而不是给 `_RETENTION_DAYS` 让界面自己推算:
+        **两头都要给**。只给最新日期,证明的是「有日聚合行会被删」,不是「边界那天有
+        行」:滚存截止天对齐且只搬更早的行,所以近 24 小时那种边界日不在表里(上界挡
+        住了);而盒子运行天数短于所选范围时,边界日会早于表里最早的一天,那句提示同样
+        落空——那要下界才挡得住。
+
+        为什么给「表里的日期区间」这个事实,而不是给 `_RETENTION_DAYS` 让界面自己推算:
         推算要用「今天」,而界面的今天是浏览器时区、日表的 date 按本机时区写入,两者能
         差一天——那正是 from_date 闸门要处理的分歧,不该在这里再引入一次。
         """
         with self.db.get_connection() as conn:
             row = conn.execute(
-                "SELECT MAX(date) FROM token_usage_daily"
+                "SELECT MIN(date), MAX(date) FROM token_usage_daily"
             ).fetchone()
-        return row[0] if row and row[0] else None
+        if not row or not row[1]:
+            return None, None
+        return row[0], row[1]
 
     def aggregate_buckets(
         self,

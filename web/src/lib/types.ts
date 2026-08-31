@@ -394,11 +394,13 @@ export interface UsageStats {
    */
   timeline: UsageTimelinePoint[];
   /**
-   * 日聚合表里已有的最新日期（YYYY-MM-DD）；表为空或接口未给时为 null。
+   * 日聚合表里已有的最早 / 最新日期（YYYY-MM-DD）；表为空或接口未给时为 null。
    *
    * 清除确认窗据此判断「清到某一天会不会连带删掉那天更早的记录」——日表按整天删，
-   * 但只有那天真的已经滚进日表才谈得上连带。见 usageTokens.dailyCaveatApplies。
+   * 但只有边界那天真的落在日表已有的日期区间里才谈得上连带。两头各挡一类落空，
+   * 见 usageTokens.dailyCaveatApplies。
    */
+  daily_earliest_date: string | null;
   daily_latest_date: string | null;
 }
 

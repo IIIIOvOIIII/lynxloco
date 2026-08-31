@@ -357,18 +357,22 @@ def test_from_date_combines_with_target(repo):
     assert sorted(daily) == [("m1", "https://a/v1"), ("m1", "https://b/v1")]
 
 
-def test_latest_daily_date_reports_table_max(repo):
-    """latest_daily_date 就是日表里的最大日期；空表为 None。
+def test_daily_date_range_reports_both_ends(repo):
+    """daily_date_range 给出日表里的最早与最新日期；空表为 (None, None)。
 
-    界面据此决定「清到某一天会不会连带删掉那天更早的记录」这句提示说不说。
+    界面据此决定「清到某一天会不会连带删掉那天更早的记录」这句提示说不说——两头
+    各挡一类落空：上界挡「边界日还没滚进日表」，下界挡「边界日早于表里最早那天」。
     """
-    assert repo.latest_daily_date() is None  # 空表：界面一律不说
+    assert repo.daily_date_range() == (None, None)  # 空表：界面一律不说
 
     today = date.today()
     _daily(repo, today - timedelta(days=9))
     _daily(repo, today - timedelta(days=4), model="m2")
     _daily(repo, today - timedelta(days=7), model="m3")
-    assert repo.latest_daily_date() == (today - timedelta(days=4)).isoformat()
+    assert repo.daily_date_range() == (
+        (today - timedelta(days=9)).isoformat(),
+        (today - timedelta(days=4)).isoformat(),
+    )
 
 
 def test_rollup_keeps_daily_table_behind_yesterday(repo):
@@ -384,7 +388,7 @@ def test_rollup_keeps_daily_table_behind_yesterday(repo):
     _raw(repo, _ts_ms(today))
     repo.insert("m1", "https://a/v1", {"input_tokens": 1, "output_tokens": 1}, "realtime")
 
-    latest = repo.latest_daily_date()
+    _, latest = repo.daily_date_range()
     assert latest is not None, "老事件应已滚进日表"
     assert latest < (today - timedelta(days=1)).isoformat(), (
         f"日表最新日期 {latest} 不该晚于前天——否则近 24 小时档的提示又会恒为真"
