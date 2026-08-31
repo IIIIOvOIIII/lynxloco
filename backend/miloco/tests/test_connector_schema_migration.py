@@ -1,14 +1,15 @@
 # Copyright (C) 2025 Xiaomi Corporation
 # This software may be used and distributed according to the terms of the Xiaomi Miloco License Agreement.
 
-"""v1→v2 schema 迁移测试.
+"""schema 迁移测试. 基线跟着 _DB_SCHEMA_VERSION 走, 用例里不写死版本号.
 
 覆盖:
-- fresh-build 直接落最新形态 (rule NOT NULL + FK, cron 表存在, 无 task_link)
-- 迁移 A/B/C/D/E 五型 orphan 各自的处置策略 (D 取 task_link 侧, A/E 删+log)
+- fresh-build 直接落当前基线形态 (rule NOT NULL + FK, cron 表存在, 无 task_link)
+- v1→v2 迁移 A/B/C/D/E 五型 orphan 各自的处置策略 (D 取 task_link 侧, A/E 删+log)
 - cron 行迁移 + cron dangling 跳过+log (不阻塞启动)
 - 迁移后三重不变量
-- rollback_v2_to_v1 反向 + internal cron 前置断言
+- 已在基线上的库再次 init 不重跑迁移
+- rollback_v2_to_v1 反向 + internal cron 前置断言 + 在高于 v2 的库上拒绝执行
 """
 
 from __future__ import annotations
@@ -145,7 +146,7 @@ def _read_rule(conn, rule_id: str) -> sqlite3.Row | None:
 # ── fresh-build ───────────────────────────────────────────────────────
 
 
-def test_fresh_build_is_v2_form(fresh_db):
+def test_fresh_build_lands_on_baseline_form(fresh_db):
     from miloco.database.connector import get_db_connector
 
     with get_db_connector().get_connection() as conn:
@@ -492,8 +493,8 @@ def test_migrate_final_invariants(v1_db):
         )
 
 
-def test_migrate_is_skipped_on_v2_db(fresh_db):
-    """已经是 v2 (fresh-build) 的库再次 init 不重跑迁移, 数据无变化."""
+def test_migrate_is_skipped_on_baseline_db(fresh_db):
+    """已经在当前基线 (fresh-build) 的库再次 init 不重跑迁移, 数据无变化."""
     from miloco.database.connector import get_db_connector
 
     with get_db_connector().get_connection() as conn:

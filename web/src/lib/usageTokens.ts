@@ -43,11 +43,16 @@ export function textResidual(input: number, video: number, audio: number): numbe
  *
  * 任一端拿不到（接口没给 / 日表为空）时返回 false——宁可不说，也不说错。
  * 三个参数都是 YYYY-MM-DD，等宽零填充，故可直接字典序比较。
+ *
+ * 三个参数都不给默认值：漏传要在编译期报错，不能降级成运行期静默失效。「不说」这一侧
+ * 本来就没有任何信号——恒返回 false 与「判断后决定不说」在界面上完全一样，一旦漏传就
+ * 再也不会有人发现那句提示已经永远不出现了。接口没返回字段是另一回事，那由取值处的
+ * 空值兜底负责。
  */
 export function dailyCaveatApplies(
   boundaryDate: string | null,
   dailyLatestDate: string | null,
-  dailyEarliestDate: string | null = null,
+  dailyEarliestDate: string | null,
 ): boolean {
   if (!boundaryDate || !dailyLatestDate || !dailyEarliestDate) return false;
   return boundaryDate >= dailyEarliestDate && boundaryDate <= dailyLatestDate;
