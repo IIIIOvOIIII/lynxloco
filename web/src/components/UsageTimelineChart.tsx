@@ -494,6 +494,16 @@ function Tooltip({
   const showTargets = sorted.length > 0;
   const soleTarget = sorted.length === 1 ? sorted[0] : null;
   const expandTargets = sorted.length > 1 && !stacked;
+  /**
+   * 这一桶**真有**模态可列。`stacked` 只说明档位允许列模态，不代表这桶有量：空桶四个
+   * 字段全是 0，下面那四行会被逐行的 `> 0` 守卫全部跳过。而空桶不是边角——绘图区是
+   * 整条做就近命中（细柱下不留死区），指针落在空桶上照样弹浮层，默认「近 24 小时 ÷
+   * 15 分」有 96 个桶，夜里成片都是空的。
+   *
+   * 底边与下面那段模态明细共用这一个判据，不各判各的：上一次悬空底边正是因为两处
+   * 口径分叉才漏掉的。
+   */
+  const showModalities = stacked && MODALITIES.some((m) => point[m.key] > 0);
   const shownTargets = expandTargets ? sorted.slice(0, MAX_TARGET_ROWS) : [];
   const restTargets = expandTargets ? sorted.slice(MAX_TARGET_ROWS) : [];
   const restTotal = restTargets.reduce((a, t) => a + targetTotal(t), 0);
@@ -539,13 +549,13 @@ function Tooltip({
       {/* 底边只在下面真有东西可分隔时才画，否则是条悬空线 */}
       <div
         className={`flex items-baseline justify-between gap-3.5 ${
-          stacked || showTargets ? "pb-1 mb-1 border-b border-border" : ""
+          showModalities || showTargets ? "pb-1 mb-1 border-b border-border" : ""
         }`}
       >
         <span className="num font-semibold text-text-primary">{humanTokens(point.tokens)}</span>
         <span className="text-text-secondary">{t("usage.tokensUnit")}</span>
       </div>
-      {stacked &&
+      {showModalities &&
         MODALITIES.map((m) =>
           point[m.key] > 0 ? (
             <div
