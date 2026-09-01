@@ -18,3 +18,10 @@
 - Expected result: Capture a narrow written design before implementation: RTSP-only, retry every 10 minutes for 12 hours, recover on success, and auto-disable the RTSP source if the window expires.
 - Result: Achieved in draft. Specification added at `docs/superpowers/specs/2026-09-01-rtsp-auto-recovery-design.md`. The design keeps recovery in the backend RTSP runtime, reuses the existing retry path, keeps the failure timer bounded so genuinely bad credentials are not retried forever, and preserves all non-RTSP state.
 - Next step: Self-review the spec, commit it, then proceed to implementation planning once the written spec is accepted.
+
+## 2026-09-01 12:53 SGT
+
+- Current work: Implemented the approved RTSP-only bounded auto-recovery behavior in an isolated worktree branch.
+- Expected result: Terminal RTSP sources are retried no earlier than 10 minutes after failure, keep their original 12-hour recovery deadline across repeated terminal failures, recover automatically when a retry reconnects, and only the matching RTSP source is disabled if the 12-hour window expires.
+- Result: Achieved locally at implementation commit `d8e48d1b490f5e2db60bbc66f6bf610d8bfbda5e`. Added source-level recovery state, a periodic adapter advance hook, and tests for retry timing, expiration auto-disable, repeated-failure deadline preservation, config-change reset, same-cycle adapter retry, and MIoT non-impact. Verification passed: `uv run ruff check ...`, `uv run ty check ...`, and `uv run --package miloco pytest miloco/tests/perception/collect/test_rtsp_camera_source.py miloco/tests/perception/collect/test_camera_adapter.py -q` with 38 passed.
+- Next step: Commit the progress record, merge the implementation branch back to `main`, push, then create a production Software CO for deployment to `miloco.esxi` using the official installer/sync path while preserving `/root/.openclaw/miloco`.
