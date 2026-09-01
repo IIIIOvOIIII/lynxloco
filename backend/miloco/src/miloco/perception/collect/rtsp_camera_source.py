@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from miloco.config.settings import RtspSourceSettings
 from miloco.perception.collect.camera_source import (
@@ -17,6 +18,7 @@ from miloco.perception.collect.camera_source import (
 )
 from miloco.perception.collect.rtsp_session import RtspSession
 from miloco.perception.types import PerceptionDevice
+from miloco.utils.agent_config import mutate_rtsp_sources
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +37,16 @@ _SAFE_TERMINAL_MESSAGES = {
     "unsupported_video_codec": "RTSP video codec could not be decoded",
     "no_video_stream": "RTSP source has no video stream",
 }
+
+RTSP_AUTO_RECOVERY_RETRY_INTERVAL_MS = 10 * 60 * 1000
+RTSP_AUTO_RECOVERY_WINDOW_MS = 12 * 60 * 60 * 1000
+
+SourcesMutation = Callable[[list[dict[str, Any]]], list[dict[str, Any]]]
+SourcesMutator = Callable[[SourcesMutation], dict[str, Any]]
+
+
+def _monotonic_ms() -> int:
+    return time.monotonic_ns() // 1_000_000
 
 
 @dataclass(frozen=True)
@@ -57,16 +69,45 @@ class _TerminalTombstone:
     state: CameraSourceState
 
 
+@dataclass(frozen=True)
+class RtspAutoRecoveryResult:
+    success: bool
+    retry_dids: frozenset[str] = frozenset()
+    disabled_dids: frozenset[str] = frozenset()
+
+
+@dataclass
+class _AutoRecoveryWindow:
+    fingerprint: str
+    first_failure_ms: int
+    last_retry_ms: int
+    attempt_count: int = 0
+    last_error_code: str | None = None
+
+
 class RtspCameraSource:
     """Own the one live ``RtspSession`` allowed for each enabled RTSP source."""
 
     source_type: Literal["miot", "rtsp"] = "rtsp"
 
-    def __init__(self, settings_loader: Callable[[], list[RtspSourceSettings]]) -> None:
+    def __init__(
+        self,
+        settings_loader: Callable[[], list[RtspSourceSettings]],
+        *,
+        sources_mutator: SourcesMutator | None = mutate_rtsp_sources,
+        clock_ms: Callable[[], int] = _monotonic_ms,
+        auto_retry_interval_ms: int = RTSP_AUTO_RECOVERY_RETRY_INTERVAL_MS,
+        auto_disable_window_ms: int = RTSP_AUTO_RECOVERY_WINDOW_MS,
+    ) -> None:
         self._settings_loader = settings_loader
+        self._sources_mutator = sources_mutator
+        self._clock_ms = clock_ms
+        self._auto_retry_interval_ms = auto_retry_interval_ms
+        self._auto_disable_window_ms = auto_disable_window_ms
         self._sessions: dict[str, _SessionEntry] = {}
         self._pending_cleanup: dict[str, _SessionEntry] = {}
         self._terminal_tombstones: dict[str, _TerminalTombstone] = {}
+        self._auto_recovery: dict[str, _AutoRecoveryWindow] = {}
         self._lifecycle_lock = asyncio.Lock()
 
     def _load_settings(self) -> dict[str, RtspSourceSettings]:
@@ -194,10 +235,12 @@ class RtspCameraSource:
         if entry.session.is_active() is True:
             return True
         if entry.session.is_terminal() is True:
-            self._terminal_tombstones[did] = _TerminalTombstone(
+            tombstone = _TerminalTombstone(
                 fingerprint=self._connection_fingerprint(entry.setting),
                 state=self._terminal_state(entry.session.state()),
             )
+            self._terminal_tombstones[did] = tombstone
+            self._record_auto_recovery_window(entry.setting, tombstone.state)
         return False
 
     async def request_retry(self, did: str) -> bool:
@@ -206,6 +249,7 @@ class RtspCameraSource:
             setting = self._load_settings().get(did)
             if setting is None or not setting.enabled:
                 self._terminal_tombstones.pop(did, None)
+                self._auto_recovery.pop(did, None)
                 return False
             if did in self._pending_cleanup and not await self._retry_pending(did):
                 return False
@@ -214,7 +258,60 @@ class RtspCameraSource:
                 if not await self._stop_active(did):
                     return False
             self._terminal_tombstones.pop(did, None)
+            self._auto_recovery.pop(did, None)
             return True
+
+    async def advance_auto_recovery(
+        self, *, now_ms: int | None = None
+    ) -> RtspAutoRecoveryResult:
+        """Advance bounded RTSP recovery windows during adapter periodic sync."""
+        async with self._lifecycle_lock:
+            current_ms = self._clock_ms() if now_ms is None else now_ms
+            settings = self._load_settings()
+            self._reconcile_terminal_tombstones(settings)
+            self._clear_recovered_sessions_locked()
+            retry_dids: set[str] = set()
+            disabled_dids: set[str] = set()
+            success = True
+
+            for did, tombstone in list(self._terminal_tombstones.items()):
+                setting = settings.get(did)
+                if setting is None or not setting.enabled:
+                    continue
+                fingerprint = self._connection_fingerprint(setting)
+                if tombstone.fingerprint != fingerprint:
+                    continue
+                window = self._auto_recovery.get(did)
+                if window is None or window.fingerprint != fingerprint:
+                    window = _AutoRecoveryWindow(
+                        fingerprint=fingerprint,
+                        first_failure_ms=current_ms,
+                        last_retry_ms=current_ms,
+                        last_error_code=tombstone.state.error_code,
+                    )
+                    self._auto_recovery[did] = window
+                if current_ms - window.first_failure_ms >= self._auto_disable_window_ms:
+                    disabled = await self._disable_setting_locked(setting)
+                    if disabled:
+                        self._terminal_tombstones.pop(did, None)
+                        self._auto_recovery.pop(did, None)
+                        disabled_dids.add(did)
+                    else:
+                        success = False
+                    continue
+                if current_ms - window.last_retry_ms < self._auto_retry_interval_ms:
+                    continue
+                window.last_retry_ms = current_ms
+                window.attempt_count += 1
+                window.last_error_code = tombstone.state.error_code
+                self._terminal_tombstones.pop(did, None)
+                retry_dids.add(did)
+
+            return RtspAutoRecoveryResult(
+                success=success,
+                retry_dids=frozenset(retry_dids),
+                disabled_dids=frozenset(disabled_dids),
+            )
 
     def get_state(self, did: str) -> CameraSourceState:
         entry = self._sessions.get(did) or self._pending_cleanup.get(did)
@@ -247,6 +344,83 @@ class RtspCameraSource:
                 or self._connection_fingerprint(setting) != tombstone.fingerprint
             ):
                 self._terminal_tombstones.pop(did, None)
+                self._auto_recovery.pop(did, None)
+
+        for did, window in list(self._auto_recovery.items()):
+            setting = settings.get(did)
+            if (
+                setting is None
+                or not setting.enabled
+                or self._connection_fingerprint(setting) != window.fingerprint
+            ):
+                self._auto_recovery.pop(did, None)
+
+    def _clear_recovered_sessions_locked(self) -> None:
+        for did, entry in list(self._sessions.items()):
+            try:
+                state = entry.session.state()
+            except Exception:  # noqa: BLE001
+                continue
+            if state.connected:
+                self._auto_recovery.pop(did, None)
+                self._terminal_tombstones.pop(did, None)
+
+    def _record_auto_recovery_window(
+        self, setting: RtspSourceSettings, state: CameraSourceState
+    ) -> None:
+        now_ms = self._clock_ms()
+        fingerprint = self._connection_fingerprint(setting)
+        existing = self._auto_recovery.get(setting.id)
+        if existing is None or existing.fingerprint != fingerprint:
+            self._auto_recovery[setting.id] = _AutoRecoveryWindow(
+                fingerprint=fingerprint,
+                first_failure_ms=now_ms,
+                last_retry_ms=now_ms,
+                last_error_code=state.error_code,
+            )
+            return
+        existing.last_error_code = state.error_code
+
+    async def _disable_setting_locked(self, setting: RtspSourceSettings) -> bool:
+        mutator = self._sources_mutator
+        if mutator is None:
+            return False
+        did = setting.id
+        fingerprint = self._connection_fingerprint(setting)
+
+        def disable_matching_source(
+            raw_sources: list[dict[str, Any]],
+        ) -> list[dict[str, Any]]:
+            updated: list[dict[str, Any]] = []
+            for raw_source in raw_sources:
+                if not isinstance(raw_source, dict) or raw_source.get("id") != did:
+                    updated.append(raw_source)
+                    continue
+                try:
+                    current = RtspSourceSettings.model_validate(raw_source)
+                except Exception:  # noqa: BLE001
+                    updated.append(raw_source)
+                    continue
+                if (
+                    current.enabled
+                    and self._connection_fingerprint(current) == fingerprint
+                ):
+                    updated.append({**raw_source, "enabled": False})
+                    continue
+                updated.append(raw_source)
+            return updated
+
+        try:
+            await asyncio.to_thread(mutator, disable_matching_source)
+        except Exception as error:  # noqa: BLE001
+            self._log_lifecycle_failure("auto-disable", did, error)
+            return False
+
+        settings = self._load_settings()
+        refreshed = settings.get(did)
+        if refreshed is None or not refreshed.enabled:
+            return True
+        return self._connection_fingerprint(refreshed) != fingerprint
 
     def _is_terminally_suppressed(self, setting: RtspSourceSettings) -> bool:
         tombstone = self._terminal_tombstones.get(setting.id)

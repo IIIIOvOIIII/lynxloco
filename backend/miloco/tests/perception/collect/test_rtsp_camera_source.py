@@ -194,6 +194,186 @@ async def test_terminal_session_is_not_a_retainable_pending_registration() -> No
 
 
 @pytest.mark.asyncio
+async def test_terminal_rtsp_is_retried_only_after_recovery_interval() -> None:
+    clock_ms = 1_000_000
+    configured = _source(101)
+    current = [configured]
+    source = RtspCameraSource(lambda: current, clock_ms=lambda: clock_ms)
+    await source.connect_device(configured.id, _video_cb, _audio_cb)
+    terminal = source.get_session(configured.id)
+    assert isinstance(terminal, _RecordingSession)
+    terminal.connected = False
+    terminal.active = False
+    terminal.terminal = True
+    terminal.state_override = CameraSourceState(
+        connected=False,
+        video_codec="h264",
+        error_code="authentication_failed",
+        error_message="RTSP authentication failed",
+    )
+
+    assert source.retain_pending_connection(configured.id) is False
+    await source.disconnect_device(configured.id)
+    assert await source.discover_devices() == {}
+
+    early = await source.advance_auto_recovery(now_ms=clock_ms + 599_999)
+    assert early.retry_dids == frozenset()
+    assert early.disabled_dids == frozenset()
+    assert await source.discover_devices() == {}
+
+    due = await source.advance_auto_recovery(now_ms=clock_ms + 600_000)
+    assert due.success is True
+    assert due.retry_dids == frozenset({configured.id})
+    assert due.disabled_dids == frozenset()
+    assert set(await source.discover_devices()) == {configured.id}
+
+
+@pytest.mark.asyncio
+async def test_terminal_rtsp_is_disabled_after_recovery_window_expires() -> None:
+    clock_ms = 1_000_000
+    configured = _source(102)
+    current = [configured]
+
+    def mutate_sources(mutation):
+        nonlocal current
+        raw_sources = [setting.model_dump(mode="json") for setting in current]
+        raw_sources = mutation(raw_sources)
+        current = [RtspSourceSettings.model_validate(item) for item in raw_sources]
+        return {"camera": {"rtsp_sources": raw_sources}}
+
+    source = RtspCameraSource(
+        lambda: current,
+        sources_mutator=mutate_sources,
+        clock_ms=lambda: clock_ms,
+    )
+    await source.connect_device(configured.id, _video_cb, _audio_cb)
+    terminal = source.get_session(configured.id)
+    assert isinstance(terminal, _RecordingSession)
+    terminal.connected = False
+    terminal.active = False
+    terminal.terminal = True
+    terminal.state_override = CameraSourceState(
+        connected=False,
+        video_codec="h264",
+        error_code="unsupported_video_codec",
+        error_message="RTSP video codec could not be decoded",
+    )
+    assert source.retain_pending_connection(configured.id) is False
+    await source.disconnect_device(configured.id)
+
+    expired = await source.advance_auto_recovery(now_ms=clock_ms + 12 * 60 * 60 * 1000)
+
+    assert expired.success is True
+    assert expired.retry_dids == frozenset()
+    assert expired.disabled_dids == frozenset({configured.id})
+    assert current == [configured.model_copy(update={"enabled": False})]
+    assert await source.discover_devices() == {}
+    assert source.get_state(configured.id) == CameraSourceState(connected=False)
+
+
+@pytest.mark.asyncio
+async def test_repeated_terminal_failures_keep_original_recovery_deadline() -> None:
+    clock_ms = 1_000_000
+    configured = _source(103)
+    current = [configured]
+
+    def mutate_sources(mutation):
+        nonlocal current
+        raw_sources = [setting.model_dump(mode="json") for setting in current]
+        raw_sources = mutation(raw_sources)
+        current = [RtspSourceSettings.model_validate(item) for item in raw_sources]
+        return {"camera": {"rtsp_sources": raw_sources}}
+
+    source = RtspCameraSource(
+        lambda: current,
+        sources_mutator=mutate_sources,
+        clock_ms=lambda: clock_ms,
+    )
+    await source.connect_device(configured.id, _video_cb, _audio_cb)
+    first_terminal = source.get_session(configured.id)
+    assert isinstance(first_terminal, _RecordingSession)
+    first_terminal.connected = False
+    first_terminal.active = False
+    first_terminal.terminal = True
+    first_terminal.state_override = CameraSourceState(
+        connected=False,
+        video_codec="h264",
+        error_code="authentication_failed",
+        error_message="RTSP authentication failed",
+    )
+    assert source.retain_pending_connection(configured.id) is False
+    await source.disconnect_device(configured.id)
+
+    retry = await source.advance_auto_recovery(now_ms=clock_ms + 600_000)
+    assert retry.retry_dids == frozenset({configured.id})
+    await source.connect_device(configured.id, _video_cb, _audio_cb)
+
+    clock_ms += 600_001
+    second_terminal = source.get_session(configured.id)
+    assert isinstance(second_terminal, _RecordingSession)
+    second_terminal.connected = False
+    second_terminal.active = False
+    second_terminal.terminal = True
+    second_terminal.state_override = CameraSourceState(
+        connected=False,
+        video_codec="h264",
+        error_code="authentication_failed",
+        error_message="RTSP authentication failed",
+    )
+    assert source.retain_pending_connection(configured.id) is False
+    await source.disconnect_device(configured.id)
+
+    expired = await source.advance_auto_recovery(now_ms=1_000_000 + 12 * 60 * 60 * 1000)
+    assert expired.disabled_dids == frozenset({configured.id})
+    assert current == [configured.model_copy(update={"enabled": False})]
+
+
+@pytest.mark.asyncio
+async def test_rtsp_auto_recovery_window_resets_when_connection_config_changes() -> (
+    None
+):
+    clock_ms = 1_000_000
+    configured = _source(104)
+    current = [configured]
+
+    def mutate_sources(mutation):
+        nonlocal current
+        raw_sources = [setting.model_dump(mode="json") for setting in current]
+        raw_sources = mutation(raw_sources)
+        current = [RtspSourceSettings.model_validate(item) for item in raw_sources]
+        return {"camera": {"rtsp_sources": raw_sources}}
+
+    source = RtspCameraSource(
+        lambda: current,
+        sources_mutator=mutate_sources,
+        clock_ms=lambda: clock_ms,
+    )
+    await source.connect_device(configured.id, _video_cb, _audio_cb)
+    terminal = source.get_session(configured.id)
+    assert isinstance(terminal, _RecordingSession)
+    terminal.connected = False
+    terminal.active = False
+    terminal.terminal = True
+    terminal.state_override = CameraSourceState(
+        connected=False,
+        video_codec="h264",
+        error_code="authentication_failed",
+        error_message="RTSP authentication failed",
+    )
+    assert source.retain_pending_connection(configured.id) is False
+    await source.disconnect_device(configured.id)
+
+    current = [configured.model_copy(update={"uri": "rtsp://changed.example/stream"})]
+    await source.apply_settings()
+    result = await source.advance_auto_recovery(now_ms=clock_ms + 12 * 60 * 60 * 1000)
+
+    assert result.retry_dids == frozenset()
+    assert result.disabled_dids == frozenset()
+    assert current[0].enabled is True
+    assert set(await source.discover_devices()) == {configured.id}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("error_code", "safe_message"),
     [

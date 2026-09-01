@@ -24,7 +24,7 @@ import logging
 import math
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable, cast
 
 from miloco.config import get_settings
 from miloco.node_monitor import NodeName, get_monitor
@@ -74,7 +74,7 @@ _RTSP_VIDEO_BUFFER_BYTES = 128 * 1024 * 1024
 def _normalize_perception_fps(raw: object) -> int:
     """Return a safe, positive perception frame rate."""
     try:
-        return max(1, int(raw))
+        return max(1, int(cast(Any, raw)))
     except (TypeError, ValueError, OverflowError):
         return 1
 
@@ -247,6 +247,17 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
         pruned = await self._prune_inactive_pending_devices()
         try:
             if all_devices is None:
+                recovery_retry_dids = await self._advance_auto_recovery(_monotonic_ms())
+                if recovery_retry_dids:
+                    retry_pruned = {
+                        did: state
+                        for did, state in pruned.items()
+                        if did in recovery_retry_dids
+                    }
+                    if retry_pruned:
+                        self._remove_pruned_devices(retry_pruned)
+                        for did in retry_pruned:
+                            pruned.pop(did, None)
                 for camera_source in self._sources:
                     refresh_if_needed = getattr(
                         camera_source, "refresh_if_needed", None
@@ -280,6 +291,41 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
             await super().sync_devices(all_devices)
         finally:
             self._remove_pruned_devices(pruned)
+
+    async def _advance_auto_recovery(self, now_ms: int) -> frozenset[str]:
+        retry_dids: set[str] = set()
+        disabled_count = 0
+        for camera_source in self._sources:
+            advance = getattr(camera_source, "advance_auto_recovery", None)
+            if not callable(advance):
+                continue
+            try:
+                result = advance(now_ms=now_ms)
+                if inspect.isawaitable(result):
+                    result = await result
+            except Exception as error:  # noqa: BLE001
+                logger.warning(
+                    "RTSP auto-recovery failed for source %s (%s)",
+                    camera_source.source_type,
+                    type(error).__name__,
+                )
+                continue
+            if getattr(result, "success", True) is not True:
+                logger.warning("RTSP auto-recovery reported incomplete source mutation")
+            result_retry_dids = getattr(result, "retry_dids", frozenset())
+            result_disabled_dids = getattr(result, "disabled_dids", frozenset())
+            try:
+                retry_dids.update(str(did) for did in result_retry_dids)
+                disabled_count += len(result_disabled_dids)
+            except TypeError:
+                logger.warning("RTSP auto-recovery returned invalid result shape")
+        if retry_dids or disabled_count:
+            logger.info(
+                "RTSP auto-recovery advanced: retry=%d disabled=%d",
+                len(retry_dids),
+                disabled_count,
+            )
+        return frozenset(retry_dids)
 
     async def connect_device(
         self, did: str, source: PerceptionDevice | None = None
@@ -315,7 +361,7 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
                 )
                 + 1,
                 max_payload_bytes=_RTSP_VIDEO_BUFFER_BYTES,
-                payload_size=lambda item: item.frame.nbytes,
+                payload_size=lambda item: cast(DecodedVideoFrame, item).frame.nbytes,
             )
 
         state = _CameraDeviceState(

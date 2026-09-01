@@ -583,6 +583,118 @@ async def test_explicit_retry_restarts_terminal_rtsp_without_config_change(
 
 
 @pytest.mark.asyncio
+async def test_periodic_sync_advances_rtsp_auto_recovery_before_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "miloco.perception.collect.rtsp_camera_source.RtspSession",
+        _AdapterRtspSession,
+    )
+    clock_ms = 1_000_000
+    monkeypatch.setattr(
+        "miloco.perception.collect.camera_adapter._monotonic_ms",
+        lambda: clock_ms,
+    )
+    camera_id = "rtsp:00000000-0000-0000-0000-000000000014"
+    settings = [
+        RtspSourceSettings(
+            id=camera_id,
+            name="auto retry camera",
+            uri="rtsp://auto-retry.example/stream",
+            enabled=True,
+        )
+    ]
+    rtsp = RtspCameraSource(lambda: settings, clock_ms=lambda: clock_ms)
+    adapter = CameraDeviceAdapter(sources=[rtsp])
+    await adapter.sync_devices()
+    terminal = rtsp.get_session(camera_id)
+    assert isinstance(terminal, _AdapterRtspSession)
+    terminal.connected = False
+    terminal.active = False
+    terminal.terminal = True
+    terminal.state_override = CameraSourceState(
+        connected=False,
+        error_code="authentication_failed",
+        error_message="RTSP authentication failed",
+    )
+
+    await adapter.sync_devices()
+    assert adapter.get_connected_devices() == {}
+    assert rtsp.get_state(camera_id).error_code == "authentication_failed"
+
+    clock_ms = 1_599_999
+    await adapter.sync_devices()
+    assert adapter.get_connected_devices() == {}
+    assert len(_AdapterRtspSession.instances) == 1
+
+    clock_ms = 1_600_000
+    await adapter.sync_devices()
+
+    assert set(adapter.get_connected_devices()) == {camera_id}
+    assert rtsp.get_state(camera_id).connected is True
+    assert len(_AdapterRtspSession.instances) == 2
+
+
+@pytest.mark.asyncio
+async def test_rtsp_auto_disable_does_not_disable_miot_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "miloco.perception.collect.rtsp_camera_source.RtspSession",
+        _AdapterRtspSession,
+    )
+    clock_ms = 1_000_000
+    monkeypatch.setattr(
+        "miloco.perception.collect.camera_adapter._monotonic_ms",
+        lambda: clock_ms,
+    )
+    camera_id = "rtsp:00000000-0000-0000-0000-000000000015"
+    configured = RtspSourceSettings(
+        id=camera_id,
+        name="auto disable camera",
+        uri="rtsp://auto-disable.example/stream",
+        enabled=True,
+    )
+    settings = [configured]
+
+    def mutate_sources(mutation):
+        nonlocal settings
+        raw_sources = [setting.model_dump(mode="json") for setting in settings]
+        raw_sources = mutation(raw_sources)
+        settings = [RtspSourceSettings.model_validate(item) for item in raw_sources]
+        return {"camera": {"rtsp_sources": raw_sources}}
+
+    miot = _FrameProducingMiotSource()
+    rtsp = RtspCameraSource(
+        lambda: settings,
+        sources_mutator=mutate_sources,
+        clock_ms=lambda: clock_ms,
+    )
+    adapter = CameraDeviceAdapter(sources=[miot, rtsp])
+    await adapter.sync_devices()
+    terminal = rtsp.get_session(camera_id)
+    assert isinstance(terminal, _AdapterRtspSession)
+    terminal.connected = False
+    terminal.active = False
+    terminal.terminal = True
+    terminal.state_override = CameraSourceState(
+        connected=False,
+        video_codec="h264",
+        error_code="unsupported_video_codec",
+        error_message="RTSP video codec could not be decoded",
+    )
+    await adapter.sync_devices()
+
+    clock_ms = 1_000_000 + 12 * 60 * 60 * 1000
+    await adapter.sync_devices()
+
+    assert settings == [configured.model_copy(update={"enabled": False})]
+    assert set(adapter.get_connected_devices()) == {"miot-stable-did"}
+    assert miot.connected is True
+    assert rtsp.get_session(camera_id) is None
+
+
+@pytest.mark.asyncio
 async def test_real_source_adapter_apply_diff_lifecycle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -601,10 +713,9 @@ async def test_real_source_adapter_apply_diff_lifecycle(
     settings = [configured]
     rtsp = RtspCameraSource(lambda: settings)
     adapter = CameraDeviceAdapter(sources=[rtsp], perception_fps_provider=lambda: 1)
-    wall_times = iter([1, 101, 201, 301])
     monkeypatch.setattr(
         "miloco.perception.collect.camera_adapter._monotonic_ms",
-        lambda: next(wall_times),
+        lambda: 1,
     )
     runner = MagicMock()
     runner.is_running = True
