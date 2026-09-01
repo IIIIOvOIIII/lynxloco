@@ -7,8 +7,8 @@ the allowlist contract independently enforceable from this first commit.
 
 from __future__ import annotations
 
-import os
 import hashlib
+import os
 import re
 import shlex
 import shutil
@@ -20,7 +20,6 @@ from pathlib import Path
 
 import pytest
 import yaml
-
 
 DEPLOY_DIR = Path(__file__).resolve().parents[1]
 REPOSITORY_ROOT = DEPLOY_DIR.parents[1]
@@ -46,10 +45,29 @@ EXPECTED_RUNTIME_ENV = {
 }
 
 EXPECTED_COMMANDS = {"build", "preflight", "deploy", "verify", "status", "rollback"}
-LAB_HOSTS = {"ai-lab01.esxi", "ai-lab02.esxi"}
-PRODUCTION_HOST = "docker.esxi"
+LAB_HOSTS = {"miloco-staging-a.example.com", "miloco-staging-b.example.com"}
+PRODUCTION_HOST = "miloco-production.example.com"
 ALLOWED_HOSTS = LAB_HOSTS | {PRODUCTION_HOST}
 FORBIDDEN_PARTS = {".git", ".env", "config.json", ".venv", "node_modules", "__pycache__"}
+PUBLIC_DEPLOYMENT_FILES = (
+    REPOSITORY_ROOT / "deploy.sh",
+    REMOTE_RELEASE_SCRIPT,
+    DEPLOY_DIR / "README.md",
+)
+PRIVATE_RELEASE_PATTERNS = (
+    (
+        "private ESXI hostname",
+        re.compile(r"\b[A-Za-z0-9-]+\." + "esxi" + r"\b"),
+    ),
+    ("private IAM domain", re.compile(r"\b[A-Za-z0-9_.-]*iam" + r"\.lc\b")),
+    ("private SSH identity name", re.compile(r"\b" + "id_co_" + "openclaw" + r"\b")),
+    ("plaintext private credential inventory", re.compile(r"\b" + "CREDENTIALS" + r"\.md\b")),
+    (
+        "literal OpenAI-style secret key",
+        re.compile(r"\b(?:sk-(?:proj|live|test)-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9]{20,})\b"),
+    ),
+    ("private PEM material", re.compile(r"-----BEGIN [A-Z ]*(?:PRIVATE KEY|OPENSSH PRIVATE KEY)-----")),
+)
 EXTERNAL_COMMANDS = (
     "git",
     "ssh",
@@ -1070,9 +1088,24 @@ def test_unknown_host_exits_two_before_ssh(command_stubs: tuple[Path, Path]) -> 
     """Catches host validation that occurs after a remote connection attempt."""
     _require_deploy_script()
     command_log, sandbox_dir = command_stubs
-    result = _run_deploy("preflight", "--host", "outside-ai-lab.esxi", sandbox_dir=sandbox_dir)
+    result = _run_deploy("preflight", "--host", "outside-miloco.example.com", sandbox_dir=sandbox_dir)
     assert result.returncode == 2
     assert not command_log.exists(), "unknown hosts must not invoke SSH, tar, or a build command"
+
+
+def test_unsafe_profile_host_exits_two_before_any_external_command(
+    command_stubs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches environment-supplied host profiles being treated as shell text."""
+    _require_deploy_script()
+    command_log, sandbox_dir = command_stubs
+    unsafe_host = "bad host; touch leaked"
+    monkeypatch.setenv("MILOCO_DEPLOY_STAGING_A_HOST", unsafe_host)
+
+    result = _run_deploy("preflight", unsafe_host, sandbox_dir=sandbox_dir)
+
+    assert result.returncode == 2
+    assert not command_log.exists(), "unsafe profile hosts must fail before git, SSH, tar, or build"
 
 
 def test_dirty_worktree_exits_three_before_build_or_transfer(
@@ -1116,7 +1149,7 @@ def test_every_remote_operation_rejects_dirty_controller_before_ssh(
         "case \"$*\" in *status*) printf ' M deploy/ai-lab/remote-release.sh\\n' ;; esac",
     )
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
-    arguments = [operation, "ai-lab01.esxi"]
+    arguments = [operation, "miloco-staging-a.example.com"]
     if operation == "rollback":
         arguments.append("7" * 40)
     result = _run_deploy(*arguments, sandbox_dir=sandbox_dir)
@@ -1149,7 +1182,7 @@ def test_remote_operation_rejects_untracked_controller_before_ssh(
         "esac",
     )
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
-    result = _run_deploy("status", "ai-lab01.esxi", sandbox_dir=sandbox_dir)
+    result = _run_deploy("status", "miloco-staging-a.example.com", sandbox_dir=sandbox_dir)
     assert result.returncode == 3
     calls = command_log.read_text(encoding="utf-8") if command_log.exists() else ""
     assert "ssh" not in calls, "untracked controller must fail before SSH"
@@ -1179,7 +1212,7 @@ def test_controller_and_readme_use_the_canonical_root_interface() -> None:
     _require_deploy_script()
     readme = (DEPLOY_DIR / "README.md").read_text(encoding="utf-8")
     assert "./deploy.sh build" in readme
-    assert "./deploy.sh preflight ai-lab01.esxi" in readme
+    assert "./deploy.sh preflight miloco-staging-a.example.com" in readme
     assert "./deploy/ai-lab/deploy.sh" not in readme
     assert "/opt/miloco-lab/state" in readme
     assert "/opt/miloco-lab/deploy-state/current" in readme
@@ -1349,7 +1382,7 @@ def test_preflight_and_transfer_are_bounded_to_the_approved_targets() -> None:
     _require_deploy_script()
     controller = DEPLOY_SCRIPT.read_text(encoding="utf-8")
     remote = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8")
-    assert set(re.findall(r"ai-lab0[12]\.esxi", controller)) == LAB_HOSTS
+    assert all(host in controller for host in LAB_HOSTS)
     assert PRODUCTION_HOST in controller
     assert PRODUCTION_HOST in remote
     assert "Docker >= 26" in remote
@@ -1373,6 +1406,18 @@ def test_preflight_and_transfer_are_bounded_to_the_approved_targets() -> None:
     assert not re.search(r"\b(?:scp|sftp|rclone|oras|skopeo)\b", controller)
     assert not re.search(r"rsync\b[^\n]*\s\.\s", controller)
     assert not re.search(r"tar\b[^\n]*-C\s+\"?\$?PROJECT_ROOT", controller)
+
+
+def test_public_deployment_files_do_not_embed_private_targets_or_credentials() -> None:
+    """Catches local deployment identities being committed to public release files."""
+    leaks: list[str] = []
+    for path in PUBLIC_DEPLOYMENT_FILES:
+        content = path.read_text(encoding="utf-8")
+        for label, pattern in PRIVATE_RELEASE_PATTERNS:
+            for match in pattern.finditer(content):
+                leaks.append(f"{path.relative_to(REPOSITORY_ROOT)}: {label}: {match.group(0)}")
+
+    assert leaks == []
 
 
 def test_remote_checksum_and_acceptance_precede_activation() -> None:
@@ -1413,12 +1458,23 @@ def test_remote_checksum_and_acceptance_precede_activation() -> None:
     assert "--platform linux/amd64" in remote
     assert 'install -d -o 10001 -g 10001 -m 0700 "$STATE_DIR"' in remote
     assert "configure_host_profile()" in remote
-    assert re.search(r"ai-lab01\.esxi\).*?cpu_limit=\"3\.0\".*?memory_limit=\"3072m\"", remote, re.S)
-    assert re.search(r"ai-lab02\.esxi\).*?cpu_limit=\"1\.25\".*?memory_limit=\"1536m\"", remote, re.S)
+    assert 'MILOCO_DEPLOY_STAGING_A_HOST:-miloco-staging-a.example.com' in remote
+    assert 'MILOCO_DEPLOY_STAGING_B_HOST:-miloco-staging-b.example.com' in remote
+    assert 'MILOCO_DEPLOY_PRODUCTION_HOST:-miloco-production.example.com' in remote
     assert re.search(
-        r"docker\.esxi\).*?SERVICE_PORT=\"1811\".*?cpu_limit=\"2\.0\".*?memory_limit=\"4096m\"",
+        r'"\$ALLOWED_HOST_1"\).*?cpu_limit="3\.0".*?memory_limit="3072m"',
         remote,
-        re.S,
+        re.DOTALL,
+    )
+    assert re.search(
+        r'"\$ALLOWED_HOST_2"\).*?cpu_limit="1\.25".*?memory_limit="1536m"',
+        remote,
+        re.DOTALL,
+    )
+    assert re.search(
+        r'"\$ALLOWED_HOST_3"\).*?SERVICE_PORT="1811".*?cpu_limit="2\.0".*?memory_limit="4096m"',
+        remote,
+        re.DOTALL,
     )
 
 
@@ -1479,6 +1535,7 @@ def test_activation_has_no_historical_retention_or_pair_removal() -> None:
 def test_deploy_streams_one_archive_through_stubbed_ssh(tmp_path: Path) -> None:
     """Catches transfer drift to broad copies or non-content-addressed remote paths."""
     sha = "0123456789abcdef0123456789abcdef01234567"
+    custom_staging_host = "private-staging.example.net"
     repository = tmp_path / "repo"
     controller = repository / "deploy.sh"
     remote_dir = repository / "deploy" / "ai-lab"
@@ -1526,7 +1583,7 @@ def test_deploy_streams_one_archive_through_stubbed_ssh(tmp_path: Path) -> None:
     )
     ssh_stub.chmod(0o755)
     result = subprocess.run(
-        [str(controller), "deploy", "ai-lab01.esxi"],
+        [str(controller), "deploy", custom_staging_host],
         cwd=repository,
         text=True,
         capture_output=True,
@@ -1535,6 +1592,7 @@ def test_deploy_streams_one_archive_through_stubbed_ssh(tmp_path: Path) -> None:
         env={
             **os.environ,
             "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            "MILOCO_DEPLOY_STAGING_A_HOST": custom_staging_host,
             "MILOCO_SSH_IDENTITY": str(identity),
         },
     )
@@ -1549,18 +1607,20 @@ def test_deploy_streams_one_archive_through_stubbed_ssh(tmp_path: Path) -> None:
     assert (tmp_path / "ssh-stdin-1").read_bytes() == REMOTE_RELEASE_SCRIPT.read_bytes()
     preflight_args = (tmp_path / "ssh-args-2").read_text(encoding="utf-8")
     assert f"/opt/miloco-lab/control/{controller_digest}/remote-release.sh" in preflight_args
-    assert "preflight ai-lab01.esxi" in preflight_args
+    assert f"MILOCO_DEPLOY_STAGING_A_HOST={custom_staging_host}" in preflight_args
+    assert f"preflight {custom_staging_host}" in preflight_args
     assert (tmp_path / "ssh-stdin-2").read_bytes() == b""
     transaction_args = (tmp_path / "ssh-args-3").read_text(encoding="utf-8")
     assert f"/opt/miloco-lab/control/{controller_digest}/remote-release.sh" in transaction_args
+    assert f"MILOCO_DEPLOY_STAGING_A_HOST={custom_staging_host}" in transaction_args
     assert (
-        f"transaction ai-lab01.esxi {sha} {archive_digest} {controller_digest} "
+        f"transaction {custom_staging_host} {sha} {archive_digest} {controller_digest} "
         f"{allowlist_digest}"
     ) in transaction_args
     assert (tmp_path / "ssh-stdin-3").read_bytes() == archive.read_bytes()
 
 
-def test_deploy_streams_archive_to_docker_esxi_with_production_profile(tmp_path: Path) -> None:
+def test_deploy_streams_archive_to_production_host_with_production_profile(tmp_path: Path) -> None:
     """Catches production deploys falling back to lab roots or broad transfer tools."""
     sha = "abcdef0123456789abcdef0123456789abcdef01"
     repository = tmp_path / "repo"
@@ -1671,7 +1731,7 @@ def test_remote_operation_refuses_missing_ssh_identity_before_ssh(tmp_path: Path
     ssh_log = tmp_path / "ssh.log"
     _write_stub(bin_dir, "ssh", ssh_log)
     result = subprocess.run(
-        [str(controller), "status", "ai-lab01.esxi"],
+        [str(controller), "status", "miloco-staging-a.example.com"],
         cwd=repository,
         text=True,
         capture_output=True,
@@ -1735,7 +1795,7 @@ def test_remote_operation_refuses_unsafe_ssh_identity_before_ssh(
     ssh_log = tmp_path / "ssh.log"
     _write_stub(bin_dir, "ssh", ssh_log)
     result = subprocess.run(
-        [str(controller), "status", "ai-lab01.esxi"],
+        [str(controller), "status", "miloco-staging-a.example.com"],
         cwd=repository,
         text=True,
         capture_output=True,
@@ -2034,7 +2094,7 @@ def test_deploy_rejects_replacement_after_clean_build_receipt(
     identity.write_text("test-only-identity\n", encoding="utf-8")
     identity.chmod(0o600)
     result = subprocess.run(
-        [str(controller), "deploy", "ai-lab01.esxi"],
+        [str(controller), "deploy", "miloco-staging-a.example.com"],
         cwd=repository,
         text=True,
         capture_output=True,
@@ -2070,7 +2130,7 @@ def test_transaction_rehashes_exact_controller_inside_one_lock(tmp_path: Path) -
         + f"printf 'receive\\n' >> '{call_log}'; /bin/cat >/dev/null; }}\n"
         + "build_and_activate_locked() { [[ \"${lock_held:-0}\" == 1 ]]; "
         + f"printf 'build-activate\\n' >> '{call_log}'; }}\n"
-        + f'transaction_release "ai-lab01.esxi" "{sha}" "{digest}" "{digest}" "{digest}"\n',
+        + f'transaction_release "miloco-staging-a.example.com" "{sha}" "{digest}" "{digest}" "{digest}"\n',
         encoding="utf-8",
     )
     harness.chmod(0o755)
@@ -2120,7 +2180,7 @@ def test_all_compose_calls_use_one_resource_and_timeout_wrapper(tmp_path: Path) 
     source = remote.rsplit('\nmain "$@"', maxsplit=1)[0]
     harness = tmp_path / "compose-wrapper.sh"
     harness.write_text(
-        source + '\ncompose_command "ai-lab02.esxi" "' + "3" * 40 + '" 7 ps -q miloco\n',
+        source + '\ncompose_command "miloco-staging-b.example.com" "' + "3" * 40 + '" 7 ps -q miloco\n',
         encoding="utf-8",
     )
     harness.chmod(0o755)
@@ -2148,10 +2208,10 @@ def test_all_compose_calls_use_one_resource_and_timeout_wrapper(tmp_path: Path) 
     )
 
 
-def test_remote_docker_esxi_profile_uses_port_1811_and_production_names(
+def test_remote_production_profile_uses_port_1811_and_production_names(
     tmp_path: Path,
 ) -> None:
-    """Catches docker.esxi accidentally reusing lab root, port, project, or image tags."""
+    """Catches miloco-production.example.com accidentally reusing lab root, port, project, or image tags."""
     sha = "4" * 40
     source = REMOTE_RELEASE_SCRIPT.read_text(encoding="utf-8").rsplit(
         '\nmain "$@"', maxsplit=1
@@ -2474,7 +2534,7 @@ def _run_existing_sha_transaction_harness(
         + "  esac\n"
         + "  case \"$*\" in *' image ls '*|*' image inspect '*) printf '%s\\n' \"$image_id\" ;; *) printf 'docker-mutation %s\\n' \"$*\" >> \"$mutation_log\"; return 99 ;; esac\n"
         + "}\n"
-        + f'transaction_release "ai-lab01.esxi" "{sha}" "{digest}" "{digest}" "{hashlib.sha256(ALLOWLIST.read_bytes()).hexdigest()}"\n',
+        + f'transaction_release "miloco-staging-a.example.com" "{sha}" "{digest}" "{digest}" "{hashlib.sha256(ALLOWLIST.read_bytes()).hexdigest()}"\n',
         encoding="utf-8",
     )
     harness.chmod(0o755)
@@ -3176,7 +3236,7 @@ def test_unaccepted_candidate_signal_cleanup_is_armed_before_first_mutation(
         + "  case \"$*\" in *' image inspect '*) printf 'sha256:%064d\\n' 0 ;; esac\n"
         + "  return 0\n"
         + "}\n"
-        + f'build_images_and_accept new "ai-lab01.esxi" "{sha}" "{lab_root}/releases/{sha}"\n',
+        + f'build_images_and_accept new "miloco-staging-a.example.com" "{sha}" "{lab_root}/releases/{sha}"\n',
         encoding="utf-8",
     )
     harness.chmod(0o755)
@@ -3288,7 +3348,7 @@ def test_activation_failure_preserves_published_proof(tmp_path: Path) -> None:
         + "wait_for_health() { return 1; }\n"
         + "collect_failure_evidence() { :; }\n"
         + "restore_previous() { return 0; }\n"
-        + f'activate_release "ai-lab01.esxi" "{candidate}"\n',
+        + f'activate_release "miloco-staging-a.example.com" "{candidate}"\n',
         encoding="utf-8",
     )
     harness.chmod(0o755)
@@ -3339,7 +3399,7 @@ def test_activation_preserves_canonical_image_ids(
         + f"observe() {{ image_reference_state 'miloco-lab:{candidate}'; image_reference_state 'miloco-lab-acceptance:{candidate}'; }}\n"
         + f"observe > '{before}'\n"
         + "set +e\n"
-        + f'activate_release "ai-lab01.esxi" "{candidate}"\n'
+        + f'activate_release "miloco-staging-a.example.com" "{candidate}"\n'
         + "status=$?\nset -e\n"
         + f"observe > '{after}'\n"
         + "exit \"$status\"\n",
@@ -3414,7 +3474,7 @@ def test_activation_success_preserves_published_proof_and_image_ids(tmp_path: Pa
         + "atomic_write() { :; }\n"
         + "compose_up() { :; }\n"
         + "wait_for_health() { :; }\n"
-        + f'activate_release "ai-lab01.esxi" "{candidate}"\n',
+        + f'activate_release "miloco-staging-a.example.com" "{candidate}"\n',
         encoding="utf-8",
     )
     harness.chmod(0o755)
@@ -3442,7 +3502,7 @@ def test_status_rejects_current_record_symlink_without_docker(tmp_path: Path) ->
         source
         + "\nrequire_root() { :; }\n"
         + f"docker_command() {{ printf docker > '{docker_log}'; }}\n"
-        + 'status_release "ai-lab01.esxi"\n',
+        + 'status_release "miloco-staging-a.example.com"\n',
         encoding="utf-8",
     )
     harness.chmod(0o755)
@@ -3511,7 +3571,7 @@ def _run_status_harness(
         + f"docker_command() {{ printf 'docker:%s\\n' \"$*\" >> '{docker_log}'; "
         + f"printf 'miloco-lab:{sha}\\n'; }}\n"
         + "container_health_status() { printf 'healthy\\n'; }\n"
-        + 'status_release "ai-lab01.esxi"\n',
+        + 'status_release "miloco-staging-a.example.com"\n',
         encoding="utf-8",
     )
     harness.chmod(0o755)
@@ -3639,7 +3699,7 @@ def test_status_rejects_raw_lab_root_symlink_without_docker(tmp_path: Path) -> N
     )
     harness.chmod(0o755)
     result = subprocess.run(
-        [str(harness), "status", "ai-lab01.esxi"],
+        [str(harness), "status", "miloco-staging-a.example.com"],
         text=True,
         capture_output=True,
         check=False,
@@ -3709,7 +3769,7 @@ def test_failure_evidence_never_reads_or_emits_application_logs(tmp_path: Path) 
         + "\ncompose_container_id() { printf 'Bearer super-secret'; }\n"
         + "container_health_status() { printf 'https://user:pass@example.invalid'; }\n"
         + "probe_http_status() { printf 'Cookie=session-secret'; }\n"
-        + 'collect_failure_evidence "ai-lab01.esxi" "' + "6" * 40 + '"\n',
+        + 'collect_failure_evidence "miloco-staging-a.example.com" "' + "6" * 40 + '"\n',
         encoding="utf-8",
     )
     harness.chmod(0o755)
@@ -3858,7 +3918,7 @@ def test_remote_status_and_unknown_rollback_are_safe_under_stubs(tmp_path: Path)
     environment = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
 
     status = subprocess.run(
-        [str(remote_copy), "status", "ai-lab01.esxi"],
+        [str(remote_copy), "status", "miloco-staging-a.example.com"],
         text=True,
         capture_output=True,
         check=False,
@@ -3872,7 +3932,7 @@ def test_remote_status_and_unknown_rollback_are_safe_under_stubs(tmp_path: Path)
 
     external_log.unlink()
     rollback = subprocess.run(
-        [str(remote_copy), "rollback", "ai-lab01.esxi", "0" * 40],
+        [str(remote_copy), "rollback", "miloco-staging-a.example.com", "0" * 40],
         text=True,
         capture_output=True,
         check=False,
@@ -3948,7 +4008,7 @@ def test_armed_signal_compensation_restores_or_reports_rollback_failure(
         + f"  return {recovery_result}\n"
         + "}\n"
         + "remove_candidate() { return 99; }\n"
-        + 'arm_transition "ai-lab01.esxi" "' + "2" * 40 + '" "' + "1" * 40 + '"\n'
+        + 'arm_transition "miloco-staging-a.example.com" "' + "2" * 40 + '" "' + "1" * 40 + '"\n'
         + "kill -TERM $$\n",
         encoding="utf-8",
     )
@@ -3961,7 +4021,7 @@ def test_armed_signal_compensation_restores_or_reports_rollback_failure(
         timeout=5,
     )
     assert result.returncode == expected_exit
-    assert recovery_log.read_text(encoding="utf-8").startswith("restore ai-lab01.esxi")
+    assert recovery_log.read_text(encoding="utf-8").startswith("restore miloco-staging-a.example.com")
     if recovery_result:
         assert "rollback_failed" in result.stderr
     else:
@@ -3979,7 +4039,7 @@ def test_candidate_removal_fails_closed_when_absence_cannot_be_verified(tmp_path
         + "\ncompose_command() {\n"
         + "  case \"$*\" in *' rm --stop --force '*) return 0 ;; *' ps --all -q '*) return 17 ;; esac\n"
         + "}\n"
-        + 'remove_candidate "ai-lab01.esxi" "' + "a" * 40 + '"\n',
+        + 'remove_candidate "miloco-staging-a.example.com" "' + "a" * 40 + '"\n',
         encoding="utf-8",
     )
     harness.chmod(0o755)
@@ -4003,7 +4063,7 @@ def test_restore_compensation_cannot_continue_after_failed_restart(tmp_path: Pat
         + "wait_for_health() { return 0; }\n"
         + f"atomic_write() {{ printf 'state-write\\n' > '{state_log}'; }}\n"
         + "set +e\n"
-        + 'restore_previous "ai-lab01.esxi" "' + "b" * 40 + '"\n'
+        + 'restore_previous "miloco-staging-a.example.com" "' + "b" * 40 + '"\n'
         + "restore_status=$?\n"
         + "set -e\n"
         + "[[ \"$restore_status\" -ne 0 ]]\n"

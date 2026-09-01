@@ -20,6 +20,9 @@ RUNTIME_IMAGE_NAME="miloco-lab"
 ACCEPTANCE_IMAGE_NAME="miloco-lab-acceptance"
 CANDIDATE_RUNTIME_IMAGE_NAME="miloco-lab-candidate"
 CANDIDATE_ACCEPTANCE_IMAGE_NAME="miloco-lab-acceptance-candidate"
+readonly ALLOWED_HOST_1="${MILOCO_DEPLOY_STAGING_A_HOST:-miloco-staging-a.example.com}"
+readonly ALLOWED_HOST_2="${MILOCO_DEPLOY_STAGING_B_HOST:-miloco-staging-b.example.com}"
+readonly ALLOWED_HOST_3="${MILOCO_DEPLOY_PRODUCTION_HOST:-miloco-production.example.com}"
 readonly REMOTE_ALLOWLIST_SHA256="02852c989db9f4efd27d1df7e3872f60af982175eb7e1e9f4bf9b751f1754ddd"
 readonly HEALTH_TIMEOUT_SECONDS=120
 readonly MINIMUM_DISK_KIB=5242880
@@ -43,14 +46,34 @@ die() {
 }
 
 validate_host() {
+    validate_profile_hosts
     case "$1" in
-        ai-lab01.esxi|ai-lab02.esxi|docker.esxi) ;;
+        "$ALLOWED_HOST_1"|"$ALLOWED_HOST_2"|"$ALLOWED_HOST_3") ;;
         *) die 2 "host is not an approved Miloco deployment target" ;;
     esac
 }
 
 validate_sha() {
     [[ "$1" =~ ^[0-9a-f]{40}$ ]] || die 2 "invalid release SHA"
+}
+
+validate_profile_host_name() {
+    local value="$1" label="$2"
+    [[ -n "$value" ]] || die 2 "$label must not be empty"
+    [[ "$value" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$ ]] \
+        || die 2 "$label must be a DNS-safe SSH host name"
+    [[ "$value" != .* && "$value" != *..* && "$value" != *. ]] \
+        || die 2 "$label must be a DNS-safe SSH host name"
+}
+
+validate_profile_hosts() {
+    validate_profile_host_name "$ALLOWED_HOST_1" "MILOCO_DEPLOY_STAGING_A_HOST"
+    validate_profile_host_name "$ALLOWED_HOST_2" "MILOCO_DEPLOY_STAGING_B_HOST"
+    validate_profile_host_name "$ALLOWED_HOST_3" "MILOCO_DEPLOY_PRODUCTION_HOST"
+    [[ "$ALLOWED_HOST_1" != "$ALLOWED_HOST_2" \
+        && "$ALLOWED_HOST_1" != "$ALLOWED_HOST_3" \
+        && "$ALLOWED_HOST_2" != "$ALLOWED_HOST_3" ]] \
+        || die 2 "deployment host profiles must be distinct"
 }
 
 require_root() {
@@ -73,7 +96,7 @@ refresh_profile_paths() {
 configure_host_profile() {
     validate_host "$1"
     case "$1" in
-        ai-lab01.esxi)
+        "$ALLOWED_HOST_1")
             LAB_ROOT="/opt/miloco-lab"
             SERVICE_PORT="1810"
             SERVER_URL="http://127.0.0.1:1810"
@@ -85,7 +108,7 @@ configure_host_profile() {
             cpu_limit="3.0"
             memory_limit="3072m"
             ;;
-        ai-lab02.esxi)
+        "$ALLOWED_HOST_2")
             LAB_ROOT="/opt/miloco-lab"
             SERVICE_PORT="1810"
             SERVER_URL="http://127.0.0.1:1810"
@@ -97,7 +120,7 @@ configure_host_profile() {
             cpu_limit="1.25"
             memory_limit="1536m"
             ;;
-        docker.esxi)
+        "$ALLOWED_HOST_3")
             LAB_ROOT="/opt/miloco"
             SERVICE_PORT="1811"
             SERVER_URL="http://127.0.0.1:1811"

@@ -2,9 +2,9 @@
 
 set -euo pipefail
 
-readonly ALLOWED_HOST_1="ai-lab01.esxi"
-readonly ALLOWED_HOST_2="ai-lab02.esxi"
-readonly ALLOWED_HOST_3="docker.esxi"
+readonly ALLOWED_HOST_1="${MILOCO_DEPLOY_STAGING_A_HOST:-miloco-staging-a.example.com}"
+readonly ALLOWED_HOST_2="${MILOCO_DEPLOY_STAGING_B_HOST:-miloco-staging-b.example.com}"
+readonly ALLOWED_HOST_3="${MILOCO_DEPLOY_PRODUCTION_HOST:-miloco-production.example.com}"
 
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 case "$SCRIPT_PATH" in
@@ -22,6 +22,7 @@ receipt_controller_digest=""
 receipt_allowlist_digest=""
 receipt_artifact_path=""
 ssh_args=()
+remote_profile_env_args=()
 
 log() {
     printf '[deploy] %s\n' "$*" >&2
@@ -47,7 +48,27 @@ validate_sha() {
     [[ "$1" =~ ^[0-9a-f]{40}$ ]] || die 2 "release SHA must be 40 lowercase hexadecimal characters"
 }
 
+validate_profile_host_name() {
+    local value="$1" label="$2"
+    [[ -n "$value" ]] || die 2 "$label must not be empty"
+    [[ "$value" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$ ]] \
+        || die 2 "$label must be a DNS-safe SSH host name"
+    [[ "$value" != .* && "$value" != *..* && "$value" != *. ]] \
+        || die 2 "$label must be a DNS-safe SSH host name"
+}
+
+validate_profile_hosts() {
+    validate_profile_host_name "$ALLOWED_HOST_1" "MILOCO_DEPLOY_STAGING_A_HOST"
+    validate_profile_host_name "$ALLOWED_HOST_2" "MILOCO_DEPLOY_STAGING_B_HOST"
+    validate_profile_host_name "$ALLOWED_HOST_3" "MILOCO_DEPLOY_PRODUCTION_HOST"
+    [[ "$ALLOWED_HOST_1" != "$ALLOWED_HOST_2" \
+        && "$ALLOWED_HOST_1" != "$ALLOWED_HOST_3" \
+        && "$ALLOWED_HOST_2" != "$ALLOWED_HOST_3" ]] \
+        || die 2 "deployment host profiles must be distinct"
+}
+
 validate_host() {
+    validate_profile_hosts
     case "$1" in
         "$ALLOWED_HOST_1"|"$ALLOWED_HOST_2"|"$ALLOWED_HOST_3") ;;
         *) die 2 "host is not an approved Miloco deployment target" ;;
@@ -91,6 +112,14 @@ configure_ssh_identity() {
     [[ "$mode" =~ ^[0-7]{3,4}$ && $((8#$mode & 8#77)) -eq 0 ]] \
         || die 2 "MILOCO_SSH_IDENTITY must not grant group or other permissions"
     ssh_args=(-o BatchMode=yes -o IdentitiesOnly=yes -i "$identity")
+}
+
+configure_remote_profile_env() {
+    remote_profile_env_args=(
+        "MILOCO_DEPLOY_STAGING_A_HOST=$ALLOWED_HOST_1"
+        "MILOCO_DEPLOY_STAGING_B_HOST=$ALLOWED_HOST_2"
+        "MILOCO_DEPLOY_PRODUCTION_HOST=$ALLOWED_HOST_3"
+    )
 }
 
 parse_arguments() {
@@ -498,7 +527,9 @@ local_release_archive() {
 run_remote_controller() {
     local target_host="$1"
     shift
-    ssh "${ssh_args[@]}" -- "$target_host" bash -s -- "$@" < "$PROJECT_ROOT/deploy/ai-lab/remote-release.sh"
+    configure_remote_profile_env
+    ssh "${ssh_args[@]}" -- "$target_host" env "${remote_profile_env_args[@]}" \
+        bash -s -- "$@" < "$PROJECT_ROOT/deploy/ai-lab/remote-release.sh"
 }
 
 preflight_remote() {
@@ -528,8 +559,11 @@ deploy_remote() {
     read_release_receipt "$sha"
     controller_path="$(remote_control_dir_for_host "$target_host")/${receipt_controller_digest}/remote-release.sh"
     install_remote_controller "$target_host" "$receipt_controller_digest"
-    ssh "${ssh_args[@]}" -- "$target_host" "$controller_path" preflight "$target_host"
-    ssh "${ssh_args[@]}" -- "$target_host" "$controller_path" transaction "$target_host" "$sha" \
+    configure_remote_profile_env
+    ssh "${ssh_args[@]}" -- "$target_host" env "${remote_profile_env_args[@]}" \
+        "$controller_path" preflight "$target_host"
+    ssh "${ssh_args[@]}" -- "$target_host" env "${remote_profile_env_args[@]}" \
+        "$controller_path" transaction "$target_host" "$sha" \
         "$receipt_archive_digest" "$receipt_controller_digest" "$receipt_allowlist_digest" \
         < "$archive"
 }
@@ -549,6 +583,7 @@ dispatch() {
             # HOST_VALIDATION_COMPLETE
             assert_clean_controller
             configure_ssh_identity
+            configure_remote_profile_env
             case "$operation" in
                 preflight) preflight_remote "$host" ;;
                 deploy) deploy_remote "$host" ;;

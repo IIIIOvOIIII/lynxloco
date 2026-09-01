@@ -1,8 +1,11 @@
 # Miloco AI-lab release contract
 
-This directory defines the release payload and operator contract for the
-isolated AI-lab deployment. The only permitted targets are `ai-lab01.esxi` and
-`ai-lab02.esxi`; deployments must not be directed at another host.
+This directory defines the release payload and operator contract for an
+isolated Miloco deployment. The built-in target names are reserved examples:
+`miloco-staging-a.example.com`, `miloco-staging-b.example.com`, and
+`miloco-production.example.com`. Real hostnames, SSH identity paths, or private
+deployment details must be supplied by the operator environment and must not be
+committed to the public repository.
 
 `artifact-files.txt` is the sole release-payload allowlist. A release is built
 from the current clean Git `HEAD`, with its exact SHA recorded in
@@ -18,19 +21,37 @@ Run the canonical controller from the repository root:
 
 ```bash
 ./deploy.sh build
-MILOCO_SSH_IDENTITY=/absolute/path/to/lab-identity ./deploy.sh preflight ai-lab01.esxi
-MILOCO_SSH_IDENTITY=/absolute/path/to/lab-identity ./deploy.sh deploy ai-lab01.esxi
-MILOCO_SSH_IDENTITY=/absolute/path/to/lab-identity ./deploy.sh verify ai-lab01.esxi
-MILOCO_SSH_IDENTITY=/absolute/path/to/lab-identity ./deploy.sh status ai-lab01.esxi
-MILOCO_SSH_IDENTITY=/absolute/path/to/lab-identity ./deploy.sh rollback ai-lab01.esxi <full-40-character-sha>
+MILOCO_SSH_IDENTITY=/absolute/path/to/lab-identity ./deploy.sh preflight miloco-staging-a.example.com
+MILOCO_SSH_IDENTITY=/absolute/path/to/lab-identity ./deploy.sh deploy miloco-staging-a.example.com
+MILOCO_SSH_IDENTITY=/absolute/path/to/lab-identity ./deploy.sh verify miloco-staging-a.example.com
+MILOCO_SSH_IDENTITY=/absolute/path/to/lab-identity ./deploy.sh status miloco-staging-a.example.com
+MILOCO_SSH_IDENTITY=/absolute/path/to/lab-identity ./deploy.sh rollback miloco-staging-a.example.com <full-40-character-sha>
 ```
 
-Use the same positional command shape with `ai-lab02.esxi`, or the equivalent
-`--host ai-lab02.esxi` form. `build` refuses a dirty worktree and does not need
+Use the same positional command shape with `miloco-staging-b.example.com`, or the equivalent
+`--host miloco-staging-b.example.com` form. `build` refuses a dirty worktree and does not need
 an SSH identity. Every remote command requires `MILOCO_SSH_IDENTITY`: an
 absolute regular file, not a symlink, owned by the current user, with no group
 or other permission bits. The controller passes that path using SSH
 `IdentitiesOnly=yes`; it never reads or prints its contents.
+
+To deploy against real infrastructure, inject the private target names at run
+time instead of editing the script:
+
+```bash
+export MILOCO_DEPLOY_STAGING_A_HOST=staging-a.internal.example
+export MILOCO_DEPLOY_STAGING_B_HOST=staging-b.internal.example
+export MILOCO_DEPLOY_PRODUCTION_HOST=miloco.internal.example
+export MILOCO_SSH_IDENTITY=/absolute/path/to/private-ssh-key
+
+./deploy.sh preflight "$MILOCO_DEPLOY_PRODUCTION_HOST"
+./deploy.sh deploy "$MILOCO_DEPLOY_PRODUCTION_HOST"
+```
+
+Keep those environment values in your local shell, CI secret store, password
+manager, or deployment orchestrator. Do not write real hostnames, key paths,
+tokens, API keys, passwords, RTSP URLs, or credential inventories into this
+repository.
 
 Every remote operation also requires both controllers to be tracked and the
 whole worktree to be the exact clean `HEAD`. `preflight` validates the selected
@@ -41,8 +62,8 @@ exit code `70`.
 
 The two-host rollout is one build and two deployments: run `./deploy.sh build`
 once, preserve its exact SHA-addressed archive and receipt unchanged, then
-deploy that same full 40-character SHA first to `ai-lab01.esxi` and then to
-`ai-lab02.esxi`. Do not rebuild, replace the archive, or create another SHA
+deploy that same full 40-character SHA first to `miloco-staging-a.example.com` and then to
+`miloco-staging-b.example.com`. Do not rebuild, replace the archive, or create another SHA
 between the two host deployments.
 
 `./deploy.sh --help` provides one machine-readable authoritative line:
@@ -89,7 +110,7 @@ maintenance design, explicit authorization, dedicated tests, and review.
 Persistent application state is `/opt/miloco-lab/state`; deployment state is
 `/opt/miloco-lab/deploy-state/current` and
 `/opt/miloco-lab/deploy-state/previous`. The service is exposed only on port
-`1810`. `ai-lab01.esxi` uses 3.0 CPUs and 3072m; `ai-lab02.esxi` uses 1.25
+`1810`. `miloco-staging-a.example.com` uses 3.0 CPUs and 3072m; `miloco-staging-b.example.com` uses 1.25
 CPUs and 1536m. `compose.yaml` declares the CPU, memory, and process limits
 that release validation checks after rendering.
 
@@ -110,7 +131,9 @@ backend is available, the suite fails before starting `deploy.sh`.
 
 ## Validated laboratory release
 
-The release validated on both laboratory hosts is Git SHA
+This public copy preserves the evidence shape from a private laboratory
+rollout, with private hostnames anonymized to the example targets above. The
+release validated on both laboratory hosts is Git SHA
 `644406e36c621dfad55939686d315a2d3ddc955c`, with archive SHA-256
 `8a057845415fa2a6d820449a9dc4744d4a18fb717300930174f3dd05e0522663`.
 This remains the deployed runtime identity. The later documentation evidence
@@ -126,13 +149,13 @@ Bearer behavior. These are deterministic fixture results. No persistent real
 RTSP source or real local VLM endpoint was supplied, so
 `real_camera=not_measured` and `real_vlm=not_measured`.
 
-Final accepted runtime evidence:
+Final accepted runtime evidence, with target names anonymized:
 
-- `ai-lab01.esxi`: exact image SHA and healthy status, UID/GID `10001:10001`,
+- `miloco-staging-a.example.com`: exact image SHA and healthy status, UID/GID `10001:10001`,
   state mode `10001:10001:700`, CPU limit `3`, memory limit `3072m`, restart
   count `0`, current-process OOM `false`, final free disk `9025812` KiB, HTTP
   dashboard and RTSP/Responses/watch UI checks passed without console errors.
-- `ai-lab02.esxi`: exact image SHA and healthy status, UID/GID `10001:10001`,
+- `miloco-staging-b.example.com`: exact image SHA and healthy status, UID/GID `10001:10001`,
   state mode `10001:10001:700`, CPU limit `1.25`, memory limit `1536m`, restart
   count `0`, current-process OOM `false`, final free disk `24126448` KiB, HTTP
   `200`, dashboard build label `g644406e36`, navigation and console checks
@@ -161,8 +184,7 @@ credential-like filename. Authorization literals were limited to synthetic
 tests. Structural inspection of both deployed containers found no API-key or
 RTSP-credential environment-variable name and did not expose values.
 
-`ai-lab02.esxi` required a user-performed memory expansion before its accepted
-deployment. `openobserve` and `openobserve-fluent-bit` remain stopped from the
-separately approved temporary action; `lab-mariadb` remained running and
-healthy. This rollout did not restart, remove, or otherwise operate on those
-unrelated services. No upstream push was performed.
+One anonymized staging target required a user-performed memory expansion before
+its accepted deployment. Unrelated observability and database services were not
+restarted, removed, or otherwise operated on during that rollout. No upstream
+push was performed.
