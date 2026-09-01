@@ -97,3 +97,8 @@ eval/sampled_*.json
 
 # Codex / Superpowers execution scratch: task ledgers, reports, review packages.
 .superpowers/
+.tmp/
+docs/superpowers/
+docs/co/
+docs/ops/
+docs/*_PROGRESS.md
