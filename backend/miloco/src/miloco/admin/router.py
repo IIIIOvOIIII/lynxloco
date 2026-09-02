@@ -1099,7 +1099,12 @@ async def put_omni_config(
     label = body.label.strip()
     if not label:
         raise HTTPException(status_code=400, detail="档案名不能为空")
-    base_url = body.base_url.strip()
+    # 去尾斜杠再落盘：本文件判「URL 变没变、旧 key 还能不能沿用」时比的就是 rstrip("/")
+    # 之后的值,探活那侧归一化同理。用量表自带 base_url 起,这行文本还是模型身份的一半——
+    # 写入口不归一化的话,住户重打一遍地址顺手改掉尾斜杠,凭证层认为 URL 没变、一次调用都
+    # 不会失败,而记账从此把同一个 endpoint 拆成两行、合计对半分,明细上「只清这一项」也
+    # 只清得掉其中一行。
+    base_url = body.base_url.strip().rstrip("/")
     model = body.model.strip()
     orig = (body.original_label or "").strip()
     profiles = _profiles_as_dicts()

@@ -97,6 +97,28 @@ async def test_call_omni_success_records_success(monkeypatch):
     assert get_omni_circuit_breaker().snapshot().state == "ok"
 
 
+async def test_call_omni_null_usage_still_records(monkeypatch):
+    """provider 把 usage 显式返回 null 时，记账仍要拿到 dict。
+
+    dict.get(k, default) 的默认值只在**键缺席**时生效；键在而值为 null 时返回 None，
+    而落库那侧第一行就是无保护的 usage.get(...)，传 None 会抛 AttributeError、被
+    fire_record 兜成 warning，整条用量事件静默丢失。把 `or {}` 去掉这条会红。
+    """
+    seen: list[object] = []
+    monkeypatch.setattr(
+        omni_client,
+        "fire_record",
+        lambda model, base_url, usage, type: seen.append(usage),
+    )
+    monkeypatch.setattr(
+        omni_client.httpx,
+        "AsyncClient",
+        _fake_async_client(resp=_FakeResp(200, {"choices": [], "usage": None})),
+    )
+    await omni_client.call_omni(_payload(), _cfg())
+    assert seen == [{}], f"记账收到的不是空 dict，而是 {seen!r}"
+
+
 async def test_call_omni_single_401_does_not_open(monkeypatch):
     """瞬时 401 不该一击停感知——运行时 CONFIG 走窗口阈值(consecutive=3),
     连续 3 次才开断路,单次视为噪声(provider 侧鉴权抖动 / 换 key 中转)。"""

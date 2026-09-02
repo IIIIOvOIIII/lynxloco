@@ -19,6 +19,10 @@
 - 滚存后日表的最新日期必然早于昨天,即「近 24 小时」那档的边界日不可能在表里
   (这是那句提示能被条件化的前提;cutoff 的天对齐语义由 test_token_usage_rollup.py
   钉着,不在这条里)
+
+还有一条服务于 insert 自己:两个 token 列建表是 NOT NULL,而上游发来的 usage 里那些
+数字字段可能是 null(按量计费未结算、流式收尾的 chunk),取值写法只兜「键缺席」就会把
+None 绑进去、抛 IntegrityError 并被 fire_record 兜成一行 warning——那一笔静默丢失。
 """
 from __future__ import annotations
 
@@ -338,6 +342,46 @@ def test_from_date_malformed_is_rejected(repo):
     with pytest.raises(ValueError, match="YYYY-MM-DD"):
         repo.clear_since(_ts_ms(date.today()), from_date="")
     assert _counts(repo)[1] == 1
+
+
+def test_insert_tolerates_null_number_fields_in_usage(repo):
+    """usage 里的数字字段为 null 时也得落库,不能静默丢掉这一笔。
+
+    两个 token 列建表是 NOT NULL(DEFAULT 只在整列被省略时生效,显式绑 NULL 一律
+    IntegrityError),而上游在按量计费未结算、或流式收尾那个 chunk 里会发半空的 usage。
+    取值写成 `.get(k, 0)` 只兜键缺席、兜不住值为 null;改回去这条会红——落库直接抛
+    IntegrityError,被 fire_record 吞成一行 warning,界面上只是少算、无从察觉。
+    """
+    repo.insert(
+        "m-null",
+        "https://a/v1",
+        {"prompt_tokens": None, "completion_tokens": 12, "prompt_tokens_details": None},
+        "realtime",
+    )
+    with repo.db.get_connection() as conn:
+        row = conn.execute(
+            "SELECT input_tokens, output_tokens, cache_tokens FROM token_usage "
+            "WHERE model = 'm-null'"
+        ).fetchone()
+    assert row is not None, "usage 里有 null 字段时这一笔被丢掉了"
+    assert tuple(row) == (0, 12, 0), f"null 字段没归零,落库成了 {tuple(row)}"
+
+
+def test_from_date_compact_form_still_deletes_the_daily_row(repo):
+    """紧凑写法过了闸门也必须真删到日表——校验用的值与拼进 SQL 的值得是同一个。
+
+    3.11 起 date.fromisoformat 也收 "20260824"，它能过「与推算日相差不超过一天」那道
+    闸门；而日表的 date 列是定宽 YYYY-MM-DD、按字典序比，"-"(0x2D) < "0"(0x30) 使
+    'date >= "20260824"' 恒命中 0 行。归一化若被拿掉，这条会红：实时表清了、日表没清，
+    留下的正是本文件开头那段说「不会有任何报错」的半清状态。
+    """
+    today = date.today()
+    _daily(repo, today)
+    _raw(repo, _ts_ms(today))
+    out = repo.clear_since(_ts_ms(today, hour=0), from_date=today.isoformat().replace("-", ""))
+    assert out["token_usage_daily"] == 1, "紧凑写法过了闸门，日表却一行没删"
+    assert out["daily_from_date"] == today.isoformat(), "回报给上层的边界日也得是归一化后的"
+    assert _counts(repo) == (0, 0), f"两表都该清空，实际剩 {_counts(repo)}"
 
 
 def test_from_date_without_since_is_rejected(repo):

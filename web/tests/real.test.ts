@@ -294,6 +294,125 @@ describe("Smart Crop 参考帧契约 — realEventRefUrl / realEventCropMeta", (
   });
 });
 
+describe("realGetUsageStats — 一次取数里的时间窗只算一遍", () => {
+  // 用量卡按周期自动重取，把页面开着过夜是常态。窗口若在 await 前后各算一次，跨过本地
+  // 午夜的那一次刷新就会「查昨天、铺今天」：服务端返回昨天的桶行，而骨架起点已是今天
+  // 00:00，每行下标为负被整体丢弃 → 图表切空态说「还没有用量」，而同一次返回的行没过
+  // 骨架、直接进了合计，左栏与明细仍显示昨天一整天的数。同一张卡自相矛盾，且不报错。
+  const realTZ = process.env.TZ;
+  afterEach(() => {
+    vi.useRealTimers();
+    if (realTZ === undefined) delete process.env.TZ;
+    else process.env.TZ = realTZ;
+  });
+
+  it("往返跨过本地午夜时，昨天的桶行仍落在骨架里", async () => {
+    process.env.TZ = "Asia/Shanghai";
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-08-24T15:59:59.900Z")); // 本地 8-24 23:59:59.9
+    const noon = new Date("2026-08-24T04:00:00Z").getTime(); // 本地 8-24 12:00
+    globalThis.fetch = vi.fn(async () => {
+      // 请求发出后、响应回来前跨过本地午夜
+      vi.setSystemTime(new Date("2026-08-24T16:00:00.100Z")); // 本地 8-25 00:00:00.1
+      return new Response(
+        JSON.stringify({
+          code: 0,
+          message: "ok",
+          data: {
+            rows: [
+              {
+                bucket_ms: noon,
+                model: "m",
+                base_url: "https://api.example/v1",
+                type: "realtime",
+                calls: 1,
+                input_tokens: 1000,
+                output_tokens: 100,
+                cache_tokens: 0,
+                video_tokens: 0,
+                audio_tokens: 0,
+              },
+            ],
+            total: 1,
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }) as unknown as typeof fetch;
+
+    const s = await realGetUsageStats("today", 60);
+    // 画进骨架的量必须等于同一次返回算出的合计——不等就说明行掉在骨架之外了
+    const drawn = s.timeline.reduce((a, p) => a + p.tokens, 0);
+    expect(drawn).toBeGreaterThan(0);
+    expect(drawn).toBe(s.totals.input + s.totals.output);
+  });
+});
+
+describe("realGetUsageStats — 今日窗口在夏令时切换当天走日历", () => {
+  // 起点是浏览器本地 00:00，终点必须走日历取次日 00:00：带夏令时的时区里本地一天是 23
+  // 或 25 小时，加固定 24 小时会让回拨那天漏掉最后一小时、前拨那天把次日头一小时算进
+  // 今日，而查询窗与桶骨架用的是同一个数，所以两边自洽、只是整体偏了，不会报错。
+  // 盒子本身在无夏令时的时区，踩不到；踩到的是浏览器所在时区有夏令时的看板使用者。
+  const realTZ = process.env.TZ;
+  afterEach(() => {
+    vi.useRealTimers();
+    // 原本没设过就删掉：赋回 undefined 会写成字符串 "undefined"，那是个非法时区，
+    // Node 会回落到 UTC，后面用例在模块加载时按本地时区算的锚点就全对不上了
+    if (realTZ === undefined) delete process.env.TZ;
+    else process.env.TZ = realTZ;
+  });
+
+  async function probe(nowUtcISO: string, binMinutes: number) {
+    process.env.TZ = "America/New_York";
+    // 只伪造 Date：连 setTimeout 一起伪造会让下面的 await 永远不结算
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(nowUtcISO));
+    let url = "";
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      url = typeof input === "string" ? input : input.toString();
+      return new Response(
+        JSON.stringify({ code: 0, message: "ok", data: { rows: [], total: 0 } }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }) as unknown as typeof fetch;
+    const s = await realGetUsageStats("today", binMinutes);
+    const since = Number(/since=(\d+)/.exec(url)?.[1]);
+    const until = Number(/until=(\d+)/.exec(url)?.[1]);
+    return { hours: (until - since) / 3_600_000, buckets: s.timeline.length };
+  }
+
+  it("回拨那天本地一天 25 小时：查询窗与桶骨架一起变长", async () => {
+    const { hours, buckets } = await probe("2026-11-01T16:00:00Z", 15);
+    expect(hours).toBe(25);
+    expect(buckets).toBe(100);
+  });
+
+  it("前拨那天本地一天 23 小时：不把次日头一小时算进今日", async () => {
+    const { hours, buckets } = await probe("2026-03-08T16:00:00Z", 15);
+    expect(hours).toBe(23);
+    expect(buckets).toBe(92);
+  });
+
+  it("无夏令时的时区不受影响，仍是 24 小时", async () => {
+    process.env.TZ = "Asia/Shanghai";
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-11-01T04:00:00Z"));
+    let url = "";
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      url = typeof input === "string" ? input : input.toString();
+      return new Response(
+        JSON.stringify({ code: 0, message: "ok", data: { rows: [], total: 0 } }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }) as unknown as typeof fetch;
+    const s = await realGetUsageStats("today", 15);
+    const since = Number(/since=(\d+)/.exec(url)?.[1]);
+    const until = Number(/until=(\d+)/.exec(url)?.[1]);
+    expect((until - since) / 3_600_000).toBe(24);
+    expect(s.timeline).toHaveLength(96);
+  });
+});
+
 describe("realGetUsageStats — today buckets 折算契约", () => {
   // 今天 00:00 的 ms 时间戳（桶 0，不依赖运行时刻，必在窗口内）
   const t0 = (() => {

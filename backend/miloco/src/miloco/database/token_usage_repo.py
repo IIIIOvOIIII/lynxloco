@@ -78,8 +78,13 @@ class TokenUsageRepo:
                 self._last_archive_check = today
 
         details = usage.get("prompt_tokens_details") or {}
-        input_tokens = usage.get("prompt_tokens", 0)
-        output_tokens = usage.get("completion_tokens", 0)
+        # 五行一律用 `or 0`：键缺席、值为 null、provider 发 0，三种情况的目标值都是 0。
+        # 写成 `.get(k, 0)` 只兜键缺席——键在而值为 null 时它返回 None，而这两列建表是
+        # NOT NULL（DEFAULT 只在整列被省略时生效，显式绑 NULL 一律 IntegrityError），
+        # 于是那笔记账被 fire_record 兜成一行 warning、静默丢失。上游按量计费未结算、
+        # 流式收尾那个 chunk 都会发这种半空的 usage。
+        input_tokens = usage.get("prompt_tokens") or 0
+        output_tokens = usage.get("completion_tokens") or 0
         cache_tokens = details.get("cached_tokens") or 0
         video_tokens = details.get("video_tokens") or 0
         audio_tokens = details.get("audio_tokens") or 0
@@ -160,6 +165,11 @@ class TokenUsageRepo:
                     f"from_date {from_date} 与 since_ms 推算的 {derived.isoformat()} "
                     "相差超过一天，只接受时区差那一天的偏移"
                 )
+            # 校验用哪个值，就用哪个值去删。日表的 date 列是定宽 YYYY-MM-DD、靠字典序
+            # 比较，而 3.11 起 fromisoformat 也收紧凑写法（"20260824"）：它能过上面的
+            # 闸门，原样拼进 SQL 却因 "-"(0x2D) < "0"(0x30) 排在所有带短横的日期之后、
+            # 恒命中 0 行——实时表清了、日表没清，正是本函数开头那段要防的半清状态。
+            from_date = given.isoformat()
 
         if (model is None) != (base_url is None):
             raise ValueError(

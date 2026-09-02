@@ -263,7 +263,7 @@ async def call_omni(
                 )
                 raise OmniError(f"omni response is not a dict (got {raw_cls})")
             await cb.record_success()
-            fire_record(config.model, config.base_url, raw.get("usage", {}), type)
+            fire_record(config.model, config.base_url, raw.get("usage") or {}, type)
         return raw
     except CircuitOpenError as ce:
         short_circuited = True

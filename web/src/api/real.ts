@@ -1631,7 +1631,20 @@ interface UsageUnit {
   audio_tokens: number;
 }
 
-const ONE_DAY_MS = 86_400_000;
+/**
+ * 今天的绝对时间窗 [startMs, endMs)。终点走日历取次日 00:00，而不是起点加固定 24 小时：
+ * 带夏令时的浏览器时区下本地一天是 23 或 25 小时——回拨那天加 24 小时落在当天 23:00，
+ * 最后一小时既查不到也画不出；前拨那天落到次日 01:00，把次日头一小时算进今日。两者都
+ * 不报错，因为查询窗与桶骨架用同一个数、只是整体偏了。与 dailyTimeline 和近 7/30 天的
+ * 查询窗共用同一条日历链（都靠 setDate 走日历，不减毫秒）。
+ */
+function todayWindow(): { startMs: number; endMs: number } {
+  const start = new Date();
+  start.setHours(0, 0, 0, 0);
+  const end = new Date(start);
+  end.setDate(end.getDate() + 1);
+  return { startMs: start.getTime(), endMs: end.getTime() };
+}
 
 function emptyBreakdown(): TokenBreakdown {
   return { input: 0, output: 0, cache: 0, video: 0, audio: 0 };
@@ -1715,12 +1728,16 @@ function accPoint(p: UsageTimelinePoint, r: UsageUnit): void {
 function bucketTimeline(
   rows: BucketRow[],
   binMinutes: number,
+  // 必须与拼查询串用的是同一份：自己再取一次的话，跨本地午夜的那次刷新会「查昨天、
+  // 铺今天」——服务端返回的是昨天的桶行，而骨架起点已是今天 00:00，每行算出的下标
+  // 全为负、被下面的范围判断整体丢掉，于是图表切空态说「还没有用量」，而同一次返回
+  // 的行没过骨架、直接进了合计，左栏与明细仍显示昨天一整天的数。
+  win: { startMs: number; endMs: number },
 ): UsageTimelinePoint[] {
-  const start = new Date();
-  start.setHours(0, 0, 0, 0);
-  const startMs = start.getTime();
+  const { startMs, endMs } = win;
   const binMs = Math.max(1, binMinutes) * 60_000;
-  const n = Math.max(1, Math.ceil(ONE_DAY_MS / binMs)); // 覆盖整天
+  // 覆盖整天：按实际窗长算，夏令时切换那天不是 24 小时
+  const n = Math.max(1, Math.ceil((endMs - startMs) / binMs));
   const buckets = Array.from({ length: n }, (_, i) =>
     emptyPoint(new Date(startMs + i * binMs).toISOString()),
   );
@@ -1735,6 +1752,9 @@ function bucketTimeline(
 function dailyTimeline(
   rows: DailyRow[],
   days: number,
+  // 与算 since/until 用的是同一个 Date，理由同 bucketTimeline：各取各的话跨午夜那次
+  // 刷新会最左挤掉一天、最右多出一个恒空的新日期。
+  today: Date,
 ): UsageTimelinePoint[] {
   // 先按 date 聚成桶（同一天可有多行：model × base_url × type 各一行——同名模型挂
   // 两个 endpoint 时同一天就会多出行）
@@ -1747,8 +1767,6 @@ function dailyTimeline(
     }
     accPoint(p, r);
   }
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
   const out: UsageTimelinePoint[] = [];
   for (let i = days - 1; i >= 0; i--) {
     // 走日历而不是减毫秒：带夏令时的浏览器时区下，跨过 spring-forward 那天减 24 小时
@@ -2122,11 +2140,11 @@ async function fetchUsageStats(
 ): Promise<UsageStats> {
   if (period === "today") {
     // 服务端按 bin 桶聚合（响应大小由桶数封顶，不随事件数增长，不会触顶截断）。
-    // 显式传 client 本地 00:00 的窗口，与 bucketTimeline 的骨架起点锚定同一绝对时刻，
-    // 避免浏览器/服务器时区不一致时今日早段被后端窗口或前端骨架静默丢弃。
-    const start = new Date();
-    start.setHours(0, 0, 0, 0);
-    const startMs = start.getTime();
+    // 显式传 client 本地的今日窗口，并把同一份对象交给骨架：起止都锚在同一绝对时刻，
+    // 既避免浏览器/服务器时区不一致时今日早段被静默丢弃，也让两侧在夏令时切换那天一起
+    // 用 23 或 25 小时。取一次传下去、不各取各的——理由见 bucketTimeline 的入参说明。
+    const win = todayWindow();
+    const { startMs, endMs } = win;
     const r = await apiFetch<
       Normal<{
         rows: BucketRow[];
@@ -2136,13 +2154,13 @@ async function fetchUsageStats(
       }>
     >(
       `/api/admin/token-usage/buckets?bin=${binMinutes}` +
-        `&since=${startMs}&until=${startMs + ONE_DAY_MS}`,
+        `&since=${startMs}&until=${endMs}`,
     );
     const rows = r.data.rows ?? [];
     return unitsToStats(
       period,
       rows.map(bucketToUnit),
-      bucketTimeline(rows, binMinutes),
+      bucketTimeline(rows, binMinutes, win),
       r.data.daily_earliest_date ?? null,
       r.data.daily_latest_date ?? null,
     );
@@ -2167,7 +2185,7 @@ async function fetchUsageStats(
   return unitsToStats(
     period,
     rows.map(rowToUnit),
-    dailyTimeline(rows, days),
+    dailyTimeline(rows, days, until),
     r.data.daily_earliest_date ?? null,
     r.data.daily_latest_date ?? null,
   );
