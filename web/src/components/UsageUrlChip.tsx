@@ -105,7 +105,7 @@ export function UsageUrlChip({
         onClick={toggle}
         aria-haspopup="dialog"
         aria-expanded={open}
-        aria-label={t("usage.modelUrlAria")}
+        aria-label={t("usage.modelUrlAria", { url })}
         className={`num text-[11px] leading-normal px-1.5 rounded border transition-colors ${
           open
             ? "border-border-strong text-text-primary"
@@ -119,7 +119,7 @@ export function UsageUrlChip({
         <div
           ref={boxRef}
           role="dialog"
-          aria-label={t("usage.modelUrlAria")}
+          aria-label={t("usage.modelUrlAria", { url })}
           style={{
             width: 320,
             // 落点未算出前先摆到锚点下方并隐形：要先渲染才量得到高度

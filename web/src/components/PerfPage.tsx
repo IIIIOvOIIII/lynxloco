@@ -60,12 +60,15 @@ import { PerfGateScoreTable } from "./PerfGateScoreTable";
 import { PerfStageTable } from "./PerfStageTable";
 import { PerfTraceList } from "./PerfTraceList";
 import { PerfTraceTimingChart } from "./PerfTraceTimingChart";
+import { RefreshIntervalInput } from "./RefreshIntervalInput";
+import { useRefreshInterval } from "@/hooks/useRefreshInterval";
 
 export function PerfPage() {
   const { t, i18n } = useTranslation();
   // 窗口选项随语言重算;memo 在 i18n.language 不变时保持引用稳定。
   const windows = useMemo(() => perfWindows(), [i18n.language]);
   const [windowKey, setWindow] = useState<PerfWindow>("1h");
+  const { sec: refreshSec, setSec: setRefreshSec } = useRefreshInterval();
   const bucket = defaultBucket(windowKey);
   const windowMs = WINDOW_MS[windowKey];
 
@@ -162,12 +165,15 @@ export function PerfPage() {
     procSeries.reload();
   };
 
-  // 30s 自动刷新。窗口切换会重置 timer。
+  // 自动刷新周期由住户设定，与「模型」页共用同一个值（见 useRefreshInterval：一处改、
+  // 两处生效，跨标签页也同步）。此前这里写死 30 秒，于是那个设置对这一整页不起作用——
+  // 设成 5 秒这里仍是 30 秒，设成十分钟这里照旧每 30 秒打十余个接口。窗口切换或周期变化
+  // 都重置 timer。
   useEffect(() => {
-    const id = setInterval(reloadAll, 30_000);
+    const id = setInterval(reloadAll, refreshSec * 1000);
     return () => clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [windowKey]);
+  }, [windowKey, refreshSec]);
 
   return (
     <div className="space-y-6">
@@ -199,6 +205,7 @@ export function PerfPage() {
         </div>
         <div className="flex items-center gap-3">
           <span className="text-caption text-text-tertiary">{t("perf.autoRefresh")}</span>
+          <RefreshIntervalInput sec={refreshSec} onChange={setRefreshSec} />
           <button
             type="button"
             onClick={reloadAll}
