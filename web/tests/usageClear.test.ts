@@ -1,5 +1,8 @@
 /**
- * 清除用量数据的请求契约。
+ * 清除用量数据的两件事：**请求契约**，以及确认窗那句「连带删除某天」的**成立条件**。
+ * 两者都属于「错了不会报错、只会静默做错事」，故放在一处。
+ *
+ * 先说请求契约。
  *
  * 这里守的是一件容易出事的事：**model 与 base_url 必须成对给或都不给**。
  * 只给一半时前端直接抛、不发请求：把半个目标丢掉会让「清这一项」静默变成
@@ -7,6 +10,10 @@
  *
  * 另一条：base_url 空串是**合法目标**（schema v3 之前的老数据，来源未记录），
  * 不是「未指定」。任何按真值判断的写法都会把这类行的定点清除变成全模型清除。
+ *
+ * 后一组（第二个 describe）不发任何请求，只判那句提示该不该出现：日表按整天删，所以
+ * 只有边界那天真的落在日表已有的日期区间里才谈得上「连带」。说错的代价是双向的——
+ * 只想清近期的人被吓退，而信了的人清完发现数据还在。
  */
 
 import { describe, it, expect, vi, afterEach } from "vitest";
@@ -116,36 +123,38 @@ describe("「连带删除某天」这句提示的成立条件", () => {
 
   it("上界：边界日晚于日表最新日期（近 24 小时那档）→ 不说", () => {
     // 滚存截止天对齐且只搬更早的行，今天/昨天永远不在日表里
-    expect(dailyCaveatApplies("2026-08-27", LATEST, EARLIEST)).toBe(false);
+    expect(dailyCaveatApplies("2026-08-27", EARLIEST, LATEST)).toBe(false);
   });
 
   it("下界：边界日早于日表最早日期（盒子刚装几天）→ 不说", () => {
-    // 日表只有 8-20 起的数据，选「近 7 天」边界日落到 8-15：
-    // `date >= '2026-08-15'` 删掉的都是本就在所选范围内的整天，没有超出预期的删除
-    expect(dailyCaveatApplies("2026-08-15", LATEST, EARLIEST)).toBe(false);
+    // 8-15 是把下界拉开距离的**构造输入**，不是这组常量下「近 7 天」产得出的边界日：
+    // EARLIEST=8-20 已意味着今天 ≥ 8-24（日表要滚存后才有 8-20），「近 7 天」边界日
+    // 最早也只到 8-17。真实的下界落空长这样：今天 8-28、日表只有 8-22 起的数据，
+    // 边界日 8-21 早于最早那天——`date >= 边界日` 删掉的都本就在所选范围内。
+    expect(dailyCaveatApplies("2026-08-15", EARLIEST, LATEST)).toBe(false);
   });
 
   it("边界日正好是区间两端 → 都要说（那天会被整天删掉）", () => {
-    expect(dailyCaveatApplies(LATEST, LATEST, EARLIEST)).toBe(true);
-    expect(dailyCaveatApplies(EARLIEST, LATEST, EARLIEST)).toBe(true);
+    expect(dailyCaveatApplies(LATEST, EARLIEST, LATEST)).toBe(true);
+    expect(dailyCaveatApplies(EARLIEST, EARLIEST, LATEST)).toBe(true);
   });
 
   it("边界日落在区间内 → 要说", () => {
-    expect(dailyCaveatApplies("2026-08-22", LATEST, EARLIEST)).toBe(true);
+    expect(dailyCaveatApplies("2026-08-22", EARLIEST, LATEST)).toBe(true);
   });
 
   it("日表为空 / 接口只给了一头 → 不说，宁可不说也不说错", () => {
     expect(dailyCaveatApplies("2026-08-22", null, null)).toBe(false);
-    expect(dailyCaveatApplies("2026-08-22", LATEST, null)).toBe(false);
-    expect(dailyCaveatApplies("2026-08-22", null, EARLIEST)).toBe(false);
+    expect(dailyCaveatApplies("2026-08-22", null, LATEST)).toBe(false);
+    expect(dailyCaveatApplies("2026-08-22", EARLIEST, null)).toBe(false);
   });
 
   it("全清档没有边界日 → 不说", () => {
-    expect(dailyCaveatApplies(null, LATEST, EARLIEST)).toBe(false);
+    expect(dailyCaveatApplies(null, EARLIEST, LATEST)).toBe(false);
   });
 
   it("跨月跨年按字典序比较仍成立（等宽零填充）", () => {
-    expect(dailyCaveatApplies("2026-09-01", "2026-08-31", "2026-08-01")).toBe(false);
-    expect(dailyCaveatApplies("2025-12-31", "2026-01-05", "2025-12-28")).toBe(true);
+    expect(dailyCaveatApplies("2026-09-01", "2026-08-01", "2026-08-31")).toBe(false);
+    expect(dailyCaveatApplies("2025-12-31", "2025-12-28", "2026-01-05")).toBe(true);
   });
 });

@@ -698,9 +698,9 @@ export interface PerfTraceRow {
   /** traces_v 视图派生:EXISTS(SELECT 1 FROM agent_runs WHERE trace_id=t.trace_id)。 */
   has_agent_turn: number;
   /**
-   * traces_v 视图派生的「耗时/窗口跨度」比值族。明细表不再单列一格显示它们
-   * (「处理耗时」与「数据包长」两列已在表上,比值是这两个数一除),但 rtf_e2e / rtf
-   * 仍是那一行「有没有跟上」的判据——沿用原判据，不另立标准。
+   * traces_v 视图派生的「耗时/窗口跨度」比值族。明细表用「实时率」一列显示
+   * rtf_e2e ?? rtf、超过 1 标红,那一行「有没有跟上」就看它;rtf_pipeline /
+   * rtf_stream_e2e / rtf_omni 表上没有对应列,留给调用方按需取。
    */
   rtf: number | null;
   rtf_pipeline: number | null;

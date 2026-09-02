@@ -215,7 +215,11 @@ def test_old_empty_base_url_rows_stay_separate_from_recorded(repo):
 
 
 def test_aggregate_paths_expose_base_url(repo):
-    """今日走分桶、近 7 天走日聚合——两条路都必须带 base_url，否则两个视图行为不一致。"""
+    """三条读取路径都必须带 base_url,否则各视图对「同名模型」的行为不一致.
+
+    今日走分桶、近 7 天走日聚合、原始事件端点走 list_events——漏掉任一条,那个视图就会
+    把两个 endpoint 的用量合成一行显示.
+    """
     _raw(repo, int(datetime.now().timestamp() * 1000), "m", "https://a/v1", 10)
     assert "base_url" in repo.aggregate_buckets()[0]
     assert "base_url" in repo.aggregate_daily()[0]

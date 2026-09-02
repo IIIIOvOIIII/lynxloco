@@ -1736,7 +1736,8 @@ function dailyTimeline(
   rows: DailyRow[],
   days: number,
 ): UsageTimelinePoint[] {
-  // 先按 date 聚成桶（同一天可有多行：model × type 各一行）
+  // 先按 date 聚成桶（同一天可有多行：model × base_url × type 各一行——同名模型挂
+  // 两个 endpoint 时同一天就会多出行）
   const byDate = new Map<string, UsageTimelinePoint>();
   for (const r of rows) {
     let p = byDate.get(r.date);
@@ -1768,8 +1769,11 @@ function unitsToStats(
   period: UsagePeriod,
   units: UsageUnit[],
   timeline: UsageTimelinePoint[],
-  dailyLatestDate: string | null = null,
-  dailyEarliestDate: string | null = null,
+  // 顺序与后端 daily_date_range() 的返回一致（早, 晚）：两个同类型参数相邻时,顺序不一致
+  // 就是个迟早会传反的坑,而传反了两个判据都还会「正常」返回 false。也不给默认值——
+  // 漏传要在编译期报错,不能降级成那句提示永远不显示。
+  dailyEarliestDate: string | null,
+  dailyLatestDate: string | null,
 ): UsageStats {
   const totals = emptyBreakdown();
   let calls = 0;
@@ -1876,8 +1880,9 @@ function rowToUnit(d: DailyRow): UsageUnit {
 }
 
 // 请求级缓存：按 (period, bin) 合并并发请求 + 5s TTL，避免重复打较重的 token-usage
-// 接口（同 fetchMiotHome 思路）。取数现在只有 UsagePage 一处，缓存留着挡住「切周期
-// 来回点」与自动刷新撞上手动刷新这类同一 tick 的重复请求。
+// 接口（同 fetchMiotHome 思路）。两个组件在取数：用量页（带周期与粒度）和首页那个
+// 今日小读数——后者不传粒度、落到默认的 60，与用量页默认档**同键**，所以「合并并发
+// 请求」这条至今仍在生效，不只是挡「切周期来回点」与自动刷新撞手动刷新。
 const usageCache = new Map<string, { ts: number; p: Promise<UsageStats> }>();
 const USAGE_TTL_MS = 5000;
 
@@ -2138,8 +2143,8 @@ async function fetchUsageStats(
       period,
       rows.map(bucketToUnit),
       bucketTimeline(rows, binMinutes),
-      r.data.daily_latest_date ?? null,
       r.data.daily_earliest_date ?? null,
+      r.data.daily_latest_date ?? null,
     );
   }
 
@@ -2163,8 +2168,8 @@ async function fetchUsageStats(
     period,
     rows.map(rowToUnit),
     dailyTimeline(rows, days),
-    r.data.daily_latest_date ?? null,
     r.data.daily_earliest_date ?? null,
+    r.data.daily_latest_date ?? null,
   );
 }
 

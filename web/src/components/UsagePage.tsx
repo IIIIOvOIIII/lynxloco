@@ -26,6 +26,7 @@ import { humanTokens } from "@/lib/formatTokens";
 import { CollapsibleCard } from "./CollapsibleCard";
 import { RefreshIntervalInput } from "./RefreshIntervalInput";
 import { useRefreshInterval } from "@/hooks/useRefreshInterval";
+import { PERIOD_KEYS } from "@/lib/usagePeriods";
 import { UsageTodayOverview } from "./UsageTodayOverview";
 import { UsageTimelineChart } from "./UsageTimelineChart";
 import { UsageBreakdownTable } from "./UsageBreakdownTable";
@@ -34,12 +35,6 @@ import { UsageClearDialog } from "./UsageClearDialog";
 import { UsageClearMenu, type ClearScope } from "./UsageClearMenu";
 import { PerfInline } from "./PerfInline";
 import { Segmented } from "./Segmented";
-
-const PERIOD_KEYS: Record<UsagePeriod, string> = {
-  today: "usage.periodToday",
-  week: "usage.periodWeek",
-  month: "usage.periodMonth",
-};
 
 /**
  * 时间粒度档位。15 分而非 10 分：24 小时切 10 分是 144 桶，1440 视口下每桶只剩
@@ -189,7 +184,7 @@ export function UsagePage() {
               className="px-2.5 py-1 rounded-md border border-error hover:bg-error-bg
                          transition-colors"
             >
-              {t("usage.retry")}
+              {t("common.retry")}
             </button>
           </div>
         )}

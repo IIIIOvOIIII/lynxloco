@@ -7,8 +7,10 @@
  *  - **按模态**：柱子按模态堆叠，与左栏环形图共用同一套颜色和同一份图例，于是
  *    「今天视频占一半」和「视频集中在傍晚」成了同一个色块的两个聚合层级。
  *
- * 用 CSS flex 柱而不是 SVG：SVG 要撑满宽度就得 `preserveAspectRatio="none"`，那会把
- * 圆角拉成椭圆、把 1px 网格线横向拉粗、让虚线密度随窗口宽变化。flex 天然 1:1。
+ * 用 CSS flex 柱而不是 SVG：柱子是「按容器宽等分、每根自己保持 1:1」的堆叠色块，用
+ * DOM 表达能直接复用环形图那套 bg-usage-* 类与圆角、过渡（同一份颜色、同一份图例），
+ * 在 SVG 里得按像素自己铺一遍。不是为了省掉宽度测量——这张图本来就在量：横轴标签密度
+ * 要实测像素宽（下面 barsRef + ResizeObserver），就近命中要 getBoundingClientRect。
  *
  * 取数路径三条都通：鼠标、触屏（pointer 事件一并覆盖）、键盘（Tab 聚焦后方向键逐段、
  * Esc 收起），并另挂一个 sr-only 的 live region 播报当前桶。此前只有 mouseenter，
@@ -36,6 +38,7 @@ import type {
 } from "@/lib/types";
 import { axisTokens, humanTokens } from "@/lib/formatTokens";
 import { shortenUrlSet } from "@/lib/modelIdentity";
+import { PERIOD_KEYS } from "@/lib/usagePeriods";
 import { Segmented } from "./Segmented";
 
 /** 浮层里最多列几个来源，其余归并成一行。见浮层里那段关于绘图区高度的说明。 */
@@ -69,12 +72,6 @@ const MODALITIES = [
   { key: "audio", cls: "bg-usage-audio", labelKey: "usage.modalityAudio" },
   { key: "output", cls: "bg-usage-output", labelKey: "usage.modalityOutput" },
 ] as const;
-
-const PERIOD_KEYS: Record<UsagePeriod, string> = {
-  today: "usage.periodToday",
-  week: "usage.periodWeek",
-  month: "usage.periodMonth",
-};
 
 function formatBucketLabel(
   ts: string,
@@ -118,7 +115,10 @@ export function UsageTimelineChart({
 
   const barsRef = useRef<HTMLDivElement | null>(null);
   const [plotW, setPlotW] = useState(0);
-  // 横轴标签密度按**实际像素宽**算，不能只按桶数抽稀，否则窄容器下相邻标签会压字
+  // 横轴标签密度按**实际像素宽**算，不能只按桶数抽稀，否则窄容器下相邻标签会压字。
+  // 没复用 hooks/useMeasuredWidth：那个用 useEffect + 首帧兜底常量（SVG 的归一化
+  // viewBox 下首帧取多少都不影响成像），而标签密度首帧取错会闪一下，所以这里用
+  // useLayoutEffect 在首次绘制前就把宽度量到。
   useLayoutEffect(() => {
     const node = barsRef.current;
     if (!node) return;
@@ -222,7 +222,7 @@ export function UsageTimelineChart({
         )}
       </div>
 
-      {isEmpty || !peak ? (
+      {!peak ? (   /* peak 由 isEmpty 派生，判它一次就够 */
         <div
           className="flex items-center justify-center text-caption text-text-secondary
                      border border-dashed border-border rounded-lg px-4 text-center"
@@ -469,22 +469,12 @@ function Tooltip({
   const shiftX = align === "center" ? "-50%" : align === "right" ? "-100%" : "0";
 
   /**
-   * 纵向落点按**实测高度**算，不用常数猜。
-   *
-   * 浮层的行数随「是否按模态」变化，高度差两三倍；而柱越高浮层越靠上，
-   * 拿一个固定地板去挡越界，只在「浮层恰好那么高」时成立——峰值柱贴着纵轴上界时
-   * 柱顶只剩几像素，浮层会整个翻到绘图区上方、盖住卡片工具条上住户刚点过的控件。
-   * 故先量出来：上方装不下就翻到柱顶下方，并夹在绘图区内——「按模态」把四个模态全列出时
-   * 浮层比绘图区本身还高，不夹的话往下翻会越出绘图区、去盖下面的明细表。宁可盖住它正在
-   * 解读的那张图，也不去盖邻区：图是浮层的上下文，而明细与工具条不是。
-   */
-  /**
    * 按来源拆分：两档都给，但「按模态」档只给一行计数、不展开。
    *
    * 浮层的落点被夹在绘图区内（PLOT_H）。「按模态」档本身已有四行模态明细，再把来源
-   * 逐个列出会把浮层撑到绘图区的一倍半——夹取只能把它顶到绘图区顶部，多出来的部分照样
-   * 溢出去盖住下面的明细表（实测：两档都展开时浮层 288px、绘图区 192px，底边压进明细表
-   * 13px）。所以按模态档压成一行「N 个来源」：默认档位下至少知道有几个来源，要看是谁
+   * 逐个列出会把浮层撑到绘图高的一倍半——夹取只能把它顶到绘图区顶部，多出来的部分照样
+   * 溢出去盖住下面的明细表（实测过：两档都展开那版的底边确实压进了明细表）。所以按模态
+   * 档压成一行「N 个来源」：默认档位下至少知道有几个来源，要看是谁
    * 切到「合计」档；合计档只有总量一行、空间富余，正好展开。
    */
   const sorted = useMemo(
@@ -497,8 +487,8 @@ function Tooltip({
   /**
    * 这一桶**真有**模态可列。`stacked` 只说明档位允许列模态，不代表这桶有量：空桶四个
    * 字段全是 0，下面那四行会被逐行的 `> 0` 守卫全部跳过。而空桶不是边角——绘图区是
-   * 整条做就近命中（细柱下不留死区），指针落在空桶上照样弹浮层，默认「近 24 小时 ÷
-   * 15 分」有 96 个桶，夜里成片都是空的。
+   * 整条做就近命中（细柱下不留死区），指针落在空桶上照样弹浮层，最细档「近 24 小时
+   * ÷ 15 分」有 96 个桶（默认 1 小时档 24 个），夜里成片都是空的。
    *
    * 底边与下面那段模态明细共用这一个判据，不各判各的：上一次悬空底边正是因为两处
    * 口径分叉才漏掉的。
@@ -508,6 +498,16 @@ function Tooltip({
   const restTargets = expandTargets ? sorted.slice(MAX_TARGET_ROWS) : [];
   const restTotal = restTargets.reduce((a, t) => a + targetTotal(t), 0);
 
+  /**
+   * 纵向落点按**实测高度**算，不用常数猜。
+   *
+   * 浮层的行数随「是否按模态」变化，高度差两三倍；而柱越高浮层越靠上，
+   * 拿一个固定地板去挡越界，只在「浮层恰好那么高」时成立——峰值柱贴着纵轴上界时
+   * 柱顶只剩几像素，浮层会整个翻到绘图区上方、盖住卡片工具条上住户刚点过的控件。
+   * 故先量出来：上方装不下就翻到柱顶下方，并夹在绘图区内——「按模态」把四个模态全列出时
+   * 浮层比绘图区本身还高，不夹的话往下翻会越出绘图区、去盖下面的明细表。宁可盖住它正在
+   * 解读的那张图，也不去盖邻区：图是浮层的上下文，而明细与工具条不是。
+   */
   const boxRef = useRef<HTMLDivElement | null>(null);
   const [boxH, setBoxH] = useState(0);
   useLayoutEffect(() => {

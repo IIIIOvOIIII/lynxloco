@@ -102,7 +102,10 @@ class TokenUsageRepo:
     def clear_all(self) -> dict[str, int | str | None]:
         """删除全部 token 用量(实时表 + 日 rollup),返回各表删除行数。
 
-        供 admin 重置统计用(不可恢复)。两表在同一事务内一并清空。
+        自「按范围清除」落地后**没有生产调用点**——清除端点一律走 clear_since,全清只是
+        它四个条件都不给的那一档。这个名字保留下来是因为「清空全部」本身是个清楚的意图,
+        留一个只做转发的入口比让调用方去写 clear_since(None) 更难读错;有用例钉住两者
+        等价,所以它不会偷偷长出第二份 SQL。
         """
         return self.clear_since(None)
 
@@ -282,7 +285,7 @@ class TokenUsageRepo:
         走 aggregate_daily），漏了它坏的正是「今日」——近 7 天走 aggregate_daily，那边自己的 GROUP BY 带着 base_url、照样分得出。
 
         Used by the "today" view: the response size is bounded by bucket count
-        (≈ day / bin × models × types), not by event count, so it never hits the
+        (≈ day / bin × (model, base_url) pairs × types), not by event count, so it never hits the
         raw-event cap regardless of activity. Returns rows with ``bucket_ms``
         (bucket start, ms epoch) plus per-bucket sums.
         """

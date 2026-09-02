@@ -120,7 +120,6 @@
     "cacheHitSummary": "{{rate}}% cache hit",
     "legendAria": "Modality breakdown",
     "updatedAt": "Updated {{time}}",
-    "retry": "Retry",
     "clearDialogTitle": "Clear usage data",
     "clearDialogTitleTarget": "Clear this entry's usage data",
     "clearDialogWarn": "Cannot be undone — history is unrecoverable.",

@@ -13,8 +13,9 @@
  * 读屏用户听到的交互模型与实际键位对不上；档位本来就是 <button>，如实呈现即可。
  *
  * 同一个组件带两种作用域：工具条上那个清所有模型，明细每行那个只清该行的
- * 「模型名 + endpoint」。同类动作用同一个图标、同一套范围档位，只差作用域——
- * 差异全部写在气泡标题、作用域徽记与确认窗里。
+ * 「模型名 + endpoint」。同类动作用同一个图标、同一套时间档位，只差作用域——作用域
+ * 写在按钮 aria-label、气泡标题、作用域徽记与确认窗里；档位列表本身也认这个差别：
+ * 「全部」那档的措辞随作用域改，工具条那个还给每档补一行副标题。
  */
 
 import {
@@ -55,7 +56,9 @@ export function UsageClearMenu({
   /**
    * 浮层定位方式。表格里的那个必须用 fixed：明细表在 overflow-x:auto 容器内，
    * 而该属性会让纵向溢出也变成滚动——绝对定位浮层实测会超出容器并催出一条
-   * 竖滚动条（锚在末行时超出 82px）。工具条不在任何 overflow 容器里，用 absolute 即可。
+   * 竖滚动条（锚在末行时超出 82px）。工具条外面只有页面级那个滚动容器（App.tsx 的
+   * `<main className="flex-1 overflow-y-auto min-h-0">`），浮层向下展开只是把页面
+   * 撑长、不会被裁，用 absolute 即可。
    */
   placement?: "absolute" | "fixed";
 }) {
@@ -207,10 +210,10 @@ export function UsageClearMenu({
           <div className="px-1.5 pb-1.5 text-caption text-text-tertiary">
             {target ? t("usage.clearTargetMenuTitle") : t("usage.clearMenuTitle")}
           </div>
-          {scopes().map((s, i) => (
+          {scopes().map((s) => (
             <div key={s.key}>
               {/* 「全部」与另两档不是一类，用分隔线划开并上警示色 */}
-              {i === 2 && <div className="h-px bg-border my-1.5 mx-1" />}
+              {s.key === "all" && <div className="h-px bg-border my-1.5 mx-1" />}
               <button
                 type="button"
                 onClick={() => {

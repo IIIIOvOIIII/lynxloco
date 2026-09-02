@@ -120,7 +120,6 @@
     "cacheHitSummary": "缓存命中 {{rate}}%",
     "legendAria": "模态构成",
     "updatedAt": "更新于 {{time}}",
-    "retry": "重试",
     "clearDialogTitle": "清空用量数据",
     "clearDialogTitleTarget": "清除这一项的用量数据",
     "clearDialogWarn": "不可恢复，历史无法找回。",

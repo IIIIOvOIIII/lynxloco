@@ -130,7 +130,7 @@ def fresh_db(tmp_path, monkeypatch):
 
 
 def _run_init(db_file):
-    """触发 init_database 走 v1→v2 步进迁移."""
+    """触发 init_database 走 user_version 步进迁移(v1 → 当前基线)."""
     import miloco.database.connector as connector_module
 
     connector_module.init_database()

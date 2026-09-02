@@ -10,7 +10,6 @@
  * 需要时点开即可,常驻一行反而占位。
  */
 
-import { Fragment } from "react";
 import { useTranslation } from "react-i18next";
 import type { TokenBreakdown, UsageStats } from "@/lib/types";
 import { humanTokens } from "@/lib/formatTokens";
@@ -125,7 +124,9 @@ export function UsageBreakdownTable({
       </h3>
 
       {/* 横向可滚区要能被键盘聚焦并用方向键滚动，否则 200% 缩放下被 overflow 藏起来的
-          列对键盘用户不可达（表内全是纯文本，没有任何可聚焦后代把滚动带出来）。 */}
+          列对键盘用户不可达——行内可聚焦的只有首列的 URL 徽记（旧数据那行是纯 span，
+          不可聚焦）与末列的清除按钮，Tab 过去只把两端滚进视野，中间那几列数字全是
+          纯文本，没有任何可聚焦后代能把它们带出来。 */}
       <div
         className="text-caption overflow-x-auto -mx-5 md:-mx-6 focus-visible:outline
                    focus-visible:outline-2 focus-visible:outline-offset-[-2px]
@@ -175,80 +176,79 @@ export function UsageBreakdownTable({
                 </td>
               </tr>
             ) : (
-              rows.map((r) => {
-                return (
-                  <Fragment key={`${r.model}\u001f${r.base_url}`}>
-                  <tr className="border-b border-border last:border-b-0">
-                    <td className="px-5 md:px-6 py-2.5 text-text-primary">
-                      <span className="inline-flex items-center gap-1.5">
-                        {r.model}
-                        {/* 有记录值就显示它；空串是 schema v3 之前的老数据，
-                            来源无从得知——直说，不做任何推断或回填。 */}
-                        {r.base_url ? (
-                          <UsageUrlChip
-                            url={r.base_url}
-                            label={urlLabels.get(r.base_url) ?? r.base_url}
-                          />
-                        ) : (
-                          <span
-                            className="text-text-tertiary text-[11px] px-1.5 py-px
-                                       rounded border border-dashed border-border"
-                            title={t("usage.modelUrlLegacyHint")}
-                          >
-                            {t("usage.modelUrlLegacy")}
-                          </span>
-                        )}
-                      </span>
-                    </td>
-                    <td className="px-3 py-2.5 text-right num text-text-secondary">
-                      {r.calls.toLocaleString()}
-                    </td>
-                    <td className="px-3 py-2.5 text-right num text-text-primary">
-                      {humanTokens(r.breakdown.input)}
-                    </td>
-                    <td className="px-3 py-2.5 text-right num text-text-primary">
-                      {humanTokens(r.breakdown.output)}
-                    </td>
-                    {/* 数值列不用 text-tertiary：白卡上 2.81:1，承不住读数 */}
-                    <td className="px-3 py-2.5 text-right num text-text-secondary">
-                      {humanTokens(r.breakdown.cache)}
-                    </td>
-                    <td className="px-3 py-2.5 text-right num text-text-secondary">
-                      {r.breakdown.input > 0
-                        ? `${((r.breakdown.cache / r.breakdown.input) * 100).toFixed(1)}%`
-                        : "—"}
-                    </td>
-                    <td className="px-3 py-2.5 text-right num text-text-secondary">
-                      {humanTokens(r.breakdown.video)}
-                    </td>
-                    {/* 无操作列时，这一格是末列，右边缘留白由它补上 */}
-                    <td
-                      className={`py-2.5 text-right num text-text-secondary ${
-                        onClear ? "px-3" : "px-5 md:px-6"
-                      }`}
-                    >
-                      {humanTokens(r.breakdown.audio)}
-                    </td>
-                    {/* 操作格竖向 padding 收到 py-1：30px 按钮配 py-2.5 会把行从 39.5px
-                        顶到 51px（实测）。收成 4px 后这一格 38px，行高仍由模型列的
-                        URL 框决定——按钮是白拿的，不加高任何一行。 */}
-                    {onClear && (
-                      <td className="pl-2 pr-5 md:pr-6 py-1 text-right">
-                        <UsageClearMenu
-                          target={{
-                            model: r.model,
-                            baseUrl: r.base_url,
-                            label: scopeChipOf(r),
-                          }}
-                          placement="fixed"
-                          onPick={onClear}
+              rows.map((r) => (
+                <tr
+                  key={`${r.model}\u001f${r.base_url}`}
+                  className="border-b border-border last:border-b-0"
+                >
+                  <td className="px-5 md:px-6 py-2.5 text-text-primary">
+                    <span className="inline-flex items-center gap-1.5">
+                      {r.model}
+                      {/* 有记录值就显示它；空串是 schema v3 之前的老数据，
+                          来源无从得知——直说，不做任何推断或回填。 */}
+                      {r.base_url ? (
+                        <UsageUrlChip
+                          url={r.base_url}
+                          label={urlLabels.get(r.base_url) ?? r.base_url}
                         />
-                      </td>
-                    )}
-                  </tr>
-                  </Fragment>
-                );
-              })
+                      ) : (
+                        <span
+                          className="text-text-tertiary text-[11px] px-1.5 py-px
+                                     rounded border border-dashed border-border"
+                          title={t("usage.modelUrlLegacyHint")}
+                        >
+                          {t("usage.modelUrlLegacy")}
+                        </span>
+                      )}
+                    </span>
+                  </td>
+                  <td className="px-3 py-2.5 text-right num text-text-secondary">
+                    {r.calls.toLocaleString()}
+                  </td>
+                  <td className="px-3 py-2.5 text-right num text-text-primary">
+                    {humanTokens(r.breakdown.input)}
+                  </td>
+                  <td className="px-3 py-2.5 text-right num text-text-primary">
+                    {humanTokens(r.breakdown.output)}
+                  </td>
+                  {/* 数值列不用 text-tertiary：白卡上 2.81:1，承不住读数 */}
+                  <td className="px-3 py-2.5 text-right num text-text-secondary">
+                    {humanTokens(r.breakdown.cache)}
+                  </td>
+                  <td className="px-3 py-2.5 text-right num text-text-secondary">
+                    {r.breakdown.input > 0
+                      ? `${((r.breakdown.cache / r.breakdown.input) * 100).toFixed(1)}%`
+                      : "—"}
+                  </td>
+                  <td className="px-3 py-2.5 text-right num text-text-secondary">
+                    {humanTokens(r.breakdown.video)}
+                  </td>
+                  {/* 无操作列时，这一格是末列，右边缘留白由它补上 */}
+                  <td
+                    className={`py-2.5 text-right num text-text-secondary ${
+                      onClear ? "px-3" : "px-5 md:px-6"
+                    }`}
+                  >
+                    {humanTokens(r.breakdown.audio)}
+                  </td>
+                  {/* 操作格竖向 padding 收到 py-1：30px 按钮配 py-2.5 会把行从 39.5px
+                      顶到 51px（实测）。收成 4px 后这一格 38px，行高仍由模型列的
+                      URL 框决定——按钮是白拿的，不加高任何一行。 */}
+                  {onClear && (
+                    <td className="pl-2 pr-5 md:pr-6 py-1 text-right">
+                      <UsageClearMenu
+                        target={{
+                          model: r.model,
+                          baseUrl: r.base_url,
+                          label: scopeChipOf(r),
+                        }}
+                        placement="fixed"
+                        onPick={onClear}
+                      />
+                    </td>
+                  )}
+                </tr>
+              ))
             )}
           </tbody>
         </table>

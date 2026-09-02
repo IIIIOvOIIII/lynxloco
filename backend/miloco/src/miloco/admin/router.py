@@ -618,7 +618,10 @@ async def get_token_usage_daily(
     until: str | None = None,
     current_user: str = Depends(verify_token),
 ):
-    """Daily rollup rows (date / model / base_url / type) combining historical + today's live.
+    """Daily rollup rows (date / model / base_url / type): the historical daily table
+    plus live aggregation of what has not been rolled up yet — today *and* the previous
+    _RETENTION_DAYS days. The week/month views read those recent days from here; they
+    are not in ``token_usage_daily`` at all.
 
     模型身份是「模型名 + base_url」：同一个模型名挂在两个 endpoint 上会各返回一行。
     """

@@ -1,6 +1,11 @@
 /**
- * 用量 token 的口径工具。单独成模块是因为它属于**数据口径**：时间序列分桶与
- * 环形图的模态构成都要用它，两个消费方必须走同一个定义。
+ * 用量侧两条**必须只有一份定义**的判据：
+ *
+ * - `textResidual` —— 模态构成的残差口径，时间序列分桶与环形图两个消费方共用。
+ * - `dailyCaveatApplies` —— 清除确认窗那句「连带删除某天」成不成立，消费方是确认窗。
+ *
+ * 共处一个模块，是因为两者都属于「写错就会静默说错话」的那类：残差算错只表现为占比
+ * 微微不对，判据算错只表现为一句提示该说没说 / 不该说却说了，两者都不会报错。
  */
 
 /**
@@ -51,8 +56,12 @@ export function textResidual(input: number, video: number, audio: number): numbe
  */
 export function dailyCaveatApplies(
   boundaryDate: string | null,
-  dailyLatestDate: string | null,
+  // 顺序与后端 daily_date_range() 的返回、以及 unitsToStats 的入参一致（早, 晚）。
+  // 这条链上三处都是这个顺序，任一处翻过来就是个迟早传反的坑——而传反了这个判据仍会
+  // 「正常」返回布尔：后端取 MIN/MAX，早 ≤ 晚恒成立，反过来的区间除「早 = 晚 = 边界」
+  // 这种退化情形外恒为 false，于是那句提示只会该说的时候不说，再没有别的信号。
   dailyEarliestDate: string | null,
+  dailyLatestDate: string | null,
 ): boolean {
   if (!boundaryDate || !dailyLatestDate || !dailyEarliestDate) return false;
   return boundaryDate >= dailyEarliestDate && boundaryDate <= dailyLatestDate;

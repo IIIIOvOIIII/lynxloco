@@ -157,7 +157,7 @@ export function UsageClearDialog({
             （下界）。说错的代价是双向的——一边吓退只想清近期的人，一边让信了的人清完发现
             数据还在，而这是个不可逆操作的确认窗。残留的不充分性见 dailyCaveatApplies。 */}
         {boundary &&
-          dailyCaveatApplies(boundary.iso, dailyLatestDate, dailyEarliestDate) && (
+          dailyCaveatApplies(boundary.iso, dailyEarliestDate, dailyLatestDate) && (
           <p className="text-caption text-text-secondary mt-2">
             {t(scope.target ? "usage.clearDailyCaveatTarget" : "usage.clearDailyCaveat", {
               date: boundary.label,

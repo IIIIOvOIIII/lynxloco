@@ -27,7 +27,6 @@ export function CollapsibleCard({
   meta,
   toolbar,
   children,
-  defaultCollapsed = false,
   busy,
 }: {
   title: string;
@@ -38,12 +37,12 @@ export function CollapsibleCard({
   /** 展开时紧跟标题下方的一行控件（周期、刷新等）。收起时一并隐藏。 */
   toolbar?: ReactNode;
   children: ReactNode;
-  defaultCollapsed?: boolean;
   /** 透传 aria-busy，供正在重取数据的卡使用。 */
   busy?: boolean;
 }) {
   const { t } = useTranslation();
-  const [collapsed, setCollapsed] = useState(defaultCollapsed);
+  // 一律从展开开始：收起是临时动作、不持久化，也没有哪个调用方要求默认收起
+  const [collapsed, setCollapsed] = useState(false);
   const bodyId = useId();
 
   return (

@@ -1,7 +1,7 @@
 # Copyright (C) 2025 Xiaomi Corporation
 # This software may be used and distributed according to the terms of the Xiaomi Miloco License Agreement.
 
-"""Unit tests for TokenUsageRepo.clear_since / clear_all against a real SQLite file.
+"""TokenUsageRepo 的清空与日表日期区间, 跑在真实 SQLite 文件上.
 
 按范围清空是**不可逆**操作,这里钉住的都是「多删」或「少删」会静默发生的地方:
 
@@ -12,6 +12,13 @@
   要么就是在悄悄多删——本测试固定住「如实多删并报告」这个行为。
 - 两表同一事务:只清一张会让总量与明细对不上且不报错
 - 边界是闭区间 >=:恰好等于 since 的那一行要被删
+
+另有两条服务于确认窗那句「连带删除某天」——它说不说由日表的日期区间决定:
+
+- daily_date_range 返回表里的最早与最新日期,空表两个都是 None
+- 滚存后日表的最新日期必然早于昨天,即「近 24 小时」那档的边界日不可能在表里
+  (这是那句提示能被条件化的前提;cutoff 的天对齐语义由 test_token_usage_rollup.py
+  钉着,不在这条里)
 """
 from __future__ import annotations
 
@@ -380,13 +387,25 @@ def test_rollup_keeps_daily_table_behind_yesterday(repo):
 
     这是确认窗那句提示能被条件化的前提：滚存截止是天对齐的 today-_RETENTION_DAYS，
     且只搬 timestamp < cutoff 的行，所以最新能进日表的是 today-_RETENTION_DAYS-1。
-    若哪天把 cutoff 改成非天对齐、或改成 <=，这条会红。
+    它钉的是这个前提本身，钉不住 cutoff 的具体语义——用例里够老到能进日表的只有
+    today-9 那条，无论 cutoff 天对齐与否、用 < 还是 <=，latest 都是它。天对齐由
+    test_token_usage_rollup.py::test_cutoff_is_day_aligned 钉着。
     """
     today = date.today()
     # 一条足够老的事件（会被滚走）+ 一条今天的（必须留在实时表）
     _raw(repo, _ts_ms(today - timedelta(days=9)))
     _raw(repo, _ts_ms(today))
-    repo.insert("m1", "https://a/v1", {"input_tokens": 1, "output_tokens": 1}, "realtime")
+    # usage 走的是 API 字段名（prompt_tokens / completion_tokens），不是库列名——
+    # 写成列名不会报错，那条事件会被静默记成 0/0。
+    repo.insert(
+        "m1", "https://a/v1", {"prompt_tokens": 1, "completion_tokens": 1}, "realtime"
+    )
+    with repo.db.get_connection() as conn:
+        row = conn.execute(
+            "SELECT input_tokens, output_tokens FROM token_usage "
+            "WHERE model = 'm1' AND base_url = 'https://a/v1'"
+        ).fetchone()
+    assert tuple(row) == (1, 1), f"insert 的 usage 字段名没对上，落库成了 {tuple(row)}"
 
     _, latest = repo.daily_date_range()
     assert latest is not None, "老事件应已滚进日表"

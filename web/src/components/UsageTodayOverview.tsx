@@ -1,5 +1,5 @@
 /**
- * 「Token 用量」卡的左栏：总量 hero + 模态构成环形图 + 横排图例。
+ * 「Token 用量」卡的左栏：总量 hero + 模态构成环形图 + 环右侧的竖列图例。
  *
  * 周期选择器与「清空数据」已移到 UsagePage 的工具条——筛选控件该一行统管它作用的
  * 全部内容，埋在某一段里会让人为了改一个条件往回滚。
@@ -14,16 +14,10 @@
 
 import { useId, useState } from "react";
 import { useTranslation } from "react-i18next";
-import type { TokenBreakdown, UsagePeriod, UsageStats } from "@/lib/types";
+import type { TokenBreakdown, UsageStats } from "@/lib/types";
 import { humanTokens } from "@/lib/formatTokens";
 import { textResidual } from "@/lib/usageTokens";
-
-/** 与工具条的周期选择器同一套文案键，别在两处各写一份。 */
-const PERIOD_KEYS: Record<UsagePeriod, string> = {
-  today: "usage.periodToday",
-  week: "usage.periodWeek",
-  month: "usage.periodMonth",
-};
+import { PERIOD_KEYS } from "@/lib/usagePeriods";
 
 /** 环形图几何：viewBox 140×140，半径 54、环宽 20。 */
 const R = 54;
@@ -31,6 +25,8 @@ const SW = 20;
 const CIRC = 2 * Math.PI * R;
 /** 扇区之间留 2.5 个单位的表面间隙——用留白分隔，而不是给色块描边。 */
 const GAP = 2.5;
+/** 环的绘制尺寸（px）。与图例并排，左栏高度由它决定。 */
+const DONUT_PX = 128;
 
 type ModalityKey = "text" | "video" | "audio" | "output";
 
@@ -102,7 +98,7 @@ export function UsageTodayOverview({ stats }: { stats: UsageStats }) {
         <div className="text-caption text-text-tertiary">{sub}</div>
       </div>
 
-      {/* 环形图 + 横排图例 */}
+      {/* 环形图 + 右侧竖列图例 */}
       <div className="flex items-center gap-4 flex-wrap mt-5">
         <Donut
           segments={segments}
@@ -155,14 +151,12 @@ function Donut({
   hover,
   onHover,
   centerLabel,
-  size = 128,
 }: {
   segments: { key: ModalityKey; stroke: string; value: number }[];
   total: number;
   hover: ModalityKey | null;
   onHover: (k: ModalityKey | null) => void;
   centerLabel: { name: string; value: string; pct: string } | null;
-  size?: number;
 }) {
   // 环本身是视觉产物：名称、数值、占比都在紧邻的图例里，读屏走图例即可
   const arcs: { key: ModalityKey; stroke: string; dash: string; offset: number }[] = [];
@@ -175,8 +169,8 @@ function Donut({
   }
 
   return (
-    <div className="relative shrink-0" style={{ width: size, height: size }}>
-      <svg viewBox="0 0 140 140" width={size} height={size} className="block" aria-hidden>
+    <div className="relative shrink-0" style={{ width: DONUT_PX, height: DONUT_PX }}>
+      <svg viewBox="0 0 140 140" width={DONUT_PX} height={DONUT_PX} className="block" aria-hidden>
         {arcs.length === 0 ? (
           <circle cx={70} cy={70} r={R} fill="none" strokeWidth={SW} className="stroke-bg-tertiary" />
         ) : (

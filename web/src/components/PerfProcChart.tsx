@@ -13,8 +13,8 @@
  * 显示形状。粗桶(24h/3d 视图 1h 桶)下均值线会抹平尖峰,峰值包络与 tooltip
  * 峰值行让尖峰仍可定位、与 header「峰值」对得上。
  *
- * SVG 骨架与 PerfMemoryChart 同款:viewBox 横向自适应 + HTML 浮层放轴标签和
- * tooltip,避免 SVG preserveAspectRatio 拉伸字号。
+ * SVG 骨架:viewBox 宽度取容器实测像素宽 + HTML 浮层放轴标签和 tooltip,避免 SVG
+ * preserveAspectRatio 拉伸字号。宽度为什么必须实测,见 hooks/useMeasuredWidth。
  */
 
 import { useState } from "react";
