@@ -7,7 +7,11 @@ from __future__ import annotations
 
 import pytest
 from miloco.config.settings import HomeAssistantEntityPolicy
-from miloco.home_assistant.mapper import control_spec_to_service, map_entity_to_device
+from miloco.home_assistant.mapper import (
+    control_spec_to_service,
+    map_entity_status_properties,
+    map_entity_to_device,
+)
 from miloco.home_assistant.schema import HaEntityState, HaErrorCode, HomeAssistantError
 
 
@@ -124,6 +128,34 @@ def test_imported_control_enabled_climate_exposes_fan_mode_spec() -> None:
         {"value": "medium", "description": "medium"},
         {"value": "high", "description": "high"},
         {"value": "silent", "description": "silent"},
+    ]
+
+
+def test_climate_status_maps_current_ha_attributes() -> None:
+    entity = HaEntityState(
+        entity_id="climate.zhonghong_hvac_1_2",
+        state="cool",
+        attributes={
+            "friendly_name": "主卧空调",
+            "fan_mode": "medium",
+            "fan_modes": ["auto", "low", "medium", "high"],
+            "hvac_modes": ["off", "cool", "heat", "dry", "fan_only"],
+            "temperature": 25,
+            "min_temp": 18,
+            "max_temp": 30,
+            "target_temp_step": 1,
+        },
+    )
+
+    assert map_entity_status_properties(
+        entity,
+        {"climate": {"set_fan_mode", "set_hvac_mode", "set_temperature"}},
+        ["state", "hvac_mode", "temperature", "fan_mode"],
+    ) == [
+        {"iid": "state", "value": "cool", "code": 0},
+        {"iid": "hvac_mode", "value": "cool", "code": 0},
+        {"iid": "temperature", "value": 25, "code": 0},
+        {"iid": "fan_mode", "value": "medium", "code": 0},
     ]
 
 

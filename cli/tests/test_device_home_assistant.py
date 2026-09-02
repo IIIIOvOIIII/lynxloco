@@ -71,3 +71,62 @@ def test_device_control_uses_unified_control_endpoint(monkeypatch) -> None:
     assert posted["path"] == "/api/devices/ha%3Aprimary%3Alight.kitchen/control"
     assert posted["body"] == {"type": "set_property", "iid": "on", "value": True}
 
+
+def test_device_control_accepts_ha_climate_underscored_spec_name(monkeypatch) -> None:
+    posted: dict[str, object] = {}
+    info = {
+        "devices": [
+            {
+                "did": "ha:primary:climate.zhonghong_hvac_1_2",
+                "name": "主卧空调",
+                "online": True,
+                "spec": {
+                    "fan_mode": {
+                        "iid": "fan_mode",
+                        "type_name": "fan_mode",
+                        "description": "风速",
+                        "format": "string",
+                        "readable": True,
+                        "writeable": True,
+                        "value_list": [
+                            {"value": "auto", "description": "auto"},
+                            {"value": "low", "description": "low"},
+                            {"value": "medium", "description": "medium"},
+                            {"value": "high", "description": "high"},
+                        ],
+                    }
+                },
+            }
+        ]
+    }
+
+    monkeypatch.setattr("miloco_cli.home_info._fetch", lambda **kwargs: info)
+
+    def fake_api_post(path, body=None, **kwargs):
+        del kwargs
+        posted["path"] = path
+        posted["body"] = body
+        return {"code": 0, "message": "ok", "data": {"results": [{"code": 0}]}}
+
+    monkeypatch.setattr("miloco_cli.client.api_post", fake_api_post)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "device",
+            "control",
+            "ha:primary:climate.zhonghong_hvac_1_2",
+            "fan_mode",
+            "medium",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert posted["path"] == (
+        "/api/devices/ha%3Aprimary%3Aclimate.zhonghong_hvac_1_2/control"
+    )
+    assert posted["body"] == {
+        "type": "set_property",
+        "iid": "fan_mode",
+        "value": "medium",
+    }

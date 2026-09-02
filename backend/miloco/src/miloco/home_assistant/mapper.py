@@ -106,6 +106,21 @@ def map_entity_to_device(
     return device
 
 
+def map_entity_status_properties(
+    entity: HaEntityState,
+    services: HaServiceCatalog,
+    iids: list[str] | None = None,
+) -> list[dict[str, object]]:
+    """Map the current HA entity state into Miloco-style readable properties."""
+    spec = _spec_for_entity(entity, services)
+    selected = iids if iids is not None else list(spec)
+    return [
+        {"iid": iid, "value": _status_value(entity, iid), "code": 0}
+        for iid in selected
+        if iid in spec
+    ]
+
+
 def control_spec_to_service(
     entity_id: str,
     iid: str,
@@ -402,6 +417,34 @@ def _bounded_int(value: object, minimum: int, maximum: int) -> int:
             f"Value must be an integer between {minimum} and {maximum}",
         ) from exc
     return max(minimum, min(maximum, number))
+
+
+def _status_value(entity: HaEntityState, iid: str) -> object:
+    domain = domain_of(entity.entity_id)
+    attributes = entity.attributes
+    if iid == "state":
+        return entity.state
+    if iid == "on" and domain in {"light", "switch", "fan"}:
+        if entity.state in {"unknown", "unavailable"}:
+            return None
+        return entity.state not in _OFF_STATES
+    if iid == "brightness":
+        return attributes.get("brightness")
+    if iid == "percentage":
+        return attributes.get("percentage")
+    if iid == "position":
+        if "current_position" in attributes:
+            return attributes.get("current_position")
+        return attributes.get("current_cover_position")
+    if iid == "hvac_mode" and domain == "climate":
+        if entity.state in {"unknown", "unavailable"}:
+            return None
+        return entity.state
+    if iid == "temperature" and domain == "climate":
+        return attributes.get("temperature")
+    if iid == "fan_mode" and domain == "climate":
+        return attributes.get("fan_mode")
+    return None
 
 
 def _temperature_range(attributes: dict[str, Any]) -> list[float] | None:

@@ -85,6 +85,34 @@ _INFO = {
             "name": "空 spec 设备",
             "spec": {},
         },
+        {
+            "did": "ha-climate",
+            "name": "主卧空调",
+            "spec": {
+                "hvac_mode": {
+                    "iid": "hvac_mode",
+                    "type_name": "hvac_mode",
+                    "description": "空调模式",
+                    "format": "string",
+                    "readable": True,
+                    "writeable": True,
+                },
+                "fan_mode": {
+                    "iid": "fan_mode",
+                    "type_name": "fan_mode",
+                    "description": "风速",
+                    "format": "string",
+                    "readable": True,
+                    "writeable": True,
+                    "value_list": [
+                        {"value": "auto", "description": "auto"},
+                        {"value": "low", "description": "low"},
+                        {"value": "medium", "description": "medium"},
+                        {"value": "high", "description": "high"},
+                    ],
+                },
+            },
+        },
     ],
 }
 
@@ -99,6 +127,11 @@ def patch_home_info(monkeypatch):
 def test_lookup_bare_type_name_unique():
     assert lookup_iid_by_key("lamp", "brightness", _INFO) == "prop.2.2"
     assert lookup_iid_by_key("lamp", "on", _INFO) == "prop.2.1"
+
+
+def test_lookup_ha_climate_underscored_spec_names():
+    assert lookup_iid_by_key("ha-climate", "hvac_mode", _INFO) == "hvac_mode"
+    assert lookup_iid_by_key("ha-climate", "fan_mode", _INFO) == "fan_mode"
 
 
 def test_lookup_iid_passthrough():

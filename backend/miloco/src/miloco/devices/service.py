@@ -75,15 +75,7 @@ class DevicesService:
         """Return current readable property values."""
         parsed = parse_ha_device_id(device_id)
         if parsed is not None:
-            device = await self._ha_service.get_device(parsed[1], refresh=False)
-            selected = set(iids or device.spec.keys())
-            return {
-                "properties": [
-                    {"iid": iid, "value": None, "code": 0}
-                    for iid in selected
-                    if iid in device.spec
-                ]
-            }
+            return await self._ha_service.get_device_status(parsed[1], iids)
         return await self._miot_service.get_device_status(device_id, iids)
 
     async def trigger_scene(self, scene_id: str) -> UnifiedActionResult:
@@ -203,4 +195,3 @@ def _normalize_areas(raw: object) -> list[dict[str, object]]:
 
 def _optional_str(value: object) -> str | None:
     return str(value) if value is not None else None
-

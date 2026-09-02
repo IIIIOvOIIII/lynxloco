@@ -157,9 +157,9 @@ def normalize_bool(raw):
     return raw
 
 
-_KEY_BARE_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*$")
+_KEY_BARE_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 # desc 部分允许 Unicode（含中文）：排除空白与 TSV / 解析层冲突字符
-_KEY_DESC_RE = re.compile(r"^([a-z0-9][a-z0-9.-]*)@([^\s|,:=@]+)$")
+_KEY_DESC_RE = re.compile(r"^([a-z0-9][a-z0-9._-]*)@([^\s|,:=@]+)$")
 _IID_RE = re.compile(r"^(prop|action)\.(\d+)\.(\d+)$")
 
 

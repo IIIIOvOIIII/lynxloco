@@ -7,11 +7,11 @@ from __future__ import annotations
 
 from typing import Any
 
+import miloco.devices.router as devices_router_module
 import pytest
 from fastapi.testclient import TestClient
-
 from miloco.config import reset_settings
-import miloco.devices.router as devices_router_module
+from miloco.devices.schema import UnifiedActionResult
 from miloco.home_assistant.schema import HaErrorCode, HomeAssistantError
 from miloco.main import app
 from miloco.manager import get_manager
@@ -71,6 +71,27 @@ class _FakeHaService:
             f"Home Assistant entity '{entity_id}' control is disabled",
         )
 
+    async def get_device_status(
+        self,
+        entity_id: str,
+        iids: list[str] | None,
+    ) -> dict[str, object]:
+        del entity_id
+        values = {
+            "state": "cool",
+            "hvac_mode": "cool",
+            "temperature": 25,
+            "fan_mode": "medium",
+        }
+        selected = iids or list(values)
+        return {
+            "properties": [
+                {"iid": iid, "value": values[iid], "code": 0}
+                for iid in selected
+                if iid in values
+            ]
+        }
+
 
 @pytest.fixture(autouse=True)
 def _isolated_backend(tmp_path, monkeypatch):
@@ -119,3 +140,24 @@ def test_ha_control_disabled_is_rejected() -> None:
     )
 
     assert response.status_code in {400, 404}
+
+
+def test_ha_status_delegates_to_home_assistant_service() -> None:
+    client = TestClient(app)
+
+    response = client.get(
+        (
+            "/api/devices/ha%3Aprimary%3Aclimate.zhonghong_hvac_1_2/status"
+            "?iid=fan_mode,hvac_mode,temperature"
+        ),
+        headers={"Authorization": "Bearer test-token"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"] == {
+        "properties": [
+            {"iid": "fan_mode", "value": "medium", "code": 0},
+            {"iid": "hvac_mode", "value": "cool", "code": 0},
+            {"iid": "temperature", "value": 25, "code": 0},
+        ]
+    }

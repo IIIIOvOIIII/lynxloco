@@ -26,6 +26,7 @@ from miloco.home_assistant.mapper import (
     control_blocked_reason,
     control_spec_to_service,
     domain_of,
+    map_entity_status_properties,
     map_entity_to_device,
 )
 from miloco.home_assistant.schema import (
@@ -225,6 +226,27 @@ class HomeAssistantService:
         if device is None:
             raise ResourceNotFoundException(f"Home Assistant entity '{entity_id}' is not imported")
         return device
+
+    async def get_device_status(
+        self,
+        entity_id: str,
+        iids: list[str] | None,
+    ) -> dict[str, object]:
+        """Return the current readable values for one imported HA entity."""
+        settings = get_settings().home_assistant
+        if not self._is_configured(settings):
+            raise HomeAssistantError(
+                HaErrorCode.NOT_CONFIGURED,
+                "Home Assistant config is incomplete",
+            )
+        states, services = await self._states_and_services(settings, refresh=False)
+        entity = self._find_entity(states, entity_id)
+        policy = self._policy_for(settings, entity.entity_id)
+        if not policy.included:
+            raise ResourceNotFoundException(f"Home Assistant entity '{entity_id}' is not imported")
+        return {
+            "properties": map_entity_status_properties(entity, services, iids),
+        }
 
     async def list_scenes(self) -> list[UnifiedSceneInfo]:
         """Expose imported HA scene/script entities as executable scenes."""
