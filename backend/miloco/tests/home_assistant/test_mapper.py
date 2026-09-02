@@ -6,9 +6,8 @@
 from __future__ import annotations
 
 import pytest
-
 from miloco.config.settings import HomeAssistantEntityPolicy
-from miloco.home_assistant.mapper import map_entity_to_device, control_spec_to_service
+from miloco.home_assistant.mapper import control_spec_to_service, map_entity_to_device
 from miloco.home_assistant.schema import HaEntityState, HaErrorCode, HomeAssistantError
 
 
@@ -86,6 +85,48 @@ def test_imported_control_enabled_light_has_on_spec() -> None:
     assert device.spec["on"].writeable is True
 
 
+def test_imported_control_enabled_climate_exposes_fan_mode_spec() -> None:
+    entity = HaEntityState(
+        entity_id="climate.zhonghong_hvac_1_0",
+        state="cool",
+        attributes={
+            "friendly_name": "客厅空调",
+            "fan_mode": "high",
+            "fan_modes": ["auto", "low", "medium", "high", "silent"],
+            "hvac_modes": ["off", "cool", "heat", "dry", "fan_only"],
+            "min_temp": 18,
+            "max_temp": 30,
+            "target_temp_step": 1,
+        },
+    )
+    policy = HomeAssistantEntityPolicy(
+        entity_id="climate.zhonghong_hvac_1_0",
+        included=True,
+        control_enabled=True,
+    )
+
+    device = map_entity_to_device(
+        entity,
+        {"climate": {"set_fan_mode", "set_hvac_mode", "set_temperature"}},
+        policy,
+        "primary",
+    )
+
+    assert device is not None
+    assert device.spec["fan_mode"].iid == "fan_mode"
+    assert device.spec["fan_mode"].description == "风速"
+    assert device.spec["fan_mode"].format == "string"
+    assert device.spec["fan_mode"].readable is True
+    assert device.spec["fan_mode"].writeable is True
+    assert device.spec["fan_mode"].value_list == [
+        {"value": "auto", "description": "auto"},
+        {"value": "low", "description": "low"},
+        {"value": "medium", "description": "medium"},
+        {"value": "high", "description": "high"},
+        {"value": "silent", "description": "silent"},
+    ]
+
+
 def test_blocked_lock_never_exposes_writable_specs() -> None:
     entity = HaEntityState(
         entity_id="lock.front_door",
@@ -126,6 +167,22 @@ def test_control_spec_to_service_maps_light_on() -> None:
     assert call.data == {"entity_id": "light.kitchen"}
 
 
+def test_control_spec_to_service_maps_climate_fan_mode() -> None:
+    call = control_spec_to_service(
+        "climate.zhonghong_hvac_1_0",
+        "fan_mode",
+        "silent",
+        {"climate": {"set_fan_mode", "set_hvac_mode", "set_temperature"}},
+    )
+
+    assert call.domain == "climate"
+    assert call.service == "set_fan_mode"
+    assert call.data == {
+        "entity_id": "climate.zhonghong_hvac_1_0",
+        "fan_mode": "silent",
+    }
+
+
 def test_control_spec_to_service_rejects_unknown_iid() -> None:
     with pytest.raises(HomeAssistantError) as exc:
         control_spec_to_service(
@@ -136,4 +193,3 @@ def test_control_spec_to_service_rejects_unknown_iid() -> None:
         )
 
     assert exc.value.code == HaErrorCode.UNSUPPORTED_DOMAIN
-

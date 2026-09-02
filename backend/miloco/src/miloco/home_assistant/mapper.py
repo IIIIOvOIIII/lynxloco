@@ -172,6 +172,14 @@ def control_spec_to_service(
             services,
         )
 
+    if domain == "climate" and iid == "fan_mode":
+        return _service_call(
+            "climate",
+            "set_fan_mode",
+            {"entity_id": entity_id, "fan_mode": str(value)},
+            services,
+        )
+
     if domain in {"scene", "script"} and iid == "activate":
         return _service_call(
             domain,
@@ -301,6 +309,24 @@ def _spec_for_entity(
                 unit="°C",
                 value_range=_temperature_range(entity.attributes),
             )
+        fan_modes = [
+            str(mode)
+            for mode in entity.attributes.get("fan_modes", [])
+            if isinstance(mode, str)
+        ]
+        if _has_services(domain, services, "set_fan_mode") and fan_modes:
+            spec["fan_mode"] = UnifiedSpecEntry(
+                iid="fan_mode",
+                type_name="fan_mode",
+                description="风速",
+                format="string",
+                readable=True,
+                writeable=True,
+                value_list=[
+                    {"value": mode, "description": mode}
+                    for mode in fan_modes
+                ],
+            )
 
     return spec
 
@@ -387,4 +413,3 @@ def _temperature_range(attributes: dict[str, Any]) -> list[float] | None:
     if not isinstance(target_step, int | float):
         target_step = 0.5
     return [float(min_temp), float(max_temp), float(target_step)]
-
