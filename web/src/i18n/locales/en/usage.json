@@ -145,7 +145,8 @@
     "modelUrlLegacyHint": "These rows were recorded before this field existed, so the endpoint is unknown and is not guessed.",
     "refreshEvery": "Refresh every",
     "refreshSecUnit": "s",
-    "refreshSecAria": "Auto-refresh interval (seconds, min {{min}})",
-    "refreshAtMin": "min {{min}}s"
+    "refreshSecAria": "Auto-refresh interval in seconds, {{min}} to {{max}}",
+    "refreshAtMin": "min {{min}}s",
+    "refreshAtMax": "At the maximum of {{max}}s"
   }
 }

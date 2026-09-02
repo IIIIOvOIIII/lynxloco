@@ -145,7 +145,8 @@
     "modelUrlLegacyHint": "这批用量记录于本字段引入之前，来源无从得知，故不作推断。",
     "refreshEvery": "刷新周期",
     "refreshSecUnit": "秒",
-    "refreshSecAria": "自动刷新周期（秒，最低 {{min}}）",
-    "refreshAtMin": "已是最低 {{min}} 秒"
+    "refreshSecAria": "自动刷新周期（秒，{{min}} 到 {{max}}）",
+    "refreshAtMin": "已是最低 {{min}} 秒",
+    "refreshAtMax": "已是最高 {{max}} 秒"
   }
 }

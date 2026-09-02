@@ -8,7 +8,11 @@
 
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { clampRefreshSec, REFRESH_MIN_SEC } from "@/hooks/useRefreshInterval";
+import {
+  clampRefreshSec,
+  REFRESH_MAX_SEC,
+  REFRESH_MIN_SEC,
+} from "@/hooks/useRefreshInterval";
 
 export function RefreshIntervalInput({
   sec,
@@ -43,7 +47,10 @@ export function RefreshIntervalInput({
         type="text"
         inputMode="numeric"
         value={text}
-        aria-label={t("usage.refreshSecAria", { min: REFRESH_MIN_SEC })}
+        aria-label={t("usage.refreshSecAria", {
+          min: REFRESH_MIN_SEC,
+          max: REFRESH_MAX_SEC,
+        })}
         onChange={(e) => {
           // 纯数字检查：非数字字符不进 state（含中文全角、负号、小数点）
           const v = e.target.value;
@@ -61,10 +68,16 @@ export function RefreshIntervalInput({
       />
       <span>{t("usage.refreshSecUnit")}</span>
       {sec <= REFRESH_MIN_SEC && (
-        // 到了下限就说一句，别让人以为还能再往下调。下限值走插值，
-        // 常量改了文案跟着变，也不会在中文界面里冒出英文小尾巴。
+        // 到了任一端就说一句，别让人以为还能再往那个方向调。两端撞的是同一个夹取规则，
+        // 只给下限解释会让人以为上限不存在——而想「关掉自动刷新」的人填个大数正好撞上。
+        // 边界值走插值，常量改了文案跟着变，也不会在中文界面里冒出英文小尾巴。
         <span className="text-text-tertiary">
           ({t("usage.refreshAtMin", { min: REFRESH_MIN_SEC })})
+        </span>
+      )}
+      {sec >= REFRESH_MAX_SEC && (
+        <span className="text-text-tertiary">
+          ({t("usage.refreshAtMax", { max: REFRESH_MAX_SEC })})
         </span>
       )}
     </label>
