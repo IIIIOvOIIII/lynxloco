@@ -128,14 +128,10 @@ export function HomeAssistantPage({ onDevicesChanged }: Props) {
   }, []);
 
   useEffect(() => {
-    setEntityPage(1);
-  }, [entityQuery, entityPageSize]);
-
-  useEffect(() => {
-    if (entityPage !== pagedEntities.page) {
-      setEntityPage(pagedEntities.page);
-    }
-  }, [entityPage, pagedEntities.page]);
+    setEntityPage((page) =>
+      page === pagedEntities.page ? page : pagedEntities.page,
+    );
+  }, [pagedEntities.page]);
 
   function bulkPatch(action: HomeAssistantBulkAction): {
     included?: boolean;
@@ -295,6 +291,7 @@ export function HomeAssistantPage({ onDevicesChanged }: Props) {
   }
 
   const configuredToken = status?.config.tokenConfigured === true;
+  const policyMutationBusy = bulkBusyAction !== null || busyEntity !== null;
   const statusTone = status?.connected
     ? "bg-success-bg text-success border-success"
     : status?.configured
@@ -347,6 +344,7 @@ export function HomeAssistantPage({ onDevicesChanged }: Props) {
             <input
               value={form.baseUrl}
               onChange={(e) => setForm((cur) => ({ ...cur, baseUrl: e.target.value }))}
+              disabled={policyMutationBusy}
               placeholder="http://homeassistant.local:8123"
               className="w-full rounded-lg border border-border bg-bg-primary px-3 py-2 text-body text-text-primary outline-none focus:border-brand-primary"
             />
@@ -359,6 +357,7 @@ export function HomeAssistantPage({ onDevicesChanged }: Props) {
               value={form.token}
               onChange={(e) => setForm((cur) => ({ ...cur, token: e.target.value }))}
               type="password"
+              disabled={policyMutationBusy}
               placeholder={
                 configuredToken
                   ? maskHomeAssistantToken(true)
@@ -374,6 +373,7 @@ export function HomeAssistantPage({ onDevicesChanged }: Props) {
             <input
               type="checkbox"
               checked={form.enabled}
+              disabled={policyMutationBusy}
               onChange={(e) => setForm((cur) => ({ ...cur, enabled: e.target.checked }))}
             />
             {t("homeAssistant.enableIntegration")}
@@ -382,6 +382,7 @@ export function HomeAssistantPage({ onDevicesChanged }: Props) {
             <input
               type="checkbox"
               checked={form.verifyTls}
+              disabled={policyMutationBusy}
               onChange={(e) => setForm((cur) => ({ ...cur, verifyTls: e.target.checked }))}
             />
             {t("homeAssistant.verifyTls")}
@@ -401,7 +402,7 @@ export function HomeAssistantPage({ onDevicesChanged }: Props) {
           <button
             type="button"
             onClick={handleTest}
-            disabled={testing || !form.baseUrl.trim()}
+            disabled={testing || policyMutationBusy || !form.baseUrl.trim()}
             className="px-3 py-2 rounded-lg border border-border text-body text-text-primary hover:bg-bg-tertiary disabled:opacity-50"
           >
             {testing ? t("homeAssistant.testing") : t("homeAssistant.test")}
@@ -409,7 +410,7 @@ export function HomeAssistantPage({ onDevicesChanged }: Props) {
           <button
             type="button"
             onClick={handleSave}
-            disabled={saving || !form.baseUrl.trim()}
+            disabled={saving || policyMutationBusy || !form.baseUrl.trim()}
             className="px-3 py-2 rounded-lg bg-brand-primary text-white text-body hover:opacity-90 disabled:opacity-50"
           >
             {saving ? t("homeAssistant.saving") : t("homeAssistant.save")}
@@ -417,7 +418,7 @@ export function HomeAssistantPage({ onDevicesChanged }: Props) {
           <button
             type="button"
             onClick={() => load(false)}
-            disabled={loading}
+            disabled={loading || policyMutationBusy}
             className="px-3 py-2 rounded-lg border border-border text-body text-text-primary hover:bg-bg-tertiary disabled:opacity-50"
           >
             {t("homeAssistant.reload")}
@@ -442,7 +443,7 @@ export function HomeAssistantPage({ onDevicesChanged }: Props) {
           <button
             type="button"
             onClick={handleRefresh}
-            disabled={refreshing || !status?.configured}
+            disabled={refreshing || policyMutationBusy || !status?.configured}
             className="px-3 py-2 rounded-lg border border-border text-body text-text-primary hover:bg-bg-tertiary disabled:opacity-50"
           >
             {refreshing ? t("homeAssistant.refreshing") : t("homeAssistant.refresh")}
@@ -457,7 +458,10 @@ export function HomeAssistantPage({ onDevicesChanged }: Props) {
               </span>
               <input
                 value={entityQuery}
-                onChange={(e) => setEntityQuery(e.target.value)}
+                onChange={(e) => {
+                  setEntityQuery(e.target.value);
+                  setEntityPage(1);
+                }}
                 placeholder={t("homeAssistant.searchPlaceholder")}
                 className="w-full rounded-lg border border-border bg-bg-primary px-3 py-2 text-body text-text-primary outline-none focus:border-brand-primary"
               />
@@ -468,7 +472,10 @@ export function HomeAssistantPage({ onDevicesChanged }: Props) {
               </span>
               <select
                 value={entityPageSize}
-                onChange={(e) => setEntityPageSize(Number(e.target.value))}
+                onChange={(e) => {
+                  setEntityPageSize(Number(e.target.value));
+                  setEntityPage(1);
+                }}
                 className="w-full rounded-lg border border-border bg-bg-primary px-3 py-2 text-body text-text-primary outline-none focus:border-brand-primary"
               >
                 {HOME_ASSISTANT_PAGE_SIZES.map((size) => (
@@ -490,7 +497,7 @@ export function HomeAssistantPage({ onDevicesChanged }: Props) {
                     key={action}
                     type="button"
                     onClick={() => updateEntities(action)}
-                    disabled={count === 0 || bulkBusyAction !== null || refreshing || loading}
+                    disabled={count === 0 || policyMutationBusy || refreshing || loading}
                     className="px-3 py-2 rounded-lg border border-border text-body text-text-primary hover:bg-bg-tertiary disabled:opacity-50"
                     title={t("homeAssistant.bulkTitle", { count })}
                   >
@@ -564,7 +571,7 @@ export function HomeAssistantPage({ onDevicesChanged }: Props) {
                   <label className="flex items-center gap-2 text-body text-text-primary">
                     <Switch
                       checked={entity.included}
-                      disabled={rowBusy}
+                      disabled={rowBusy || bulkBusyAction !== null}
                       onChange={() =>
                         updateEntity(entity, {
                           included: !entity.included,
@@ -578,7 +585,7 @@ export function HomeAssistantPage({ onDevicesChanged }: Props) {
                   <div className="flex items-center gap-2">
                     <Switch
                       checked={entity.controlEnabled && entity.included}
-                      disabled={rowBusy || disabledReason !== null}
+                      disabled={rowBusy || bulkBusyAction !== null || disabledReason !== null}
                       onChange={() =>
                         updateEntity(entity, {
                           controlEnabled: !entity.controlEnabled,
