@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Iterable
+from typing import cast
 
 from pydantic import ValidationError
 
@@ -31,7 +32,11 @@ from miloco.home_assistant.schema import (
     HaEntityState,
     HaErrorCode,
     HaServiceCatalog,
+    HomeAssistantBulkSkippedReason,
     HomeAssistantConfigUpdate,
+    HomeAssistantEntityPolicyBulkResult,
+    HomeAssistantEntityPolicyBulkSkipped,
+    HomeAssistantEntityPolicyBulkUpdate,
     HomeAssistantEntityView,
     HomeAssistantError,
     HomeAssistantPublicConfig,
@@ -277,6 +282,127 @@ class HomeAssistantService:
             next_policy,
         )
 
+    async def update_entity_policies(
+        self,
+        update: HomeAssistantEntityPolicyBulkUpdate,
+    ) -> HomeAssistantEntityPolicyBulkResult:
+        """Persist import/control policy for multiple HA entities."""
+        settings = get_settings().home_assistant
+        needs_live_ha = update.included is True or update.control_enabled is True
+        state_by_id: dict[str, HaEntityState] = {}
+        services: HaServiceCatalog = {}
+        if needs_live_ha:
+            states, services = await self._states_and_services(settings, refresh=True)
+            state_by_id = {entity.entity_id: entity for entity in states}
+
+        entities = {
+            key: value.model_dump()
+            for key, value in settings.entities.items()
+        }
+        updated: list[HomeAssistantEntityView] = []
+        skipped: list[HomeAssistantEntityPolicyBulkSkipped] = []
+
+        for entity_id in update.entity_ids:
+            if not entity_id:
+                skipped.append(
+                    HomeAssistantEntityPolicyBulkSkipped(
+                        entity_id=entity_id,
+                        reason="invalid-entity-id",
+                    )
+                )
+                continue
+
+            current = self._policy_for(settings, entity_id)
+            entity = state_by_id.get(entity_id)
+            next_included = current.included
+            next_control_enabled = current.control_enabled
+
+            if update.included is True:
+                if entity is None:
+                    skipped.append(
+                        HomeAssistantEntityPolicyBulkSkipped(
+                            entity_id=entity_id,
+                            reason="not-found",
+                        )
+                    )
+                    continue
+                next_included = True
+                if not current.included and update.control_enabled is True:
+                    next_control_enabled = False
+                    skipped.append(
+                        HomeAssistantEntityPolicyBulkSkipped(
+                            entity_id=entity_id,
+                            reason="not-imported",
+                        )
+                    )
+
+            if update.included is False:
+                next_included = False
+                next_control_enabled = False
+
+            if update.control_enabled is True:
+                if not current.included:
+                    if update.included is True and entity is not None:
+                        next_control_enabled = False
+                    else:
+                        skipped.append(
+                            HomeAssistantEntityPolicyBulkSkipped(
+                                entity_id=entity_id,
+                                reason="not-imported",
+                            )
+                        )
+                        continue
+                else:
+                    if entity is None:
+                        skipped.append(
+                            HomeAssistantEntityPolicyBulkSkipped(
+                                entity_id=entity_id,
+                                reason="not-found",
+                            )
+                        )
+                        continue
+                    reason = control_blocked_reason(entity, services)
+                    if reason is not None:
+                        skipped.append(
+                            HomeAssistantEntityPolicyBulkSkipped(
+                                entity_id=entity_id,
+                                reason=cast(HomeAssistantBulkSkippedReason, reason),
+                            )
+                        )
+                        continue
+                    next_control_enabled = True
+
+            if update.control_enabled is False:
+                next_control_enabled = False
+
+            next_policy = HomeAssistantEntityPolicy(
+                entity_id=entity_id,
+                included=next_included,
+                control_enabled=next_control_enabled,
+                last_seen_at=current.last_seen_at,
+                last_control_at=current.last_control_at,
+                last_error=current.last_error,
+            )
+            entities[entity_id] = next_policy.model_dump()
+            updated.append(
+                self._entity_view(
+                    entity or HaEntityState(entity_id=entity_id, state="unknown"),
+                    services,
+                    next_policy,
+                )
+            )
+
+        if updated:
+            update_shared_config(home_assistant={"entities": entities})
+            reset_settings()
+
+        return HomeAssistantEntityPolicyBulkResult(
+            updated=updated,
+            skipped=skipped,
+            updated_count=len(updated),
+            skipped_count=len(skipped),
+        )
+
     async def control(
         self,
         entity_id: str,
@@ -481,4 +607,3 @@ def _parse_services(payload: object) -> HaServiceCatalog:
             if isinstance(name, str)
         }
     return catalog
-

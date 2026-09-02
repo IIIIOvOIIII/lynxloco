@@ -6,8 +6,9 @@
 from __future__ import annotations
 
 from enum import Enum
+from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class HaErrorCode(str, Enum):
@@ -104,6 +105,50 @@ class HomeAssistantEntityPolicyUpdate(BaseModel):
     control_enabled: bool | None = None
 
 
+HomeAssistantBulkSkippedReason = Literal[
+    "invalid-entity-id",
+    "not-found",
+    "not-imported",
+    "blocked-risk",
+    "unsupported-domain",
+    "service-unavailable",
+]
+
+
+class HomeAssistantEntityPolicyBulkSkipped(BaseModel):
+    """One HA entity that was not updated by a bulk policy request."""
+
+    entity_id: str
+    reason: HomeAssistantBulkSkippedReason
+
+
+class HomeAssistantEntityPolicyBulkUpdate(BaseModel):
+    """Bulk HA entity import/control policy update."""
+
+    entity_ids: list[str] = Field(..., min_length=1, max_length=1000)
+    included: bool | None = None
+    control_enabled: bool | None = None
+
+    @field_validator("entity_ids")
+    @classmethod
+    def _normalize_entity_ids(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw_value in values:
+            value = raw_value.strip()
+            if value in seen:
+                continue
+            seen.add(value)
+            normalized.append(value)
+        return normalized
+
+    @model_validator(mode="after")
+    def _require_patch(self) -> "HomeAssistantEntityPolicyBulkUpdate":
+        if self.included is None and self.control_enabled is None:
+            raise ValueError("At least one Home Assistant policy field is required")
+        return self
+
+
 class HomeAssistantEntityView(BaseModel):
     """HA entity row rendered by the management UI."""
 
@@ -120,3 +165,11 @@ class HomeAssistantEntityView(BaseModel):
     last_control_at: int | None = None
     last_error: str | None = None
 
+
+class HomeAssistantEntityPolicyBulkResult(BaseModel):
+    """Bulk HA entity policy update result."""
+
+    updated: list[HomeAssistantEntityView] = Field(default_factory=list)
+    skipped: list[HomeAssistantEntityPolicyBulkSkipped] = Field(default_factory=list)
+    updated_count: int = 0
+    skipped_count: int = 0
