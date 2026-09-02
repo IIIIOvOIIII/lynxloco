@@ -37,7 +37,6 @@ import type {
   UsageTimelineTarget,
 } from "@/lib/types";
 import { axisTokens, humanTokens } from "@/lib/formatTokens";
-import { shortenUrlSet } from "@/lib/modelIdentity";
 import { PERIOD_KEYS } from "@/lib/usagePeriods";
 import { Segmented } from "./Segmented";
 
@@ -99,9 +98,12 @@ function niceCeil(v: number): number {
 export function UsageTimelineChart({
   stats,
   binMinutes,
+  urlLabels,
 }: {
   stats: UsageStats;
   binMinutes: number;
+  /** 全卡共用的地址压短映射，见 UsagePage 里那段说明——与明细表必须是同一份。 */
+  urlLabels: Map<string, string>;
 }) {
   const { t } = useTranslation();
   // 用 stats.period（数据自带）而非外部选中值，避免切周期时数据未到位却用新周期
@@ -116,16 +118,6 @@ export function UsageTimelineChart({
   const barsRef = useRef<HTMLDivElement | null>(null);
   const [plotW, setPlotW] = useState(0);
   const n = data.length;
-  /**
-   * 地址压短按**整条序列**的集合算一次，不逐桶算：逐桶算时同一个地址在「桶里有几个
-   * endpoint」不同的两个桶上会被压成不同的形式，横向移动读浮层就会看到它忽长忽短。
-   */
-  const urlShort = useMemo(
-    // 预算 18 比明细表那侧的 22 更紧：浮层宽度受 max-w 限制、还要与模型名共处一行，
-    // 而这里只需分辨「是哪一个 endpoint」，不需要读全地址（读全的地方在明细表）。
-    () => shortenUrlSet(data.flatMap((d) => d.targets.map((x) => x.base_url)).filter(Boolean), 18),
-    [data],
-  );
   const max = data.reduce((m, d) => Math.max(m, d.tokens), 0);
   const niceMax = niceCeil(max);
   const peakIdx = data.reduce((m, d, i) => (d.tokens > data[m].tokens ? i : m), 0);
@@ -369,7 +361,7 @@ export function UsageTimelineChart({
               period={period}
               binMinutes={binMinutes}
               stacked={coloring === "modality"}
-              urlShort={urlShort}
+              urlShort={urlLabels}
             />
           )}
 
@@ -463,7 +455,7 @@ function Tooltip({
   period: UsagePeriod;
   binMinutes: number;
   stacked: boolean;
-  /** 整条序列共用的地址压短映射，见 urlShort 的说明。 */
+  /** 全卡共用的地址压短映射，由页面层算一次传下来（见 UsagePage 的说明）。 */
   urlShort: Map<string, string>;
 }) {
   const { t } = useTranslation();

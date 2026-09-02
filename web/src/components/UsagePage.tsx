@@ -23,6 +23,7 @@ import { clearUsageData, getUsageStats } from "@/api";
 import { useAsync } from "@/hooks/useAsync";
 import type { UsagePeriod, UsageStats } from "@/lib/types";
 import { humanTokens } from "@/lib/formatTokens";
+import { shortenUrlSet } from "@/lib/modelIdentity";
 import { CollapsibleCard } from "./CollapsibleCard";
 import { RefreshIntervalInput } from "./RefreshIntervalInput";
 import { useRefreshInterval } from "@/hooks/useRefreshInterval";
@@ -93,6 +94,23 @@ export function UsagePage() {
   );
 
   const stats = usage.data;
+  /**
+   * 短地址对照**全卡实际出现的那一组**算一次，浮层与明细表共用。
+   *
+   * 两处若各算各的：预算不同、输入集合也不同（浮层取时间序列里出现过的地址，表里取明细
+   * 行的），而成组压缩会自动放宽到「全组互不相同」为止，于是两边停在不同档上——同一个
+   * endpoint 在浮层里可能是 `…om/openai/v1-test`（尾段吃满预算，退化成纯头部省略）、
+   * 在表里却是 `api.co…/openai/v1-test`（保住主机头），肉眼不像同一台机器。而这两块就
+   * 在同一屏上、读的是同一份数据，拿浮层里某一行去表里找对应那行正是它们并排的理由。
+   *
+   * 预算取两处里更紧的那个（浮层）：浮层是 max-w 限宽 + CSS truncate，放不下会从**尾部**
+   * 截断，而尾段恰是区分 endpoint 的地方——压短保尾就是为了防这个；明细表窄一点无妨，
+   * 那里的地址徽记点开就是完整原文。
+   */
+  const urlLabels = useMemo(
+    () => shortenUrlSet((stats?.rows ?? []).map((r) => r.base_url).filter(Boolean), 18),
+    [stats],
+  );
   const timeLabel = updatedAt
     ? updatedAt.toLocaleTimeString(i18n.language === "en" ? "en-US" : "zh-CN", {
         hour: "2-digit",
@@ -214,6 +232,7 @@ export function UsagePage() {
                 <UsageTimelineChart
                   stats={stats}
                   binMinutes={binMinutes}
+                  urlLabels={urlLabels}
                 />
               </div>
             </div>
@@ -222,6 +241,7 @@ export function UsagePage() {
               <UsageBreakdownTable
                 stats={stats}
                 onClear={setClearScope}
+                urlLabels={urlLabels}
               />
             </div>
           </div>

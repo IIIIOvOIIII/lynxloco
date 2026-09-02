@@ -13,7 +13,6 @@
 import { useTranslation } from "react-i18next";
 import type { TokenBreakdown, UsageStats } from "@/lib/types";
 import { humanTokens } from "@/lib/formatTokens";
-import { shortenUrlSet } from "@/lib/modelIdentity";
 import { UsageUrlChip } from "./UsageUrlChip";
 import { UsageClearMenu, type ClearScope } from "./UsageClearMenu";
 import { HelpTip } from "./HelpTip";
@@ -63,22 +62,16 @@ function rowsByModel(stats: UsageStats): ModelRow[] {
 export function UsageBreakdownTable({
   stats,
   onClear,
+  urlLabels,
 }: {
   stats: UsageStats;
   /** 给了才出「操作」列。逐行清除只清该行的「模型名 + endpoint」。 */
   onClear?: (s: ClearScope) => void;
+  /** 全卡共用的地址压短映射，见 UsagePage 里那段说明——与时间分布浮层必须是同一份。 */
+  urlLabels: Map<string, string>;
 }) {
   const { t } = useTranslation();
   const rows = rowsByModel(stats);
-  /**
-   * 短形式对照**全表实际出现的 URL 集合**算，保证互不相同——固定规则逐个截时，
-   * 差异落在预算之外的两行会截成同一串（见 shortenUrlSet 的说明）。
-   * 22 是实测折中：够分辨、模型列约 +60px。
-   */
-  const urlLabels = shortenUrlSet(
-    rows.map((r) => r.base_url).filter(Boolean),
-    22,
-  );
   /**
    * 清除气泡标题里的作用域徽记：文字与框线跟模型列一致，但**不可交互**——
    * 气泡里再套一个能弹气泡的 chip 没有意义，完整 URL 挂 title 即可。

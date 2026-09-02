@@ -59,6 +59,23 @@ describe("shortenUrl", () => {
   });
 });
 
+describe("同一地址在不同预算下形状不同 —— 跨面板必须共用一份", () => {
+  it("尾段吃满预算时会从「保主机头」退化成「纯头部省略」", () => {
+    // 时间分布浮层与明细表就在同一屏上、读的是同一份数据，住户拿浮层里某一行去表里找
+    // 对应那行是它们并排的理由。两处若各用各的预算，同一个 endpoint 一个以主机名开头、
+    // 一个以省略号开头，肉眼不像同一台机器——所以短地址由页面层算一次、两处共用。
+    const u = "https://api.corp.example.com/openai/v1-test";
+    const wide = shortenUrl(u, 22);
+    const tight = shortenUrl(u, 18);
+    expect(wide).not.toBe(tight);
+    expect(wide.startsWith("…")).toBe(false); // 预算够时保住主机头
+    expect(tight.startsWith("…")).toBe(true); // 不够时退化成纯头部省略
+    // 两者都保住了区分 endpoint 的尾段
+    expect(wide.endsWith("/openai/v1-test")).toBe(true);
+    expect(tight.endsWith("/openai/v1-test")).toBe(true);
+  });
+});
+
 describe("shortenUrlSet", () => {
   const short = (m: Map<string, string>) => [...m.values()];
 
