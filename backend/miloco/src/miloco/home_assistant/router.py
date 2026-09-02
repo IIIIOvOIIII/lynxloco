@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, Query
 from miloco.home_assistant.schema import (
     HaErrorCode,
     HomeAssistantConfigUpdate,
+    HomeAssistantEntityPolicyBulkUpdate,
     HomeAssistantEntityPolicyUpdate,
     HomeAssistantError,
 )
@@ -100,6 +101,19 @@ async def list_entities(
         message="ok",
         data=[entity.model_dump() for entity in entities],
     )
+
+
+@router.put("/entities/policies", response_model=NormalResponse)
+async def update_entity_policies(
+    body: HomeAssistantEntityPolicyBulkUpdate,
+    current_user: str = Depends(verify_token),
+):
+    del current_user
+    try:
+        result = await manager.home_assistant_service.update_entity_policies(body)
+    except HomeAssistantError as exc:
+        _raise_ha_error(exc)
+    return NormalResponse(code=0, message="ok", data=result.model_dump())
 
 
 @router.put("/entities/{entity_id:path}/policy", response_model=NormalResponse)

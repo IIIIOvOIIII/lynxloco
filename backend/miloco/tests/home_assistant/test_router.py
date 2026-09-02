@@ -122,3 +122,93 @@ def test_home_assistant_test_alias_matches_public_spec(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.json()["data"]["connected"] is True
     assert "secret-token" not in response.text
+
+
+def test_bulk_policy_endpoint_forwards_request_and_masks_secrets(monkeypatch) -> None:
+    from miloco.home_assistant.schema import (
+        HomeAssistantEntityPolicyBulkResult,
+        HomeAssistantEntityPolicyBulkUpdate,
+        HomeAssistantEntityView,
+    )
+
+    class _FakeHaService:
+        def __init__(self) -> None:
+            self.received: HomeAssistantEntityPolicyBulkUpdate | None = None
+
+        async def update_entity_policies(self, body: HomeAssistantEntityPolicyBulkUpdate):
+            self.received = body
+            return HomeAssistantEntityPolicyBulkResult(
+                updated=[
+                    HomeAssistantEntityView(
+                        entity_id="light.kitchen",
+                        name="Kitchen Light",
+                        domain="light",
+                        state="off",
+                        room="Kitchen",
+                        included=True,
+                        control_enabled=False,
+                        control_supported=True,
+                    )
+                ],
+                skipped=[],
+                updated_count=1,
+                skipped_count=0,
+            )
+
+    fake_service = _FakeHaService()
+    manager = get_manager()
+    monkeypatch.setattr(
+        manager,
+        "_home_assistant_service",
+        fake_service,
+        raising=False,
+    )
+
+    client = TestClient(app)
+    response = client.put(
+        "/api/home-assistant/entities/policies",
+        headers={"Authorization": "Bearer test-token"},
+        json={
+            "entity_ids": ["light.kitchen", " light.kitchen "],
+            "included": True,
+            "control_enabled": False,
+        },
+    )
+
+    assert response.status_code == 200
+    assert fake_service.received is not None
+    assert fake_service.received.entity_ids == ["light.kitchen"]
+    assert fake_service.received.included is True
+    assert fake_service.received.control_enabled is False
+    body = response.json()["data"]
+    assert body["updated_count"] == 1
+    assert body["skipped_count"] == 0
+    assert body["updated"][0]["entity_id"] == "light.kitchen"
+    assert "secret-token" not in response.text
+
+
+def test_bulk_policy_endpoint_requires_a_patch() -> None:
+    client = TestClient(app)
+    response = client.put(
+        "/api/home-assistant/entities/policies",
+        headers={"Authorization": "Bearer test-token"},
+        json={"entity_ids": ["light.kitchen"]},
+    )
+
+    assert response.status_code == 422
+    assert "secret-token" not in response.text
+
+
+def test_bulk_policy_endpoint_requires_auth(monkeypatch) -> None:
+    monkeypatch.delenv("MILOCO_TEST_DEFAULT_SERVICE_AUTH", raising=False)
+    client = TestClient(app)
+    response = client.put(
+        "/api/home-assistant/entities/policies",
+        json={
+            "entity_ids": ["light.kitchen"],
+            "included": True,
+            "control_enabled": False,
+        },
+    )
+
+    assert response.status_code in {401, 403}
