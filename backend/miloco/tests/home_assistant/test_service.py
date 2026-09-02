@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import miloco.home_assistant.service as service_module
@@ -66,14 +67,14 @@ async def test_bulk_import_writes_once_and_defaults_read_only(monkeypatch) -> No
         )
 
     calls: list[dict[str, Any]] = []
-    real_update_shared_config = service_module.update_shared_config
+    real_mutate_shared_config = service_module.mutate_shared_config
 
-    def recording_update_shared_config(**kwargs):
-        calls.append(kwargs)
-        return real_update_shared_config(**kwargs)
+    def recording_mutate_shared_config(mutation):
+        calls.append({"mutation": mutation})
+        return real_mutate_shared_config(mutation)
 
     monkeypatch.setattr(service, "_states_and_services", fake_states_and_services)
-    monkeypatch.setattr(service_module, "update_shared_config", recording_update_shared_config)
+    monkeypatch.setattr(service_module, "mutate_shared_config", recording_mutate_shared_config)
 
     result = await service.update_entity_policies(
         HomeAssistantEntityPolicyBulkUpdate(
@@ -155,6 +156,90 @@ async def test_bulk_allow_control_skips_unsafe_and_not_imported(monkeypatch) -> 
     assert settings.entities["light.kitchen"].control_enabled is True
     assert settings.entities["lock.front_door"].control_enabled is False
     assert "switch.freezer" not in settings.entities
+
+
+@pytest.mark.asyncio
+async def test_bulk_allow_control_does_not_restore_policy_removed_during_discovery(
+    monkeypatch,
+) -> None:
+    _configure_ha(
+        entities={
+            "light.kitchen": {
+                "entity_id": "light.kitchen",
+                "included": True,
+                "control_enabled": False,
+            }
+        }
+    )
+    service = HomeAssistantService()
+    discovery_started = asyncio.Event()
+    finish_discovery = asyncio.Event()
+
+    async def delayed_states_and_services(settings, *, refresh: bool):
+        del settings
+        assert refresh is True
+        discovery_started.set()
+        await finish_discovery.wait()
+        return (
+            [_state("light.kitchen", name="Kitchen Light")],
+            {"light": {"turn_on", "turn_off"}},
+        )
+
+    monkeypatch.setattr(service, "_states_and_services", delayed_states_and_services)
+
+    bulk_task = asyncio.create_task(
+        service.update_entity_policies(
+            HomeAssistantEntityPolicyBulkUpdate(
+                entity_ids=["light.kitchen"],
+                control_enabled=True,
+            )
+        )
+    )
+    await discovery_started.wait()
+
+    service.update_entity_policy(
+        "light.kitchen",
+        included=False,
+        control_enabled=False,
+    )
+    finish_discovery.set()
+    result = await bulk_task
+
+    assert result.updated_count == 0
+    assert [(item.entity_id, item.reason) for item in result.skipped] == [
+        ("light.kitchen", "not-imported")
+    ]
+    policy = get_settings().home_assistant.entities["light.kitchen"]
+    assert policy.included is False
+    assert policy.control_enabled is False
+
+
+@pytest.mark.asyncio
+async def test_list_entities_exposes_persisted_control_permission_when_unavailable(
+    monkeypatch,
+) -> None:
+    _configure_ha(
+        entities={
+            "light.kitchen": {
+                "entity_id": "light.kitchen",
+                "included": True,
+                "control_enabled": True,
+            }
+        }
+    )
+    service = HomeAssistantService()
+
+    async def unavailable_states_and_services(settings, *, refresh: bool):
+        del settings, refresh
+        return ([_state("light.kitchen", name="Kitchen Light")], {"light": set()})
+
+    monkeypatch.setattr(service, "_states_and_services", unavailable_states_and_services)
+
+    entity = (await service.list_entities())[0]
+
+    assert entity.control_enabled is True
+    assert entity.control_supported is False
+    assert entity.control_blocked_reason == "service-unavailable"
 
 
 @pytest.mark.asyncio

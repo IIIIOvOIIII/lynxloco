@@ -94,15 +94,28 @@ def _shared_config_lock(path: Path):
 
 
 def _mutate_shared_config(
-    mutation: Callable[[dict[str, Any]], dict[str, Any]],
-) -> dict[str, Any]:
+    mutation: Callable[[dict[str, Any]], dict[str, Any] | None],
+) -> dict[str, Any] | None:
     path = _user_config_path()
     with _shared_config_lock(path):
         existing = _read_config_dict(path)
         merged = mutation(existing)
+        if merged is None:
+            return None
         _atomic_write_json(path, merged)
         reset_settings()
         return merged
+
+
+def mutate_shared_config(
+    mutation: Callable[[dict[str, Any]], dict[str, Any] | None],
+) -> dict[str, Any] | None:
+    """Apply a conditional config mutation while holding the shared writer lock.
+
+    Returning ``None`` leaves the current file unchanged. Callers that need a
+    read-modify-write decision must make that decision inside ``mutation``.
+    """
+    return _mutate_shared_config(mutation)
 
 
 def ensure_backend_token() -> str:
@@ -143,7 +156,9 @@ def update_shared_config(**updates: Any) -> dict[str, Any]:
     is re-read only after both locks are held, so updates to disjoint fields are
     not lost.
     """
-    return _mutate_shared_config(lambda existing: deep_merge(existing, updates))
+    result = mutate_shared_config(lambda existing: deep_merge(existing, updates))
+    assert result is not None
+    return result
 
 
 def mutate_rtsp_sources(

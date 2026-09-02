@@ -47,6 +47,27 @@ describe("Home Assistant helpers", () => {
     ).toBe("blocked-risk");
   });
 
+  it("allows revoking persisted control when it is currently unavailable", () => {
+    expect(
+      controlDisabledReason(
+        entity({
+          controlEnabled: true,
+          controlSupported: false,
+          controlBlockedReason: "service-unavailable",
+        }),
+      ),
+    ).toBeNull();
+    expect(
+      controlDisabledReason(
+        entity({
+          controlEnabled: false,
+          controlSupported: false,
+          controlBlockedReason: "unsupported-domain",
+        }),
+      ),
+    ).toBe("unsupported-domain");
+  });
+
   it("disables control for non-imported entities", () => {
     expect(controlDisabledReason(entity({ included: false }))).toBe(
       "not-imported",
@@ -130,6 +151,13 @@ describe("Home Assistant helpers", () => {
         controlEnabled: true,
         controlSupported: true,
       }),
+      entity({
+        entityId: "light.unavailable_enabled",
+        included: true,
+        controlEnabled: true,
+        controlSupported: false,
+        controlBlockedReason: "service-unavailable",
+      }),
     ];
 
     expect(getHomeAssistantBulkTargets(rows, "import").map((row) => row.entityId)).toEqual([
@@ -139,19 +167,21 @@ describe("Home Assistant helpers", () => {
       "light.read_only",
       "lock.blocked",
       "switch.enabled",
+      "light.unavailable_enabled",
     ]);
     expect(getHomeAssistantBulkTargets(rows, "allow-control").map((row) => row.entityId)).toEqual([
       "light.read_only",
     ]);
     expect(getHomeAssistantBulkTargets(rows, "disable-control").map((row) => row.entityId)).toEqual([
       "switch.enabled",
+      "light.unavailable_enabled",
     ]);
 
     expect(summarizeHomeAssistantBulkTargets(rows)).toEqual({
       import: 1,
-      "remove-import": 3,
+      "remove-import": 4,
       "allow-control": 1,
-      "disable-control": 1,
+      "disable-control": 2,
     });
   });
 

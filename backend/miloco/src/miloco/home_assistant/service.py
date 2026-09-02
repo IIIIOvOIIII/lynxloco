@@ -45,7 +45,8 @@ from miloco.home_assistant.schema import (
     HomeAssistantTestResult,
 )
 from miloco.middleware.exceptions import BadRequestException, ResourceNotFoundException
-from miloco.utils.agent_config import update_shared_config
+from miloco.utils.agent_config import mutate_shared_config, update_shared_config
+from miloco.utils.common import deep_merge
 
 logger = logging.getLogger(__name__)
 
@@ -298,66 +299,41 @@ class HomeAssistantService:
             states, services = await self._states_and_services(settings, refresh=True)
             state_by_id = {entity.entity_id: entity for entity in states}
 
-        entities = {
-            key: value.model_dump()
-            for key, value in settings.entities.items()
-        }
         updated: list[
             HomeAssistantEntityView | HomeAssistantEntityPolicyBulkPolicyUpdate
         ] = []
         skipped: list[HomeAssistantEntityPolicyBulkSkipped] = []
 
-        for entity_id in update.entity_ids:
-            if not entity_id:
-                skipped.append(
-                    HomeAssistantEntityPolicyBulkSkipped(
-                        entity_id=entity_id,
-                        reason="invalid-entity-id",
-                    )
-                )
-                continue
+        def apply(existing: dict[str, object]) -> dict[str, object] | None:
+            raw_home_assistant = existing.get("home_assistant")
+            current_settings = HomeAssistantSettings.model_validate(
+                raw_home_assistant if isinstance(raw_home_assistant, dict) else {}
+            )
+            entities = {
+                key: value.model_dump()
+                for key, value in current_settings.entities.items()
+            }
 
-            current = self._policy_for(settings, entity_id)
-            entity = state_by_id.get(entity_id)
-            next_included = current.included
-            next_control_enabled = current.control_enabled
-
-            if update.included is False:
-                next_included = False
-                next_control_enabled = False
-            else:
-                if update.included is True:
-                    if entity is None:
-                        skipped.append(
-                            HomeAssistantEntityPolicyBulkSkipped(
-                                entity_id=entity_id,
-                                reason="not-found",
-                            )
+            for entity_id in update.entity_ids:
+                if not entity_id:
+                    skipped.append(
+                        HomeAssistantEntityPolicyBulkSkipped(
+                            entity_id=entity_id,
+                            reason="invalid-entity-id",
                         )
-                        continue
-                    next_included = True
-                    if not current.included:
-                        next_control_enabled = False
+                    )
+                    continue
 
-                if update.control_enabled is True:
-                    if not current.included:
-                        if update.included is True and entity is not None:
-                            next_control_enabled = False
-                            skipped.append(
-                                HomeAssistantEntityPolicyBulkSkipped(
-                                    entity_id=entity_id,
-                                    reason="not-imported",
-                                )
-                            )
-                        else:
-                            skipped.append(
-                                HomeAssistantEntityPolicyBulkSkipped(
-                                    entity_id=entity_id,
-                                    reason="not-imported",
-                                )
-                            )
-                            continue
-                    else:
+                current = self._policy_for(current_settings, entity_id)
+                entity = state_by_id.get(entity_id)
+                next_included = current.included
+                next_control_enabled = current.control_enabled
+
+                if update.included is False:
+                    next_included = False
+                    next_control_enabled = False
+                else:
+                    if update.included is True:
                         if entity is None:
                             skipped.append(
                                 HomeAssistantEntityPolicyBulkSkipped(
@@ -366,43 +342,76 @@ class HomeAssistantService:
                                 )
                             )
                             continue
-                        reason = control_blocked_reason(entity, services)
-                        if reason is not None:
-                            skipped.append(
-                                HomeAssistantEntityPolicyBulkSkipped(
-                                    entity_id=entity_id,
-                                    reason=cast(HomeAssistantBulkSkippedReason, reason),
+                        next_included = True
+                        if not current.included:
+                            next_control_enabled = False
+
+                    if update.control_enabled is True:
+                        if not current.included:
+                            if update.included is True and entity is not None:
+                                next_control_enabled = False
+                                skipped.append(
+                                    HomeAssistantEntityPolicyBulkSkipped(
+                                        entity_id=entity_id,
+                                        reason="not-imported",
+                                    )
                                 )
-                            )
-                            continue
-                        next_control_enabled = True
+                            else:
+                                skipped.append(
+                                    HomeAssistantEntityPolicyBulkSkipped(
+                                        entity_id=entity_id,
+                                        reason="not-imported",
+                                    )
+                                )
+                                continue
+                        else:
+                            if entity is None:
+                                skipped.append(
+                                    HomeAssistantEntityPolicyBulkSkipped(
+                                        entity_id=entity_id,
+                                        reason="not-found",
+                                    )
+                                )
+                                continue
+                            reason = control_blocked_reason(entity, services)
+                            if reason is not None:
+                                skipped.append(
+                                    HomeAssistantEntityPolicyBulkSkipped(
+                                        entity_id=entity_id,
+                                        reason=cast(HomeAssistantBulkSkippedReason, reason),
+                                    )
+                                )
+                                continue
+                            next_control_enabled = True
 
-                if update.control_enabled is False:
-                    next_control_enabled = False
+                    if update.control_enabled is False:
+                        next_control_enabled = False
 
-            next_policy = HomeAssistantEntityPolicy(
-                entity_id=entity_id,
-                included=next_included,
-                control_enabled=next_control_enabled,
-                last_seen_at=current.last_seen_at,
-                last_control_at=current.last_control_at,
-                last_error=current.last_error,
-            )
-            entities[entity_id] = next_policy.model_dump()
-            if entity is None:
-                updated.append(
-                    HomeAssistantEntityPolicyBulkPolicyUpdate(
-                        entity_id=entity_id,
-                        included=next_policy.included,
-                        control_enabled=next_policy.control_enabled,
-                    )
+                next_policy = HomeAssistantEntityPolicy(
+                    entity_id=entity_id,
+                    included=next_included,
+                    control_enabled=next_control_enabled,
+                    last_seen_at=current.last_seen_at,
+                    last_control_at=current.last_control_at,
+                    last_error=current.last_error,
                 )
-            else:
-                updated.append(self._entity_view(entity, services, next_policy))
+                entities[entity_id] = next_policy.model_dump()
+                if entity is None:
+                    updated.append(
+                        HomeAssistantEntityPolicyBulkPolicyUpdate(
+                            entity_id=entity_id,
+                            included=next_policy.included,
+                            control_enabled=next_policy.control_enabled,
+                        )
+                    )
+                else:
+                    updated.append(self._entity_view(entity, services, next_policy))
 
-        if updated:
-            update_shared_config(home_assistant={"entities": entities})
-            reset_settings()
+            if not updated:
+                return None
+            return deep_merge(existing, {"home_assistant": {"entities": entities}})
+
+        mutate_shared_config(apply)
 
         return HomeAssistantEntityPolicyBulkResult(
             updated=updated,
@@ -538,7 +547,7 @@ class HomeAssistantService:
                 or "未分配"
             ),
             included=policy.included,
-            control_enabled=policy.control_enabled and reason is None,
+            control_enabled=policy.control_enabled,
             control_supported=reason is None,
             control_blocked_reason=reason,
             last_seen_at=policy.last_seen_at,
