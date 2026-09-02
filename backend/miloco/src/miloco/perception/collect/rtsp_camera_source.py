@@ -33,6 +33,7 @@ _CONNECTION_FIELDS = (
 _SAFE_TERMINAL_MESSAGES = {
     "invalid_uri": "RTSP URI is invalid",
     "authentication_failed": "RTSP authentication failed",
+    "connection_failed": "RTSP connection failed",
     "resource_not_found": "RTSP resource was not found",
     "unsupported_video_codec": "RTSP video codec could not be decoded",
     "no_video_stream": "RTSP source has no video stream",

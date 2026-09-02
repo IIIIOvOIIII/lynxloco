@@ -36,6 +36,7 @@ _AUDIO_SAMPLE_RATE = 16_000
 # stop that is waiting for the demux owner to leave native code to eight seconds.
 _IO_TIMEOUT_SEC = 8.0
 _JITTER_BOUND = 0.2
+_MAX_FRAMELESS_RECOVERABLE_FAILURES = 6
 _TaskResult = TypeVar("_TaskResult")
 
 
@@ -339,12 +340,16 @@ class RtspSession:
                 self._record_error(error, reconnect_attempt=attempt)
                 return
 
-            self._record_error(error, reconnect_attempt=attempt + 1)
+            next_attempt = attempt + 1
+            self._record_error(error, reconnect_attempt=next_attempt)
+            if next_attempt >= _MAX_FRAMELESS_RECOVERABLE_FAILURES:
+                self._terminal = True
+                return
             delay = reconnect_delay(
                 attempt,
                 jitter=random.uniform(-_JITTER_BOUND, _JITTER_BOUND),
             )
-            attempt += 1
+            attempt = next_attempt
             if await self._wait_for_stop(delay):
                 return
 

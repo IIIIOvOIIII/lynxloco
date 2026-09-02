@@ -311,6 +311,16 @@ class _SequenceOpener:
         return result
 
 
+class _AlwaysFailingOpener:
+    def __init__(self, failure: BaseException) -> None:
+        self.failure = failure
+        self.calls = 0
+
+    def __call__(self, *_args: object, **_kwargs: object) -> object:
+        self.calls += 1
+        raise self.failure
+
+
 class _BlockingOpenSequence:
     def __init__(
         self,
@@ -421,6 +431,40 @@ async def test_stop_cancels_backoff_without_waiting_for_delay(
     assert session.state().connected is False
     assert session.state().error_code == "connection_reset"
     assert "private" not in (session.state().error_message or "")
+
+
+@pytest.mark.asyncio
+async def test_sustained_frameless_recoverable_failures_enter_terminal_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_module = _rtsp_session()
+    opener = _AlwaysFailingOpener(
+        RtspSourceError(
+            "connection_failed",
+            "RTSP connection failed",
+            recoverable=True,
+        )
+    )
+    monkeypatch.setattr(
+        session_module,
+        "_MAX_FRAMELESS_RECOVERABLE_FAILURES",
+        3,
+        raising=False,
+    )
+    monkeypatch.setattr(session_module.av, "open", opener)
+    monkeypatch.setattr(session_module, "reconnect_delay", lambda *_a, **_kw: 0.0)
+    session = session_module.RtspSession(_source())
+
+    await session.start(_unused_video_cb, _unused_audio_cb)
+    await _wait_until(lambda: session.is_terminal())
+
+    state = session.state()
+    assert opener.calls == 3
+    assert state.connected is False
+    assert state.error_code == "connection_failed"
+    assert state.error_message == "RTSP connection failed"
+    assert state.reconnect_attempt == 3
+    await session.stop()
 
 
 @pytest.mark.asyncio

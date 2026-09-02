@@ -379,6 +379,7 @@ async def test_rtsp_auto_recovery_window_resets_when_connection_config_changes()
     [
         ("authentication_failed", "RTSP authentication failed"),
         ("resource_not_found", "RTSP resource was not found"),
+        ("connection_failed", "RTSP connection failed"),
         ("no_video_stream", "RTSP source has no video stream"),
     ],
 )
