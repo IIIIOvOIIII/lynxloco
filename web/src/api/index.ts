@@ -15,6 +15,8 @@ import type {
   EventCropMeta,
   HomeAssistantConfigUpdate,
   HomeAssistantEntity,
+  HomeAssistantEntityPolicyBulkResult,
+  HomeAssistantEntityPolicyBulkUpdate,
   HomeAssistantEntityPolicyUpdate,
   HomeAssistantPublicConfig,
   HomeAssistantStatus,
@@ -376,6 +378,12 @@ export async function updateHomeAssistantEntityPolicy(
   patch: HomeAssistantEntityPolicyUpdate,
 ): Promise<HomeAssistantEntity> {
   return impl.realUpdateHomeAssistantEntityPolicy(entityId, patch);
+}
+
+export async function updateHomeAssistantEntityPolicies(
+  input: HomeAssistantEntityPolicyBulkUpdate,
+): Promise<HomeAssistantEntityPolicyBulkResult> {
+  return impl.realUpdateHomeAssistantEntityPolicies(input);
 }
 
 // ── 场景 ──────────────────────────────────────────────────

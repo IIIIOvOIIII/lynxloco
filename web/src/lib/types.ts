@@ -280,6 +280,48 @@ export interface HomeAssistantEntityPolicyUpdate {
   controlEnabled?: boolean;
 }
 
+export type HomeAssistantBulkAction =
+  | "import"
+  | "remove-import"
+  | "allow-control"
+  | "disable-control";
+
+export interface HomeAssistantEntityPolicyBulkUpdate {
+  entityIds: string[];
+  included?: boolean;
+  controlEnabled?: boolean;
+}
+
+export interface HomeAssistantEntityPolicyBulkSkipped {
+  entityId: string;
+  reason:
+    | "invalid-entity-id"
+    | "not-found"
+    | "not-imported"
+    | "blocked-risk"
+    | "unsupported-domain"
+    | "service-unavailable";
+}
+
+/**
+ * A policy-only update is returned when the backend did not need a live
+ * Home Assistant discovery lookup. Consumers merge it into their existing row.
+ */
+export interface HomeAssistantEntityPolicyBulkPolicyUpdate {
+  entityId: string;
+  included: boolean;
+  controlEnabled: boolean;
+}
+
+export interface HomeAssistantEntityPolicyBulkResult {
+  updated: Array<
+    HomeAssistantEntity | HomeAssistantEntityPolicyBulkPolicyUpdate
+  >;
+  skipped: HomeAssistantEntityPolicyBulkSkipped[];
+  updatedCount: number;
+  skippedCount: number;
+}
+
 // ── 活动事件(meaningful_events)─────────────────────────────
 // 数据源:GET /api/events(perception/events_router).
 // 一次感知推理 = 一行 event;同窗口 N 摄像头合并 1 行,device_ids 记录本行真正相关的

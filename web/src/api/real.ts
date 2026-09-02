@@ -31,6 +31,9 @@ import type {
   CameraSummary,
   HomeAssistantConfigUpdate,
   HomeAssistantEntity,
+  HomeAssistantEntityPolicyBulkResult,
+  HomeAssistantEntityPolicyBulkSkipped,
+  HomeAssistantEntityPolicyBulkUpdate,
   HomeAssistantEntityPolicyUpdate,
   HomeAssistantPublicConfig,
   HomeAssistantStatus,
@@ -440,6 +443,26 @@ interface BackendHomeAssistantEntity {
   last_seen_at?: number | null;
   last_control_at?: number | null;
   last_error?: string | null;
+}
+
+interface BackendHomeAssistantEntityPolicyBulkPolicyUpdate {
+  entity_id: string;
+  included: boolean;
+  control_enabled: boolean;
+}
+
+interface BackendHomeAssistantEntityPolicyBulkSkipped {
+  entity_id: string;
+  reason: HomeAssistantEntityPolicyBulkSkipped["reason"];
+}
+
+interface BackendHomeAssistantEntityPolicyBulkResult {
+  updated: Array<
+    BackendHomeAssistantEntity | BackendHomeAssistantEntityPolicyBulkPolicyUpdate
+  >;
+  skipped: BackendHomeAssistantEntityPolicyBulkSkipped[];
+  updated_count: number;
+  skipped_count: number;
 }
 
 interface BackendPerson {
@@ -1496,6 +1519,59 @@ function mapHomeAssistantEntity(
   };
 }
 
+function homeAssistantEntityPolicyPayload(input: HomeAssistantEntityPolicyUpdate) {
+  return {
+    included: input.included,
+    control_enabled: input.controlEnabled,
+  };
+}
+
+function homeAssistantEntityPolicyBulkPayload(
+  input: HomeAssistantEntityPolicyBulkUpdate,
+) {
+  return {
+    entity_ids: input.entityIds,
+    included: input.included,
+    control_enabled: input.controlEnabled,
+  };
+}
+
+function isBackendHomeAssistantEntity(
+  entity:
+    | BackendHomeAssistantEntity
+    | BackendHomeAssistantEntityPolicyBulkPolicyUpdate,
+): entity is BackendHomeAssistantEntity {
+  return "domain" in entity;
+}
+
+function mapHomeAssistantBulkSkipped(
+  item: BackendHomeAssistantEntityPolicyBulkSkipped,
+): HomeAssistantEntityPolicyBulkSkipped {
+  return {
+    entityId: item.entity_id,
+    reason: item.reason,
+  };
+}
+
+function mapHomeAssistantBulkResult(
+  result: BackendHomeAssistantEntityPolicyBulkResult,
+): HomeAssistantEntityPolicyBulkResult {
+  return {
+    updated: result.updated.map((item) =>
+      isBackendHomeAssistantEntity(item)
+        ? mapHomeAssistantEntity(item)
+        : {
+            entityId: item.entity_id,
+            included: item.included,
+            controlEnabled: item.control_enabled,
+          },
+    ),
+    skipped: result.skipped.map(mapHomeAssistantBulkSkipped),
+    updatedCount: result.updated_count,
+    skippedCount: result.skipped_count,
+  };
+}
+
 export async function realGetHomeAssistantStatus(): Promise<HomeAssistantStatus> {
   const res = await apiFetch<Normal<BackendHomeAssistantStatus>>(
     "/api/home-assistant/status",
@@ -1558,13 +1634,23 @@ export async function realUpdateHomeAssistantEntityPolicy(
     `/api/home-assistant/entities/${encodeURIComponent(entityId)}/policy`,
     {
       method: "PUT",
-      body: JSON.stringify({
-        included: patch.included,
-        control_enabled: patch.controlEnabled,
-      }),
+      body: JSON.stringify(homeAssistantEntityPolicyPayload(patch)),
     },
   );
   return mapHomeAssistantEntity(res.data);
+}
+
+export async function realUpdateHomeAssistantEntityPolicies(
+  input: HomeAssistantEntityPolicyBulkUpdate,
+): Promise<HomeAssistantEntityPolicyBulkResult> {
+  const res = await apiFetch<Normal<BackendHomeAssistantEntityPolicyBulkResult>>(
+    "/api/home-assistant/entities/policies",
+    {
+      method: "PUT",
+      body: JSON.stringify(homeAssistantEntityPolicyBulkPayload(input)),
+    },
+  );
+  return mapHomeAssistantBulkResult(res.data);
 }
 
 // ── 摄像头 ────────────────────────────────────────────────
