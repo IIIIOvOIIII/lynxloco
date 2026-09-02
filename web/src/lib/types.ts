@@ -413,6 +413,9 @@ export interface CameraSummary {
   hasPassword: boolean;
   errorCode: string | null;
   errorMessage: string | null;
+  // 每摄像头自定义「感知须知」prompt。RTSP 与米家摄像头共用语义：
+  // "" = 无自定义；启用感知后会随该机位一起注入模型提示。
+  perceptionPrompt: string;
 }
 
 export interface PerceptionCameraView {

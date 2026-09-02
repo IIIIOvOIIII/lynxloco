@@ -27,6 +27,7 @@ function camera(overrides: Partial<CameraSummary> = {}): CameraSummary {
     hasPassword: true,
     errorCode: null,
     errorMessage: null,
+    perceptionPrompt: "",
     ...overrides,
   };
 }

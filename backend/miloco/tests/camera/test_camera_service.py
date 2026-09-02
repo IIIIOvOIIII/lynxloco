@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from collections.abc import Callable
 from types import SimpleNamespace
@@ -9,10 +10,13 @@ import pytest
 from miloco.camera.schema import RtspSourceUpsert
 from miloco.camera.service import (
     CameraConflictError,
+    CameraInvalidPromptError,
     CameraNotFoundError,
     CameraService,
 )
 from miloco.config.settings import RtspSourceSettings
+from miloco.database.kv_repo import ScopeConfigKeys
+from miloco.miot.filter import MAX_CAMERA_PROMPT_LEN
 from miloco.perception.collect.camera_adapter import CameraDeviceAdapter
 from miloco.perception.collect.camera_source import CameraSourceState
 from miloco.perception.collect.rtsp_camera_source import RtspCameraSource
@@ -92,6 +96,20 @@ class _ConfigStore:
             ]
             self.write_count += 1
             return {"camera": {"rtsp_sources": raw_sources}}
+
+
+class _FakeKV:
+    def __init__(self, initial: dict[str, str] | None = None) -> None:
+        self.store = dict(initial or {})
+        self.write_count = 0
+
+    def get(self, key: str, default_value: str | None = None) -> str | None:
+        return self.store.get(key, default_value)
+
+    def set(self, key: str, value: str) -> bool:
+        self.store[key] = value
+        self.write_count += 1
+        return True
 
 
 class _Perception:
@@ -182,16 +200,21 @@ def _service(
     *,
     miot: _Miot | None = None,
     probe: Callable | None = None,
+    kv_repo: _FakeKV | None = None,
 ) -> CameraService:
     async def successful_probe(_source: RtspSourceSettings) -> RtspProbeResult:
         return _probe_result()
 
+    kwargs = {}
+    if kv_repo is not None:
+        kwargs["kv_repo"] = kv_repo
     return CameraService(
         miot or _Miot(),
         perception or _Perception(),
         settings_loader=store.load,
         sources_mutator=store.mutate,
         probe=probe or successful_probe,
+        **kwargs,
     )
 
 
@@ -256,10 +279,11 @@ async def test_list_aggregates_miot_and_redacted_rtsp_state() -> None:
         "video_codec": "h264",
         "audio_codec": "aac",
         "last_frame_unix_ms": 1_787_851_234_567,
-        "has_password": True,
-        "error_code": None,
-        "error_message": None,
-    }
+            "has_password": True,
+            "error_code": None,
+            "error_message": None,
+            "perception_prompt": "",
+        }
     assert "stored-secret" not in repr(summaries)
     assert "camera-user" not in repr(summaries)
 
@@ -272,6 +296,83 @@ async def test_list_reports_null_frame_time_until_rtsp_source_decodes_a_frame() 
     ).list_cameras()
 
     assert summaries[0].last_frame_unix_ms is None
+
+
+@pytest.mark.asyncio
+async def test_list_reports_rtsp_perception_prompt_from_shared_prompt_map() -> None:
+    store = _ConfigStore([_source(enabled=True)])
+    kv = _FakeKV(
+        {
+            ScopeConfigKeys.CAMERA_PROMPT_MAP_KEY: json.dumps(
+                {SOURCE_ID: "客厅画面右侧电视反光请忽略"}
+            )
+        }
+    )
+
+    summaries = await _service(store, kv_repo=kv).list_cameras()
+
+    assert summaries[0].model_dump()["perception_prompt"] == "客厅画面右侧电视反光请忽略"
+    assert summaries[0].perception_prompt == "客厅画面右侧电视反光请忽略"
+    serialized = repr(summaries) + str(summaries[0].model_dump())
+    assert "stored-secret" not in serialized
+    assert "camera-user" not in serialized
+    assert "rtsp://camera.local/live" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_set_rtsp_perception_prompt_writes_shared_map_without_reconnect() -> None:
+    store = _ConfigStore([_source(enabled=False)])
+    kv = _FakeKV()
+    perception = _Perception()
+
+    async def forbidden_probe(_source: RtspSourceSettings) -> RtspProbeResult:
+        raise AssertionError("prompt updates must not probe RTSP streams")
+
+    updated = await _service(
+        store, perception, probe=forbidden_probe, kv_repo=kv
+    ).set_prompt(SOURCE_ID, "  门口左下角摆件不是宠物  ")
+
+    assert updated.perception_prompt == "门口左下角摆件不是宠物"
+    assert json.loads(kv.get(ScopeConfigKeys.CAMERA_PROMPT_MAP_KEY) or "{}") == {
+        SOURCE_ID: "门口左下角摆件不是宠物"
+    }
+    assert store.write_count == 0
+    assert perception.sync_count == 0
+    assert perception.retry_count == 0
+
+
+@pytest.mark.asyncio
+async def test_clear_rtsp_perception_prompt_deletes_shared_map_without_reconnect() -> None:
+    store = _ConfigStore([_source(enabled=True)])
+    kv = _FakeKV(
+        {ScopeConfigKeys.CAMERA_PROMPT_MAP_KEY: json.dumps({SOURCE_ID: "旧须知"})}
+    )
+    perception = _Perception()
+
+    cleared = await _service(store, perception, kv_repo=kv).clear_prompt(SOURCE_ID)
+
+    assert cleared.perception_prompt == ""
+    assert json.loads(kv.get(ScopeConfigKeys.CAMERA_PROMPT_MAP_KEY) or "{}") == {}
+    assert store.write_count == 0
+    assert perception.sync_count == 0
+    assert perception.retry_count == 0
+
+
+@pytest.mark.asyncio
+async def test_rtsp_perception_prompt_rejects_unknown_and_too_long_without_write() -> None:
+    kv = _FakeKV()
+    service = _service(_ConfigStore(), kv_repo=kv)
+
+    with pytest.raises(CameraNotFoundError):
+        await service.set_prompt(SOURCE_ID, "须知")
+    with pytest.raises(CameraInvalidPromptError, match="感知须知过长") as caught:
+        await _service(_ConfigStore([_source()]), kv_repo=kv).set_prompt(
+            SOURCE_ID, "字" * (MAX_CAMERA_PROMPT_LEN + 1)
+        )
+    assert caught.value.code == "invalid_camera_prompt"
+
+    assert kv.get(ScopeConfigKeys.CAMERA_PROMPT_MAP_KEY) is None
+    assert kv.write_count == 0
 
 
 @pytest.mark.asyncio

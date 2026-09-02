@@ -347,6 +347,7 @@ class Manager:
         self._camera_service = CameraService(
             self._miot_service,
             self._perception_service,
+            kv_repo=self._kv_repo,
         )
         self._initialize_live_stream_hub()
 

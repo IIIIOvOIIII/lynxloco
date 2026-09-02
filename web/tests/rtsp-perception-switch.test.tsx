@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
+import { renderToStaticMarkup } from "react-dom/server";
 
-import { RtspPerceptionSwitch } from "@/components/HeroNow";
+import { RtspCameraControls, RtspPerceptionSwitch } from "@/components/HeroNow";
+import i18n from "@/i18n";
 import type { CameraSummary } from "@/lib/types";
 
 function camera(overrides: Partial<CameraSummary> = {}): CameraSummary {
@@ -17,6 +19,7 @@ function camera(overrides: Partial<CameraSummary> = {}): CameraSummary {
     hasPassword: true,
     errorCode: null,
     errorMessage: null,
+    perceptionPrompt: "",
     ...overrides,
   };
 }
@@ -73,5 +76,27 @@ describe("RtspPerceptionSwitch", () => {
 
     expect(element.props.disabled).toBe(true);
     expect(onToggle).not.toHaveBeenCalled();
+  });
+
+  it("renders the perception notes button for RTSP camera controls", async () => {
+    await i18n.changeLanguage("zh");
+
+    const html = renderToStaticMarkup(
+      <div>
+        <RtspCameraControls
+          camera={camera({ perceptionPrompt: "电视反光请忽略" })}
+          busy={false}
+          canToggle={true}
+          onEdit={vi.fn()}
+          onDelete={vi.fn()}
+          onEditPrompt={vi.fn()}
+          onToggle={vi.fn()}
+        />
+      </div>,
+    );
+
+    expect(html).toContain("编辑「Kitchen RTSP」的感知须知");
+    expect(html).toContain("编辑感知须知（已配置）");
+    expect(html).toContain("须知");
   });
 });

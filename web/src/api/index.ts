@@ -10,6 +10,7 @@ import * as realImpl from "./real";
 import { apiFetch } from "./client";
 import type {
   ActivityEvent,
+  CameraSummary,
   Device,
   EventCropMeta,
   HomeAssistantConfigUpdate,
@@ -505,6 +506,18 @@ export async function setScopeCameraPrompt(
 // 清除相机自定义感知须知（DELETE /api/miot/scope/cameras/prompt）。
 export async function clearScopeCameraPrompt(did: string): Promise<void> {
   return impl.realClearScopeCameraPrompt(did);
+}
+
+// 通用摄像头感知须知（MIoT + RTSP）：用于 Dashboard 卡片统一编辑入口。
+export async function setCameraPrompt(
+  cameraId: string,
+  text: string,
+): Promise<CameraSummary> {
+  return impl.realSetCameraPrompt(cameraId, text);
+}
+
+export async function clearCameraPrompt(cameraId: string): Promise<CameraSummary> {
+  return impl.realClearCameraPrompt(cameraId);
 }
 
 export async function listCameras(homeId?: HomeId): Promise<PerceptionCamera[]> {

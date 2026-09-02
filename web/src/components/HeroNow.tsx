@@ -310,6 +310,8 @@ export function HeroNow({
         onRefresh={onRefreshRtsp}
         onToggle={onToggleRtsp}
         onDelete={onDeleteRtsp}
+        onSetPrompt={onSetCameraPrompt}
+        onClearPrompt={onClearCameraPrompt}
       />
     </section>
   );
@@ -322,6 +324,8 @@ function RtspCameraSection({
   onRefresh,
   onToggle,
   onDelete,
+  onSetPrompt,
+  onClearPrompt,
 }: {
   cameras: CameraSummary[];
   onAdd?: () => void;
@@ -329,11 +333,17 @@ function RtspCameraSection({
   onRefresh?: () => void | Promise<void>;
   onToggle?: (camera: CameraSummary, enabled: boolean) => void | Promise<void>;
   onDelete?: (camera: CameraSummary) => void | Promise<void>;
+  onSetPrompt: (cameraId: string, text: string) => void | Promise<void>;
+  onClearPrompt: (cameraId: string) => void | Promise<void>;
 }) {
   const { t } = useTranslation();
   const [busyId, setBusyId] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<CameraSummary | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [promptEditing, setPromptEditing] = useState<CameraSummary | null>(null);
+  const [promptDraft, setPromptDraft] = useState("");
+  const [promptSaving, setPromptSaving] = useState(false);
+  const [hadPrompt, setHadPrompt] = useState(false);
 
   const refresh = async () => {
     if (!onRefresh || refreshing) return;
@@ -352,6 +362,39 @@ function RtspCameraSection({
       await onToggle(camera, enabled);
     } finally {
       setBusyId(null);
+    }
+  };
+
+  const openPromptEditor = (camera: CameraSummary) => {
+    setPromptDraft(camera.perceptionPrompt);
+    setHadPrompt(!!camera.perceptionPrompt);
+    setPromptEditing(camera);
+  };
+
+  const savePrompt = async () => {
+    if (!promptEditing || promptSaving) return;
+    const text = promptDraft.trim();
+    if (!text) {
+      if (!hadPrompt) return;
+      return clearPrompt();
+    }
+    setPromptSaving(true);
+    try {
+      await onSetPrompt(promptEditing.id, text);
+      setPromptEditing(null);
+    } finally {
+      setPromptSaving(false);
+    }
+  };
+
+  const clearPrompt = async () => {
+    if (!promptEditing || promptSaving) return;
+    setPromptSaving(true);
+    try {
+      await onClearPrompt(promptEditing.id);
+      setPromptEditing(null);
+    } finally {
+      setPromptSaving(false);
     }
   };
 
@@ -461,41 +504,13 @@ function RtspCameraSection({
                     )}
                   </div>
                   <div className="flex shrink-0 items-center gap-1">
-                    <button
-                      type="button"
-                      disabled={busy}
-                      onClick={() => onEdit?.(camera)}
-                      aria-label={t("rtspCamera.edit")}
-                      className="rounded-md border border-border p-1.5 text-text-secondary hover:text-text-primary disabled:opacity-50"
-                    >
-                      <IconPencil width={14} height={14} />
-                    </button>
-                    <button
-                      type="button"
-                      disabled={busy}
-                      onClick={() => setDeleteTarget(camera)}
-                      aria-label={t("rtspCamera.delete")}
-                      className="rounded-md border border-border p-1.5 text-text-secondary hover:text-error disabled:opacity-50"
-                    >
-                      <IconTrash width={14} height={14} />
-                    </button>
-                    <RtspPerceptionSwitch
+                    <RtspCameraControls
                       camera={camera}
                       busy={busy}
-                      disabled={!onToggle}
-                      label={t("rtspCamera.perception")}
-                      busyLabel={t("rtspCamera.enableTesting")}
-                      ariaLabel={t(
-                        camera.enabled
-                          ? "rtspCamera.toggleAriaDisable"
-                          : "rtspCamera.toggleAriaEnable",
-                        { name: camera.name },
-                      )}
-                      title={t(
-                        camera.enabled
-                          ? "rtspCamera.toggleTitleDisable"
-                          : "rtspCamera.toggleTitleEnable",
-                      )}
+                      canToggle={!!onToggle}
+                      onEdit={onEdit}
+                      onDelete={setDeleteTarget}
+                      onEditPrompt={openPromptEditor}
                       onToggle={(target, enabled) => void runToggle(target, enabled)}
                     />
                   </div>
@@ -542,7 +557,85 @@ function RtspCameraSection({
           </div>
         </div>
       )}
+      {promptEditing && (
+        <CameraPromptDialog
+          name={promptEditing.name}
+          draft={promptDraft}
+          hadPrompt={hadPrompt}
+          saving={promptSaving}
+          onDraftChange={setPromptDraft}
+          onSave={() => void savePrompt()}
+          onClear={() => void clearPrompt()}
+          onClose={() => setPromptEditing(null)}
+        />
+      )}
     </div>
+  );
+}
+
+export function RtspCameraControls({
+  camera,
+  busy,
+  canToggle,
+  onEdit,
+  onDelete,
+  onEditPrompt,
+  onToggle,
+}: {
+  camera: CameraSummary;
+  busy: boolean;
+  canToggle: boolean;
+  onEdit?: (camera: CameraSummary) => void;
+  onDelete: (camera: CameraSummary) => void;
+  onEditPrompt: (camera: CameraSummary) => void;
+  onToggle: (camera: CameraSummary, enabled: boolean) => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <>
+      <PromptButton
+        hasPrompt={!!camera.perceptionPrompt}
+        name={camera.name}
+        onClick={() => onEditPrompt(camera)}
+      />
+      <button
+        type="button"
+        disabled={busy}
+        onClick={() => onEdit?.(camera)}
+        aria-label={t("rtspCamera.edit")}
+        className="rounded-md border border-border p-1.5 text-text-secondary hover:text-text-primary disabled:opacity-50"
+      >
+        <IconPencil width={14} height={14} />
+      </button>
+      <button
+        type="button"
+        disabled={busy}
+        onClick={() => onDelete(camera)}
+        aria-label={t("rtspCamera.delete")}
+        className="rounded-md border border-border p-1.5 text-text-secondary hover:text-error disabled:opacity-50"
+      >
+        <IconTrash width={14} height={14} />
+      </button>
+      <RtspPerceptionSwitch
+        camera={camera}
+        busy={busy}
+        disabled={!canToggle}
+        label={t("rtspCamera.perception")}
+        busyLabel={t("rtspCamera.enableTesting")}
+        ariaLabel={t(
+          camera.enabled
+            ? "rtspCamera.toggleAriaDisable"
+            : "rtspCamera.toggleAriaEnable",
+          { name: camera.name },
+        )}
+        title={t(
+          camera.enabled
+            ? "rtspCamera.toggleTitleDisable"
+            : "rtspCamera.toggleTitleEnable",
+        )}
+        onToggle={onToggle}
+      />
+    </>
   );
 }
 
@@ -563,17 +656,36 @@ interface CameraSectionProps {
   showEmpty: boolean;
 }
 
-function SourceNeutralCamCard({ camera }: { camera: PerceptionCameraView }) {
+function SourceNeutralCamCard({
+  camera,
+  onEditPrompt,
+}: {
+  camera: PerceptionCameraView;
+  onEditPrompt?: (camera: PerceptionCameraView) => void;
+}) {
   const { t } = useTranslation();
+  const canEditPrompt =
+    camera.sourceType === "rtsp" && !!camera.summary && !!onEditPrompt;
 
   return (
     <article className="w-[min(82vw,420px)] shrink-0 snap-start rounded-xl border border-border bg-bg-primary p-3">
-      <LivePlayerPlaceholder
-        cameraName={camera.name}
-        roomName={camera.roomName}
-        cameraId={camera.id}
-        className="mb-3"
-      />
+      <div className="relative">
+        <LivePlayerPlaceholder
+          cameraName={camera.name}
+          roomName={camera.roomName}
+          cameraId={camera.id}
+          className="mb-3"
+        />
+        {canEditPrompt && (
+          <div className="absolute top-2 right-2 z-10">
+            <PromptButton
+              hasPrompt={!!camera.summary?.perceptionPrompt}
+              name={camera.name}
+              onClick={() => onEditPrompt?.(camera)}
+            />
+          </div>
+        )}
+      </div>
       <div className="flex flex-wrap items-center gap-1.5 text-caption text-text-secondary">
         <span className="text-body text-text-primary">{camera.name}</span>
         {camera.sourceType === "rtsp" && (
@@ -827,7 +939,17 @@ function CameraSection({
                   />
                   );
                 })() : (
-                  <SourceNeutralCamCard key={view.id} camera={view} />
+                  <SourceNeutralCamCard
+                    key={view.id}
+                    camera={view}
+                    onEditPrompt={(target) =>
+                      openPromptEditor(
+                        target.id,
+                        target.name,
+                        target.summary?.perceptionPrompt ?? "",
+                      )
+                    }
+                  />
                 ),
               )}
             </div>
@@ -992,65 +1114,105 @@ function CameraSection({
 
       {/* 感知须知编辑弹窗：给该机位补环境说明 / 关注 / 忽略，指导感知消解固定误识。 */}
       {promptEditing && (
-        <div
-          className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40"
-          onClick={promptSaving ? undefined : () => setPromptEditing(null)}
-        >
-          <div
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="cam-prompt-title"
-            className="w-[90%] max-w-md bg-bg-secondary border border-border rounded-2xl shadow-lg p-6 anim-in"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h2 id="cam-prompt-title" className="text-title font-semibold text-text-primary mb-1">
-              {t("hero.camPromptTitle", { name: promptEditing.name })}
-            </h2>
-            <p className="text-body text-text-secondary mb-3">{t("hero.camPromptIntro")}</p>
-            <textarea
-              value={promptDraft}
-              onChange={(e) => setPromptDraft(e.target.value)}
-              maxLength={CAMERA_PROMPT_MAX_LEN}
-              rows={5}
-              disabled={promptSaving}
-              placeholder={t("hero.camPromptPlaceholder")}
-              className="w-full text-body rounded-lg bg-bg-primary border border-border text-text-primary p-3 resize-y focus:border-border-strong focus:outline-none disabled:opacity-60"
-            />
-            <div className="text-caption text-text-tertiary text-right mt-1 num">
-              {promptDraft.length} / {CAMERA_PROMPT_MAX_LEN}
-            </div>
-            <div className="flex justify-between items-center gap-2 mt-4">
-              <button
-                type="button"
-                onClick={() => void doClearPrompt()}
-                disabled={promptSaving || !promptDraft.trim()}
-                className="text-body px-3 py-2 rounded-lg text-error hover:bg-bg-primary disabled:opacity-40"
-              >
-                {t("hero.camPromptClear")}
-              </button>
-              <div className="flex gap-2">
-                <button
-                  type="button"
-                  onClick={() => setPromptEditing(null)}
-                  disabled={promptSaving}
-                  className="text-body px-4 py-2 rounded-lg bg-bg-primary border border-border text-text-primary hover:border-border-strong disabled:opacity-60"
-                >
-                  {t("hero.camPromptCancel")}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void savePrompt()}
-                  disabled={promptSaving || (!hadPrompt && !promptDraft.trim())}
-                  className="text-body px-4 py-2 rounded-lg font-semibold bg-brand-primary text-white hover:opacity-90 disabled:opacity-60"
-                >
-                  {promptDraft.trim() ? t("hero.camPromptSave") : t("hero.camPromptClear")}
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
+        <CameraPromptDialog
+          name={promptEditing.name}
+          draft={promptDraft}
+          hadPrompt={hadPrompt}
+          saving={promptSaving}
+          onDraftChange={setPromptDraft}
+          onSave={() => void savePrompt()}
+          onClear={() => void doClearPrompt()}
+          onClose={() => setPromptEditing(null)}
+        />
       )}
     </>
+  );
+}
+
+function CameraPromptDialog({
+  name,
+  draft,
+  hadPrompt,
+  saving,
+  onDraftChange,
+  onSave,
+  onClear,
+  onClose,
+}: {
+  name: string;
+  draft: string;
+  hadPrompt: boolean;
+  saving: boolean;
+  onDraftChange: (text: string) => void;
+  onSave: () => void;
+  onClear: () => void;
+  onClose: () => void;
+}) {
+  const { t } = useTranslation();
+  const trimmed = draft.trim();
+  return (
+    <div
+      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40"
+      onClick={saving ? undefined : onClose}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="cam-prompt-title"
+        className="w-[90%] max-w-md bg-bg-secondary border border-border rounded-2xl shadow-lg p-6 anim-in"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h2
+          id="cam-prompt-title"
+          className="text-title font-semibold text-text-primary mb-1"
+        >
+          {t("hero.camPromptTitle", { name })}
+        </h2>
+        <p className="text-body text-text-secondary mb-3">
+          {t("hero.camPromptIntro")}
+        </p>
+        <textarea
+          value={draft}
+          onChange={(e) => onDraftChange(e.target.value)}
+          maxLength={CAMERA_PROMPT_MAX_LEN}
+          rows={5}
+          disabled={saving}
+          placeholder={t("hero.camPromptPlaceholder")}
+          className="w-full text-body rounded-lg bg-bg-primary border border-border text-text-primary p-3 resize-y focus:border-border-strong focus:outline-none disabled:opacity-60"
+        />
+        <div className="text-caption text-text-tertiary text-right mt-1 num">
+          {draft.length} / {CAMERA_PROMPT_MAX_LEN}
+        </div>
+        <div className="flex justify-between items-center gap-2 mt-4">
+          <button
+            type="button"
+            onClick={onClear}
+            disabled={saving || (!trimmed && !hadPrompt)}
+            className="text-body px-3 py-2 rounded-lg text-error hover:bg-bg-primary disabled:opacity-40"
+          >
+            {t("hero.camPromptClear")}
+          </button>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={onClose}
+              disabled={saving}
+              className="text-body px-4 py-2 rounded-lg bg-bg-primary border border-border text-text-primary hover:border-border-strong disabled:opacity-60"
+            >
+              {t("hero.camPromptCancel")}
+            </button>
+            <button
+              type="button"
+              onClick={onSave}
+              disabled={saving || (!hadPrompt && !trimmed)}
+              className="text-body px-4 py-2 rounded-lg font-semibold bg-brand-primary text-white hover:opacity-90 disabled:opacity-60"
+            >
+              {trimmed ? t("hero.camPromptSave") : t("hero.camPromptClear")}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 

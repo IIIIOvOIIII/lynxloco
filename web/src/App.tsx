@@ -22,8 +22,8 @@ import {
   pausePerception,
   resumePerception,
   setFeatures,
-  setScopeCameraPrompt,
-  clearScopeCameraPrompt,
+  setCameraPrompt,
+  clearCameraPrompt,
   toggleScopeCamera,
   toggleScopeCameraVoice,
   switchScopeHome,
@@ -468,20 +468,20 @@ function MainApp({
                 scopeCameras.reload();
               }}
               onSetCameraPrompt={async (did, text) => {
-                try { await setScopeCameraPrompt(did, text); }
+                try { await setCameraPrompt(did, text); }
                 catch (e) {
                   toast(e instanceof Error ? e.message : t("common.switchFailed"), "warn");
                   throw e;
                 }
-                scopeCameras.reload();
+                void Promise.allSettled([scopeCameras.reload(), refreshRtspAfterMutation()]);
               }}
               onClearCameraPrompt={async (did) => {
-                try { await clearScopeCameraPrompt(did); }
+                try { await clearCameraPrompt(did); }
                 catch (e) {
                   toast(e instanceof Error ? e.message : t("common.switchFailed"), "warn");
                   throw e;
                 }
-                scopeCameras.reload();
+                void Promise.allSettled([scopeCameras.reload(), refreshRtspAfterMutation()]);
               }}
               onRefresh={async () => {
                 // 手动刷新:force 绕过 8s 节流打后端刷相机状态,再 await 列表重拉落地——

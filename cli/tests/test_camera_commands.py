@@ -251,6 +251,44 @@ def test_camera_delete_with_yes_maps_delete(runner: CliRunner) -> None:
     assert json.loads(result.output) == SUCCESS
 
 
+def test_camera_prompt_set_maps_generic_put(runner: CliRunner) -> None:
+    response = {
+        "code": 0,
+        "message": "ok",
+        "data": {"id": SOURCE_ID, "perception_prompt": "玄关左下角摆件不是宠物"},
+    }
+    with patch("miloco_cli.client.api_put", return_value=response) as api_put:
+        result = runner.invoke(
+            cli,
+            ["camera", "prompt-set", SOURCE_ID, "玄关左下角摆件不是宠物", "--pretty"],
+        )
+
+    assert result.exit_code == 0, result.output
+    api_put.assert_called_once_with(
+        f"/api/cameras/{SOURCE_ID}/prompt",
+        {"prompt": "玄关左下角摆件不是宠物"},
+        safe_errors=True,
+    )
+    assert json.loads(result.output) == response
+
+
+def test_camera_prompt_clear_maps_generic_delete(runner: CliRunner) -> None:
+    response = {
+        "code": 0,
+        "message": "ok",
+        "data": {"id": SOURCE_ID, "perception_prompt": ""},
+    }
+    with patch("miloco_cli.client.api_delete", return_value=response) as api_delete:
+        result = runner.invoke(cli, ["camera", "prompt-clear", SOURCE_ID])
+
+    assert result.exit_code == 0, result.output
+    api_delete.assert_called_once_with(
+        f"/api/cameras/{SOURCE_ID}/prompt",
+        safe_errors=True,
+    )
+    assert json.loads(result.output) == response
+
+
 @pytest.mark.parametrize("input_text", ["", "\n"])
 def test_password_stdin_rejects_eof_or_empty_line_without_request(
     runner: CliRunner, input_text: str
@@ -548,6 +586,7 @@ def test_backend_unsafe_or_invalid_error_is_generic_without_leaking_request(
         ["camera", "rtsp", "add", *_common_upsert_args(), "--transport", "sctp"],
         ["camera", "rtsp", "add", *_common_upsert_args(), "--password", SECRET],
         ["camera", "rtsp", "add", *_common_upsert_args(), "--transport"],
+        ["camera", "prompt-set", SOURCE_ID],
         ["camera", "enable"],
         ["camera", "unknown-command"],
     ],

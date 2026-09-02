@@ -58,6 +58,7 @@ describe("RTSP camera form model", () => {
       hasPassword: true,
       errorCode: null,
       errorMessage: null,
+      perceptionPrompt: "",
     });
     expect(draft.name).toBe("Door");
     expect(draft.room_name).toBe("Entry");

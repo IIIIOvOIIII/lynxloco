@@ -19,7 +19,7 @@ from miloco.auth.dependencies import (
     valid_service_token,
     verify_websocket_dashboard_or_service,
 )
-from miloco.camera.schema import RtspSourceUpsert
+from miloco.camera.schema import CameraPromptUpsert, RtspSourceUpsert
 from miloco.camera.service import CameraNotFoundError, CameraService, CameraServiceError
 from miloco.camera.stream import LiveJpegStreamHub, LiveStreamHub
 from miloco.config import get_settings
@@ -85,16 +85,38 @@ async def _parse_rtsp_upsert(request: Request) -> RtspSourceUpsert:
         ) from None
 
 
+async def _parse_camera_prompt(request: Request) -> CameraPromptUpsert:
+    """Validate without exposing prompt content or credential-looking text."""
+    try:
+        payload = await request.json()
+        return CameraPromptUpsert.model_validate(payload)
+    except (ValidationError, ValueError, TypeError):
+        logger.warning("Camera prompt request validation failed")
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "invalid_camera_prompt",
+                "message": "Camera perception prompt is invalid",
+            },
+        ) from None
+
+
 CameraServiceDependency = Annotated[CameraService, Depends(_get_camera_service)]
 LiveStreamHubDependency = Annotated[LiveStreamHub, Depends(_get_live_stream_hub)]
 LiveJpegStreamHubDependency = Annotated[
     LiveJpegStreamHub, Depends(_get_live_jpeg_stream_hub)
 ]
 RtspBody = Annotated[RtspSourceUpsert, Depends(_parse_rtsp_upsert)]
+CameraPromptBody = Annotated[CameraPromptUpsert, Depends(_parse_camera_prompt)]
 
 
 def _raise_management_error(error: CameraServiceError | RtspSourceError) -> None:
-    status_code = 404 if isinstance(error, CameraNotFoundError) else 409
+    if isinstance(error, CameraNotFoundError):
+        status_code = 404
+    elif getattr(error, "code", None) == "invalid_camera_prompt":
+        status_code = 422
+    else:
+        status_code = 409
     raise HTTPException(
         status_code=status_code,
         detail={"code": error.code, "message": error.safe_message},
@@ -184,6 +206,32 @@ async def delete_camera(
     except (CameraServiceError, RtspSourceError) as error:
         _raise_management_error(error)
     return NormalResponse(code=0, message="Camera deleted", data=None)
+
+
+@router.put("/{camera_id}/prompt", dependencies=[Depends(verify_token)])
+async def set_camera_prompt(
+    camera_id: str, body: CameraPromptBody, service: CameraServiceDependency
+) -> NormalResponse:
+    try:
+        camera = await service.set_prompt(camera_id, body.prompt)
+    except (CameraServiceError, RtspSourceError) as error:
+        _raise_management_error(error)
+    return NormalResponse(
+        code=0, message="Camera perception prompt updated", data=camera.model_dump()
+    )
+
+
+@router.delete("/{camera_id}/prompt", dependencies=[Depends(verify_token)])
+async def clear_camera_prompt(
+    camera_id: str, service: CameraServiceDependency
+) -> NormalResponse:
+    try:
+        camera = await service.clear_prompt(camera_id)
+    except (CameraServiceError, RtspSourceError) as error:
+        _raise_management_error(error)
+    return NormalResponse(
+        code=0, message="Camera perception prompt cleared", data=camera.model_dump()
+    )
 
 
 def _stream_close_for_error(error: CameraServiceError) -> tuple[int, str]:

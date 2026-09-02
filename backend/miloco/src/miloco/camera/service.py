@@ -12,6 +12,12 @@ from miloco.camera.schema import CameraSummary, RtspSourceUpsert
 from miloco.camera.stream import LiveStreamSource
 from miloco.config import get_settings
 from miloco.config.settings import MilocoSettings, RtspSourceSettings
+from miloco.miot.filter import (
+    MAX_CAMERA_PROMPT_LEN,
+    camera_prompts,
+    clear_camera_prompt,
+    set_camera_prompt,
+)
 from miloco.perception.collect.camera_source import CameraSourceState
 from miloco.perception.collect.rtsp_probe import RtspProbeResult, probe_rtsp_source
 from miloco.utils.agent_config import mutate_rtsp_sources
@@ -21,6 +27,10 @@ logger = logging.getLogger(__name__)
 
 class _MiotCameraLister(Protocol):
     async def list_cameras_with_state(self) -> list[dict]: ...
+
+    async def set_camera_prompt(self, items: list[dict]) -> list[dict]: ...
+
+    async def clear_camera_prompt(self, dids: list[str]) -> list[dict]: ...
 
 
 class _CameraSourceSynchronizer(Protocol):
@@ -43,8 +53,19 @@ class CameraNotFoundError(CameraServiceError):
         super().__init__("camera_not_found", "Camera was not found")
 
 
+class CameraInvalidPromptError(CameraServiceError):
+    def __init__(self, safe_message: str = "Camera perception prompt is invalid") -> None:
+        super().__init__("invalid_camera_prompt", safe_message)
+
+
 class CameraConflictError(CameraServiceError):
     pass
+
+
+class _PromptKV(Protocol):
+    def get(self, key: str, default_value: str | None = None) -> str | None: ...
+
+    def set(self, key: str, value: str) -> bool: ...
 
 
 SettingsLoader = Callable[[], MilocoSettings | Any]
@@ -64,12 +85,14 @@ class CameraService:
         settings_loader: SettingsLoader = get_settings,
         sources_mutator: SourcesMutator = mutate_rtsp_sources,
         probe: Probe = probe_rtsp_source,
+        kv_repo: _PromptKV | None = None,
     ) -> None:
         self._miot_service = miot_service
         self._perception_service = perception_service
         self._settings_loader = settings_loader
         self._sources_mutator = sources_mutator
         self._probe = probe
+        self._kv_repo = kv_repo
         self._write_lock = asyncio.Lock()
 
     async def list_cameras(self) -> list[CameraSummary]:
@@ -214,6 +237,38 @@ class CameraService:
 
             await self._await_shielded_transaction(self._mutate_and_sync(delete))
 
+    async def set_prompt(self, camera_id: str, prompt: str) -> CameraSummary:
+        text = prompt.strip()
+        if not text:
+            raise CameraInvalidPromptError()
+        if len(text) > MAX_CAMERA_PROMPT_LEN:
+            raise CameraInvalidPromptError(
+                f"感知须知过长（超过 {MAX_CAMERA_PROMPT_LEN} 字）"
+            )
+
+        if camera_id.startswith("rtsp:"):
+            sources = await asyncio.to_thread(self._load_sources_safely)
+            _index, source = self._locate(sources, camera_id)
+            kv_repo = self._require_kv_repo()
+            set_camera_prompt(kv_repo, camera_id, text)
+            return self._rtsp_summary(source)
+
+        rows = await self._miot_service.set_camera_prompt(
+            [{"did": camera_id, "prompt": text}]
+        )
+        return self._summary_from_miot_rows(camera_id, rows)
+
+    async def clear_prompt(self, camera_id: str) -> CameraSummary:
+        if camera_id.startswith("rtsp:"):
+            sources = await asyncio.to_thread(self._load_sources_safely)
+            _index, source = self._locate(sources, camera_id)
+            kv_repo = self._require_kv_repo()
+            clear_camera_prompt(kv_repo, camera_id)
+            return self._rtsp_summary(source)
+
+        rows = await self._miot_service.clear_camera_prompt([camera_id])
+        return self._summary_from_miot_rows(camera_id, rows)
+
     def _sources(self) -> list[RtspSourceSettings]:
         return list(self._settings_loader().camera.rtsp_sources)
 
@@ -227,6 +282,22 @@ class CameraService:
             raise CameraConflictError(
                 "persistence_failed", "Camera configuration could not be loaded"
             ) from None
+
+    def _require_kv_repo(self) -> _PromptKV:
+        if self._kv_repo is None:
+            raise CameraConflictError(
+                "persistence_failed", "Camera prompt configuration is unavailable"
+            )
+        return self._kv_repo
+
+    def _prompt_map(self) -> dict[str, str]:
+        if self._kv_repo is None:
+            return {}
+        try:
+            return camera_prompts(self._kv_repo)
+        except Exception as error:  # noqa: BLE001
+            logger.warning("Camera prompt map read failed (%s)", type(error).__name__)
+            return {}
 
     @staticmethod
     def _locate(
@@ -412,6 +483,7 @@ class CameraService:
 
     def _rtsp_summary(self, source: RtspSourceSettings) -> CameraSummary:
         state = self._rtsp_state(source.id)
+        prompt = self._prompt_map().get(source.id, "")
         return CameraSummary(
             id=source.id,
             source_type="rtsp",
@@ -425,6 +497,7 @@ class CameraService:
             has_password=bool(source.password),
             error_code=state.error_code,
             error_message=state.error_message,
+            perception_prompt=prompt,
         )
 
     @staticmethod
@@ -442,4 +515,16 @@ class CameraService:
             connected=bool(row.get("connected", False)),
             video_codec=None,
             audio_codec=None,
+            perception_prompt=str(row.get("perception_prompt") or ""),
         )
+
+    @staticmethod
+    def _summary_from_miot_rows(camera_id: str, rows: list[dict]) -> CameraSummary:
+        for row in rows:
+            did = str(row.get("did") or "")
+            channel_count = int(row.get("channel_count") or 1)
+            channel = int(row.get("channel") or 0)
+            resolved = f"{did}:ch{channel}" if channel_count > 1 else did
+            if resolved == camera_id or did == camera_id:
+                return CameraService._miot_summary(row)
+        raise CameraNotFoundError()

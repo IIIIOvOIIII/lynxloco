@@ -378,6 +378,47 @@ def camera_disable(camera_id: str | None, pretty: bool) -> None:
     _state_command("disable", camera_id, pretty)
 
 
+@camera_group.command("prompt-set")
+@click.argument("camera_id", required=False)
+@click.argument("prompt", required=False)
+@click.option("--pretty", is_flag=True)
+def camera_prompt_set(
+    camera_id: str | None,
+    prompt: str | None,
+    pretty: bool,
+) -> None:
+    """Set perception notes for a camera source."""
+    from miloco_cli.client import api_put
+
+    validated_id = _require(camera_id, "camera id")
+    validated_prompt = _require(prompt, "prompt")
+    _request_and_print(
+        lambda: api_put(
+            f"{_API_PREFIX}/{validated_id}/prompt",
+            {"prompt": validated_prompt},
+            safe_errors=True,
+        ),
+        pretty=pretty,
+    )
+
+
+@camera_group.command("prompt-clear")
+@click.argument("camera_id", required=False)
+@click.option("--pretty", is_flag=True)
+def camera_prompt_clear(camera_id: str | None, pretty: bool) -> None:
+    """Clear perception notes for a camera source."""
+    from miloco_cli.client import api_delete
+
+    validated_id = _require(camera_id, "camera id")
+    _request_and_print(
+        lambda: api_delete(
+            f"{_API_PREFIX}/{validated_id}/prompt",
+            safe_errors=True,
+        ),
+        pretty=pretty,
+    )
+
+
 @camera_group.command("delete")
 @click.argument("camera_id", required=False)
 @click.option("--yes", is_flag=True, help="Confirm permanent deletion.")

@@ -93,6 +93,16 @@ class _Service:
         self.calls.append(("delete", camera_id))
         self._raise()
 
+    async def set_prompt(self, camera_id, prompt):
+        self.calls.append(("set_prompt", camera_id, prompt))
+        self._raise()
+        return _summary()
+
+    async def clear_prompt(self, camera_id):
+        self.calls.append(("clear_prompt", camera_id))
+        self._raise()
+        return _summary()
+
 
 @pytest.fixture
 def service() -> _Service:
@@ -250,6 +260,66 @@ def test_client_supplied_id_is_ignored(client: TestClient, service: _Service) ->
     submitted = service.calls[-1][1]
     assert not hasattr(submitted, "id")
     assert not hasattr(submitted, "enabled")
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "json_body", "call"),
+    [
+        (
+            "put",
+            f"/api/cameras/{SOURCE_ID}/prompt",
+            {"prompt": "  客厅画面右侧电视反光请忽略  "},
+            ("set_prompt", SOURCE_ID, "客厅画面右侧电视反光请忽略"),
+        ),
+        (
+            "delete",
+            f"/api/cameras/{SOURCE_ID}/prompt",
+            None,
+            ("clear_prompt", SOURCE_ID),
+        ),
+    ],
+)
+def test_prompt_management_endpoints_are_authenticated_and_routed(
+    client: TestClient,
+    service: _Service,
+    method: str,
+    path: str,
+    json_body: dict | None,
+    call: tuple,
+) -> None:
+    unauthorized = client.request(method, path, json=json_body)
+    assert unauthorized.status_code == 401
+
+    response = client.request(method, path, headers=_auth(), json=json_body)
+
+    assert response.status_code == 200
+    assert service.calls[-1] == call
+    serialized = response.text
+    assert "stored-secret" not in serialized
+    assert "camera-user" not in serialized
+
+
+def test_invalid_prompt_request_never_echoes_body_or_uri(
+    client: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING)
+    secret = "prompt-private-secret"
+    response = client.put(
+        f"/api/cameras/{SOURCE_ID}/prompt",
+        headers=_auth(),
+        json={"prompt": f"rtsp://camera.local/live {secret} " + ("字" * 600)},
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": {
+            "code": "invalid_camera_prompt",
+            "message": "Camera perception prompt is invalid",
+        }
+    }
+    combined = response.text + caplog.text
+    assert secret not in combined
+    assert "rtsp://camera.local/live" not in combined
 
 
 def test_persistence_failure_response_and_logs_are_redacted(

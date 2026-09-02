@@ -2,11 +2,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   realCreateRtspCamera,
+  realClearCameraPrompt,
   realDeleteCamera,
   realDisableCamera,
   realEditRtspCamera,
   realEnableCamera,
   realListCameraSummaries,
+  realSetCameraPrompt,
   realTestRtspCamera,
 } from "@/api/real";
 import type { RtspSourceInput } from "@/lib/types";
@@ -43,6 +45,7 @@ function summary(overrides: Record<string, unknown> = {}) {
     has_password: true,
     error_code: null,
     error_message: null,
+    perception_prompt: "Ignore TV reflection",
     ...overrides,
   };
 }
@@ -96,6 +99,7 @@ describe("generic camera API", () => {
         hasPassword: true,
         errorCode: null,
         errorMessage: null,
+        perceptionPrompt: "Ignore TV reflection",
       },
     ]);
     expect(cameras[0]).not.toHaveProperty("uri");
@@ -151,6 +155,32 @@ describe("generic camera API", () => {
     await realDeleteCamera("rtsp:source/1");
     expect(calls[0].url).toBe("/api/cameras/rtsp%3Asource%2F1");
     expect(calls[0].init?.method).toBe("DELETE");
+  });
+
+  it("sets a camera prompt through the generic camera endpoint", async () => {
+    const calls = mockNormal(summary({ perception_prompt: "玄关左下角摆件不是宠物" }));
+
+    const updated = await realSetCameraPrompt(
+      "rtsp:source/1",
+      "玄关左下角摆件不是宠物",
+    );
+
+    expect(calls[0].url).toBe("/api/cameras/rtsp%3Asource%2F1/prompt");
+    expect(calls[0].init?.method).toBe("PUT");
+    expect(JSON.parse(String(calls[0].init?.body))).toEqual({
+      prompt: "玄关左下角摆件不是宠物",
+    });
+    expect(updated.perceptionPrompt).toBe("玄关左下角摆件不是宠物");
+  });
+
+  it("clears a camera prompt through the generic camera endpoint", async () => {
+    const calls = mockNormal(summary({ perception_prompt: "" }));
+
+    const updated = await realClearCameraPrompt("rtsp:source/1");
+
+    expect(calls[0].url).toBe("/api/cameras/rtsp%3Asource%2F1/prompt");
+    expect(calls[0].init?.method).toBe("DELETE");
+    expect(updated.perceptionPrompt).toBe("");
   });
 
   it("preserves a stable probe error from FastAPI detail", async () => {

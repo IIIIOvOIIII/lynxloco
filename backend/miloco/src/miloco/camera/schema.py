@@ -7,6 +7,8 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from miloco.miot.filter import MAX_CAMERA_PROMPT_LEN
+
 
 class CameraSummary(BaseModel):
     """Unified public representation of a MIoT or RTSP camera."""
@@ -23,6 +25,23 @@ class CameraSummary(BaseModel):
     has_password: bool = False
     error_code: str | None = None
     error_message: str | None = None
+    perception_prompt: str = ""
+
+
+class CameraPromptUpsert(BaseModel):
+    """Per-camera perception prompt payload; never echo raw input in errors."""
+
+    model_config = ConfigDict(hide_input_in_errors=True, extra="ignore")
+
+    prompt: str = Field(..., max_length=MAX_CAMERA_PROMPT_LEN)
+
+    @field_validator("prompt", mode="after")
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("Camera perception prompt is invalid")
+        return stripped
 
 
 class RtspSourceUpsert(BaseModel):

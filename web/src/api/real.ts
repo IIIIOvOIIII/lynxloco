@@ -75,6 +75,7 @@ interface BackendCameraSummary {
   has_password?: boolean;
   error_code?: string | null;
   error_message?: string | null;
+  perception_prompt?: string;
 }
 
 interface BackendRtspProbeResult {
@@ -101,6 +102,7 @@ function mapCameraSummary(camera: BackendCameraSummary): CameraSummary {
     hasPassword: camera.has_password ?? false,
     errorCode: camera.error_code ?? null,
     errorMessage: camera.error_message ?? null,
+    perceptionPrompt: camera.perception_prompt ?? "",
   };
 }
 
@@ -1638,6 +1640,30 @@ export async function realDeleteCamera(cameraId: string): Promise<void> {
   await apiFetch<Normal<null>>(`/api/cameras/${encodeURIComponent(cameraId)}`, {
     method: "DELETE",
   });
+}
+
+export async function realSetCameraPrompt(
+  cameraId: string,
+  text: string,
+): Promise<CameraSummary> {
+  const response = await apiFetch<Normal<BackendCameraSummary>>(
+    `/api/cameras/${encodeURIComponent(cameraId)}/prompt`,
+    {
+      method: "PUT",
+      body: JSON.stringify({ prompt: text }),
+    },
+  );
+  return mapCameraSummary(response.data);
+}
+
+export async function realClearCameraPrompt(
+  cameraId: string,
+): Promise<CameraSummary> {
+  const response = await apiFetch<Normal<BackendCameraSummary>>(
+    `/api/cameras/${encodeURIComponent(cameraId)}/prompt`,
+    { method: "DELETE" },
+  );
+  return mapCameraSummary(response.data);
 }
 
 // ── 米家账号绑定 OAuth ────────────────────────────────────

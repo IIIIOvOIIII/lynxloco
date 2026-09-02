@@ -14,11 +14,13 @@ const summaries: CameraSummary[] = [
     id: "miot-1", sourceType: "miot", name: "MIoT summary", roomName: "Study",
     enabled: true, connected: true, videoCodec: "h264", audioCodec: null,
     lastFrameUnixMs: 1, hasPassword: false, errorCode: null, errorMessage: null,
+    perceptionPrompt: "",
   },
   {
     id: "rtsp-1", sourceType: "rtsp", name: "RTSP summary", roomName: "Garage",
     enabled: true, connected: true, videoCodec: "h264", audioCodec: null,
     lastFrameUnixMs: 1, hasPassword: true, errorCode: null, errorMessage: null,
+    perceptionPrompt: "车库门反光请忽略",
   },
 ];
 
