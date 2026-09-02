@@ -1229,7 +1229,7 @@ export async function realListDevices(): Promise<Device[]> {
         : undefined;
 
     const allProps: DeviceProperty[] = Object.entries(d.spec ?? {})
-      .filter(([iid]) => iid.startsWith("prop."))
+      .filter(([iid, spec]) => isVisibleDeviceProp(d.source, iid, spec))
       .map(([iid, spec]) => mapProp(iid, spec, valueByIid.get(iid)));
     const statusKind = deviceStatusKind(d, mainSwitch?.current, valueByIid);
     const controlAvailable = (d.control_enabled ?? true) && !d.read_only_reason;
@@ -1323,6 +1323,20 @@ function mapProp(
     value: (value as DeviceProperty["value"]) ?? "—",
     unit,
   };
+}
+
+function isVisibleDeviceProp(
+  source: BackendDevice["source"] | undefined,
+  iid: string,
+  spec: BackendPropSpec,
+): boolean {
+  if (iid.startsWith("prop.")) {
+    return true;
+  }
+  if (source !== "home_assistant") {
+    return false;
+  }
+  return Boolean(spec.readable || spec.writeable);
 }
 
 type StatusText = {
@@ -1426,10 +1440,20 @@ export async function realControlDeviceProp(
   iid: string,
   value: number | string | boolean,
 ): Promise<void> {
-  await apiFetch<Normal<unknown>>(`/api/miot/devices/${did}/control`, {
-    method: "POST",
-    body: JSON.stringify({ type: "set_property", iid, value }),
-  });
+  const encodedDid = encodeURIComponent(did);
+  const body = JSON.stringify({ type: "set_property", iid, value });
+  try {
+    await apiFetch<Normal<unknown>>(`/api/devices/${encodedDid}/control`, {
+      method: "POST",
+      body,
+    });
+  } catch (error) {
+    if (!isNotFound(error)) throw error;
+    await apiFetch<Normal<unknown>>(`/api/miot/devices/${encodedDid}/control`, {
+      method: "POST",
+      body,
+    });
+  }
 }
 
 // ── 场景 ──────────────────────────────────────────────────

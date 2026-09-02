@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  realControlDeviceProp,
   realListDevices,
   realListHomeAssistantEntities,
 } from "@/api/real";
@@ -19,6 +20,29 @@ function mockNormal(data: unknown) {
       calls.push({ url: request.toString(), init });
       return new Response(JSON.stringify({ code: 0, message: "ok", data }), {
         status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    },
+  ) as unknown as typeof fetch;
+  return calls;
+}
+
+function mockFetchByUrl(matches: Record<string, unknown>) {
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  globalThis.fetch = vi.fn(
+    async (request: RequestInfo | URL, init?: RequestInit) => {
+      const url = request.toString();
+      calls.push({ url, init });
+      for (const [key, body] of Object.entries(matches)) {
+        if (url.includes(key)) {
+          return new Response(JSON.stringify(body), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+      }
+      return new Response(JSON.stringify({ code: 404, message: "not found" }), {
+        status: 404,
         headers: { "Content-Type": "application/json" },
       });
     },
@@ -91,6 +115,104 @@ describe("unified device API mapping", () => {
       controlAvailable: false,
       controlPolicy: "read_only",
       readOnlyReason: "control-disabled",
+    });
+  });
+
+  it("shows Home Assistant climate fan mode as a controllable device property", async () => {
+    mockFetchByUrl({
+      "/api/devices/home": {
+        code: 0,
+        message: "ok",
+        data: {
+          homes: [],
+          scenes: [],
+          devices: [
+            {
+              did: "ha:primary:climate.zhonghong_hvac_1_0",
+              name: "客厅空调",
+              category: "climate",
+              room: "客厅",
+              online: true,
+              source: "home_assistant",
+              source_label: "Home Assistant",
+              included: true,
+              control_enabled: true,
+              spec: {
+                state: {
+                  iid: "state",
+                  description: "当前状态",
+                  format: "string",
+                  readable: true,
+                  writeable: false,
+                },
+                fan_mode: {
+                  iid: "fan_mode",
+                  description: "风速",
+                  format: "string",
+                  readable: true,
+                  writeable: true,
+                  value_list: [
+                    { value: "auto", description: "auto" },
+                    { value: "low", description: "low" },
+                    { value: "medium", description: "medium" },
+                    { value: "high", description: "high" },
+                    { value: "silent", description: "silent" },
+                  ],
+                },
+              },
+            },
+          ],
+        },
+      },
+      "/api/devices/ha%3Aprimary%3Aclimate.zhonghong_hvac_1_0/status": {
+        code: 0,
+        message: "ok",
+        data: { properties: [{ iid: "fan_mode", value: "high", code: 0 }] },
+      },
+    });
+
+    const devices = await realListDevices();
+
+    expect(devices[0]?.props).toContainEqual(
+      expect.objectContaining({
+        iid: "fan_mode",
+        label: "风速",
+        type: "enum",
+        value: "high",
+        options: [
+          { label: "auto", value: "auto" },
+          { label: "low", value: "low" },
+          { label: "medium", value: "medium" },
+          { label: "high", value: "high" },
+          { label: "silent", value: "silent" },
+        ],
+      }),
+    );
+  });
+
+  it("uses the unified control endpoint for Home Assistant device properties", async () => {
+    const calls = mockFetchByUrl({
+      "/api/devices/ha%3Aprimary%3Aclimate.zhonghong_hvac_1_0/control": {
+        code: 0,
+        message: "ok",
+        data: { success: true },
+      },
+    });
+
+    await realControlDeviceProp(
+      "ha:primary:climate.zhonghong_hvac_1_0",
+      "fan_mode",
+      "high",
+    );
+
+    expect(calls[0]?.url).toBe(
+      "/api/devices/ha%3Aprimary%3Aclimate.zhonghong_hvac_1_0/control",
+    );
+    expect(calls[0]?.init?.method).toBe("POST");
+    expect(JSON.parse(String(calls[0]?.init?.body))).toEqual({
+      type: "set_property",
+      iid: "fan_mode",
+      value: "high",
     });
   });
 });
