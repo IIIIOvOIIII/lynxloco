@@ -166,10 +166,20 @@ class HomeAssistantEntityView(BaseModel):
     last_error: str | None = None
 
 
+class HomeAssistantEntityPolicyBulkPolicyUpdate(BaseModel):
+    """Policy-only bulk update returned when discovery data was not requested."""
+
+    entity_id: str
+    included: bool
+    control_enabled: bool
+
+
 class HomeAssistantEntityPolicyBulkResult(BaseModel):
     """Bulk HA entity policy update result."""
 
-    updated: list[HomeAssistantEntityView] = Field(default_factory=list)
+    updated: list[
+        HomeAssistantEntityView | HomeAssistantEntityPolicyBulkPolicyUpdate
+    ] = Field(default_factory=list)
     skipped: list[HomeAssistantEntityPolicyBulkSkipped] = Field(default_factory=list)
     updated_count: int = 0
     skipped_count: int = 0

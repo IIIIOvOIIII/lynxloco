@@ -12,6 +12,7 @@ import pytest
 from miloco.config import get_settings, reset_settings
 from miloco.home_assistant.schema import (
     HaEntityState,
+    HomeAssistantEntityPolicyBulkPolicyUpdate,
     HomeAssistantEntityPolicyBulkUpdate,
 )
 from miloco.home_assistant.service import HomeAssistantService
@@ -225,3 +226,117 @@ async def test_bulk_permission_reduction_does_not_call_home_assistant(monkeypatc
     policy = get_settings().home_assistant.entities["light.kitchen"]
     assert policy.included is False
     assert policy.control_enabled is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "entity_id",
+    ["light.kitchen", "lock.front_door"],
+)
+async def test_bulk_remove_takes_precedence_over_control_enablement(
+    monkeypatch,
+    entity_id: str,
+) -> None:
+    _configure_ha(
+        entities={
+            entity_id: {
+                "entity_id": entity_id,
+                "included": True,
+                "control_enabled": True,
+            }
+        }
+    )
+    service = HomeAssistantService()
+
+    async def fail_if_live_ha_is_called(settings, *, refresh: bool):
+        del settings, refresh
+        raise AssertionError("import removal must not require live Home Assistant")
+
+    monkeypatch.setattr(service, "_states_and_services", fail_if_live_ha_is_called)
+
+    result = await service.update_entity_policies(
+        HomeAssistantEntityPolicyBulkUpdate(
+            entity_ids=[entity_id],
+            included=False,
+            control_enabled=True,
+        )
+    )
+
+    assert result.updated_count == 1
+    assert result.skipped_count == 0
+    policy = get_settings().home_assistant.entities[entity_id]
+    assert policy.included is False
+    assert policy.control_enabled is False
+
+
+@pytest.mark.asyncio
+async def test_bulk_first_import_clears_latent_control_enabled(monkeypatch) -> None:
+    _configure_ha(
+        entities={
+            "light.kitchen": {
+                "entity_id": "light.kitchen",
+                "included": False,
+                "control_enabled": True,
+            }
+        }
+    )
+    service = HomeAssistantService()
+
+    async def fake_states_and_services(settings, *, refresh: bool):
+        del settings
+        assert refresh is True
+        return (
+            [_state("light.kitchen", name="Kitchen Light")],
+            {"light": {"turn_on", "turn_off"}},
+        )
+
+    monkeypatch.setattr(service, "_states_and_services", fake_states_and_services)
+
+    result = await service.update_entity_policies(
+        HomeAssistantEntityPolicyBulkUpdate(
+            entity_ids=["light.kitchen"],
+            included=True,
+        )
+    )
+
+    assert result.updated_count == 1
+    assert result.updated[0].included is True
+    assert result.updated[0].control_enabled is False
+    policy = get_settings().home_assistant.entities["light.kitchen"]
+    assert policy.included is True
+    assert policy.control_enabled is False
+
+
+@pytest.mark.asyncio
+async def test_bulk_permission_reduction_returns_policy_only_update(monkeypatch) -> None:
+    _configure_ha(
+        entities={
+            "light.kitchen": {
+                "entity_id": "light.kitchen",
+                "included": True,
+                "control_enabled": True,
+            }
+        }
+    )
+    service = HomeAssistantService()
+
+    async def fail_if_live_ha_is_called(settings, *, refresh: bool):
+        del settings, refresh
+        raise AssertionError("permission reduction must not require live Home Assistant")
+
+    monkeypatch.setattr(service, "_states_and_services", fail_if_live_ha_is_called)
+
+    result = await service.update_entity_policies(
+        HomeAssistantEntityPolicyBulkUpdate(
+            entity_ids=["light.kitchen"],
+            control_enabled=False,
+        )
+    )
+
+    assert result.updated_count == 1
+    assert isinstance(result.updated[0], HomeAssistantEntityPolicyBulkPolicyUpdate)
+    assert result.updated[0].model_dump() == {
+        "entity_id": "light.kitchen",
+        "included": True,
+        "control_enabled": False,
+    }
