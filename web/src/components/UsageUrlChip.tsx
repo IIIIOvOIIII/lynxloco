@@ -103,6 +103,7 @@ export function UsageUrlChip({
         ref={btnRef}
         type="button"
         onClick={toggle}
+        aria-haspopup="dialog"
         aria-expanded={open}
         aria-label={t("usage.modelUrlAria")}
         className={`num text-[11px] leading-normal px-1.5 rounded border transition-colors ${

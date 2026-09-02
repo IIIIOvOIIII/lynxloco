@@ -115,21 +115,6 @@ export function UsageTimelineChart({
 
   const barsRef = useRef<HTMLDivElement | null>(null);
   const [plotW, setPlotW] = useState(0);
-  // 横轴标签密度按**实际像素宽**算，不能只按桶数抽稀，否则窄容器下相邻标签会压字。
-  // 没复用 hooks/useMeasuredWidth：那个用 useEffect + 首帧兜底常量（SVG 的归一化
-  // viewBox 下首帧取多少都不影响成像），而标签密度首帧取错会闪一下，所以这里用
-  // useLayoutEffect 在首次绘制前就把宽度量到。
-  useLayoutEffect(() => {
-    const node = barsRef.current;
-    if (!node) return;
-    const measure = () => setPlotW(node.clientWidth);
-    measure();
-    if (typeof ResizeObserver === "undefined") return;
-    const ro = new ResizeObserver(measure);
-    ro.observe(node);
-    return () => ro.disconnect();
-  }, []);
-
   const n = data.length;
   /**
    * 地址压短按**整条序列**的集合算一次，不逐桶算：逐桶算时同一个地址在「桶里有几个
@@ -202,6 +187,25 @@ export function UsageTimelineChart({
   const isEmpty = max <= 0 || n === 0;
   const peak = isEmpty ? null : data[peakIdx];
   const active = activeIdx != null ? data[activeIdx] : null;
+
+  // 横轴标签密度按**实际像素宽**算，不能只按桶数抽稀，否则窄容器下相邻标签会压字。
+  // 依赖 isEmpty 而不是空数组：被测的柱区只在非空分支里渲染（空态是另一个不挂 ref 的
+  // 容器），空依赖的话「首次挂载时今日零用量」会让 effect 早退、此后柱子出现也不再重跑,
+  // 实测宽度永远停在 0、ResizeObserver 也从未 attach，于是标签密度长期吃兜底的 600px
+  // ——窄屏下正是这套测量要防的压字。放在 isEmpty 之后声明才拿得到它。
+  // 没复用 hooks/useMeasuredWidth：那个用 useEffect + 首帧兜底常量（SVG 的归一化
+  // viewBox 下首帧取多少都不影响成像），而标签密度首帧取错会闪一下，所以这里用
+  // useLayoutEffect 在首次绘制前就把宽度量到。
+  useLayoutEffect(() => {
+    const node = barsRef.current;
+    if (!node) return;
+    const measure = () => setPlotW(node.clientWidth);
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(measure);
+    ro.observe(node);
+    return () => ro.disconnect();
+  }, [isEmpty]);
 
   return (
     <section aria-labelledby="usage-timeline-title">

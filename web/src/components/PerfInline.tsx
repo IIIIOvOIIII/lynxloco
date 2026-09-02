@@ -145,7 +145,9 @@ export function PerfInline() {
     ? updatedAt.toLocaleTimeString(i18n.language === "en" ? "en-US" : "zh-CN", {
         hour: "2-digit",
         minute: "2-digit",
-        hour12: false,
+        // 与用量卡同一套（见 UsagePage 同名处的理由）：必须用 hourCycle，hour12: false 在
+        // en-US 上配出的是 h24，午夜显示成 24:07。
+        hourCycle: "h23",
       })
     : null;
 

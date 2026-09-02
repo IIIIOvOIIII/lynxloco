@@ -115,11 +115,13 @@ export function UsageBreakdownTable({
 
   return (
     <section aria-labelledby="usage-breakdown-title">
-      <h3
-        id="usage-breakdown-title"
-        className="text-body font-semibold text-text-primary mb-3 flex items-center gap-1.5"
-      >
-        {t("usage.breakdownTitle")}
+      {/* id 挂在只包标题文本的 span 上，不挂 h3：aria-labelledby 会对被引用节点整棵子树
+          跑 Name From Content，而 HelpTip 的提示是 opacity-0 的 tooltip（accname 只跳过
+          display:none / visibility:hidden / aria-hidden，不跳过 opacity），连同「?」按钮
+          的 aria-label 一起会被拼进名字——section 与本表的横滚区都用这个 id，念出来就
+          从「明细」变成整段说明，还连念两遍。 */}
+      <h3 className="text-body font-semibold text-text-primary mb-3 flex items-center gap-1.5">
+        <span id="usage-breakdown-title">{t("usage.breakdownTitle")}</span>
         <HelpTip text={t("usage.breakdownNote")} wide />
       </h3>
 

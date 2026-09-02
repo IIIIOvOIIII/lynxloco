@@ -102,6 +102,20 @@ describe("shortenUrlSet", () => {
     expect(m.get(b)).toBe(b);
   });
 
+  it("共享长尾段、主机名只在中间不同：也会走到兜底，不是只有 scheme 那一类", () => {
+    // 尾段 57 字符，从 max 到 hardMax 每一轮 budget 都 <= 3，压短退化成纯头部省略，
+    // 取到的末尾字符全落在共享尾段里；唯一 budget > 3 的那轮（n=62）主机头只分到 4 个
+    // 字符，"api-" 两条也一样。与上一条不同的是，这两条原文本身就分得开，不靠 scheme。
+    const t = "/openai/deployments/gpt-realtime-preview/chat/completions";
+    const a = `https://api-a.corp.example.com${t}`;
+    const b = `https://api-b.corp.example.com${t}`;
+    expect(a.replace(/^https?:\/\//, "")).not.toBe(b.replace(/^https?:\/\//, ""));
+    const m = shortenUrlSet([a, b], 22);
+    expect(m.get(a)).toBe(a);
+    expect(m.get(b)).toBe(b);
+    expect(new Set(short(m)).size).toBe(2);
+  });
+
   it("主机名极长、只在末段差一个字符：压短后仍可分辨，且不带 scheme", () => {
     // 尾段被完整保住，所以第一轮预算就已经分得开——走的是循环的正常出口，
     // 不是兜底（兜底那条由上一个用例覆盖）。

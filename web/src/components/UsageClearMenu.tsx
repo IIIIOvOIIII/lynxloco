@@ -8,9 +8,13 @@
  *
  * 顺带补了一个原先没有的能力：**按时间范围清**。后端此前只有全清。
  *
- * 刻意**不**声明成 ARIA menu（只用 aria-haspopup / aria-expanded + 一组普通按钮）：
- * menu 模式约定方向键在项间移动焦点，而这里只有 Tab / Esc / 点击。声明了却不实现，
- * 读屏用户听到的交互模型与实际键位对不上；档位本来就是 <button>，如实呈现即可。
+ * 刻意**不**声明成 ARIA menu：menu 模式约定方向键在项间移动焦点，而这里只有
+ * Tab / Esc / 点击，声明了却不实现，读屏用户听到的交互模型与实际键位对不上；档位
+ * 本来就是 <button>，如实呈现即可。注意 aria-haspopup="true" 按 WAI-ARIA 正是
+ * "menu" 的历史别名，写 "true" 等于把这个决定原样撤销——取值必须显式写 "dialog"，
+ * 浮层那侧也如实挂 role="dialog"——与同样共用 placePopover 的 UsageUrlChip 声明成
+ * 同一种弹出物。浮层的名字用 aria-labelledby 指向它里面那行可见标题，不为它另写一
+ * 份只给读屏看的文案（两份会各自漂移）。
  *
  * 同一个组件带两种作用域：工具条上那个清所有模型，明细每行那个只清该行的
  * 「模型名 + endpoint」。同类动作用同一个图标、同一套时间档位，只差作用域——作用域
@@ -70,6 +74,8 @@ export function UsageClearMenu({
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
   const menuId = useId();
+  // 浮层的名字直接指向里面那行可见标题，不另写一份 aria 文案——两份会各自漂移
+  const titleId = `${menuId}-title`;
 
   // 点外面 / Esc 关闭。Esc 同时把焦点还给触发按钮，否则键盘用户会掉到 body。
   useEffect(() => {
@@ -158,7 +164,7 @@ export function UsageClearMenu({
           }
           setOpen(next);
         }}
-        aria-haspopup="true"
+        aria-haspopup="dialog"
         aria-expanded={open}
         aria-controls={open ? menuId : undefined}
         aria-label={target ? t("usage.clearTargetAria") : t("usage.clearData")}
@@ -178,6 +184,8 @@ export function UsageClearMenu({
         <div
           id={menuId}
           ref={menuRef}
+          role="dialog"
+          aria-labelledby={titleId}
           style={
             placement === "fixed"
               ? {
@@ -207,7 +215,7 @@ export function UsageClearMenu({
               {target.label}
             </div>
           )}
-          <div className="px-1.5 pb-1.5 text-caption text-text-tertiary">
+          <div id={titleId} className="px-1.5 pb-1.5 text-caption text-text-tertiary">
             {target ? t("usage.clearTargetMenuTitle") : t("usage.clearMenuTitle")}
           </div>
           {scopes().map((s) => (

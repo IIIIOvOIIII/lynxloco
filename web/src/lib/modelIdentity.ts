@@ -64,9 +64,14 @@ export function shortenUrlSet(
     const out = new Map(uniq.map((u) => [u, shortenUrl(u, n)]));
     if (new Set(out.values()).size === uniq.length) return out;
   }
-  // 兜底返回**原文**（连 scheme 一起）：循环里每一轮都已经做过「去掉 scheme」，
-  // 这里再剥一次不增加任何区分能力。而循环唯一撞到 hardMax 的情形，恰好就是两个
-  // URL 去掉 scheme 后完全相同——同一台机器先后换过是否走 TLS 就会这样——此时
-  // 只有留着 scheme 才分得开。宁可撑宽一列，也不能给出分不出来的两行。
+  // 兜底返回**原文**（连 scheme 一起）：循环里每一轮都已经做过「去掉 scheme」，这里
+  // 再剥一次不增加区分能力，反而会把「两个 URL 只差 http/https」那一类压成同一串——
+  // 同一台机器先后换过是否走 TLS 就会这样，那一类只有留着 scheme 才分得开。
+  //
+  // 但撞到 hardMax 的不止那一类：尾段长到主机头分不到预算时，压短会退化成纯头部省略
+  // （见 shortenUrl 的 budget <= 3 分支），于是两条共享长尾段、主机名只在**中间**不同
+  // 的地址——api-a.corp.example.com/openai/… 与 api-b.corp.example.com/openai/…——每一
+  // 轮都压成同一串，同样落到这里；这一类原文本身就分得开，不靠 scheme。两类都覆盖在
+  // 用例里。宁可撑宽一列，也不能给出分不出来的两行。
   return new Map(uniq.map((u) => [u, u]));
 }

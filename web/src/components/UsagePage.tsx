@@ -97,8 +97,11 @@ export function UsagePage() {
     ? updatedAt.toLocaleTimeString(i18n.language === "en" ? "en-US" : "zh-CN", {
         hour: "2-digit",
         minute: "2-digit",
-        // 与性能卡同一套：两张卡上下相邻，英文档下一处 12 小时制一处 24 小时制会很扎眼
-        hour12: false,
+        // 与性能卡同一套：两张卡上下相邻，英文档下一处 12 小时制一处 24 小时制会很扎眼。
+        // 用 hourCycle 而不是 hour12: false——后者按 ECMA-402 取的是「该 locale 默认时制的
+        // 非 12 小时对偶」，en-US 的默认是 h12，配出来的是 h24（1–24 循环，午夜记作 24），
+        // 旧引擎上 00:07 会显示成 24:07。两者不能并列传，hour12 会把 hourCycle 静默丢掉。
+        hourCycle: "h23",
       })
     : null;
 
