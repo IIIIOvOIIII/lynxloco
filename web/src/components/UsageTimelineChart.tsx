@@ -185,9 +185,9 @@ export function UsageTimelineChart({
   // 容器），空依赖的话「首次挂载时今日零用量」会让 effect 早退、此后柱子出现也不再重跑,
   // 实测宽度永远停在 0、ResizeObserver 也从未 attach，于是标签密度长期吃兜底的 600px
   // ——窄屏下正是这套测量要防的压字。放在 isEmpty 之后声明才拿得到它。
-  // 没复用 hooks/useMeasuredWidth：那个用 useEffect + 首帧兜底常量（SVG 的归一化
-  // viewBox 下首帧取多少都不影响成像），而标签密度首帧取错会闪一下，所以这里用
-  // useLayoutEffect 在首次绘制前就把宽度量到。
+  // 没复用 hooks/useMeasuredWidth：那个 hook 把 ref 挂在组件根上、依赖数组为空，而这里
+  // 被测的柱区只在非空分支里渲染，必须跟着 isEmpty 重跑（见下面的依赖）。测量本身两边
+  // 同款：都先量一次再看有没有 ResizeObserver，都用 useLayoutEffect 在首次绘制前量到。
   useLayoutEffect(() => {
     const node = barsRef.current;
     if (!node) return;
