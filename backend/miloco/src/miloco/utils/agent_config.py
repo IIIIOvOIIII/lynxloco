@@ -173,4 +173,6 @@ def mutate_rtsp_sources(
         updated = mutation(current)
         return deep_merge(existing, {"camera": {"rtsp_sources": updated}})
 
-    return _mutate_shared_config(apply)
+    result = _mutate_shared_config(apply)
+    assert result is not None
+    return result
