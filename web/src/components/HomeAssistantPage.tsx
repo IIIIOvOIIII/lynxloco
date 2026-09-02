@@ -7,10 +7,25 @@ import {
   refreshHomeAssistantEntities,
   saveHomeAssistantConfig,
   testHomeAssistantConfig,
+  updateHomeAssistantEntityPolicies,
   updateHomeAssistantEntityPolicy,
 } from "@/api";
-import { controlDisabledReason, maskHomeAssistantToken } from "@/lib/homeAssistant";
-import type { HomeAssistantEntity, HomeAssistantStatus } from "@/lib/types";
+import {
+  HOME_ASSISTANT_PAGE_SIZES,
+  controlDisabledReason,
+  filterHomeAssistantEntities,
+  getHomeAssistantBulkTargets,
+  maskHomeAssistantToken,
+  mergeHomeAssistantBulkUpdates,
+  paginateHomeAssistantEntities,
+  summarizeHomeAssistantBulkTargets,
+  summarizeHomeAssistantSkippedReasons,
+} from "@/lib/homeAssistant";
+import type {
+  HomeAssistantBulkAction,
+  HomeAssistantEntity,
+  HomeAssistantStatus,
+} from "@/lib/types";
 import { Switch } from "./Switch";
 import { toast } from "./Toast";
 
@@ -49,6 +64,10 @@ export function HomeAssistantPage({ onDevicesChanged }: Props) {
   const [testing, setTesting] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [busyEntity, setBusyEntity] = useState<string | null>(null);
+  const [bulkBusyAction, setBulkBusyAction] = useState<HomeAssistantBulkAction | null>(null);
+  const [entityQuery, setEntityQuery] = useState("");
+  const [entityPage, setEntityPage] = useState(1);
+  const [entityPageSize, setEntityPageSize] = useState(25);
   const [error, setError] = useState<string | null>(null);
   const [testMessage, setTestMessage] = useState<string | null>(null);
 
@@ -62,6 +81,18 @@ export function HomeAssistantPage({ onDevicesChanged }: Props) {
         (entity) => entity.included && entity.controlEnabled && entity.controlSupported,
       ).length,
     [entities],
+  );
+  const filteredEntities = useMemo(
+    () => filterHomeAssistantEntities(entities, entityQuery),
+    [entities, entityQuery],
+  );
+  const pagedEntities = useMemo(
+    () => paginateHomeAssistantEntities(filteredEntities, entityPage, entityPageSize),
+    [filteredEntities, entityPage, entityPageSize],
+  );
+  const bulkTargets = useMemo(
+    () => summarizeHomeAssistantBulkTargets(filteredEntities),
+    [filteredEntities],
   );
 
   async function load(refresh = false) {
@@ -95,6 +126,45 @@ export function HomeAssistantPage({ onDevicesChanged }: Props) {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    setEntityPage(1);
+  }, [entityQuery, entityPageSize]);
+
+  useEffect(() => {
+    if (entityPage !== pagedEntities.page) {
+      setEntityPage(pagedEntities.page);
+    }
+  }, [entityPage, pagedEntities.page]);
+
+  function bulkPatch(action: HomeAssistantBulkAction): {
+    included?: boolean;
+    controlEnabled?: boolean;
+  } {
+    switch (action) {
+      case "import":
+        return { included: true, controlEnabled: false };
+      case "remove-import":
+        return { included: false, controlEnabled: false };
+      case "allow-control":
+        return { controlEnabled: true };
+      case "disable-control":
+        return { controlEnabled: false };
+    }
+  }
+
+  function bulkActionLabel(action: HomeAssistantBulkAction): string {
+    return t(`homeAssistant.bulkLabel.${action}`);
+  }
+
+  function confirmBulkAction(action: HomeAssistantBulkAction, count: number): boolean {
+    if (action !== "remove-import" && action !== "allow-control") return true;
+    return window.confirm(
+      t(`homeAssistant.bulkConfirm.${action}`, {
+        count,
+      }),
+    );
+  }
 
   async function handleTest() {
     const token = form.token.trim();
@@ -178,6 +248,49 @@ export function HomeAssistantPage({ onDevicesChanged }: Props) {
       toast(errorMessage(e), "warn");
     } finally {
       setBusyEntity(null);
+    }
+  }
+
+  async function updateEntities(action: HomeAssistantBulkAction) {
+    const targets = getHomeAssistantBulkTargets(filteredEntities, action);
+    if (targets.length === 0) return;
+    if (!confirmBulkAction(action, targets.length)) return;
+
+    setBulkBusyAction(action);
+    try {
+      const result = await updateHomeAssistantEntityPolicies({
+        entityIds: targets.map((entity) => entity.entityId),
+        ...bulkPatch(action),
+      });
+      if (result.updated.length > 0) {
+        setEntities((rows) => mergeHomeAssistantBulkUpdates(rows, result.updated));
+        await onDevicesChanged();
+      }
+
+      if (result.skippedCount > 0) {
+        const summary = summarizeHomeAssistantSkippedReasons(result.skipped);
+        toast(
+          summary
+            ? t("homeAssistant.bulkSkippedWithReason", {
+                count: result.skippedCount,
+                reason: t(reasonKey(summary.reason)),
+              })
+            : t("homeAssistant.bulkSkipped", { count: result.skippedCount }),
+          "warn",
+        );
+      } else {
+        toast(
+          t("homeAssistant.bulkSaved", {
+            action: bulkActionLabel(action),
+            count: result.updatedCount,
+          }),
+          "ok",
+        );
+      }
+    } catch (e) {
+      toast(errorMessage(e), "warn");
+    } finally {
+      setBulkBusyAction(null);
     }
   }
 
@@ -336,6 +449,70 @@ export function HomeAssistantPage({ onDevicesChanged }: Props) {
           </button>
         </div>
 
+        <div className="border-t border-border px-5 py-3 space-y-3">
+          <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+            <label className="min-w-0 flex-1 space-y-1">
+              <span className="text-caption text-text-tertiary">
+                {t("homeAssistant.search")}
+              </span>
+              <input
+                value={entityQuery}
+                onChange={(e) => setEntityQuery(e.target.value)}
+                placeholder={t("homeAssistant.searchPlaceholder")}
+                className="w-full rounded-lg border border-border bg-bg-primary px-3 py-2 text-body text-text-primary outline-none focus:border-brand-primary"
+              />
+            </label>
+            <label className="space-y-1">
+              <span className="text-caption text-text-tertiary">
+                {t("homeAssistant.pageSize")}
+              </span>
+              <select
+                value={entityPageSize}
+                onChange={(e) => setEntityPageSize(Number(e.target.value))}
+                className="w-full rounded-lg border border-border bg-bg-primary px-3 py-2 text-body text-text-primary outline-none focus:border-brand-primary"
+              >
+                {HOME_ASSISTANT_PAGE_SIZES.map((size) => (
+                  <option key={size} value={size}>
+                    {t("homeAssistant.pageSizeOption", { count: size })}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            {(["import", "remove-import", "allow-control", "disable-control"] as const).map(
+              (action) => {
+                const count = bulkTargets[action];
+                const busy = bulkBusyAction === action;
+                return (
+                  <button
+                    key={action}
+                    type="button"
+                    onClick={() => updateEntities(action)}
+                    disabled={count === 0 || bulkBusyAction !== null || refreshing || loading}
+                    className="px-3 py-2 rounded-lg border border-border text-body text-text-primary hover:bg-bg-tertiary disabled:opacity-50"
+                    title={t("homeAssistant.bulkTitle", { count })}
+                  >
+                    {busy
+                      ? t("homeAssistant.bulkRunning")
+                      : t(`homeAssistant.bulk.${action}`, { count })}
+                  </button>
+                );
+              },
+            )}
+          </div>
+
+          <p className="text-caption text-text-tertiary">
+            {t("homeAssistant.filterMeta", {
+              filtered: filteredEntities.length,
+              total: entities.length,
+              start: pagedEntities.startIndex,
+              end: pagedEntities.endIndex,
+            })}
+          </p>
+        </div>
+
         {loading ? (
           <div className="px-5 py-10 text-body text-text-secondary text-center">
             {t("homeAssistant.loading")}
@@ -344,9 +521,13 @@ export function HomeAssistantPage({ onDevicesChanged }: Props) {
           <div className="px-5 py-10 text-body text-text-secondary text-center">
             {t("homeAssistant.empty")}
           </div>
+        ) : filteredEntities.length === 0 ? (
+          <div className="px-5 py-10 text-body text-text-secondary text-center">
+            {t("homeAssistant.emptyFiltered")}
+          </div>
         ) : (
           <div className="divide-y divide-border">
-            {entities.map((entity) => {
+            {pagedEntities.items.map((entity) => {
               const disabledReason = controlDisabledReason(entity);
               const rowBusy = busyEntity === entity.entityId;
               return (
@@ -417,6 +598,37 @@ export function HomeAssistantPage({ onDevicesChanged }: Props) {
                 </div>
               );
             })}
+            <div className="flex flex-wrap items-center justify-between gap-3 px-5 py-3">
+              <span className="text-caption text-text-tertiary">
+                {t("homeAssistant.pageMeta", {
+                  page: pagedEntities.page,
+                  pages: pagedEntities.pages,
+                  start: pagedEntities.startIndex,
+                  end: pagedEntities.endIndex,
+                  total: pagedEntities.total,
+                })}
+              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setEntityPage((page) => Math.max(1, page - 1))}
+                  disabled={pagedEntities.page <= 1}
+                  className="px-3 py-1.5 rounded-lg border border-border text-body text-text-primary hover:bg-bg-tertiary disabled:opacity-50"
+                >
+                  {t("homeAssistant.previousPage")}
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setEntityPage((page) => Math.min(pagedEntities.pages, page + 1))
+                  }
+                  disabled={pagedEntities.page >= pagedEntities.pages}
+                  className="px-3 py-1.5 rounded-lg border border-border text-body text-text-primary hover:bg-bg-tertiary disabled:opacity-50"
+                >
+                  {t("homeAssistant.nextPage")}
+                </button>
+              </div>
+            </div>
           </div>
         )}
       </div>

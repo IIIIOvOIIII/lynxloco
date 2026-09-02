@@ -1,6 +1,7 @@
 import type {
   HomeAssistantBulkAction,
   HomeAssistantEntity,
+  HomeAssistantEntityPolicyBulkPolicyUpdate,
   HomeAssistantEntityPolicyBulkSkipped,
 } from "./types";
 
@@ -147,4 +148,21 @@ export function summarizeHomeAssistantSkippedReasons(
     }
   }
   return winner;
+}
+
+export function mergeHomeAssistantBulkUpdates(
+  rows: HomeAssistantEntity[],
+  updates: Array<HomeAssistantEntity | HomeAssistantEntityPolicyBulkPolicyUpdate>,
+): HomeAssistantEntity[] {
+  const updatesById = new Map(updates.map((entity) => [entity.entityId, entity]));
+  return rows.map((row) => {
+    const update = updatesById.get(row.entityId);
+    if (!update) return row;
+    if ("domain" in update) return update;
+    return {
+      ...row,
+      included: update.included,
+      controlEnabled: update.controlEnabled,
+    };
+  });
 }

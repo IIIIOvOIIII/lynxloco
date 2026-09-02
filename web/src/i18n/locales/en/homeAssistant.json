@@ -30,6 +30,36 @@
     "refreshing": "Refreshing…",
     "refreshed": "HA entities refreshed",
     "empty": "No HA entities yet. Save a working connection and refresh once.",
+    "search": "Search entities",
+    "searchPlaceholder": "Search by name, entity_id, type, room, or state",
+    "pageSize": "Page size",
+    "pageSizeOption": "{{count}} entities",
+    "filterMeta": "{{filtered}} / {{total}} matching, showing {{start}}-{{end}}",
+    "emptyFiltered": "No entities match the current search.",
+    "pageMeta": "Page {{page}} / {{pages}} · {{start}}-{{end}} / {{total}}",
+    "previousPage": "Previous",
+    "nextPage": "Next",
+    "bulkTitle": "Applies to {{count}} entities in the current filter",
+    "bulkRunning": "Working…",
+    "bulkSaved": "{{action}} complete: {{count}} entities updated",
+    "bulkSkipped": "{{count}} entities were skipped",
+    "bulkSkippedWithReason": "{{count}} entities were skipped. Main reason: {{reason}}",
+    "bulk": {
+      "import": "Import filtered results ({{count}})",
+      "remove-import": "Remove imports ({{count}})",
+      "allow-control": "Allow control ({{count}})",
+      "disable-control": "Disable control ({{count}})"
+    },
+    "bulkLabel": {
+      "import": "bulk import",
+      "remove-import": "remove imports",
+      "allow-control": "allow control",
+      "disable-control": "disable control"
+    },
+    "bulkConfirm": {
+      "remove-import": "This removes {{count}} filtered HA entities from Miloco and clears Miloco control permission for them. Nothing is deleted in Home Assistant. Continue?",
+      "allow-control": "This allows Miloco to control {{count}} filtered, imported, and safe HA entities. Continue?"
+    },
     "state": "State: {{state}}",
     "import": "Import",
     "control": "Allow control",
@@ -38,6 +68,8 @@
     "policySaved": "Device policy saved",
     "reasonUnknown": "Control is unavailable",
     "reason": {
+      "not-found": "Home Assistant did not return this entity",
+      "invalid-entity-id": "Invalid entity ID",
       "not-imported": "Not imported into Miloco",
       "blocked-risk": "Blocked because this is a safety-sensitive domain",
       "unsupported-domain": "Miloco does not support controlling this HA domain yet",

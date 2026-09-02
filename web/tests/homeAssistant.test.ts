@@ -6,6 +6,7 @@ import {
   filterHomeAssistantEntities,
   getHomeAssistantBulkTargets,
   maskHomeAssistantToken,
+  mergeHomeAssistantBulkUpdates,
   paginateHomeAssistantEntities,
   summarizeHomeAssistantBulkTargets,
   summarizeHomeAssistantSkippedReasons,
@@ -163,5 +164,37 @@ describe("Home Assistant helpers", () => {
       ]),
     ).toEqual({ reason: "blocked-risk", count: 2 });
     expect(summarizeHomeAssistantSkippedReasons([])).toBeNull();
+  });
+
+  it("merges policy-only bulk updates without discarding discovered entity details", () => {
+    const existing = entity({
+      entityId: "switch.living_room_plug",
+      name: "客厅插座",
+      domain: "switch",
+      state: "on",
+      room: "客厅",
+      included: true,
+      controlEnabled: true,
+      controlSupported: true,
+      lastSeenAt: 1720000000000,
+      lastControlAt: 1720000001000,
+      lastError: "temporary failure",
+    });
+
+    expect(
+      mergeHomeAssistantBulkUpdates([existing], [
+        {
+          entityId: "switch.living_room_plug",
+          included: false,
+          controlEnabled: false,
+        },
+      ]),
+    ).toEqual([
+      {
+        ...existing,
+        included: false,
+        controlEnabled: false,
+      },
+    ]);
   });
 });

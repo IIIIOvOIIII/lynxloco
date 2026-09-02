@@ -30,6 +30,36 @@
     "refreshing": "刷新中…",
     "refreshed": "HA 实体已刷新",
     "empty": "暂无 HA 实体。保存可用连接后刷新一次即可看到实体。",
+    "search": "搜索实体",
+    "searchPlaceholder": "按名称、entity_id、类型、房间或状态搜索",
+    "pageSize": "每页显示",
+    "pageSizeOption": "{{count}} 个",
+    "filterMeta": "当前筛选 {{filtered}} / {{total}} 个，正在显示 {{start}}-{{end}}",
+    "emptyFiltered": "没有实体匹配当前搜索条件。",
+    "pageMeta": "第 {{page}} / {{pages}} 页 · {{start}}-{{end}} / {{total}}",
+    "previousPage": "上一页",
+    "nextPage": "下一页",
+    "bulkTitle": "将对当前筛选出的 {{count}} 个实体生效",
+    "bulkRunning": "处理中…",
+    "bulkSaved": "{{action}}完成：已处理 {{count}} 个实体",
+    "bulkSkipped": "有 {{count}} 个实体未处理",
+    "bulkSkippedWithReason": "有 {{count}} 个实体未处理，主要原因：{{reason}}",
+    "bulk": {
+      "import": "批量导入筛选结果（{{count}}）",
+      "remove-import": "批量取消导入（{{count}}）",
+      "allow-control": "批量允许控制（{{count}}）",
+      "disable-control": "批量解除控制（{{count}}）"
+    },
+    "bulkLabel": {
+      "import": "批量导入",
+      "remove-import": "批量取消导入",
+      "allow-control": "批量允许控制",
+      "disable-control": "批量解除控制"
+    },
+    "bulkConfirm": {
+      "remove-import": "将取消导入当前筛选出的 {{count}} 个 HA 实体，并清除这些实体的 Miloco 控制权限。Home Assistant 内的实体不会被删除。确认继续？",
+      "allow-control": "将允许 Miloco 控制当前筛选出的 {{count}} 个已导入且安全可控的 HA 实体。确认继续？"
+    },
     "state": "状态：{{state}}",
     "import": "导入",
     "control": "允许控制",
@@ -38,6 +68,8 @@
     "policySaved": "设备策略已保存",
     "reasonUnknown": "当前不可控制",
     "reason": {
+      "not-found": "HA 当前没有返回该实体",
+      "invalid-entity-id": "实体 ID 无效",
       "not-imported": "未导入 Miloco",
       "blocked-risk": "安全风险域已阻止",
       "unsupported-domain": "暂不支持该 HA 域控制",
