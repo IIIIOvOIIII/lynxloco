@@ -234,6 +234,39 @@ async def test_resolve_live_config_no_change_keeps_state(monkeypatch):
     assert cb.snapshot().state == "error"
 
 
+async def test_resolve_live_config_strips_trailing_slash(monkeypatch):
+    """生效配置里的地址要去尾斜杠——它是模型身份的一半，在这里定形。
+
+    写进 settings.model.omni 的来路有四条(web PUT / activate / CLI set / env 或直接改
+    配置文件)，只有 web PUT 那条在落盘时归一化过；激活是把档案里的值逐字段原样拷过去的，
+    而升级前存下的档案完全可能带着尾斜杠。这一处是四条来路的必经收口，也是唯一决定「这次
+    调用记到哪个身份名下」的地方：漏掉的话同一个 endpoint 裂成两个身份，用量对半分、
+    「只清这一项」只清得掉一半，且两者在日表里是独立主键行、滚存后合不回来——全程无报错。
+    """
+    from miloco.config import reset_settings
+
+    reset_settings()
+    if hasattr(omni_client._maybe_reset_breaker_on_config_change, "_last_triple"):
+        del omni_client._maybe_reset_breaker_on_config_change._last_triple
+
+    class _Mo:
+        model = "m1"
+        base_url = "https://x/v1/"  # 激活 / CLI / env / 存量配置都可能是这个形态
+        api_key = "sk-1"
+
+    class _M:
+        omni = _Mo()
+
+    class _S:
+        model = _M()
+
+    monkeypatch.setattr("miloco.config.get_settings", lambda: _S(), raising=True)
+    out = omni_client.resolve_live_omni_config(
+        OmniConfig(model="m1", base_url="https://x/v1", api_key="sk-1")
+    )
+    assert out.base_url == "https://x/v1", f"生效配置没去尾斜杠: {out.base_url!r}"
+
+
 async def test_resolve_live_config_change_resets_breaker(monkeypatch):
     """settings.model.omni 三元组变化时清熔断。"""
     from miloco.config import reset_settings
