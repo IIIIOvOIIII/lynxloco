@@ -481,6 +481,7 @@ async def test_call_omni_allows_empty_key_normalizes_before_consumers_and_saniti
     assert records == [
         (
             "local-vlm",
+            "http://127.0.0.1:8000/v1",
             {
                 "prompt_tokens": 5,
                 "completion_tokens": 2,
@@ -586,7 +587,7 @@ async def test_live_switch_to_keyless_responses_never_sends_old_cloud_key(
     assert omni_client._maybe_reset_breaker_on_config_change._last_triple == (
         "openai_responses",
         "local-vlm",
-        "http://127.0.0.1:8000/v1/",
+        "http://127.0.0.1:8000/v1",
         "",
     )
 
@@ -782,7 +783,9 @@ async def test_fused_responses_key_policy_and_normalization_precede_consumers(
             "prompt_tokens_details": {"cached_tokens": 2},
         },
     }
-    assert records == [("local-vlm", result["usage"], "realtime")]
+    assert records == [
+        ("local-vlm", "http://127.0.0.1:8000/v1", result["usage"], "realtime")
+    ]
     assert omni.extract_usage(result) == {
         "input_tokens": 8,
         "output_tokens": 3,

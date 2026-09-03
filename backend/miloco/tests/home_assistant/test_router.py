@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import pytest
 from fastapi.testclient import TestClient
-
 from miloco.config import reset_settings
 from miloco.home_assistant.schema import HomeAssistantTestResult
 from miloco.main import app

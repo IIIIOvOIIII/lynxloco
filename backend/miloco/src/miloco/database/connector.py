@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 # 当前 schema 版本。fresh-build 直接落到此值; 老库启动时按 _SCHEMA_MIGRATIONS
 # 步进跑到此值。历史基线 v1 (cron 挪出 task_link + rule 加 FK CASCADE 前)。
-_DB_SCHEMA_VERSION = 3
+_DB_SCHEMA_VERSION = 4
 
 
 def incremental_vacuum(
@@ -300,8 +300,9 @@ class SQLiteConnector:
                         conn.commit()
                         logger.info("All required tables already exist")
 
-                    # PRAGMA user_version 步进迁移: v1 老库跑 _migrate_v1_to_v2,
-                    # v2 老库跑 _migrate_v2_to_v3。函数内部
+                    # PRAGMA user_version 步进迁移: v1 老库依次跑 _migrate_v1_to_v2
+                    # 到 v2、_migrate_v2_to_v3 到 v3、_migrate_v3_to_v4 到 v4。
+                    # 函数内部
                     # 单事务原子 (业务 DML + PRAGMA user_version 同 COMMIT),
                     # 抛异常 → backend fail-fast, 运维介入。
                     current_version = cursor.execute(
@@ -711,6 +712,11 @@ class SQLiteConnector:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp INTEGER NOT NULL,
                 model TEXT NOT NULL,
+                -- 模型的唯一身份是 (model, base_url)：同一个模型名完全可以挂在两个
+                -- 不同 endpoint 上。存**完整 URL 原文**，不做任何归一或截断——差异
+                -- 可能落在 URL 的任何位置（主机、路径、端口），截断是展示层的事。
+                -- '' = 该行早于本列引入，来源未记录（v3 迁移给老数据留的值，永不回填）。
+                base_url TEXT NOT NULL DEFAULT '',
                 type TEXT NOT NULL,
                 input_tokens INTEGER NOT NULL DEFAULT 0,
                 output_tokens INTEGER NOT NULL DEFAULT 0,
@@ -728,8 +734,11 @@ class SQLiteConnector:
     def _create_token_usage_daily_table(self, conn: sqlite3.Connection) -> None:
         """Create token_usage_daily table holding per-day rollup of older events.
 
-        Rows are keyed by (date, model, type) so historical trend / model / type
-        breakdown all stay queryable after the live table is pruned.
+        Rows are keyed by (date, model, base_url, type) so historical trend /
+        model / endpoint / type breakdown all stay queryable after the live table
+        is pruned. base_url is part of the key on purpose: a model name can be
+        served by more than one endpoint, and merging them here is unrecoverable
+        (the rollup UPSERT accumulates, then deletes the original rows).
         Field semantics identical to token_usage (modality columns ⊆ input_tokens).
         """
         cursor = conn.cursor()
@@ -737,6 +746,10 @@ class SQLiteConnector:
             CREATE TABLE IF NOT EXISTS token_usage_daily (
                 date TEXT NOT NULL,
                 model TEXT NOT NULL,
+                -- 见 token_usage.base_url 的说明。**进主键**：不进的话两个 endpoint
+                -- 的同日数据会在 rollup 的 UPSERT 里被静默累加成一行，而原始行紧接着
+                -- 就被 DELETE，不可恢复。
+                base_url TEXT NOT NULL DEFAULT '',
                 type TEXT NOT NULL,
                 calls INTEGER NOT NULL DEFAULT 0,
                 input_tokens INTEGER NOT NULL DEFAULT 0,
@@ -744,7 +757,7 @@ class SQLiteConnector:
                 cache_tokens INTEGER NOT NULL DEFAULT 0,
                 video_tokens INTEGER NOT NULL DEFAULT 0,
                 audio_tokens INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (date, model, type)
+                PRIMARY KEY (date, model, base_url, type)
             )
         """)
         cursor.execute(
@@ -1308,15 +1321,127 @@ def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
         cursor.execute("PRAGMA foreign_keys=ON")
 
 
+def _ensure_token_usage_base_url_schema(
+    conn: sqlite3.Connection,
+    *,
+    migration_label: str,
+) -> None:
+    """确保 token_usage 两张表具备 endpoint 维度。
+
+    动机: 模型的唯一身份是 (model, base_url)。同一个模型名可以同时挂在两个
+    endpoint 上（实机就有 mimo-v2.5 同时配在 /v1 与 /v1-test），此前用量表只记
+    model，于是花在哪个 endpoint 上无从区分。
+
+    **老数据一律留 '' 表示「来源未记录」，本迁移不做任何回填。**
+    回填只有两种可能来源，都不能用: 一是按「当前生效档案」猜——在任何换过
+    endpoint 的机器上都是错的; 二是按运维口述——那是关于某一台的事实，不该写进
+    发给所有装机的代码里。展示侧对 '' 直接说「旧版本数据未记录 URL」，诚实且不可
+    误读；把断言写进库则会让它和记录值长得一模一样，日后再也分不清哪个是量出来的。
+
+    为什么 base_url 必须进日表主键: 不进的话，rollup 的
+    ``ON CONFLICT(date, model, type) DO UPDATE SET x = x + excluded.x`` 会把两个
+    endpoint 的同日数据**静默累加成一行**，而 rollup 紧接着就 DELETE 原始行——
+    不可恢复。
+    """
+    cursor = conn.cursor()
+    # ── 实时表加列 ───────────────────────────────────────────────
+    cols = {
+        r[1] for r in cursor.execute("PRAGMA table_info(token_usage)").fetchall()
+    }
+    if "base_url" not in cols:
+        cursor.execute(
+            "ALTER TABLE token_usage ADD COLUMN base_url TEXT NOT NULL DEFAULT ''"
+        )
+
+    # ── 日表重建（改主键）────────────────────────────────────────
+    daily_info = cursor.execute("PRAGMA table_info(token_usage_daily)").fetchall()
+    dcols = {r[1] for r in daily_info}
+    dpk = [r[1] for r in sorted((r for r in daily_info if r[5]), key=lambda r: r[5])]
+    if dpk != ["date", "model", "base_url", "type"]:
+        cursor.execute("DROP TABLE IF EXISTS token_usage_daily_v4")
+        cursor.execute("""
+            CREATE TABLE token_usage_daily_v4 (
+                date TEXT NOT NULL,
+                model TEXT NOT NULL,
+                base_url TEXT NOT NULL DEFAULT '',
+                type TEXT NOT NULL,
+                calls INTEGER NOT NULL DEFAULT 0,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_tokens INTEGER NOT NULL DEFAULT 0,
+                video_tokens INTEGER NOT NULL DEFAULT 0,
+                audio_tokens INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (date, model, base_url, type)
+            )
+        """)
+        # 老行 base_url 一律 ''；若是另一条 v3 历史已经有 base_url，则按实值搬。
+        base_url_expr = "base_url" if "base_url" in dcols else "''"
+        cursor.execute(f"""
+            INSERT INTO token_usage_daily_v4
+                (date, model, base_url, type, calls,
+                 input_tokens, output_tokens, cache_tokens,
+                 video_tokens, audio_tokens)
+            SELECT date, model, {base_url_expr}, type, calls,
+                   input_tokens, output_tokens, cache_tokens,
+                   video_tokens, audio_tokens
+            FROM token_usage_daily
+        """)
+        moved = cursor.execute(
+            "SELECT COUNT(*) FROM token_usage_daily_v4"
+        ).fetchone()[0]
+        before = cursor.execute(
+            "SELECT COUNT(*) FROM token_usage_daily"
+        ).fetchone()[0]
+        if moved != before:
+            raise RuntimeError(
+                f"{migration_label} migration invariant broken: "
+                f"token_usage_daily {before} rows in, {moved} rows out"
+            )
+        cursor.execute("DROP TABLE token_usage_daily")
+        cursor.execute(
+            "ALTER TABLE token_usage_daily_v4 RENAME TO token_usage_daily"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_token_usage_daily_date "
+            "ON token_usage_daily(date)"
+        )
+
+
+def _ensure_dashboard_auth_schema(conn: sqlite3.Connection) -> None:
+    _create_dashboard_user_table_on(conn)
+    _create_dashboard_session_table_on(conn)
+
+
 def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
-    """Add dashboard authentication tables to existing v2 databases."""
+    """v2 → v3: 收敛 fork 的 dashboard auth 与上游 token usage endpoint 维度。"""
     cursor = conn.cursor()
     cursor.execute("BEGIN IMMEDIATE")
     try:
-        _create_dashboard_user_table_on(conn)
-        _create_dashboard_session_table_on(conn)
+        _ensure_dashboard_auth_schema(conn)
+        _ensure_token_usage_base_url_schema(conn, migration_label="v2→v3")
         cursor.execute("PRAGMA user_version = 3")
         conn.commit()
+        logger.info("v2→v3 migration done: auth and token usage schema ensured")
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
+    """v3 → v4: 修复 fork 与 upstream 同占 v3 造成的生产升级歧义。
+
+    lynxloco 的 v3 是 dashboard auth；XiaoMi upstream 的 v3 是 token_usage.base_url。
+    所以任何 user_version=3 的库都不能假定已经包含另一条历史。v4 做幂等补齐：
+    缺 auth 表则建表，缺 base_url/四元组主键则迁移；都已有则只推进版本号。
+    """
+    cursor = conn.cursor()
+    cursor.execute("BEGIN IMMEDIATE")
+    try:
+        _ensure_dashboard_auth_schema(conn)
+        _ensure_token_usage_base_url_schema(conn, migration_label="v3→v4")
+        cursor.execute("PRAGMA user_version = 4")
+        conn.commit()
+        logger.info("v3→v4 migration done: fork/upstream v3 histories reconciled")
     except Exception:
         conn.rollback()
         raise
@@ -1326,6 +1451,7 @@ def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
 _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     2: _migrate_v1_to_v2,
     3: _migrate_v2_to_v3,
+    4: _migrate_v3_to_v4,
 }
 
 
@@ -1341,6 +1467,11 @@ def rollback_v2_to_v1() -> dict[str, int]:
     **前置条件**: internal cron 必须已被 caller 手工清空 (v1 无 cron 表, rollback
     语义 = 彻底回到迁移前状态; internal 是 backend 建的用户数据, 不能盲目丢弃)。
     函数内断言 internal_count == 0, 否则 raise。
+
+    **只处理 v2 → v1 这一级**: 它不认识 v3 引入的 token_usage.base_url 与日表四元组
+    主键, 也不会去回退它们。故库必须正好停在 v2; 在 v3 库上跑会把 user_version 盖成 1
+    而表形态仍是 v3, 之后启动时步进循环会从 v1 重跑一遍 —— 函数内断言当前版本 == 2,
+    不满足直接 raise, 不做「猜一个中间状态」这种事。
     """
     stats: dict[str, int] = {
         "rule_reverted_to_link": 0,
@@ -1353,6 +1484,12 @@ def rollback_v2_to_v1() -> dict[str, int]:
         cursor.execute("PRAGMA foreign_keys=OFF")
         cursor.execute("BEGIN IMMEDIATE")
         try:
+            ver = cursor.execute("PRAGMA user_version").fetchone()[0]
+            if ver != 2:
+                raise RuntimeError(
+                    f"rollback_v2_to_v1 refused: user_version={ver}, expected 2. "
+                    "本函数只回退 v2 引入的那些变化, 不认识更高版本的 schema。"
+                )
             internal_count = cursor.execute(
                 "SELECT COUNT(*) FROM cron WHERE dispatch_owner='internal'"
             ).fetchone()[0]

@@ -310,6 +310,7 @@ async def _call_omni_messages(
     """
     if adapter is None:
         adapter = get_adapter(config.api_protocol, config.model)
+    base_url = config.base_url.strip().rstrip("/")
     api_key = resolve_api_key(config)
     if adapter.auth_required and not api_key:
         raise ValueError(
@@ -327,7 +328,7 @@ async def _call_omni_messages(
     )
 
     forced_stream = body.get("stream", False)
-    url = adapter.endpoint(config.base_url, config.model, stream=forced_stream)
+    url = adapter.endpoint(base_url, config.model, stream=forced_stream)
 
     client = _get_fused_http_client(config.timeout)
     cb = get_omni_circuit_breaker()
@@ -396,7 +397,7 @@ async def _call_omni_messages(
             )
             raise OmniError(f"omni response is not a dict (got {raw_cls})")
         await cb.record_success()
-        fire_record(config.model, raw.get("usage", {}), type)
+        fire_record(config.model, base_url, raw.get("usage") or {}, type)
         return raw
     except CircuitOpenError as ce:
         short_circuited = True

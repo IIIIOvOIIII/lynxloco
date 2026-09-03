@@ -4,9 +4,13 @@ from typing import Any
 
 import httpx
 import pytest
-
 from miloco.perception.engine.config import OmniConfig
-from miloco.perception.types import CaptionEntry, RealtimePerceptionResult, Speech, Suggestion
+from miloco.perception.types import (
+    CaptionEntry,
+    RealtimePerceptionResult,
+    Speech,
+    Suggestion,
+)
 
 
 class _AsyncClient:

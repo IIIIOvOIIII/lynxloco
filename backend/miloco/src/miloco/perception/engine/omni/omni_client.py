@@ -165,20 +165,25 @@ def resolve_live_omni_config(base: OmniConfig) -> OmniConfig:
     from miloco.config import get_settings
 
     o = get_settings().model.omni
+    # 地址在这里去尾斜杠，而不是只在保存档案那个入口做：写入口有四条，只有
+    # web PUT 那条归一化过；这一处是所有来路的必经收口、也是决定「这次调用
+    # 记到哪个身份名下」的地方。
+    live_protocol = getattr(o, "api_protocol", None)
+    base_url = (o.base_url or "").strip().rstrip("/")
     same_identity = (
         resolve_api_protocol(base.api_protocol, base.model)
-        == resolve_api_protocol(o.api_protocol, o.model)
+        == resolve_api_protocol(live_protocol, o.model)
         and base.model == o.model
-        and base.base_url.rstrip("/") == o.base_url.rstrip("/")
+        and base.base_url.rstrip("/") == base_url
     )
     api_key = (o.api_key or base.api_key) if same_identity else o.api_key
     resolved = replace(
         base,
         model=o.model,
-        base_url=o.base_url,
+        base_url=base_url,
         api_key=api_key,
-        api_protocol=o.api_protocol,
-        timeout=o.timeout,
+        api_protocol=live_protocol,
+        timeout=getattr(o, "timeout", base.timeout),
     )
     _maybe_reset_breaker_on_config_change(resolved)
     return resolved
@@ -215,6 +220,7 @@ async def call_omni(
     ``"on_demand"`` (user-initiated query).
     """
     adapter = get_adapter(config.api_protocol, config.model)
+    base_url = config.base_url.strip().rstrip("/")
     api_key = resolve_api_key(config)
     if adapter.auth_required and not api_key:
         raise ValueError(
@@ -234,7 +240,7 @@ async def call_omni(
     )
 
     forced_stream = body.get("stream", False)
-    url = adapter.endpoint(config.base_url, config.model, stream=forced_stream)
+    url = adapter.endpoint(base_url, config.model, stream=forced_stream)
 
     cb = get_omni_circuit_breaker()
     t0 = time.monotonic()
@@ -290,7 +296,7 @@ async def call_omni(
                 )
                 raise OmniError(f"omni response is not a dict (got {raw_cls})")
             await cb.record_success()
-            fire_record(config.model, raw.get("usage", {}), type)
+            fire_record(config.model, base_url, raw.get("usage") or {}, type)
         return raw
     except CircuitOpenError as ce:
         short_circuited = True
@@ -591,6 +597,7 @@ async def call_omni_stream(
         type: 给 ``fire_record`` 的调用类型标签，默认 ``"realtime"``，跟 ``call_omni`` 对齐。
     """
     adapter = get_adapter(config.api_protocol, config.model)
+    base_url = config.base_url.strip().rstrip("/")
     api_key = resolve_api_key(config)
     if adapter.auth_required and not api_key:
         raise ValueError(
@@ -613,7 +620,7 @@ async def call_omni_stream(
         **adapter.auth_headers(api_key),
         "User-Agent": MILOCO_USER_AGENT,
     }
-    url = adapter.endpoint(config.base_url, config.model, stream=True)
+    url = adapter.endpoint(base_url, config.model, stream=True)
 
     # 累积本次调用最后一次见到的 raw usage（OpenAI 字段），循环结束后统一上报一次，
     # 跟 call_omni / _call_omni_messages 的非 stream 路径完全对齐。
@@ -675,7 +682,7 @@ async def call_omni_stream(
     finally:
         # generator close (正常 / 异常 / 消费方提前 break) 时统一上报一次
         if raw_usage_seen is not None:
-            fire_record(config.model, raw_usage_seen, type)
+            fire_record(config.model, base_url, raw_usage_seen, type)
         # stream 路径没有原生 raw response,只能用累积的 chunks + usage 拼一份伪 raw
         # 让 push_omni_trace 用同一 _pick_response_fields 路径抽 content/usage.
         # error 路径 raw_for_trace 仍传 (拼出 content="" usage={}),让 trace 行包含

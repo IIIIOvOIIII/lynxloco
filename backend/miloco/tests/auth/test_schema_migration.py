@@ -26,4 +26,6 @@ def test_fresh_database_creates_dashboard_auth_tables(tmp_path, monkeypatch) -> 
         }
         assert "dashboard_user" in tables
         assert "dashboard_session" in tables
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        from miloco.database.connector import _DB_SCHEMA_VERSION
+
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == _DB_SCHEMA_VERSION

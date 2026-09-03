@@ -134,11 +134,13 @@ def test_runtime_summary_returns_silent_state_with_sanitized_omni(
         RealtimeOmniDiagnostic,
         get_runtime_diagnostics,
     )
-    from miloco.perception.schema import EngineState, PerceptionEngineStatus
+    from miloco.perception.schema import (
+        EngineState,
+        PerceptionEngineStatus,
+        PerceptionLogEntry,
+    )
     from miloco.perception.service import PerceptionService
     from miloco.perception.types import PerceptionDevice
-
-    from miloco.perception.schema import PerceptionLogEntry
 
     now_ms_value = 10_000_000
     log_repo = PerceptionLogRepo()
@@ -241,7 +243,6 @@ def test_runtime_summary_returns_silent_state_with_sanitized_omni(
 def test_runtime_summary_router_returns_standard_envelope(monkeypatch):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
-
     from miloco.perception import router as perception_router
 
     captured = {}

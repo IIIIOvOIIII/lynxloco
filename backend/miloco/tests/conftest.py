@@ -15,9 +15,7 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-
 from miloco.config import get_settings
-
 
 _DEFAULT_AUTH_ENV = "MILOCO_TEST_DEFAULT_SERVICE_AUTH"
 _AUTH_BOUNDARY_TESTS = ("/tests/auth/", "/tests/camera/", "/test_sse_auth.py")

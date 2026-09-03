@@ -5,8 +5,8 @@
 
 from __future__ import annotations
 
-import pytest
 import miloco.config.settings as settings_module
+import pytest
 from miloco.config import reset_settings
 from miloco.config.settings import MilocoSettings
 from pydantic import ValidationError

@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import httpx
 import pytest
-
 from miloco.home_assistant.client import HomeAssistantClient
 from miloco.home_assistant.schema import HaErrorCode, HomeAssistantError
 

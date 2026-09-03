@@ -30,7 +30,13 @@ import type {
   OmniProfile,
   OmniTestResult,
 } from "@/lib/types";
-import { IconX, IconEye, IconEyeOff } from "@/lib/icons";
+import {
+  IconX,
+  IconEye,
+  IconEyeOff,
+  IconChevronDown,
+  IconChevronUp,
+} from "@/lib/icons";
 import { toast } from "./Toast";
 
 const INPUT_CLS =
@@ -194,7 +200,7 @@ function Field({
   );
 }
 
-/** 通用组合框:可输入(自由文本)+ ▾ 展开面板点选。输入时按子串过滤;已选/空时点 ▾ 看全部。 */
+/** 通用组合框:可输入(自由文本)+ 尖括号展开面板点选。输入时按子串过滤;已选/空时点它看全部。 */
 function ComboBox({
   value,
   onChange,
@@ -240,10 +246,10 @@ function ComboBox({
         <button
           type="button"
           onClick={() => setOpen((o) => !o)}
-          className="absolute right-2 top-1/2 -translate-y-1/2 text-text-tertiary px-1 text-xl leading-none"
+          className="absolute right-2 top-1/2 -translate-y-1/2 text-text-tertiary px-1 leading-none"
           aria-label={t("usage.expandOptions")}
         >
-          ▾
+          <IconChevronDown width={16} height={16} />
         </button>
       )}
       {open && list.length > 0 && (
@@ -653,8 +659,14 @@ export function UsageOmniConfig() {
             </span>
           )}
         </span>
-        <span className="text-text-tertiary text-caption shrink-0">
-          {collapsed ? t("usage.expand") : t("usage.collapse")}
+        {/* 与 CollapsibleCard 保持一致（这张卡的头早于共用组件、单独实现了一份） */}
+        <span className="text-text-tertiary text-caption shrink-0 inline-flex items-center gap-1">
+          {collapsed ? t("common.expand") : t("common.collapse")}
+          {collapsed ? (
+            <IconChevronDown width={16} height={16} />
+          ) : (
+            <IconChevronUp width={16} height={16} />
+          )}
         </span>
       </button>
 
@@ -1041,7 +1053,7 @@ export function UsageOmniConfig() {
                 type="button"
                 onClick={confirmDelete}
                 disabled={deleting}
-                className="text-body px-4 py-2 rounded-lg bg-error text-white hover:bg-error/90 disabled:opacity-60"
+                className="text-body px-4 py-2 rounded-lg bg-error text-white hover:brightness-95 disabled:opacity-60 transition-[filter,opacity]"
               >
                 {deleting ? t("usage.deleting") : t("usage.delete")}
               </button>

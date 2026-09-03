@@ -1,7 +1,6 @@
 from unittest.mock import AsyncMock
 
 import pytest
-
 from miloco.devices.schema import DeviceSource, UnifiedActionResult
 from miloco.home_assistant.schema import HaErrorCode, HomeAssistantError
 from miloco.rule.runner import RuleRunner
