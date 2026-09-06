@@ -59,6 +59,7 @@ from miloco.perception.engine.types import IdentityPacket, OmniContext, OmniOutp
 from miloco.perception.runtime_diagnostics import record_omni_http_diagnostic
 from miloco.perception.snapshot_context import push_omni_trace
 from miloco.perception.types import MatchedRule, Speech, Suggestion
+from miloco.perception.window_runtime import WindowRejected, current_job, model_request
 
 if TYPE_CHECKING:
     from miloco.perception.engine.identity.engine import IdentityEngine
@@ -200,6 +201,17 @@ async def run_omni_fused(
             matching_moot=person_lib_empty,
         )
         raw_response = await _call_omni_messages(payload["messages"], config, adapter=adapter)
+        job = current_job()
+        if job is not None and not await job.begin_commit():
+            # Keep recognition evidence but do not update current identities.
+            await identity_engine.deliver_fused_failure("stale_window")
+            output = parse_omni_response(raw_response, _rule_name_to_id(context))
+            output.usage = extract_usage(raw_response)
+            return output
+    except asyncio.CancelledError:
+        if candidates:
+            await identity_engine.deliver_fused_failure("cancelled")
+        raise
     except OmniError as e:
         # omni API / 网络错:_call_omni_messages 已在源头打日志(omni API 调用失败),
         # 这里只做 inflight track 清理 + 上抛,不重复打。
@@ -343,43 +355,44 @@ async def _call_omni_messages(
     }
     try:
         await cb.before_call()
-        if not forced_stream:
-            resp = await client.post(url, headers=headers, json=body)
-            classified = classify_response(resp, visual_request=visual_request)
-            if classified is not None:
-                await cb.record_failure(classified)
-                logger.error(
-                    "[omni] omni API 调用失败，错误码=%d", resp.status_code
-                )
-                if resp.status_code == 400:
-                    logger.error(
-                        "[omni] omni 400 payload 摘要 | %s",
-                        _summarize_multimodal_payload(messages),
-                    )
-                resp.raise_for_status()
-            raw = adapter.parse_response(resp.json())
-        else:
-            # forced-stream (Qwen 等 adapter 强制 stream=True) 走 _collect_stream_response,
-            # 内部对非 200 直接 raise_for_status → HTTPStatusError。下方 except 守卫
-            # `not isinstance(e, HTTPStatusError)` 会跳过 record_failure(防非流路径双重
-            # 计数),导致 forced-stream 路径的 4xx/5xx 熔断器完全看不到。此处显式补一次
-            # classify + record_failure 后再抛,与非流路径行为对齐。
-            try:
-                raw = await _collect_stream_response(
-                    client, url, headers, body, adapter
-                )
-            except httpx.HTTPStatusError as e:
-                classified = classify_response(
-                    e.response,
-                    visual_request=visual_request,
-                )
+        async with model_request(body):
+            if not forced_stream:
+                resp = await client.post(url, headers=headers, json=body)
+                classified = classify_response(resp, visual_request=visual_request)
                 if classified is not None:
                     await cb.record_failure(classified)
                     logger.error(
-                        "[omni] omni API 调用失败(stream)，错误码=%d",
-                        e.response.status_code,
+                        "[omni] omni API 调用失败，错误码=%d", resp.status_code
                     )
-                raise
+                    if resp.status_code == 400:
+                        logger.error(
+                            "[omni] omni 400 payload 摘要 | %s",
+                            _summarize_multimodal_payload(messages),
+                        )
+                    resp.raise_for_status()
+                raw = adapter.parse_response(resp.json())
+            else:
+                # forced-stream (Qwen 等 adapter 强制 stream=True) 走 _collect_stream_response,
+                # 内部对非 200 直接 raise_for_status → HTTPStatusError。下方 except 守卫
+                # `not isinstance(e, HTTPStatusError)` 会跳过 record_failure(防非流路径双重
+                # 计数),导致 forced-stream 路径的 4xx/5xx 熔断器完全看不到。此处显式补一次
+                # classify + record_failure 后再抛,与非流路径行为对齐。
+                try:
+                    raw = await _collect_stream_response(
+                        client, url, headers, body, adapter
+                    )
+                except httpx.HTTPStatusError as e:
+                    classified = classify_response(
+                        e.response,
+                        visual_request=visual_request,
+                    )
+                    if classified is not None:
+                        await cb.record_failure(classified)
+                        logger.error(
+                            "[omni] omni API 调用失败(stream)，错误码=%d",
+                            e.response.status_code,
+                        )
+                    raise
         # 服务端在 fused 大 payload 下偶发返回非 dict body (~1.5%);只记录稳定的
         # status/type 元数据，原始响应可能包含用户内容，不得写入普通日志。
         if not isinstance(raw, dict):
@@ -408,7 +421,7 @@ async def _call_omni_messages(
     except OmniError:
         raise
     except Exception as e:
-        if not isinstance(e, httpx.HTTPStatusError):
+        if not isinstance(e, (httpx.HTTPStatusError, WindowRejected)):
             await cb.record_failure(classify_exception(e))
         error = {"code": e.__class__.__name__, "msg": str(e)[:512]}
         raise OmniError(
@@ -416,7 +429,8 @@ async def _call_omni_messages(
             original=e,
         ) from e
     finally:
-        latency_ms = 0.0 if short_circuited else (time.monotonic() - t0) * 1000
+        job = current_job()
+        latency_ms = job.http_ms if job is not None else (0.0 if short_circuited else (time.monotonic() - t0) * 1000)
         push_omni_trace(
             request_messages=messages,
             response_raw=raw,

@@ -90,8 +90,8 @@ def test_query_observability_windows_aggregates_recent_traces(tmp_path):
             INSERT INTO traces (
               trace_id, timestamp, skipped, gate_video_pass, gate_audio_pass,
               gate_hold_pass, omni_call_count, omni_error_count,
-              cycle_error_msg, dropped_windows_total, overflow_count_total
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              cycle_error_msg, dropped_windows_total, overflow_count_total, metric_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2)
             """,
             ("recent", 1_000_000, 0, 1, 0, 1, 2, 1, "", 4, 1),
         )
@@ -100,8 +100,8 @@ def test_query_observability_windows_aggregates_recent_traces(tmp_path):
             INSERT INTO traces (
               trace_id, timestamp, skipped, gate_video_pass, gate_audio_pass,
               gate_hold_pass, omni_call_count, omni_error_count,
-              cycle_error_msg, dropped_windows_total, overflow_count_total
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              cycle_error_msg, dropped_windows_total, overflow_count_total, metric_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2)
             """,
             ("old", 1_000_000 - 20 * 60_000, 1, 0, 1, 0, 1, 0, "boom", 9, 3),
         )
@@ -122,7 +122,7 @@ def test_query_observability_windows_aggregates_recent_traces(tmp_path):
     assert by_minutes[60]["cycle_count"] == 2
     assert by_minutes[60]["skipped_count"] == 1
     assert by_minutes[60]["cycle_error_count"] == 1
-    assert by_minutes[60]["overflow_count"] == 3
+    assert by_minutes[60]["overflow_count"] == 4
 
 
 def test_runtime_summary_returns_silent_state_with_sanitized_omni(
@@ -160,8 +160,8 @@ def test_runtime_summary_returns_silent_state_with_sanitized_omni(
             INSERT INTO traces (
               trace_id, timestamp, skipped, gate_video_pass, gate_audio_pass,
               gate_hold_pass, omni_call_count, omni_error_count,
-              cycle_error_msg, dropped_windows_total, overflow_count_total
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              cycle_error_msg, dropped_windows_total, overflow_count_total, metric_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2)
             """,
             ("recent", now_ms_value - 1_000, 0, 1, 0, 1, 3, 0, "", 2, 0),
         )
@@ -195,6 +195,7 @@ def test_runtime_summary_returns_silent_state_with_sanitized_omni(
     service._log_repo = log_repo
     service._meaningful_events_dao = meaningful_dao
     service._engine = SimpleNamespace(
+        concurrency_status=lambda: {"limit": 8, "active": 4, "peak_at_limit": 8},
         status=lambda: PerceptionEngineStatus(
             running=True,
             engine=EngineState(ready=True, status="ready", message=""),
@@ -228,6 +229,7 @@ def test_runtime_summary_returns_silent_state_with_sanitized_omni(
     summary = service.runtime_summary(obs_db_path=obs_db, now_ms_value=now_ms_value)
 
     assert summary.engine.running is True
+    assert summary.engine.concurrency == {"limit": 8, "active": 4, "peak_at_limit": 8}
     assert summary.sources.active_count == 2
     assert summary.logs.today_inference_count == 3
     assert summary.logs.raw_last_hour == 0

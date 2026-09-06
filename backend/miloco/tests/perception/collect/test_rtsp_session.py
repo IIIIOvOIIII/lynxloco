@@ -1722,3 +1722,20 @@ async def _unused_video_cb(*_args: object) -> None:
 
 async def _unused_audio_cb(*_args: object) -> None:
     return None
+
+
+def test_audio_burst_does_not_evict_every_admitted_video_frame():
+    """Three-slot mixed ingress must retain a video during a decode audio burst."""
+    from unittest.mock import Mock
+    session_module = _rtsp_session()
+    session = session_module.RtspSession(_source(), queue_size=3)
+    loop = Mock()
+    def event(kind, ts):
+        return session_module._DecodedEvent(kind, np.zeros((2, 2, 3), np.uint8)
+            if kind == "video" else np.zeros(160, np.int16), ts, ts, ts)
+    session._enqueue_media_from_thread(event("video", 1), loop)
+    for ts in range(2, 20):
+        session._enqueue_media_from_thread(event("audio", ts), loop)
+    assert len(session._media_ingress) == 3
+    assert any(e.kind == "video" for e in session._media_ingress)
+    assert [e.stream_ts for e in session._media_ingress if e.kind == "audio"] == [18, 19]

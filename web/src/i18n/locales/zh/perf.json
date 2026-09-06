@@ -1,5 +1,9 @@
 {
   "perf": {
+    "kpiCameraWindows": "已处理摄像头窗口",
+    "kpiBatches": "批次",
+    "kpiLegacyOnly": "旧口径历史：暂无新口径数据。",
+    "kpiLegacyWarning": "包含旧口径历史；新口径窗口统计不包含旧批次。",
     "windowAria": "性能视图时间窗口",
     "inlineTitle": "性能监测",
 
@@ -77,15 +81,15 @@
     "kpiGateFilterRate": "Gate 过滤率",
     "kpiGateFilterRateHint": "被过滤占比",
     "kpiDropRate": "窗口丢弃率",
-    "kpiDropRateHint": "队列满整窗丢弃",
+    "kpiDropRateHint": "整窗丢弃 / 应处理摄像头窗口；部分丢帧不计整窗丢弃",
     "kpiOmniErrorRate": "Omni 错误率",
-    "kpiOmniErrorRateHint": "omni 推理失败",
-    "kpiRtfP95": "实时率 P95",
-    "kpiRtfP95Hint": "端到端含等待",
-    "kpiOmniRtfP95": "omni 实时率 P95",
-    "kpiOmniRtfP95Hint": "仅 omni 成功",
-    "kpiAgentCall": "Agent 调用",
-    "kpiAgentCallHint": "触发 Agent 次数",
+    "kpiOmniErrorRateHint": "实际 Omni 请求中的失败占比",
+    "kpiRtfP95": "成功实时率 P95",
+    "kpiRtfP95Hint": "仅实际调用 Omni 且成功的批次；端到端含等待",
+    "kpiOmniRtfP95": "Omni 成功实时率 P95",
+    "kpiOmniRtfP95Hint": "仅实际调用 Omni 且成功；耗时取最慢摄像头",
+    "kpiAgentCall": "Agent 已完成运行",
+    "kpiAgentCallHint": "已结束的运行次数（含成功与失败）",
 
     "procTitle": "进程 CPU / 线程数",
     "procHeaderRecent": "最近 {{bucket}} 均值 {{pct}}%",

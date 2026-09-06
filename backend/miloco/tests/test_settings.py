@@ -38,6 +38,22 @@ def test_schema_is_valid_draft_2020_12() -> None:
     Draft202012Validator.check_schema(schema)
 
 
+def test_concurrency_environment_parses_integer_without_weakening_json(monkeypatch):
+    monkeypatch.setenv("MILOCO_MODEL__OMNI__CONCURRENCY", "8")
+    assert get_settings().model.omni.concurrency == 8
+    with pytest.raises(ValueError):
+        OmniModelSettings(concurrency=True)
+    with pytest.raises(ValueError):
+        OmniModelSettings(concurrency="8")
+
+
+@pytest.mark.parametrize("value", ["0", "9", "1.5", "true"])
+def test_concurrency_environment_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv("MILOCO_MODEL__OMNI__CONCURRENCY", value)
+    with pytest.raises(ValueError):
+        get_settings()
+
+
 def _collect_schema_fields(schema: dict, prefix: str = "") -> dict[str, dict]:
     """把 schema.properties 展开成扁平的 {dotted.path: field_spec}。"""
     out: dict[str, dict] = {}

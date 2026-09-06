@@ -94,6 +94,7 @@ class _CameraDeviceState:
     """
 
     did: str
+    source_generation: int = field(default_factory=time.monotonic_ns)
     sync_buffer: MultiTrackSyncBuffer = field(
         default_factory=lambda: MultiTrackSyncBuffer(_CAMERA_TRACKS)
     )
@@ -500,7 +501,7 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
                     type(error).__name__,
                 )
 
-    def collect(self, did: str, *, drain: bool = True) -> DeviceData | None:
+    def collect(self, did: str, *, drain: bool = True, fifo: bool = False) -> DeviceData | None:
         """Collect multimodal data from the device's sync buffer.
 
         Args:
@@ -513,7 +514,7 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
             return None
 
         if drain:
-            ready = state.sync_buffer.drain_ready()
+            ready = state.sync_buffer.drain_ready(mode="fifo" if fifo else "latest")
             if ready is None or not any(ready.tracks.values()):
                 return None
             # drain 后立刻拉丢包增量,clear 后给下一 cycle 重新累。
@@ -525,6 +526,7 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
                 ready.tracks,
                 window_start_ms=ready.start_ms,
                 window_end_ms=ready.end_ms,
+                partial_windows_count=state.sync_buffer.consume_partial_stats(),
                 dropped_windows=dropped,
                 overflow_count=ovf_cnt,
                 max_buffer_depth=max_depth,
@@ -584,6 +586,7 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
         window_start_ms: int = 0,
         window_end_ms: int = 0,
         *,
+        partial_windows_count: int = 0,
         dropped_windows: int = 0,
         overflow_count: int = 0,
         max_buffer_depth: int = 0,
@@ -630,6 +633,8 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
             decode_avg_ms=decode_combined,
             decode_video_avg_ms=decode_video_avg,
             decode_audio_avg_ms=decode_audio_avg,
+            partial_windows_count=partial_windows_count,
+            source_generation=(state.source_generation << 16) + state.sync_buffer.generation,
             dropped_windows=dropped_windows,
             overflow_count=overflow_count,
             max_buffer_depth=max_buffer_depth,

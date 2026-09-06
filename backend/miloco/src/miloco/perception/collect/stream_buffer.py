@@ -121,6 +121,8 @@ class MultiTrackSyncBuffer:
         # 丢包统计:put 路径累加,consume_drop_stats() 拉取增量后清零。
         # 全部在 self._lock 内读写。
         self._dropped_since_drain: int = 0
+        self._partial_since_drain: int = 0
+        self.generation: int = 0
         self._overflow_count_since_drain: int = 0
         self._max_depth_since_drain: int = 0
         self._last_overflow_action: str | None = None
@@ -386,7 +388,13 @@ class MultiTrackSyncBuffer:
                 self._overflow_count_since_drain += 1
 
                 if self._buffer_full_action == "clear":
-                    dropped = ready_before + active_before
+                    # Ready keys are already members of _windows. The triggering
+                    # current window is rebuilt below, so only other unique keys
+                    # are wholly lost. Drained windows were already accounted for.
+                    dropped = len(set(self._windows) - {key})
+                    current = self._windows.get(key)
+                    if current is not None and sum(map(len, current.tracks.values())) > 1:
+                        self._partial_since_drain += 1
                     self._clear_payload_locked()
                     self._windows.clear()
                     self._ready_queue.clear()
@@ -432,7 +440,7 @@ class MultiTrackSyncBuffer:
 
     # ---- Consume (drain ready windows) ----
 
-    def drain_ready(self) -> ReadyWindow | None:
+    def drain_ready(self, *, mode: Literal["latest", "fifo"] = "latest") -> ReadyWindow | None:
         """Drain all ready windows for realtime inference, returning only the newest.
 
         实时感知只关心"当前画面"。若把积压的旧窗口逐个送推理,结果会越追越旧
@@ -448,7 +456,11 @@ class MultiTrackSyncBuffer:
             if not self._ready_queue:
                 return None
 
+            if mode not in {"latest", "fifo"}:
+                raise ValueError("drain mode must be latest or fifo")
             ordered_keys = sorted(self._ready_queue)
+            if mode == "fifo":
+                ordered_keys = ordered_keys[:1]
             newest_key = ordered_keys[-1]
             newest_win: _TimeWindow | None = None
             drained_count = 0
@@ -462,8 +474,8 @@ class MultiTrackSyncBuffer:
                 drained_count += 1
                 if key == newest_key:
                     newest_win = win
-            self._ready_queue.clear()
-            self._ready_keys.clear()
+            for key in ordered_keys:
+                self._remove_ready_key_locked(key)
 
             # 实时推理只取最新一个,其余更旧的窗口被"跳过"(数据仍在 _drained 可 peek,
             # 但未送推理)。计入丢弃统计并标 action="skip",让 dashboard 的背压指标
@@ -612,6 +624,7 @@ class MultiTrackSyncBuffer:
     def clear(self) -> None:
         """Remove all windows and reset state."""
         with self._lock:
+            self.generation += 1
             self._clear_payload_locked()
             self._windows.clear()
             self._ready_queue.clear()
@@ -642,3 +655,10 @@ class MultiTrackSyncBuffer:
             self._max_depth_since_drain = 0
             self._last_overflow_action = None
             return stats
+
+    def consume_partial_stats(self) -> int:
+        """Consume partial truncations separately from fully lost windows."""
+        with self._lock:
+            count = self._partial_since_drain
+            self._partial_since_drain = 0
+            return count

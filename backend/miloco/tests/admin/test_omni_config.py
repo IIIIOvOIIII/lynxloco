@@ -1813,3 +1813,130 @@ def test_test_connection_failure_does_not_touch_breaker(
 
     # 熔断仍是 error
     assert get_omni_circuit_breaker().snapshot().state == "error"
+
+
+def _concurrency_config(**overrides):
+    return {
+        "label": "parallel",
+        "model": "vision",
+        "base_url": "https://model.example/v1",
+        "api_protocol": "openai_chat_completions",
+        "api_key": "test-model-key",
+        "concurrency": 8,
+        **overrides,
+    }
+
+
+def test_concurrency_roundtrip_save_rename_activate_and_legacy_update(client, tmp_path):
+    import json
+
+    response = client.put("/api/admin/omni-config", json=_concurrency_config())
+    assert response.status_code == 200
+    assert _get(client)["active"]["concurrency"] == 8
+    response = client.put(
+        "/api/admin/omni-config",
+        json=_concurrency_config(label="renamed", original_label="parallel", concurrency=4),
+    )
+    assert response.status_code == 200
+    legacy = _concurrency_config(label="renamed", original_label="renamed", activate=False)
+    del legacy["concurrency"]
+    assert client.put("/api/admin/omni-config", json=legacy).status_code == 200
+    assert _get(client)["active"]["concurrency"] == 4
+    assert _get(client)["profiles"][0]["concurrency"] == 4
+    client.post("/api/admin/omni-config/deactivate", json={"label": "renamed"})
+    response = client.post("/api/admin/omni-config/activate", json={"label": "renamed"})
+    assert response.status_code == 200
+    assert response.json()["data"]["active"]["concurrency"] == 4
+    stored = json.loads((tmp_path / "config.json").read_text())["model"]
+    assert stored["omni"]["concurrency"] == 4
+    assert stored["omni_profiles"][0]["concurrency"] == 4
+
+
+@pytest.mark.parametrize("concurrency", [0, 9, 1.5, 4.0, True, False, "4", None])
+def test_concurrency_rejects_non_integer_or_out_of_range(client, tmp_path, concurrency):
+    before = (tmp_path / "config.json").read_bytes()
+    response = client.put(
+        "/api/admin/omni-config", json=_concurrency_config(concurrency=concurrency)
+    )
+    assert response.status_code == 422
+    assert (tmp_path / "config.json").read_bytes() == before
+
+
+def test_concurrency_defaults_for_legacy_active_and_profile(client):
+    from miloco.config.settings import OmniModelSettings, get_settings
+
+    get_settings().model.omni_profiles = [OmniModelSettings(label="old")]
+    data = _get(client)
+    assert data["active"]["concurrency"] == 1
+    assert data["profiles"][0]["concurrency"] == 1
+
+
+@pytest.mark.parametrize("value", [0, 9, 1.5, True])
+def test_concurrency_settings_reject_invalid_value(value):
+    from miloco.config.settings import OmniModelSettings
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        OmniModelSettings(concurrency=value)
+
+
+def test_active_concurrency_edit_keeps_model_and_health_without_probe(client, monkeypatch):
+    from miloco.perception.engine.omni.circuit_breaker import get_omni_circuit_breaker
+
+    client.put("/api/admin/omni-config", json=_concurrency_config())
+    _force_breaker_open_config()
+    calls = []
+
+    async def unexpected_probe(*args, **kwargs):
+        calls.append(args)
+        return {"ok": False, "code": "unreachable"}
+
+    monkeypatch.setattr("miloco.admin.router._probe.probe_omni", unexpected_probe)
+    response = client.put(
+        "/api/admin/omni-config",
+        json=_concurrency_config(original_label="parallel", concurrency=4, activate=False),
+    )
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["active"]["label"] == "parallel"
+    assert data["active"]["concurrency"] == 4
+    assert data["profiles"][0]["active"] is True
+    assert calls == []
+    assert get_omni_circuit_breaker().snapshot().state == "error"
+
+
+@pytest.mark.parametrize("concurrency", [8, 4])
+def test_saved_concurrency_survives_other_profile_write_and_activation(client, concurrency):
+    response = client.put(
+        "/api/admin/omni-config",
+        json=_concurrency_config(concurrency=concurrency, activate=False),
+    )
+    assert response.status_code == 200
+    assert client.put(
+        "/api/admin/omni-config", json=_concurrency_config(label="other", concurrency=2)
+    ).status_code == 200
+    response = client.post("/api/admin/omni-config/activate", json={"label": "parallel"})
+    assert response.status_code == 200
+    assert response.json()["data"]["active"]["concurrency"] == concurrency
+
+
+@pytest.mark.parametrize("change", [
+    {"model": "changed-model"},
+    {"base_url": "https://changed.example/v1"},
+    {"api_protocol": "openai_responses"},
+    {"api_key": "changed-test-key"},
+])
+def test_concurrency_does_not_bypass_probe_for_changed_connection(client, monkeypatch, tmp_path, change):
+    assert client.put("/api/admin/omni-config", json=_concurrency_config()).status_code == 200
+    before = (tmp_path / "config.json").read_bytes()
+
+    async def failed_probe(*args, **kwargs):
+        return {"ok": False, "code": "unreachable"}
+
+    monkeypatch.setattr("miloco.admin.router._probe.probe_omni", failed_probe)
+    response = client.put(
+        "/api/admin/omni-config",
+        json=_concurrency_config(original_label="parallel", concurrency=4, activate=False, **change),
+    )
+    assert response.status_code == 400
+    assert (tmp_path / "config.json").read_bytes() == before

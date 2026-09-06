@@ -200,6 +200,34 @@ function Field({
   );
 }
 
+export function OmniConcurrencyField({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <Field label={t("usage.concurrencyLabel")} className="md:col-span-2">
+      <input
+        type="number"
+        min={1}
+        max={8}
+        step={1}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        aria-label={t("usage.concurrencyLabel")}
+        aria-describedby="omni-concurrency-hint"
+        className={INPUT_CLS}
+      />
+      <span id="omni-concurrency-hint" className="text-caption mt-1 block text-text-tertiary">
+        {t("usage.concurrencyHint")}
+      </span>
+    </Field>
+  );
+}
+
 /** 通用组合框:可输入(自由文本)+ 尖括号展开面板点选。输入时按子串过滤;已选/空时点它看全部。 */
 function ComboBox({
   value,
@@ -287,6 +315,7 @@ export function UsageOmniConfig() {
   const [apiKey, setApiKey] = useState("");
   const [showKey, setShowKey] = useState(false); // API Key 明文/密文切换(末端眼睛图标)
   const [model, setModel] = useState("");
+  const [concurrency, setConcurrency] = useState("1");
   const [apiProtocol, setApiProtocol] = useState<OmniApiProtocol>(
     "openai_chat_completions",
   );
@@ -372,6 +401,7 @@ export function UsageOmniConfig() {
     setApiKey("");
     setShowKey(false);
     setModel("");
+    setConcurrency("1");
     setApiProtocol("openai_chat_completions");
     setModels([]);
     setModelsMsg(null);
@@ -388,6 +418,7 @@ export function UsageOmniConfig() {
     setApiKey("");
     setShowKey(false);
     setModel(p.model);
+    setConcurrency(String(p.concurrency ?? 1));
     setApiProtocol(p.api_protocol);
     setModels([]);
     setModelsMsg(null);
@@ -451,6 +482,11 @@ export function UsageOmniConfig() {
       toast(t("usage.apiKeyRequired"), "warn");
       return;
     }
+    const parallelism = Number(concurrency);
+    if (!Number.isInteger(parallelism) || parallelism < 1 || parallelism > 8) {
+      toast(t("usage.concurrencyInvalid"), "warn");
+      return;
+    }
     setSaving(true);
     try {
       const s = await updateOmniConfig({
@@ -460,6 +496,7 @@ export function UsageOmniConfig() {
         api_protocol: apiProtocol,
         api_key: apiKey.trim() || undefined,
         original_label: target,
+        concurrency: parallelism,
         activate: false, // 只入列表;启用由模型列表的「启用」负责
       });
       acceptMutation(s);
@@ -654,7 +691,7 @@ export function UsageOmniConfig() {
             <span className="text-caption text-text-secondary num">
               {t("usage.currentPrefix")}
               {hasConfiguredModel
-                ? `${active.model} · ${hostOf(active.base_url)}`
+                ? `${active.model} · ${hostOf(active.base_url)} · ${t("usage.concurrencySummary", { n: active.concurrency ?? 1 })}`
                 : t("usage.noApiKeyConfigured")}
             </span>
           )}
@@ -717,6 +754,9 @@ export function UsageOmniConfig() {
                         >
                           <td className="px-5 md:px-6 py-2.5 num text-text-primary">
                             {p.model}
+                            <span className="ml-2 text-text-tertiary">
+                              {t("usage.concurrencySummary", { n: p.concurrency ?? 1 })}
+                            </span>
                             {p.active && (
                               <span className="ml-2 align-middle inline-block rounded px-1.5 py-0.5 bg-brand-primary text-white text-caption">
                                 {t("usage.activeTag")}
@@ -949,6 +989,7 @@ export function UsageOmniConfig() {
                               : t("usage.modelsHint")}
                     </span>
                   </Field>
+                  <OmniConcurrencyField value={concurrency} onChange={setConcurrency} />
                   <div className="md:col-span-2 pt-1 flex items-center gap-3 flex-wrap">
                     <button
                       type="button"

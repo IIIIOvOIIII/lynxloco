@@ -107,6 +107,10 @@ class DeviceData:
     # 背压统计:本 cycle 期间(自上次 drain 起)该设备 stream_buffer 的累计结果。
     # dropped_windows 含两类:put 侧 full_action 硬丢 + drain 侧取最新时跳过的旧窗口
     # (后者数据仍在 _drained 可 peek,action 标 "skip")。
+    partial_windows_count: int = 0
+    source_generation: int = 0
+    released_video_count: int = 0
+    released_audio_count: int = 0
     dropped_windows: int = 0
     overflow_count: int = 0  # 仅 put 侧 full_action 触发次数,不含 drain skip
     max_buffer_depth: int = 0
@@ -452,6 +456,7 @@ class PerceptionEngineStatus(BaseModel):
 
 
 class RuntimeEngineSummary(BaseModel):
+    concurrency: dict[str, Any] = Field(default_factory=dict)
     running: bool = False
     ready: bool = False
     status: str = "not_initialized"

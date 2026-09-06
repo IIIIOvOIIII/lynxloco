@@ -24,6 +24,7 @@ def aggregate_cycle(
     gates = [d.gate for d in device_records]
     identities = [d.identity for d in device_records if d.identity is not None]
     omnis = [d.omni for d in device_records if d.omni is not None]
+    requests = [o for o in omnis if o.error_code != "CircuitOpenError"]
 
     skipped = (not gates) or all(g.skipped for g in gates)
 
@@ -38,9 +39,13 @@ def aggregate_cycle(
         gate_hold_pass=any(g.hold_pass for g in gates),
         identity_ms=sum(i.ms for i in identities),
         omni_ms=sum(o.ms for o in omnis),
+        omni_wall_ms=max((o.ms for o in omnis), default=0.0),
+        omni_request_count=len(requests),
+        omni_request_error_count=sum(o.error_code is not None for o in requests),
         omni_call_count=1 if omnis else 0,
         omni_error_count=1 if any(o.error_code is not None for o in omnis) else 0,
         dropped_windows_total=sum(d.dropped_windows_count for d in device_records),
         overflow_count_total=sum(d.overflow_count for d in device_records),
+        partial_windows_total=sum(d.partial_windows_count for d in device_records),
         **cycle_meta,
     )

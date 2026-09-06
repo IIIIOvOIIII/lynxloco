@@ -91,7 +91,7 @@ class MultimodalCollector:
         if state and state.lifecycle == Lifecycle.STARTING:
             mon.set_lifecycle(NodeName.COLLECTOR, Lifecycle.READY)
 
-    def collect(self, did: str, *, drain: bool = True) -> DeviceData | None:
+    def collect(self, did: str, *, drain: bool = True, fifo: bool = False) -> DeviceData | None:
         """Collect multimodal data from a specific device.
 
         Args:
@@ -100,7 +100,7 @@ class MultimodalCollector:
         """
         for adapter in self._adapters.values():
             if did in adapter.get_connected_devices():
-                return adapter.collect(did, drain=drain)
+                return adapter.collect(did, drain=drain, **({"fifo": True} if fifo else {}))
         return None
 
     def peek_latest_frame(self, did: str):
@@ -116,7 +116,7 @@ class MultimodalCollector:
         return None
 
     def collect_batch(
-        self, dids: list[str] | None = None, *, drain: bool = True
+        self, dids: list[str] | None = None, *, drain: bool = True, fifo: bool = False
     ) -> PerceptionBatch:
         """Collect and assemble a PerceptionBatch from multiple devices.
 
@@ -137,7 +137,7 @@ class MultimodalCollector:
             target_dids = dids if dids else list(self.get_all_active_sources())
 
             for did in target_dids:
-                device_data = self.collect(did, drain=drain)
+                device_data = self.collect(did, drain=drain, **({"fifo": True} if fifo else {}))
                 if device_data and device_data.has_data:
                     batch.devices[did] = device_data
 

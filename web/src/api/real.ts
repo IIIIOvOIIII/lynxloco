@@ -2605,12 +2605,13 @@ export async function realGetOmniConfig(): Promise<OmniConfigState> {
 export async function realUpdateOmniConfig(
   input: OmniConfigUpdate,
 ): Promise<OmniConfigState> {
-  const body: Record<string, string | boolean> = {
+  const body: Record<string, string | boolean | number> = {
     label: input.label,
     model: input.model,
     base_url: input.base_url,
     api_protocol: input.api_protocol,
   };
+  if (input.concurrency !== undefined) body.concurrency = input.concurrency;
   if (input.api_key) body.api_key = input.api_key;
   if (input.original_label !== undefined)
     body.original_label = input.original_label;

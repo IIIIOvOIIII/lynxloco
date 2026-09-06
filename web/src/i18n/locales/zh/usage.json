@@ -1,5 +1,9 @@
 {
   "usage": {
+    "concurrencyLabel": "模型并发数",
+    "concurrencyHint": "允许同时处理的模型请求数（1–8），默认 1。提高并发可加快处理，但可能增加 API 费用和服务压力。",
+    "concurrencyInvalid": "模型并发数必须是 1 到 8 的整数",
+    "concurrencySummary": "并发 {{n}}",
     "tokenUsageTitle": "Token 用量",
     "loading": "加载中…",
     "loadError": "用量加载失败",

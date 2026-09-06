@@ -184,6 +184,7 @@ class DeviceTraceRecord:
     overflow_count: int = 0
     max_buffer_depth: int = 0
     last_overflow_action: str | None = None  # "clear" | "drop" | "skip" | None
+    partial_windows_count: int = 0
 
     def to_row(self) -> dict[str, Any]:
         row: dict[str, Any] = {
@@ -209,6 +210,7 @@ class DeviceTraceRecord:
             "overflow_count": self.overflow_count,
             "max_buffer_depth": self.max_buffer_depth,
             "last_overflow_action": self.last_overflow_action,
+            "partial_windows_count": self.partial_windows_count,
         }
         if self.identity is not None:
             row["identity_ms"] = self.identity.ms
@@ -252,6 +254,11 @@ class CycleTraceRecord:
     timing_detail: dict[str, float] | None = None
     # 非 OmniError 异常路径下 cycle 的错误摘要;omni 错误走 omni_error_count + traces_device.omni_error_code,不写这里。
     cycle_error_msg: str | None = None
+    omni_wall_ms: float | None = None
+    omni_request_count: int = 0
+    omni_request_error_count: int = 0
+    partial_windows_total: int = 0
+    metric_version: int = 2
 
     def to_row(self) -> dict[str, Any]:
         row: dict[str, Any] = {
@@ -283,6 +290,11 @@ class CycleTraceRecord:
             "dropped_windows_total": self.dropped_windows_total,
             "overflow_count_total": self.overflow_count_total,
             "cycle_error_msg": self.cycle_error_msg,
+            "omni_wall_ms": self.omni_wall_ms,
+            "omni_request_count": self.omni_request_count,
+            "omni_request_error_count": self.omni_request_error_count,
+            "partial_windows_total": self.partial_windows_total,
+            "metric_version": self.metric_version,
         }
         if self.timing_detail is not None:
             row["timing_detail"] = json.dumps(self.timing_detail, ensure_ascii=False)

@@ -1029,6 +1029,7 @@ def _full_omni_payload() -> dict:
             "base_url": p.base_url,
             "api_protocol": resolve_api_protocol(p.api_protocol, p.model),
             "protocol_inferred": p.api_protocol is None,
+            "concurrency": p.concurrency,
             "api_key_masked": _mask_api_key(p.api_key),
             "has_key": bool(p.api_key),
             "active": p.label == active.label,
@@ -1044,6 +1045,7 @@ def _full_omni_payload() -> dict:
                 "base_url": active.base_url,
                 "api_protocol": resolve_api_protocol(active.api_protocol, active.model),
                 "protocol_inferred": active.api_protocol is None,
+                "concurrency": active.concurrency,
                 "api_key_masked": _mask_api_key(active.api_key),
                 "has_key": True,
                 "active": True,
@@ -1057,6 +1059,7 @@ def _full_omni_payload() -> dict:
             "base_url": active.base_url,
             "api_protocol": resolve_api_protocol(active.api_protocol, active.model),
             "protocol_inferred": active.api_protocol is None,
+            "concurrency": active.concurrency,
             "api_key_masked": _mask_api_key(active.api_key),
             "has_key": bool(active.api_key),
             "health": health,
@@ -1073,6 +1076,8 @@ def _profiles_as_dicts() -> list[dict]:
             "base_url": p.base_url,
             "api_key": p.api_key,
             "api_protocol": p.api_protocol,
+            "concurrency": p.concurrency,
+            "timeout": p.timeout,
         }
         for p in get_settings().model.omni_profiles
     ]
@@ -1084,6 +1089,7 @@ class OmniConfigBody(BaseModel):
     model: str
     api_protocol: OmniApiProtocol
     api_key: str | None = None  # 留空 = 仅同 URL+协议+model identity 沿用旧 key
+    concurrency: int = Field(default=1, strict=True, ge=1, le=8)
     original_label: str | None = None  # 正在编辑的档案原名(支持改名/定位);None=新增
     activate: bool = True  # True=同时设为当前生效;False=只入列表(激活由 /activate 负责)
 
@@ -1122,7 +1128,8 @@ async def put_omni_config(
       与否都同步刷新 ``model.omni``,使改 key/model 即时对运行中的感知生效。
     - 若本次会写 ``model.omni``(激活或编辑当前生效那套),落盘前先跑 preflight
       (``_probe.probe_omni``),失败返 400——避免任何绕过 web「测试连接」的调用方(CLI/curl)
-      把未校验配置写进运行时。
+      把未校验配置写进运行时。仅调整当前档案并发数且模型连接信息未变时跳过预检，
+      并保留当前熔断状态。
     - 写 config.json,感知下个推理周期热生效。env ``MILOCO_MODEL__OMNI__*`` 优先级更高会盖过。
     """
     label = body.label.strip()
@@ -1149,17 +1156,35 @@ async def put_omni_config(
         api_protocol=body.api_protocol,
         model=model,
     )
+    tgt = orig or label
+    is_active = _label_is_active(tgt)
+    active = get_settings().model.omni
+    previous = target or (active.model_dump() if is_active else {})
     entry = {
         "label": label,
         "base_url": base_url,
         "model": model,
         "api_key": key,
         "api_protocol": body.api_protocol,
+        "concurrency": (
+            body.concurrency
+            if "concurrency" in body.model_fields_set
+            else previous.get("concurrency", 1)
+        ),
+        "timeout": previous.get("timeout", 120.0),
     }
-    tgt = orig or label
-    will_activate = body.activate or _label_is_active(tgt)
+    will_activate = body.activate or is_active
+    concurrency_only = (
+        is_active
+        and "concurrency" in body.model_fields_set
+        and model == active.model
+        and base_url == active.base_url.rstrip("/")
+        and body.api_protocol == resolve_api_protocol(active.api_protocol, active.model)
+        and key == active.api_key
+    )
+    needs_probe = will_activate and not concurrency_only
     effective_protocol = resolve_api_protocol(body.api_protocol, model)
-    if will_activate:
+    if needs_probe:
         if not key and effective_protocol != "openai_responses":
             raise HTTPException(
                 status_code=400, detail={"code": "no_key", "message": "未配置 API Key"}
@@ -1175,7 +1200,7 @@ async def put_omni_config(
     if will_activate:
         update["omni"] = entry
     update_shared_config(model=update)
-    if will_activate:
+    if needs_probe:
         # preflight 通过 = 新配置已验可用,主动把熔断状态清掉。之前 OPEN_CONFIG (bad_key
         # 之类) 时 before_call 短路一切,omni_client 里的 _maybe_reset_breaker_on_config_change
         # 只在真正调 omni 时才触发,永远等不到,用户改完 key 仍要手动点 retry 才恢复。
@@ -1216,6 +1241,8 @@ async def activate_omni_config(
                         "base_url": p.base_url,
                         "api_key": p.api_key,
                         "api_protocol": p.api_protocol,
+                        "concurrency": p.concurrency,
+                        "timeout": p.timeout,
                     }
                 }
             )

@@ -1,5 +1,9 @@
 {
   "perf": {
+    "kpiCameraWindows": "Camera windows processed",
+    "kpiBatches": "Batches",
+    "kpiLegacyOnly": "Legacy metrics: no corrected data in this period.",
+    "kpiLegacyWarning": "Legacy metrics are present; corrected window counts exclude legacy batches.",
     "windowAria": "Performance view time window",
     "inlineTitle": "Performance",
 
@@ -77,15 +81,15 @@
     "kpiGateFilterRate": "Gate filter rate",
     "kpiGateFilterRateHint": "share filtered out",
     "kpiDropRate": "Window drop rate",
-    "kpiDropRateHint": "full-window drops when queue is full",
+    "kpiDropRateHint": "Whole windows dropped / expected camera windows; partial frame loss excluded",
     "kpiOmniErrorRate": "Omni error rate",
-    "kpiOmniErrorRateHint": "omni inference failures",
-    "kpiRtfP95": "RTF P95",
-    "kpiRtfP95Hint": "end-to-end incl. wait",
-    "kpiOmniRtfP95": "omni RTF P95",
-    "kpiOmniRtfP95Hint": "successful omni calls only",
-    "kpiAgentCall": "Agent calls",
-    "kpiAgentCallHint": "times agent triggered",
+    "kpiOmniErrorRateHint": "Failure share of actual Omni requests",
+    "kpiRtfP95": "Successful RTF P95",
+    "kpiRtfP95Hint": "Only batches with actual Omni requests that succeeded; includes waiting",
+    "kpiOmniRtfP95": "Successful Omni RTF P95",
+    "kpiOmniRtfP95Hint": "Actual successful Omni calls only; time of the slowest camera",
+    "kpiAgentCall": "Completed agent runs",
+    "kpiAgentCallHint": "Finished runs, including successes and failures",
 
     "procTitle": "Process CPU / threads",
     "procHeaderRecent": "Last {{bucket}} avg {{pct}}%",

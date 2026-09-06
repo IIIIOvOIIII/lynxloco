@@ -180,6 +180,8 @@ async def test_runner_stop_cancels_inflight_omni_probe_tasks():
     runner._perception_task = None
     runner._sync_devices_task = None
     runner._inference_worker = MagicMock()
+    runner._window_tasks = {}
+    runner._last_window = {}
 
     # 起一个真的 fire-and-forget task,注册进 _OMNI_PROBE_TASKS (与 processor 同款)
     cancelled_marker: list[str] = []

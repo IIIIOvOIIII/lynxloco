@@ -504,6 +504,11 @@ class PerceptionService:
             recent_window=recent_window,
         )
 
+        concurrency_reader = getattr(self._engine, "concurrency_status", None)
+        concurrency_status = concurrency_reader() if callable(concurrency_reader) else {}
+        if not isinstance(concurrency_status, dict):
+            concurrency_status = {}
+
         return PerceptionRuntimeSummary(
             now_ms=current_ms,
             engine=RuntimeEngineSummary(
@@ -511,6 +516,7 @@ class PerceptionService:
                 ready=status.engine.ready,
                 status=status.engine.status,
                 message=status.engine.message,
+                concurrency=concurrency_status,
             ),
             sources=RuntimeSourceSummary(
                 active_count=len(active_sources),
@@ -565,8 +571,8 @@ class PerceptionService:
                           COALESCE(SUM(omni_call_count), 0) AS omni_call_count,
                           COALESCE(SUM(omni_error_count), 0) AS omni_error_count,
                           SUM(CASE WHEN cycle_error_msg IS NOT NULL AND cycle_error_msg != '' THEN 1 ELSE 0 END) AS cycle_error_count,
-                          COALESCE(MAX(dropped_windows_total), 0) AS dropped_windows_count,
-                          COALESCE(MAX(overflow_count_total), 0) AS overflow_count
+                          COALESCE(SUM(CASE WHEN metric_version >= 2 THEN dropped_windows_total ELSE 0 END), 0) AS dropped_windows_count,
+                          COALESCE(SUM(overflow_count_total), 0) AS overflow_count
                         FROM traces
                         WHERE timestamp >= ?
                         """,

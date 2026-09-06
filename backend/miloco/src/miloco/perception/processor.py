@@ -398,7 +398,7 @@ class PipelineProcessor:
                     # unsubscribe_sse 或 GC 清理即可。
                     continue
 
-    async def process_realtime(self) -> RealtimePerceptionResult | None | bool:
+    async def process_realtime(self, *, batch: PerceptionBatch | None = None) -> RealtimePerceptionResult | None | bool:
         """Realtime perception pipeline.
 
         1. Batch-collect all active devices via collector.collect_batch()
@@ -413,14 +413,15 @@ class PipelineProcessor:
             None — no data available to process (buffer empty).
         """
         async with get_monitor().track_async(NodeName.PROCESSOR, "realtime") as _proc_h:
-            return await self._process_realtime_inner(_proc_h)
+            return await self._process_realtime_inner(_proc_h, batch=batch)
 
-    async def _process_realtime_inner(self, _proc_h=None) -> RealtimePerceptionResult | None | bool:
+    async def _process_realtime_inner(self, _proc_h=None, *, batch: PerceptionBatch | None = None) -> RealtimePerceptionResult | None | bool:
         t_cycle = time.monotonic()
 
         # 1. Drain all active devices into a batch (consuming from buffers)
         t = time.monotonic()
-        batch = self._collector.collect_batch(drain=True)
+        if batch is None:
+            batch = self._collector.collect_batch(drain=True)
         collect_ms = _ms_since(t)
 
         if batch.empty:
@@ -438,6 +439,7 @@ class PipelineProcessor:
         trace_id = str(uuid.uuid4())
         cycle_start_unix_ms = int(time.time() * 1000)
         trace_token = set_trace_id(trace_id)
+        trace_published = False
 
         try:
             start_dt = datetime.fromtimestamp(
@@ -610,6 +612,7 @@ class PipelineProcessor:
                     stream_lag_ms=stream_lag_ms,
                     error_code=result.error_code,
                 )
+                trace_published = True
 
             # Report window duration for node monitor RTF calculation
             if _proc_h is not None and batch.end_timestamp and batch.start_timestamp:
@@ -622,6 +625,15 @@ class PipelineProcessor:
                 )
 
             return result
+        except asyncio.CancelledError:
+            if self._perf_enabled and not trace_published:
+                self._publish_failed_trace(
+                    trace_id=trace_id, cycle_start_unix_ms=cycle_start_unix_ms,
+                    batch=batch, in_delay_s=in_delay_s,
+                    collect_ms=collect_ms, t_cycle=t_cycle,
+                    exc=asyncio.CancelledError("window deadline or lifecycle stop"),
+                )
+            raise
         finally:
             reset_trace_id(trace_token)
 
@@ -691,8 +703,8 @@ class PipelineProcessor:
                 decode=DecodeTrace(
                     video_avg_ms=dd.decode_video_avg_ms,
                     audio_avg_ms=dd.decode_audio_avg_ms,
-                    video_frame_count=len(dd.video),
-                    audio_frame_count=len(dd.audio),
+                    video_frame_count=len(dd.video) + dd.released_video_count,
+                    audio_frame_count=len(dd.audio) + dd.released_audio_count,
                 ),
                 gate=GateTrace(
                     ms=gv + ga, video_ms=gv, audio_ms=ga,
@@ -704,6 +716,7 @@ class PipelineProcessor:
                 # error_code 时,即使 gate timing 缺失(整 batch 早死)也算"omni 被尝试且失败",
                 # 让 omni_error_count 在 aggregate 里 +1。
                 omni=(
+                    None if timing.get(f"_http_started_{did}") == 0 else
                     OmniTrace(ms=omni_ms, error_code=error_code)
                     if error_code is not None
                     else (
@@ -712,6 +725,7 @@ class PipelineProcessor:
                         else (None if gate_skipped else OmniTrace(ms=omni_ms))
                     )
                 ),
+                partial_windows_count=dd.partial_windows_count,
                 dropped_windows_count=dd.dropped_windows,
                 overflow_count=dd.overflow_count,
                 max_buffer_depth=dd.max_buffer_depth,
@@ -740,6 +754,17 @@ class PipelineProcessor:
             cycle.skipped = False
         client.publish_trace(cycle, device_records)
 
+    def record_window_gap(self, batch: PerceptionBatch, reason: str) -> None:
+        """Record a consumed window rejected before preparation, including drops."""
+        if not self._perf_enabled:
+            return
+        from miloco.perception.window_runtime import WindowRejected
+        self._publish_failed_trace(
+            trace_id=str(uuid.uuid4()), cycle_start_unix_ms=int(time.time() * 1000),
+            batch=batch, in_delay_s=max(0, time.time() - batch.end_timestamp / 1000),
+            collect_ms=0.0, t_cycle=time.monotonic(), exc=WindowRejected(reason),
+        )
+
     def _publish_failed_trace(
         self,
         *,
@@ -767,6 +792,23 @@ class PipelineProcessor:
                 0.0,
                 float(batch.end_timestamp - batch.window_first_frame_recv_ms),
             )
+        from miloco.perception.window_runtime import current_job
+        job = current_job()
+        timing = {}
+        if job is not None:
+            dd = batch.devices.get(job.camera)
+            room = (dd.meta.room_name if dd else None) or job.camera
+            timing = {k if k.startswith("_") else f"{room}/{k}": v
+                      for k, v in dict(job.trace_timing).items()}
+            timing[f"{room}/omni_{job.camera}_ms"] = job.http_elapsed_ms()
+            timing[f"{room}/http_{job.camera}_ms"] = job.http_elapsed_ms()
+            timing[f"{room}/slot_wait_{job.camera}_ms"] = job.slot_wait_ms
+            timing[f"{room}/reorder_wait_{job.camera}_ms"] = job.reorder_wait_ms
+            timing[f"_http_started_{job.camera}"] = job.http_started_count
+            if job.http_started_count > job.http_finished_count:
+                timing[f"_omni_error_{job.camera}"] = type(exc).__name__
+            elif job.http_error_code:
+                timing[f"_omni_error_{job.camera}"] = job.http_error_code
         window_duration_ms = float(batch.end_timestamp - batch.start_timestamp)
         latency = PerceptionLatency(
             in_delay_ms=in_delay_s * 1000,
@@ -778,13 +820,15 @@ class PipelineProcessor:
             device_count=batch.device_count,
             skipped=False,
             timestamp=time.time() * 1000,
+            omni_ms=job.http_elapsed_ms() if job is not None else 0.0,
+            timing_detail={k: v for k, v in timing.items() if not k.startswith("_")},
         )
         self._publish_trace(
             trace_id=trace_id,
             cycle_start_unix_ms=cycle_start_unix_ms,
             batch=batch,
             latency=latency,
-            timing={},
+            timing=timing,
             stream_lag_ms=stream_lag_ms,
             cycle_error_msg=error_msg,
         )

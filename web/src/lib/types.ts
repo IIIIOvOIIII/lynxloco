@@ -689,6 +689,8 @@ export interface OmniModelConfig {
   model: string;
   base_url: string;
   api_protocol: OmniApiProtocol;
+  /** 旧服务响应缺失时按 1 显示。 */
+  concurrency?: number;
   protocol_inferred: boolean;
   /** 打码后的 api_key，如 "sk-…79a8"；无 key 时为空串。 */
   api_key_masked: string;
@@ -766,6 +768,8 @@ export interface OmniConfigUpdate {
   model: string;
   base_url: string;
   api_protocol: OmniApiProtocol;
+  /** 1–8；省略时保留档案现有值。 */
+  concurrency?: number;
   /** 省略 / 留空 = 沿用该档案原 key（不被打码值覆盖）。 */
   api_key?: string;
   /** 正在编辑的档案原名（支持改名/定位）；省略=新增。 */
@@ -798,13 +802,22 @@ export type PerfBucket = "1m" | "5m" | "1h" | "1d";
 /** /api/stats?metric=summary 返回。 */
 export interface PerfSummary {
   cycle_count: number;
-  /** 窗口内被 buffer clear 丢的窗口数。cycle_count + dropped_count = 应处理总数。 */
+  /** 新口径按摄像头窗口计数；可选字段兼容旧服务。 */
+  camera_window_count?: number;
+  expected_window_count?: number;
+  legacy_cycle_count?: number;
+  partial_windows_count?: number;
+  omni_request_count?: number;
+  omni_request_error_count?: number;
+  omni_success_cycle_count?: number;
+  /** 完整丢弃的摄像头窗口数。 */
   dropped_count: number;
   skip_rate: number;
-  drop_rate: number;
+  /** null 表示只有旧口径历史，无法计算新口径丢弃率。 */
+  drop_rate: number | null;
   omni_error_rate: number;
   p95_rtf_e2e: number;
-  /** P95 of rtf_omni 仅 omni 成功 cycle(omni_error_count=0)。看 omni 单段实时性,
+  /** P95 of rtf_omni 仅实际调用 Omni 且成功的批次，Omni 时长取最慢摄像头。
    *  跟 p95_rtf_e2e(端到端含等待)对比反映等待时间占比。 */
   p95_rtf_omni: number;
   agent_call_count: number;

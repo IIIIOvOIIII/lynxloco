@@ -183,6 +183,13 @@ class OmniModelSettings(BaseModel):
             "Omni API 协议；旧档案缺失时仅按模型名兼容推断，Base URL 不参与协议选择"
         ),
     )
+    concurrency: int = Field(
+        default=1,
+        strict=True,
+        ge=1,
+        le=8,
+        description="允许同时处理的模型请求数（1–8）",
+    )
     timeout: float = Field(
         default=120.0,
         description="多模态模型请求超时（秒）；本地/内网视觉模型可能需要更长推理时间。",
@@ -813,6 +820,15 @@ class ProtocolScopedEnvSource(PydanticBaseSettingsSource):
 
     def __call__(self) -> dict[str, Any]:  # type: ignore[override]
         env_data = self._env_source()
+        env_model = env_data.get("model")
+        env_omni = env_model.get("omni") if isinstance(env_model, dict) else None
+        if isinstance(env_omni, dict) and isinstance(env_omni.get("concurrency"), str):
+            try:
+                value = json.loads(env_omni["concurrency"])
+            except ValueError:
+                value = None
+            if type(value) is int:
+                env_omni["concurrency"] = value
         effective_protocol = None
         protocol_source = None
         for source_name, source in (

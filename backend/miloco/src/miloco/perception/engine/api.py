@@ -340,6 +340,7 @@ class PerceptionEngine(BasePerceptionEngine):
         self._tierc_last_clear_date: dict[str, str] = {}            # key: device_id → "YYYY-MM-DD"
         # 累计帧序号（重审周期判定用）
         self._global_frame_index = 0
+        self._camera_frame_indices = {}
 
     def _scope_label_for(self, device_id: str, room_name: str) -> str:
         """计算（并记忆）一个 device 在所在 room 内的 scope_label，格式 ``"<room>-dev<idx>"``。
@@ -710,6 +711,8 @@ class PerceptionEngine(BasePerceptionEngine):
         if self._tierc_clear_task is not None:
             self._tierc_clear_task.cancel()
             self._tierc_clear_task = None
+        if hasattr(self, "_window_locks"):
+            self._window_locks.clear()
         for did, eng in self._identity_engines.items():
             if eng is None:
                 continue
@@ -871,6 +874,7 @@ class PerceptionEngine(BasePerceptionEngine):
             if eng is not None:
                 eng.reset()
         self._global_frame_index = 0
+        self._camera_frame_indices = {}
         # 旧场景基准帧 vs 新场景首帧的 diff 不代表真实变化,清掉退化为冷启动语义
         self._gate_prev_frames.clear()
         # hold 状态机一并清,首通后 6min 倒计时重启
@@ -964,7 +968,53 @@ class PerceptionEngine(BasePerceptionEngine):
             self._pending_speech.pop(did, None)
             self._pending_speech_rounds.pop(did, None)
 
-    async def realtime_perceive(
+    async def realtime_perceive(self, batch, rules=None, on_early_speeches=None,
+                               on_early_matched_rules=None, on_early_suggestions=None):
+        from miloco.perception.window_runtime import current_job
+        job = current_job()
+        if job is None:
+            return await self._realtime_perceive_window(
+                batch, rules, on_early_speeches, on_early_matched_rules,
+                on_early_suggestions)
+        if len(batch.snapshots) != 1 or batch.snapshots[0].device.did != job.camera:
+            raise ValueError("concurrent jobs require exactly one camera window")
+        if not hasattr(self, "_window_locks"):
+            self._window_locks = {}
+            self._source_generations = {}
+        lock = self._window_locks.setdefault(job.camera, asyncio.Lock())
+        await lock.acquire()
+        job.prepare_lock = lock
+        job.owns_lock = True
+        try:
+            if not job.valid:
+                raise asyncio.CancelledError()
+            old_generation = self._source_generations.get(job.camera)
+            if old_generation is not None and old_generation != job.generation:
+                self._reset_camera_session(job.camera)
+            self._source_generations[job.camera] = job.generation
+            # Streaming fields are parsed normally but committed once, together
+            # with the final result, after predecessor side effects complete.
+            return await self._realtime_perceive_window(batch, rules)
+        finally:
+            job.release_preparation()
+            job.release_state()
+
+    def _reset_camera_session(self, did: str) -> None:
+        svc = self._tracking_services.get(did)
+        if svc is not None and hasattr(svc, "reset_session"):
+            svc.reset_session()
+        eng = self._identity_engines.get(did)
+        if eng is not None:
+            eng.reset()
+        if hasattr(self, "_camera_frame_indices"):
+            self._camera_frame_indices.pop(did, None)
+        for name in ("_gate_prev_frames", "_gate_last_visual_pass_ts",
+                     "_gate_last_audio_pass_ts", "_gate_hold_active",
+                     "_gate_hold_started_at", "_audio_tail", "_pending_speech",
+                     "_pending_speech_rounds", "_last_captions", "_sugg_table"):
+            getattr(self, name, {}).pop(did, None)
+
+    async def _realtime_perceive_window(
         self,
         batch: BatchedSnapshot,
         rules: list[dict] | None = None,
@@ -1061,6 +1111,10 @@ class PerceptionEngine(BasePerceptionEngine):
                         sample_rate=snapshot.sample_rate,
                     )
 
+        from miloco.perception.window_runtime import current_job
+        job = current_job()
+        frame_index_offsets = self._reserve_frame_indices(batch)
+        frame_index_offset = min(frame_index_offsets.values(), default=0)
         # Run batch pipeline（通过 factory 回调懒加载 per-device tracking_service /
         # identity_engine，让 fused 模式下回灌路径打通）
         try:
@@ -1076,7 +1130,8 @@ class PerceptionEngine(BasePerceptionEngine):
                 # 流式早出的 suggestion 经此闸门解析事件链（与 _merge_results 同一方法、
                 # 同一推理线程），心跳/重复抑制后才外发
                 assign_suggestion_link=self.assign_id_and_update_link,
-                frame_index_offset=self._global_frame_index,
+                frame_index_offset=frame_index_offset,
+                frame_index_offsets=frame_index_offsets,
                 gate_prev_frames=self._gate_prev_frames,
                 gate_last_visual_pass_ts=self._gate_last_visual_pass_ts,
                 gate_last_audio_pass_ts=self._gate_last_audio_pass_ts,
@@ -1087,13 +1142,33 @@ class PerceptionEngine(BasePerceptionEngine):
             logger.error("Batch pipeline failed: %s", e, exc_info=True)
             raise  # 让上层 processor 按异常类型分类（OmniError → omni_error_count）
 
-        # 推进全局帧序号——驱动 IdentityEngine recheck 周期与 dead-track GC
-        # 增量按 downsample 后单窗口帧数估算（fps × period_sec），与 run_identity
-        # 内部 ``frame_index_offset + len(gate_packet.frames)`` 语义对齐
-        self._global_frame_index += self._config.input.fps * self._config.input.period_sec
+        if job is not None:
+            actionable = await job.begin_commit()
+            for rr in result.rooms.values():
+                if rr.timing is None:
+                    rr.timing = {}
+                rr.timing[f"omni_{job.camera}_ms"] = job.http_ms
+                rr.timing[f"http_{job.camera}_ms"] = job.http_ms
+                rr.timing[f"slot_wait_{job.camera}_ms"] = job.slot_wait_ms
+                rr.timing[f"reorder_wait_{job.camera}_ms"] = job.reorder_wait_ms
+                rr.timing[f"_http_started_{job.camera}"] = job.http_started_count
+            if not actionable:
+                return self._merge_historical_results(result)
 
         # Merge all rooms into a single RealtimePerceptionResult
         return self._merge_results(result, contexts, device_rule_map=device_rule_map)
+
+    def _reserve_frame_indices(self, batch: BatchedSnapshot) -> dict[str, int]:
+        if not hasattr(self, "_camera_frame_indices"):
+            self._camera_frame_indices = {}
+        increment = self._config.input.fps * self._config.input.period_sec
+        offsets = {}
+        for snapshot in batch.snapshots:
+            did = snapshot.device.did
+            offsets[did] = self._camera_frame_indices.get(did, 0)
+            self._camera_frame_indices[did] = offsets[did] + increment
+        self._global_frame_index = max(self._camera_frame_indices.values(), default=0)
+        return offsets
 
     async def on_demand_perceive(
         self,
@@ -1130,6 +1205,7 @@ class PerceptionEngine(BasePerceptionEngine):
             if cap:
                 per_room_last_caption[room_name] = cap
 
+        frame_index_offsets = self._reserve_frame_indices(batch)
         try:
             results = await run_query_pipeline(
                 batch,
@@ -1138,14 +1214,12 @@ class PerceptionEngine(BasePerceptionEngine):
                 get_tracking_service=self._get_or_create_tracking_service,
                 get_identity_engine=self._get_or_create_identity_engine,
                 last_captions=per_room_last_caption,
-                frame_index_offset=self._global_frame_index,
+                frame_index_offset=min(frame_index_offsets.values(), default=0),
+                frame_index_offsets=frame_index_offsets,
             )
         except Exception as e:
             logger.error("Query pipeline failed: %s", e, exc_info=True)
             return OnDemandPerceptionResult(answer="")
-
-        # 与 realtime_perceive 保持一致地推进全局帧序号
-        self._global_frame_index += self._config.input.fps * self._config.input.period_sec
 
         # Merge all room answers
         answers = [r.answer for r in results.values() if r.answer]
@@ -1154,6 +1228,25 @@ class PerceptionEngine(BasePerceptionEngine):
     # ------------------------------------------------------------------
     # Result merging
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _merge_historical_results(result: BatchPipelineResult) -> RealtimePerceptionResult:
+        timing = dict(result.timing or {})
+        merged = RealtimePerceptionResult(timing=timing)
+        for room, rr in result.rooms.items():
+            for key, value in (rr.timing or {}).items():
+                timing[key if key.startswith("_") else f"{room}/{key}"] = value
+            for dr in rr.device_results.values():
+                out = dr.omni_output
+                if out is not None and not out.skipped:
+                    merged.caption.extend(out.caption)
+                    merged.matched_rules.extend(out.matched_rules)
+                    merged.speeches.extend(out.speeches)
+                    merged.suggestions.extend(out.suggestions)
+                    merged.env_sounds.extend(out.env_sounds)
+        timing["_actions_suppressed"] = "window_age_or_generation"
+        merged.timing = timing
+        return merged
 
     def _merge_results(
         self,

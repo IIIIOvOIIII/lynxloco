@@ -41,7 +41,9 @@ usage() {
         'Operations: build preflight deploy verify status rollback' \
         '' \
         'Host operations accept HOST positionally or as --host HOST.' \
-        'Rollback additionally requires a full 40-character Git SHA.'
+        'Rollback additionally requires a full 40-character Git SHA.' \
+        'MILOCO_DEPLOY_RUNTIME=openclaw selects the native production profile.' \
+        'Native rollback SHA identifies the current transaction to undo; Docker SHA identifies the version to restore.'
 }
 
 validate_sha() {
@@ -597,4 +599,11 @@ dispatch() {
 
 parse_arguments "$@"
 cd "$PROJECT_ROOT"
-dispatch
+case "${MILOCO_DEPLOY_RUNTIME:-docker}" in
+    docker) dispatch ;;
+    openclaw)
+        source "$PROJECT_ROOT/deploy/openclaw/local.sh"
+        openclaw_dispatch
+        ;;
+    *) die 2 "unsupported deployment runtime" ;;
+esac

@@ -168,3 +168,49 @@ def test_keep_action_trims_drained_to_max_windows():
     got = {f.data for f in peeked["video"]}
     assert b"v1" not in got, "最旧窗应已被裁"
     assert b"v5" in got, "最新窗必须保留"
+
+
+def test_clear_counts_unique_lost_windows_and_current_partial_separately():
+    buf = MultiTrackSyncBuffer(["video", "audio"], window_ms=4000,
+                               max_windows=3, window_settle_ms=500,
+                               buffer_full_action="clear")
+    for w in range(5):
+        ts = w * 4000 + 100
+        buf.put("video", b"v", ts, ts)
+        buf.put("audio", b"a", ts, ts)
+    # Audio first creates the current window; video then closes the previous one.
+    buf.put("audio", b"old-current", 20000, 19999)
+    buf.put("video", b"current", 20100, 20100)
+    assert buf.consume_drop_stats() == (4, 1, 4, "clear")
+    assert buf.window_count == 1
+    assert buf.consume_partial_stats() == 0  # triggering fragment was sole current data
+    assert buf.consume_partial_stats() == 0
+
+
+def test_fifo_drain_preserves_coverage_and_latest_peek():
+    buf = MultiTrackSyncBuffer(["video"], window_ms=100, window_settle_ms=0,
+                               max_windows=4, buffer_full_action="drop")
+    for w in range(5):
+        buf.put("video", bytes([w]), w * 100 + 10, w * 100 + 10)
+    assert [buf.drain_ready(mode="fifo").start_ms for _ in range(3)] == [100, 200, 300]
+    assert buf.consume_drop_stats() == (0, 0, 0, None)
+    assert buf.peek_latest()["video"][-1].data == bytes([4])
+
+
+def test_clear_records_current_window_partial_once():
+    buf = MultiTrackSyncBuffer(["video", "audio"], window_ms=4000,
+                               max_windows=3, window_settle_ms=500,
+                               buffer_full_action="clear")
+    for w in range(4):
+        ts = w * 4000 + 100
+        buf.put("video", b"v", ts, ts)
+        buf.put("audio", b"a", ts, ts)
+    # Previous window waits for the missing audio until the settle deadline.
+    buf.put("video", b"previous", 16100, 16100)
+    buf.put("video", b"current-video", 20000, 20000)
+    buf.put("audio", b"current-audio", 20100, 20100)
+    buf.put("audio", b"trigger", 20600, 20600)
+    assert buf.consume_drop_stats() == (4, 1, 4, "clear")
+    assert buf.consume_partial_stats() == 1
+    assert buf.consume_partial_stats() == 0
+    assert buf.peek_latest()["audio"][0].data == b"trigger"

@@ -17,6 +17,7 @@ import json
 import logging
 import time
 import uuid
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 
 from miloco.config import get_settings
@@ -54,6 +55,7 @@ from miloco.perception.types import (
     Suggestion,
     suggestion_intra_priority,
 )
+from miloco.perception.window_runtime import current_job
 
 
 def _attach_caption(
@@ -264,6 +266,8 @@ class PerceptionEngineProxy:
         # 软停(stop_to_unconfigured)与在飞 perceive 互斥:teardown 必等当前推理完成,
         # 持锁期间进来的 perceive 在 if not ready 守卫处安全跳过 → 杜绝 use-after-close。
         self._engine_lock = asyncio.Lock()
+        self._concurrent_calls = {}
+        self._closing = False
 
         self._init_engine()
 
@@ -420,6 +424,7 @@ class PerceptionEngineProxy:
         (模型缺失/API key 没配),不应被 set_inference_worker 误唤醒回 READY。
         """
         self._inference_worker = worker
+        self._closing = False
         mon = get_monitor()
         state = mon.get_state(NodeName.ENGINE)
         if state and state.lifecycle == Lifecycle.STOPPED and self.perception_engine is not None:
@@ -430,13 +435,46 @@ class PerceptionEngineProxy:
         if self.perception_engine is not None:
             self.perception_engine.set_tierc_frame_provider(provider)
 
+    @asynccontextmanager
+    async def _perceive_guard(self):
+        job = current_job()
+        if job is None:
+            async with self._engine_lock:
+                yield
+            return
+        task = asyncio.current_task()
+        async with self._engine_lock:
+            if getattr(self, "_closing", False):
+                raise asyncio.CancelledError()
+            if not hasattr(self, "_concurrent_calls"):
+                self._concurrent_calls = {}
+            self._concurrent_calls[task] = job
+        try:
+            yield
+        finally:
+            self._concurrent_calls.pop(task, None)
+
+    async def _cancel_concurrent_calls(self):
+        self._closing = True
+        tasks = list(getattr(self, "_concurrent_calls", {}))
+        for task in tasks:
+            self._concurrent_calls[task].valid = False
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     async def close(self) -> None:
         """Close engine resources (e.g., IdentityEngine dispatcher worker)."""
         if self.perception_engine is None:
             return  # PREREQ_MISSING / FAILED — nothing to stop, preserve lifecycle
+        await self._cancel_concurrent_calls()
         get_monitor().set_lifecycle(NodeName.ENGINE, Lifecycle.STOPPED)
         try:
-            await self.perception_engine.close()
+            worker = self._inference_worker
+            if worker is not None and worker.is_running:
+                await worker.submit(self.perception_engine.close())
+            else:
+                await self.perception_engine.close()
         except AttributeError:
             pass
         except Exception as e:  # noqa: BLE001
@@ -451,6 +489,9 @@ class PerceptionEngineProxy:
         no-op：settings 已由 PUT config 持久化，下次 ``_init_engine`` 自然读到新值。
         """
         async with self._engine_lock:
+            active = list(getattr(self, "_concurrent_calls", {}))
+            if active:
+                await asyncio.gather(*(asyncio.shield(t) for t in active), return_exceptions=True)
             if self.perception_engine is not None:
                 self.perception_engine.apply_omni_fps(omni_fps)
 
@@ -470,6 +511,7 @@ class PerceptionEngineProxy:
                 self.perception_engine = None  # ready→False,tick 的 realtime_perceive 立即跳过
             # 按当前(删后已清空 key 的)配置重判:落 no_omni_api_key;万一 key 仍在则重建为 ready。
             self._init_engine()
+            self._closing = False
 
     # ---- Internal impls (run in inference thread) ----
 
@@ -698,7 +740,7 @@ class PerceptionEngineProxy:
         executor 线程,只能显式透传 reference).
         """
         # _engine_lock:与 stop_to_unconfigured 互斥,持锁期间引擎不会被 teardown 拔掉。
-        async with get_monitor().track_async(NodeName.ENGINE, "perceive") as _eng_h, self._engine_lock:
+        async with get_monitor().track_async(NodeName.ENGINE, "perceive") as _eng_h, self._perceive_guard():
             if not self.ready:
                 _eng_h.skip_rolling()
                 return None, set(), {}, set()
@@ -717,6 +759,21 @@ class PerceptionEngineProxy:
             t = time.monotonic()
             batched_snapshot = batch.to_batched_snapshot()
             convert_ms = _ms_since(t)
+            job = current_job()
+            if job is not None:
+                # Keep counts and timestamps for traces, not a second raw-media
+                # copy throughout the network wait.
+                for dd in batch.devices.values():
+                    dd.released_video_count = len(dd.video)
+                    dd.released_audio_count = len(dd.audio)
+                    dd.video = []
+                    dd.audio = []
+                if batched_snapshot is not None:
+                    def release_snapshot_media():
+                        for snapshot in batched_snapshot.snapshots:
+                            snapshot.video = None
+                            snapshot.audio = None
+                    job.release_media.append(release_snapshot_media)
 
             if batched_snapshot is None:
                 _eng_h.skip_rolling()
@@ -782,6 +839,12 @@ class PerceptionEngineProxy:
         artifacts.clips / artifacts.trace（同 realtime_perceive 语义）。
         """
         async with get_monitor().track_async(NodeName.ENGINE, "on_demand") as _eng_h, self._engine_lock:
+            active = list(getattr(self, "_concurrent_calls", {}))
+            if active:
+                # Query preparation uses the same tracker/identity instances.
+                # The admission lock pauses new realtime windows while existing
+                # bounded jobs finish, preserving the legacy exclusive query.
+                await asyncio.gather(*(asyncio.shield(t) for t in active), return_exceptions=True)
             if not self.ready:
                 _eng_h.skip_rolling()
                 return None
@@ -828,7 +891,8 @@ class PerceptionEngineProxy:
         落盘扩展名 + SSE 推 kind.artifacts.trace 由 omni HTTP 调用 finally 填入,
         随 clip 一起落到 event_dir.
         """
-        if result.skipped:
+        job = current_job()
+        if result.skipped or (result.timing or {}).get("_actions_suppressed") or (job is not None and not job.actionable):
             return
 
         from miloco.manager import get_manager
@@ -890,6 +954,8 @@ class PerceptionEngineProxy:
         # spawn 后异常照常上抛，与「persist 领先循环」时的传播语义一致。
         try:
             for matched_rule in result.matched_rules:
+                if job is not None and not job.actionable:
+                    return
                 did = matched_rule.source_device_ids[0] if matched_rule.source_device_ids else "perception"
                 if early_sent_rule_ids and (matched_rule.rule_id, did) in early_sent_rule_ids:
                     continue
@@ -928,6 +994,8 @@ class PerceptionEngineProxy:
             enabled_set = set(svc.get_enabled_rule_ids())
             for did, rule_ids in result.device_rule_map.items():
                 for rule_id in rule_ids:
+                    if job is not None and not job.actionable:
+                        return
                     if (rule_id, did) in matched_pairs:
                         continue
                     # 防 race:下发后 rule 在 cycle 内被 disable
@@ -971,6 +1039,14 @@ class PerceptionEngineProxy:
                 )
                 _PERSIST_BG_TASKS.add(task)
                 task.add_done_callback(_PERSIST_BG_TASKS.discard)
+                if job is not None:
+                    # Keep this job's encoded-byte reservation until its media
+                    # write completes; concurrent windows must not create an
+                    # unbounded background persistence queue.
+                    await task
+
+        if job is not None and not job.actionable:
+            return
 
         # result.suggestions 含本窗全部「新链」（dump/上下文已完整）。per-omni 下这些新链
         # 已在 _on_early_suggestions 逐相机早送过（id 记入 early_sent_sugg_ids）——此处据此
@@ -998,6 +1074,9 @@ class PerceptionEngineProxy:
                     "suggestion", kept, build_suggestions_text,
                     intra_priority=suggestion_intra_priority(kept),
                 )
+
+        if job is not None and not job.actionable:
+            return
 
         # handle speeches (skip those already sent via streaming early callback)
         speeches: list[Speech] = []

@@ -120,15 +120,15 @@ def app_with_full_data(tmp_path):
             "in_delay_ms, stream_lag_ms, "
             "gate_video_pass, gate_audio_pass, "
             "omni_call_count, omni_error_count, "
-            "dropped_windows_total, overflow_count_total) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "dropped_windows_total, overflow_count_total, device_count, metric_version, omni_wall_ms) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,2,?)",
             (f"c-{i}", ts, skipped,
              10.0, 5.0, 3.0, 2.0, identity_ms, omni_ms, 1.0,
              100.0 + i * 10, 90.0 + i * 10, 3000.0,
              50.0, 20.0,
              1 if i % 2 == 0 else 0, 1 if i % 3 == 0 else 0,
              omni_call, omni_err,
-             dropped, overflow),
+             dropped, overflow, omni_ms),
         )
         # 前 7 条 cycle 各挂 1 个 agent_run
         if i < 7:

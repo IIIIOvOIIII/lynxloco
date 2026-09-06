@@ -108,6 +108,13 @@
               "default": null,
               "description": "Omni API 协议；旧档案缺失时仅按模型名兼容推断，Base URL 不参与协议选择"
             },
+            "concurrency": {
+              "type": "integer",
+              "default": 1,
+              "minimum": 1,
+              "maximum": 8,
+              "description": "允许同时处理的模型请求数（1–8）"
+            },
             "timeout": {
               "type": "number",
               "default": 120.0,

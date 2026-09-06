@@ -685,7 +685,11 @@ class RtspSession:
         schedule_drain = False
         with self._ingress_lock:
             if len(self._media_ingress) >= self._queue_size:
-                self._media_ingress.popleft()
+                # Evict this modality's oldest item first. Otherwise a burst
+                # of audio packets can erase every already-admitted video.
+                oldest_same = next((i for i, old in enumerate(self._media_ingress)
+                                    if old.kind == event.kind), 0)
+                del self._media_ingress[oldest_same]
                 self._dropped_frames += 1
             self._media_ingress.append(event)
             if not self._media_drain_scheduled:

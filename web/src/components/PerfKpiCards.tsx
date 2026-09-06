@@ -1,5 +1,5 @@
 /**
- * 7 张 KPI 卡:轮次(含应处理) / Gate 过滤率 / 窗口丢弃率 / Omni 错误率 / 实时率 P95 /
+ * 7 张 KPI 卡:摄像头窗口(含应处理) / Gate 过滤率 / 窗口丢弃率 / Omni 错误率 / 实时率 P95 /
  * omni 实时率 P95 / Agent 调用。
  *
  * 阈值颜色:>5% drop / >5% omni error / RTF>1 → 红字提醒,其余中性。
@@ -86,8 +86,12 @@ export function PerfKpiCards({ state, embedded = false }: Props) {
   if (!state.data) return null;
 
   const s = state.data;
-  // 空窗口提示
-  if (s.cycle_count === 0) {
+  const legacyApi = s.camera_window_count === undefined;
+  const legacyOnly = !legacyApi && (s.legacy_cycle_count ?? 0) > 0
+    && (s.expected_window_count ?? 0) === 0;
+  const noSuccessfulOmni = s.omni_success_cycle_count === 0;
+  // 丢弃窗口也要展示，即使本时段没有完成批次。
+  if (s.cycle_count === 0 && (s.expected_window_count ?? s.dropped_count) === 0) {
     return (
       <div className={embedded ? "p-8 text-center text-text-secondary" : "rounded-xl bg-bg-secondary border border-border shadow-sm p-8 text-center text-text-secondary"}>
         {t("perf.kpiEmptyTrace")}
@@ -97,15 +101,21 @@ export function PerfKpiCards({ state, embedded = false }: Props) {
 
   return (
     <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-7 gap-3">
+      {(legacyApi || (s.legacy_cycle_count ?? 0) > 0) && (
+        <div role="note" className="col-span-full text-caption text-warning">
+          {t(legacyOnly ? "perf.kpiLegacyOnly" : "perf.kpiLegacyWarning")}
+        </div>
+      )}
       <KpiCard
         embedded={embedded}
-        label={t("perf.kpiCycle")}
-        value={s.cycle_count.toLocaleString()}
+        label={t(legacyApi ? "perf.kpiCycle" : "perf.kpiCameraWindows")}
+        value={legacyOnly ? "—" : (s.camera_window_count ?? s.cycle_count).toLocaleString()}
         sub={[
           {
             label: t("perf.kpiShouldProcess"),
-            value: (s.cycle_count + s.dropped_count).toLocaleString(),
+            value: legacyOnly ? "—" : (s.expected_window_count ?? (s.cycle_count + s.dropped_count)).toLocaleString(),
           },
+          ...(!legacyApi ? [{ label: t("perf.kpiBatches"), value: s.cycle_count.toLocaleString() }] : []),
         ]}
       />
       <KpiCard
@@ -117,28 +127,28 @@ export function PerfKpiCards({ state, embedded = false }: Props) {
       <KpiCard
         embedded={embedded}
         label={t("perf.kpiDropRate")}
-        value={pct(s.drop_rate)}
+        value={s.drop_rate == null ? "—" : pct(s.drop_rate)}
         hint={t("perf.kpiDropRateHint")}
-        warn={s.drop_rate > 0.05}
+        warn={s.drop_rate != null && s.drop_rate > 0.05}
       />
       <KpiCard
         embedded={embedded}
         label={t("perf.kpiOmniErrorRate")}
-        value={pct(s.omni_error_rate)}
+        value={s.omni_request_count === 0 ? "—" : pct(s.omni_error_rate)}
         hint={t("perf.kpiOmniErrorRateHint")}
         warn={s.omni_error_rate > 0.05}
       />
       <KpiCard
         embedded={embedded}
         label={t("perf.kpiRtfP95")}
-        value={s.p95_rtf_e2e.toFixed(2)}
+        value={noSuccessfulOmni ? "—" : s.p95_rtf_e2e.toFixed(2)}
         hint={t("perf.kpiRtfP95Hint")}
         warn={s.p95_rtf_e2e > 1}
       />
       <KpiCard
         embedded={embedded}
         label={t("perf.kpiOmniRtfP95")}
-        value={s.p95_rtf_omni.toFixed(2)}
+        value={noSuccessfulOmni ? "—" : s.p95_rtf_omni.toFixed(2)}
         hint={t("perf.kpiOmniRtfP95Hint")}
         warn={s.p95_rtf_omni > 1}
       />

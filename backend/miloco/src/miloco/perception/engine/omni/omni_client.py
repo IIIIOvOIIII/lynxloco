@@ -35,6 +35,7 @@ from miloco.perception.engine.omni.provider import (
 )
 from miloco.perception.runtime_diagnostics import record_omni_http_diagnostic
 from miloco.perception.snapshot_context import push_omni_trace
+from miloco.perception.window_runtime import WindowRejected, current_job, model_request
 
 logger = logging.getLogger(__name__)
 
@@ -254,7 +255,7 @@ async def call_omni(
     }
     try:
         await cb.before_call()  # 熔断 OPEN → 直接抛 CircuitOpenError
-        async with httpx.AsyncClient(timeout=config.timeout) as client:
+        async with model_request(body), httpx.AsyncClient(timeout=config.timeout) as client:
             if not forced_stream:
                 resp = await client.post(url, headers=headers, json=body)
                 classified = classify_response(resp, visual_request=visual_request)
@@ -306,7 +307,7 @@ async def call_omni(
         raise
     except Exception as e:
         # HTTP 响应异常已在 record_failure 里记过;这里补记 exception 类。
-        if not isinstance(e, httpx.HTTPStatusError):
+        if not isinstance(e, (httpx.HTTPStatusError, WindowRejected)):
             await cb.record_failure(classify_exception(e))
         error = {"code": e.__class__.__name__, "msg": str(e)[:512]}
         raise OmniError(
@@ -314,7 +315,8 @@ async def call_omni(
         ) from e
     finally:
         # 熔断短路 latency=0(不占实际墙钟),便于 dashboard 区分"实际尝试失败"和"熔断跳过"
-        latency_ms = 0.0 if short_circuited else (time.monotonic() - t0) * 1000
+        job = current_job()
+        latency_ms = job.http_ms if job is not None else (0.0 if short_circuited else (time.monotonic() - t0) * 1000)
         push_omni_trace(
             request_messages=messages,
             response_raw=raw,
@@ -633,7 +635,7 @@ async def call_omni_stream(
     t0 = time.monotonic()
     try:
         await cb.before_call()
-        async with httpx.AsyncClient(
+        async with model_request(body), httpx.AsyncClient(
             timeout=httpx.Timeout(config.timeout, connect=10.0)
         ) as client:
             async with client.stream(
@@ -673,7 +675,7 @@ async def call_omni_stream(
     except OmniError:
         raise  # 不重复包装
     except Exception as e:
-        if not isinstance(e, httpx.HTTPStatusError):
+        if not isinstance(e, (httpx.HTTPStatusError, WindowRejected)):
             await cb.record_failure(classify_exception(e))
         error = {"code": e.__class__.__name__, "msg": str(e)[:512]}
         raise OmniError(
@@ -691,7 +693,8 @@ async def call_omni_stream(
             "choices": [{"message": {"content": "".join(response_chunks)}}],
             "usage": raw_usage_seen or {},
         }
-        latency_ms = 0.0 if short_circuited else (time.monotonic() - t0) * 1000
+        job = current_job()
+        latency_ms = job.http_ms if job is not None else (0.0 if short_circuited else (time.monotonic() - t0) * 1000)
         push_omni_trace(
             request_messages=messages,
             response_raw=raw_for_trace,

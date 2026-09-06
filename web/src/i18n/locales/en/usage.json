@@ -1,5 +1,9 @@
 {
   "usage": {
+    "concurrencyLabel": "Model concurrency",
+    "concurrencyHint": "Simultaneous model requests (1–8), default 1. Higher concurrency can improve throughput but may increase API costs and service load.",
+    "concurrencyInvalid": "Model concurrency must be an integer from 1 to 8",
+    "concurrencySummary": "Concurrency {{n}}",
     "tokenUsageTitle": "Token usage",
     "loading": "Loading…",
     "loadError": "Couldn't load usage",

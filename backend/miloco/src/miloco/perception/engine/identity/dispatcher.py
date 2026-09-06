@@ -159,7 +159,23 @@ class FusedDispatcher:
 
     def __init__(self, config: DispatchConfig | None = None) -> None:
         self.config = config or DispatchConfig()
-        self._pending: _FusedPending | None = None
+        self._pending_jobs: dict[str, _FusedPending] = {}
+
+    @property
+    def _pending(self) -> _FusedPending | None:
+        from miloco.perception.window_runtime import current_job
+        job = current_job()
+        return self._pending_jobs.get(job.job_id if job else "legacy")
+
+    @_pending.setter
+    def _pending(self, value: _FusedPending | None) -> None:
+        from miloco.perception.window_runtime import current_job
+        job = current_job()
+        key = job.job_id if job else "legacy"
+        if value is None:
+            self._pending_jobs.pop(key, None)
+        else:
+            self._pending_jobs[key] = value
 
     async def dispatch(
         self,
@@ -212,7 +228,7 @@ class FusedDispatcher:
             )
 
     async def close(self) -> None:
-        self._pending = None
+        self._pending_jobs.clear()
 
     # ----- Fused-specific API -----
 

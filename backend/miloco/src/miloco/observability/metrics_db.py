@@ -12,7 +12,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _TRACES_SCHEMA = """
 CREATE TABLE IF NOT EXISTS traces (
@@ -44,7 +44,12 @@ CREATE TABLE IF NOT EXISTS traces (
   timing_detail         TEXT,
   dropped_windows_total INTEGER DEFAULT 0,
   overflow_count_total  INTEGER DEFAULT 0,
-  cycle_error_msg       TEXT
+  cycle_error_msg       TEXT,
+  omni_wall_ms          REAL,
+  omni_request_count    INTEGER DEFAULT 0,
+  omni_request_error_count INTEGER DEFAULT 0,
+  partial_windows_total INTEGER DEFAULT 0,
+  metric_version        INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_traces_ts ON traces(timestamp);
 """
@@ -76,7 +81,8 @@ CREATE TABLE IF NOT EXISTS traces_device (
   dropped_windows_count  INTEGER DEFAULT 0,
   overflow_count         INTEGER DEFAULT 0,
   max_buffer_depth       INTEGER DEFAULT 0,
-  last_overflow_action   TEXT
+  last_overflow_action   TEXT,
+  partial_windows_count INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_td_cycle ON traces_device(cycle_id);
 CREATE INDEX IF NOT EXISTS idx_td_device_ts ON traces_device(device_id, timestamp);
@@ -171,6 +177,10 @@ SELECT
        ELSE NULL END AS rtf_stream_e2e,
   CASE WHEN window_duration_ms > 0 AND omni_ms IS NOT NULL
        THEN omni_ms / window_duration_ms ELSE NULL END AS rtf_omni,
+  CASE WHEN window_duration_ms > 0 THEN
+       COALESCE(omni_wall_ms,
+         (SELECT MAX(d.omni_ms) FROM traces_device d WHERE d.cycle_id=t.trace_id)
+       ) / window_duration_ms ELSE NULL END AS rtf_omni_wall,
   CASE WHEN gate_video_pass = 1 OR gate_audio_pass = 1 OR gate_hold_pass = 1 THEN 1 ELSE 0 END AS gate_passed
 FROM traces t;
 """
@@ -281,9 +291,30 @@ def _migrate_v4_action_home(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_v5_concurrency_metrics(conn: sqlite3.Connection) -> None:
+    columns = {
+        "traces": {
+            "omni_wall_ms": "REAL",
+            "omni_request_count": "INTEGER DEFAULT 0",
+            "omni_request_error_count": "INTEGER DEFAULT 0",
+            "partial_windows_total": "INTEGER DEFAULT 0",
+            "metric_version": "INTEGER NOT NULL DEFAULT 1",
+        },
+        "traces_device": {"partial_windows_count": "INTEGER DEFAULT 0"},
+    }
+    for table, additions in columns.items():
+        existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for column, definition in additions.items():
+            if column not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+    conn.execute("DROP VIEW IF EXISTS traces_v")
+    conn.executescript(_TRACES_V_VIEW)
+
+
 # 步进迁移注册表:{target_version: fn}。fn 只做 additive DDL,须幂等。
 _MIGRATIONS = {
     2: _migrate_v2_action_ledger,
     3: _migrate_v3_action_source,
     4: _migrate_v4_action_home,
+    5: _migrate_v5_concurrency_metrics,
 }

@@ -391,6 +391,7 @@ async def run_batch_pipeline(
     on_early_suggestions: Callable[[list[Suggestion]], Awaitable[None]] | None = None,
     assign_suggestion_link: "Callable[[str, Suggestion, float], bool] | None" = None,
     frame_index_offset: int = 0,
+    frame_index_offsets: dict[str, int] | None = None,
     gate_prev_frames: "dict[str, NDArray[np.uint8]] | None" = None,
     gate_last_visual_pass_ts: "dict[str, float] | None" = None,
     gate_last_audio_pass_ts: "dict[str, float] | None" = None,
@@ -454,6 +455,10 @@ async def run_batch_pipeline(
         snapshot = downsample_snapshot(snapshot, config.input.fps)
 
         did = snapshot.device.did
+        from miloco.perception.window_runtime import current_job
+        job = current_job()
+        if job is not None:
+            job.trace_timing = room_timing
         device_name = snapshot.device.name
         time_window = _fmt_time_window(snapshot.start_timestamp, snapshot.end_timestamp)
         context = contexts.get(did, OmniContext())
@@ -577,7 +582,7 @@ async def run_batch_pipeline(
         identity_packet = await run_identity(
             gate_packet, config.identity, tracking_service,
             identity_engine=identity_engine,
-            frame_index_offset=frame_index_offset,
+            frame_index_offset=(frame_index_offsets or {}).get(did, frame_index_offset),
         )
         room_timing[f"identity_{did}_ms"] = _ms_since(t)
 
@@ -599,8 +604,30 @@ async def run_batch_pipeline(
             omni_packet = _downsample_for_omni(
                 identity_packet, config.input.fps, config.input.omni_fps
             )
+            from miloco.perception.window_runtime import current_job
+            job = current_job()
+            if job is not None:
+                def release_window_media():
+                    import numpy as np
+                    snapshot.video = None
+                    snapshot.audio = None
+                    gate_packet.frames = []
+                    gate_packet.audio_clip = np.zeros(0, dtype=np.int16)
+                    for packet in (identity_packet, omni_packet):
+                        packet.frames = []
+                        packet.all_frames = []
+                        packet.audio_clip = np.zeros(0, dtype=np.int16)
+                        packet.targets = []
+                job.release_media.append(release_window_media)
             # omni 配置热更新:每周期从当前 settings 刷新,web 改完下个周期生效。
             omni_cfg = resolve_live_omni_config(config.omni)
+            if job is not None:
+                from miloco.perception.window_runtime import (
+                    model_identity,
+                    request_version,
+                )
+                job.model_identity = model_identity(omni_cfg)
+                job.config_version = request_version(omni_cfg)
             if use_fused:
                 omni_output = await run_omni_fused(
                     [omni_packet], context, omni_cfg, identity_engine,
@@ -664,6 +691,10 @@ async def run_batch_pipeline(
             )
         finally:
             reset_device_context(device_ctx_token)
+        from miloco.perception.window_runtime import current_job
+        job = current_job()
+        if job is not None:
+            await job.begin_commit()
         _inject_source_meta(omni_output, room_name, [did], device_name, time_window)
 
         # per-omni 早送(仅 fused):本相机 omni 一好就送 suggestion/speech,不等其它相机 gather。
@@ -781,6 +812,7 @@ async def run_query_pipeline(
     get_identity_engine: Callable[[str, str], "IdentityEngine | None"] | None = None,
     last_captions: dict[str, str] | None = None,
     frame_index_offset: int = 0,
+    frame_index_offsets: dict[str, int] | None = None,
 ) -> dict[str, QueryOutput]:
     """Active query pipeline: skip Gate, run Identity, Omni with query prompt.
 
@@ -842,7 +874,7 @@ async def run_query_pipeline(
             identity_packet = await run_identity(
                 gate_packet, config.identity, tracking_service,
                 identity_engine=identity_engine,
-                frame_index_offset=frame_index_offset,
+                frame_index_offset=(frame_index_offsets or {}).get(did, frame_index_offset),
                 )
             # query 路径的 packet 只喂 build_query_prompt→omni, 同主路径口径下采到
             # omni_fps(否则 fps 提频后 on-demand 查询送 omni 的帧数翻倍、延迟上升)

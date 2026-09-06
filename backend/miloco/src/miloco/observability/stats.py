@@ -72,9 +72,9 @@ def rtf_series(conn, bucket, since, until):
     s, u = _window(since, until)
     rows = conn.execute(
         "SELECT (timestamp/?)*? AS ts, AVG(rtf), AVG(rtf_e2e), "
-        "AVG(rtf_stream_e2e), AVG(rtf_pipeline), AVG(rtf_omni), "
-        "AVG(CASE WHEN omni_error_count = 0 THEN rtf_e2e END) AS rtf_e2e_ok, "
-        "AVG(CASE WHEN omni_error_count = 0 THEN rtf_omni END) AS rtf_omni_ok "
+        "AVG(rtf_stream_e2e), AVG(rtf_pipeline), AVG(rtf_omni_wall), "
+        "AVG(CASE WHEN omni_error_count = 0 AND omni_call_count > 0 AND COALESCE(cycle_error_msg, '') = '' THEN rtf_e2e END) AS rtf_e2e_ok, "
+        "AVG(CASE WHEN omni_error_count = 0 AND omni_call_count > 0 AND COALESCE(cycle_error_msg, '') = '' THEN rtf_omni_wall END) AS rtf_omni_ok "
         "FROM traces_v WHERE timestamp BETWEEN ? AND ? "
         "GROUP BY ts ORDER BY ts",
         (bms, bms, s, u),
@@ -217,7 +217,7 @@ def drop_series(conn, bucket, since, until):
     rows = conn.execute(
         "SELECT (timestamp/?)*? AS ts, "
         "SUM(dropped_windows_total), SUM(overflow_count_total), COUNT(*) "
-        "FROM traces WHERE timestamp BETWEEN ? AND ? "
+        "FROM traces WHERE timestamp BETWEEN ? AND ? AND metric_version >= 2 "
         "GROUP BY ts ORDER BY ts",
         (bms, bms, s, u),
     ).fetchall()
@@ -286,57 +286,45 @@ def omni_error_series(conn, bucket, since, until):
 
 
 def summary(conn, bucket, since, until):
-    """窗口内总览,单点聚合(不分时间桶)。bucket 入参保留但忽略,只为统一签名。
-
-    agent_call_count 从 agent_runs 表来——拆表后语义是"agent 调用次数"
-    (含同 trace 多 turn),前端的"窗口内 agent 活跃度"看这个更准。
-    """
+    """Count batches separately from camera windows; keep old coverage unclassified."""
     s, u = _window(since, until)
     row = conn.execute(
-        "SELECT COUNT(*), AVG(skipped), "
-        "SUM(dropped_windows_total), "
-        "SUM(omni_error_count), SUM(omni_call_count) "
-        "FROM traces WHERE timestamp BETWEEN ? AND ?",
+        "SELECT COUNT(*), AVG(skipped), SUM(omni_error_count), SUM(omni_call_count), "
+        "SUM(CASE WHEN metric_version >= 2 THEN device_count ELSE 0 END), "
+        "SUM(CASE WHEN metric_version >= 2 THEN dropped_windows_total ELSE 0 END), "
+        "SUM(CASE WHEN metric_version < 2 THEN 1 ELSE 0 END), "
+        "SUM(omni_request_count), SUM(omni_request_error_count), "
+        "SUM(partial_windows_total) FROM traces WHERE timestamp BETWEEN ? AND ?",
         (s, u),
     ).fetchone()
-    cycle_count, skip_avg, dropped_sum, omni_err, omni_call = row
+    cycles, skipped, errors, calls, cameras, dropped, legacy, requests, request_errors, partial = row
+    cameras, dropped, legacy = cameras or 0, dropped or 0, legacy or 0
+    expected = cameras + dropped
     agent_count = conn.execute(
-        "SELECT COUNT(*) FROM agent_runs WHERE timestamp BETWEEN ? AND ?",
-        (s, u),
+        "SELECT COUNT(*) FROM agent_runs WHERE timestamp BETWEEN ? AND ?", (s, u),
     ).fetchone()[0]
-    if not cycle_count:
-        return {
-            "cycle_count": 0,
-            "dropped_count": 0,
-            "skip_rate": 0.0,
-            "drop_rate": 0.0,
-            "omni_error_rate": 0.0,
-            "p95_rtf_e2e": 0.0,
-            "p95_rtf_omni": 0.0,
-            "agent_call_count": 0,
-            "window": {"since": s, "until": u},
-        }
-    dropped_sum = dropped_sum or 0
-    drop_rate = dropped_sum / (dropped_sum + cycle_count)
-    omni_call = omni_call or 0
-    omni_err = omni_err or 0
-    omni_error_rate = (omni_err / omni_call) if omni_call > 0 else 0.0
     rtf_rows = conn.execute(
-        "SELECT rtf_e2e, rtf_omni FROM traces_v "
-        "WHERE timestamp BETWEEN ? AND ? AND omni_error_count = 0",
+        "SELECT rtf_e2e, rtf_omni_wall FROM traces_v "
+        "WHERE timestamp BETWEEN ? AND ? AND omni_call_count > 0 AND omni_error_count = 0 "
+        "AND COALESCE(cycle_error_msg, '') = ''",
         (s, u),
     ).fetchall()
-    rtf_e2e_vals = [r[0] for r in rtf_rows if r[0] is not None]
-    rtf_omni_vals = [r[1] for r in rtf_rows if r[1] is not None]
     return {
-        "cycle_count": cycle_count,
-        "dropped_count": dropped_sum,
-        "skip_rate": skip_avg or 0.0,
-        "drop_rate": drop_rate,
-        "omni_error_rate": omni_error_rate,
-        "p95_rtf_e2e": _percentile(rtf_e2e_vals, 0.95) if rtf_e2e_vals else 0.0,
-        "p95_rtf_omni": _percentile(rtf_omni_vals, 0.95) if rtf_omni_vals else 0.0,
-        "agent_call_count": agent_count or 0,
+        "cycle_count": cycles,
+        "camera_window_count": cameras,
+        "expected_window_count": expected,
+        "legacy_cycle_count": legacy,
+        "dropped_count": dropped,
+        "partial_windows_count": partial or 0,
+        "skip_rate": skipped or 0.0,
+        "drop_rate": dropped / expected if expected else (None if legacy else 0.0),
+        "omni_error_rate": (errors or 0) / calls if calls else 0.0,
+        "omni_request_count": requests or 0,
+        "omni_request_error_count": request_errors or 0,
+        "omni_success_cycle_count": len(rtf_rows),
+        "p95_rtf_e2e": _percentile([r[0] for r in rtf_rows if r[0] is not None], 0.95),
+        "p95_rtf_omni": _percentile([r[1] for r in rtf_rows if r[1] is not None], 0.95),
+        "agent_call_count": agent_count,
         "window": {"since": s, "until": u},
     }
 

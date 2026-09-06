@@ -1299,7 +1299,19 @@ class IdentityEngine:
     def _make_on_result(self, *, now_ts: float) -> Callable[[OmniIdentityResult], Awaitable[None]]:
         """构造 dispatcher 的 on_result 回调（闭包绑定 now_ts）。"""
 
+        from miloco.perception.window_runtime import current_job
+        job = current_job()
+        states_at_dispatch = dict(self._states) if job is not None else None
+        frame_at_dispatch = getattr(self, "_cur_frame_index", 0)
+
         async def _on_result(result: OmniIdentityResult) -> None:
+            if states_at_dispatch is not None:
+                state = states_at_dispatch.get(result.track_id)
+                if state is None or self._states.get(result.track_id) is not state:
+                    return  # track was reset/reused after this request was made
+                if not job.actionable or not result.omni_answered:
+                    state.inflight = False
+                    return  # missing/failed/stale is unknown, never negative evidence
             # 每次 omni 回结果先打一条 log (含 dispatcher 解析后的字段),
             # 配合 [Identity] state log 看状态机如何被驱动。
             logger.info(
@@ -1401,6 +1413,7 @@ class IdentityEngine:
                     effective_person_id is not None
                     and effective_person_id == state.committed_person_id
                     and result.batch_size < 3
+                    and (job is None or frame_at_dispatch == self._cur_frame_index)
                 ):
                     # 时序一致性核心: confirmed 重审一致时也尝试累积 tier_c, 让
                     # write_eligible_count 累计到 N 才真写入。多目标批次阈值放宽到
@@ -1630,7 +1643,9 @@ class IdentityEngine:
             state.in_flight_tier_c = True
             state.write_eligible_count = 0
         try:
-            fut = asyncio.run_coroutine_threadsafe(self._process_tier_c_candidate(cand), loop)
+            from miloco.perception.window_runtime import window_scope
+            with window_scope(None):
+                fut = asyncio.run_coroutine_threadsafe(self._process_tier_c_candidate(cand), loop)
         except RuntimeError:
             # loop 已关停(app 退出): 回滚 in_flight, 不留"卡死"残留。
             if state is not None:

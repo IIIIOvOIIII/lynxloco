@@ -13,10 +13,13 @@ The perception loop reacts to two triggers:
 
 import asyncio
 import logging
+import time
+from collections import Counter
 
 from miloco.config import get_settings
 from miloco.database.perception_repo import PerceptionLogRepo
 from miloco.perception import omni_probe_registry
+from miloco.perception import window_runtime as windows
 from miloco.perception.collect.collector import MultimodalCollector
 from miloco.perception.inference_worker import InferenceWorker
 from miloco.perception.processor import PipelineProcessor
@@ -44,6 +47,12 @@ class PerceptionRunner:
         self._perception_task: asyncio.Task | None = None
         self._sync_devices_task: asyncio.Task | None = None
         self._window_ready = window_ready_event
+        self._window_tasks: dict[asyncio.Task, windows.WindowJob] = {}
+        self._last_window: dict[str, windows.WindowJob] = {}
+        self._window_sequence: Counter = Counter()
+        self._window_counts: Counter = Counter()
+        self._camera_cursor = 0
+        self._run_generation = 0
 
         # Persistent worker thread with a durable event loop for inference.
         # Replaces the old ThreadPoolExecutor + asyncio.run() pattern that
@@ -89,6 +98,8 @@ class PerceptionRunner:
             return
 
         self._is_running = True
+        self._run_generation += 1
+        self._last_window.clear()
 
         # 重启时重读窗口时长（config 可能在停止期间被改）——__init__ 只读一次，
         # 不重读会导致「应用设置」改了 window_size 后引擎仍按旧值跑。
@@ -141,11 +152,11 @@ class PerceptionRunner:
         self._perception_task = None
         self._sync_devices_task = None
 
+        await self._cancel_windows()
+
         # 清理 in-flight probe task,防同进程再启 runner 时 _probe_in_flight 残留导致
         # 自愈通道永久卡死。registry 是独立 module,不进 runner↔processor 循环链。
         await omni_probe_registry.cancel_inflight()
-
-        self._inference_worker.shutdown(wait=False)
 
         # 关闭 perception engine（含 IdentityEngine dispatcher worker 等）
         try:
@@ -153,6 +164,7 @@ class PerceptionRunner:
         except Exception as e:  # noqa: BLE001
             logger.error("[engine] 关闭引擎失败 | %s", e)
 
+        self._inference_worker.shutdown(wait=False)
         await self._collector.shutdown()
         logger.info("Perception engine stopped")
 
@@ -175,10 +187,109 @@ class PerceptionRunner:
         # (见 try_reinit);配合 STARTING 后移,未满足前置条件时零开销、零 event_log 噪声。
         self._pipeline.try_reinit_engine()
 
+        if windows.concurrency() > 1 or self._window_tasks:
+            await self._tick_concurrent()
+            return
+
         result = await self._pipeline.process_realtime()
         # 缓冲区里可能积压了多个 ready 窗口，此处循环处理直到缓冲区清空
-        while result is not None and self._is_running:
+        while result is not None and self._is_running and windows.concurrency() == 1:
             result = await self._pipeline.process_realtime()
+
+    async def _cancel_windows(self) -> None:
+        tasks = list(self._window_tasks)
+        for task in tasks:
+            self._window_tasks[task].valid = False
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._window_tasks.clear()
+        self._last_window.clear()
+
+    def concurrency_status(self) -> dict:
+        return {**windows.HTTP_LIMITER.snapshot(),
+                "jobs": len(self._window_tasks),
+                "generation": self._run_generation,
+                "windows": dict(self._window_counts)}
+
+    async def _process_window(self, job, batch):
+        with windows.window_scope(job):
+            try:
+                remaining = windows.MAX_WINDOW_AGE_SECONDS - max(
+                    0, time.time() - job.end_unix_ms / 1000)
+                if remaining <= 0:
+                    self._window_counts["expired_before_prepare"] += 1
+                    self._pipeline.record_window_gap(batch, "expired_before_prepare")
+                    return
+                async with asyncio.timeout(remaining):
+                    await self._pipeline.process_realtime(batch=batch)
+                self._window_counts["completed"] += 1
+            except TimeoutError:
+                job.valid = False
+                self._window_counts["deadline_gap"] += 1
+                logger.warning("[windows] deadline gap camera=%s sequence=%d", job.camera, job.sequence)
+            except asyncio.CancelledError:
+                job.valid = False
+                self._window_counts["cancelled_gap"] += 1
+                raise
+            except Exception:
+                self._window_counts["failed_gap"] += 1
+                logger.exception("[windows] failed gap camera=%s sequence=%d", job.camera, job.sequence)
+            finally:
+                job.finish()
+
+    async def _tick_concurrent(self) -> None:
+        sources = list(self._collector.get_all_active_sources())
+        if not sources:
+            return
+        # Round-robin over cameras, with a strict count bound independent of
+        # input rate. Only one unencoded window is prepared at any instant.
+        admitted = 0
+        empty = set()
+        cap = windows.concurrency()
+        per_camera = (cap + len(sources) - 1) // len(sources) + windows.MAX_WAITING_PER_CAMERA
+        while self._is_running and len(self._window_tasks) < cap + windows.MAX_WAITING:
+            did = sources[self._camera_cursor % len(sources)]
+            self._camera_cursor += 1
+            if did in empty:
+                if len(empty) == len(sources):
+                    break
+                continue
+            if sum(j.camera == did for j in self._window_tasks.values()) >= per_camera:
+                empty.add(did)
+                continue
+            batch = self._collector.collect_batch([did], drain=True, fifo=True)
+            if batch.empty:
+                empty.add(did)
+                continue
+            dd = batch.devices[did]
+            generation = (self._run_generation << 32) + dd.source_generation
+            previous = self._last_window.get(did)
+            if previous is not None and previous.generation != generation:
+                for task, old in list(self._window_tasks.items()):
+                    if old.camera == did:
+                        old.valid = False
+                        task.cancel()
+                previous = None
+            self._window_sequence[did] += 1
+            job = windows.WindowJob(did, generation, self._window_sequence[did],
+                                    batch.end_timestamp, previous=previous,
+                                    config_version=str(cap))
+            self._last_window[did] = job
+            task = asyncio.create_task(self._process_window(job, batch))
+            self._window_tasks[task] = job
+            def done(task):
+                self._window_tasks.pop(task, None)
+                if self._window_ready is not None:
+                    self._window_ready.set()
+            task.add_done_callback(done)
+            self._window_counts["admitted"] += 1
+            # The worker releases raw arrays immediately after encoding, before
+            # it waits for an HTTP slot. Do not accumulate raw BGR in this loop.
+            await asyncio.shield(asyncio.wrap_future(job.prepared))
+            admitted += 1
+            if admitted >= cap + windows.MAX_WAITING:
+                break
 
     async def _wait_for_trigger(self) -> None:
         """Wait for window-ready event OR capture interval timeout.
