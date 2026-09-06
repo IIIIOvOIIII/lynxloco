@@ -1,0 +1,484 @@
+{
+  "co": "CHG260906002",
+  "scope": "read-only miloco.esxi; no new inference or Agent request",
+  "runtime_version": "2026.8.6.post1.dev304+g28d588c39",
+  "deployed_source": "28d588c390198197539a168559e6d09ff4f6a6c5",
+  "screenshot_window": {
+    "since_ms": 1788670740000,
+    "until_ms": 1788674340000,
+    "cycles": 108,
+    "camera_windows": 156,
+    "drops_reported": 3161,
+    "overflow_count": 339,
+    "expected_display": 3269,
+    "drop_rate_display": 0.9669623738146222,
+    "skip_count": 29,
+    "omni_cycle_calls": 79,
+    "omni_cycle_errors": 4,
+    "omni_device_attempts": 86,
+    "omni_device_errors": 4,
+    "agent_runs": 0,
+    "dashboard_p95_e2e": 20.256,
+    "dashboard_p95_omni": 20.777,
+    "successful": 75,
+    "success_cycle_mean_ms": 39240.32557850238,
+    "success_cycle_p95_ms": 83223.106,
+    "success_max_device_omni_mean_ms": 37429.21489705177,
+    "success_max_device_omni_p95_ms": 79642.954,
+    "success_in_delay_mean_ms": 1528.5022666666666,
+    "sum_cycle_ms": 3435214.0766121447,
+    "sum_max_device_omni_ms": 3287661.297494895,
+    "cameras": [
+      {
+        "room": "厨房",
+        "windows": 65,
+        "video_zero": 4,
+        "video_one": 53,
+        "video_ge2": 8,
+        "video_max": 5,
+        "video_mean": 1.1384615384615384,
+        "omni_attempts": 18,
+        "gate_video": 9,
+        "gate_audio": 0,
+        "gate_hold": 9
+      },
+      {
+        "room": "客厅",
+        "windows": 91,
+        "video_zero": 51,
+        "video_one": 32,
+        "video_ge2": 8,
+        "video_max": 5,
+        "video_mean": 0.6263736263736264,
+        "omni_attempts": 68,
+        "gate_video": 37,
+        "gate_audio": 0,
+        "gate_hold": 31
+      }
+    ]
+  },
+  "last_sample": {
+    "since_ms": 1788671416880,
+    "until_ms": 1788675016880,
+    "cycles": 103,
+    "camera_windows": 159,
+    "drops_reported": 3456,
+    "overflow_count": 371,
+    "expected_display": 3559,
+    "drop_rate_display": 0.971059286316381,
+    "skip_count": 29,
+    "omni_cycle_calls": 74,
+    "omni_cycle_errors": 6,
+    "omni_device_attempts": 81,
+    "omni_device_errors": 6,
+    "agent_runs": 0,
+    "dashboard_p95_e2e": 22.21,
+    "dashboard_p95_omni": 22.05,
+    "successful": 68,
+    "success_cycle_mean_ms": 40560.685699613874,
+    "success_cycle_p95_ms": 92904.336,
+    "success_max_device_omni_mean_ms": 38561.820875411606,
+    "success_max_device_omni_p95_ms": 89718.952,
+    "success_in_delay_mean_ms": 1501.3409264705883,
+    "sum_cycle_ms": 3496174.2899083765,
+    "sum_max_device_omni_ms": 3342984.456856968,
+    "cameras": [
+      {
+        "room": "厨房",
+        "windows": 74,
+        "video_zero": 4,
+        "video_one": 60,
+        "video_ge2": 10,
+        "video_max": 5,
+        "video_mean": 1.1486486486486487,
+        "omni_attempts": 18,
+        "gate_video": 9,
+        "gate_audio": 0,
+        "gate_hold": 9
+      },
+      {
+        "room": "客厅",
+        "windows": 85,
+        "video_zero": 44,
+        "video_one": 29,
+        "video_ge2": 12,
+        "video_max": 5,
+        "video_mean": 0.7411764705882353,
+        "omni_attempts": 63,
+        "gate_video": 38,
+        "gate_audio": 0,
+        "gate_hold": 25
+      }
+    ]
+  },
+  "agent_last24h": [
+    {
+      "timestamp": 1788604772907,
+      "source": "suggestion",
+      "success": 1,
+      "duration_ms": 14605.0,
+      "webhook_rtt_ms": 15224.080817890354,
+      "llm_call_count": 1,
+      "tool_call_count": 0
+    },
+    {
+      "timestamp": 1788634075930,
+      "source": "suggestion",
+      "success": 1,
+      "duration_ms": 10912.0,
+      "webhook_rtt_ms": 12371.956016984768,
+      "llm_call_count": 1,
+      "tool_call_count": 0
+    },
+    {
+      "timestamp": 1788647386033,
+      "source": "suggestion",
+      "success": 1,
+      "duration_ms": 37967.0,
+      "webhook_rtt_ms": 38811.97065289598,
+      "llm_call_count": 1,
+      "tool_call_count": 4
+    },
+    {
+      "timestamp": 1788665887298,
+      "source": "suggestion",
+      "success": 1,
+      "duration_ms": 64958.0,
+      "webhook_rtt_ms": 66336.17241296452,
+      "llm_call_count": 1,
+      "tool_call_count": 4
+    }
+  ],
+  "event_counts_last_hour": [
+    {
+      "event_type": "gate_hold_expired",
+      "n": 8
+    },
+    {
+      "event_type": "gate_hold_recovered",
+      "n": 14
+    },
+    {
+      "event_type": "gate_hold_start",
+      "n": 21
+    }
+  ],
+  "main_database_aggregates": {
+    "1h": {
+      "tokens": [
+        {
+          "model": "grok-4.6",
+          "type": "realtime",
+          "n": 78,
+          "mean_input": 12036.384615384615,
+          "mean_output": 1772.7179487179487,
+          "max_output": 5649,
+          "input_total": 938838,
+          "output_total": 138272
+        }
+      ],
+      "perception": [
+        {
+          "n": 69,
+          "first": 1788671277602,
+          "last": 1788674673097
+        }
+      ],
+      "meaningful": [
+        {
+          "n": 0,
+          "rule_hits": null,
+          "suggestions": null,
+          "asr": null
+        }
+      ],
+      "rule_logs": []
+    },
+    "6h": {
+      "tokens": [
+        {
+          "model": "grok-4.6",
+          "type": "realtime",
+          "n": 364,
+          "mean_input": 12941.384615384615,
+          "mean_output": 1986.184065934066,
+          "max_output": 5945,
+          "input_total": 4710664,
+          "output_total": 722971
+        }
+      ],
+      "perception": [
+        {
+          "n": 300,
+          "first": 1788656203152,
+          "last": 1788674673097
+        }
+      ],
+      "meaningful": [
+        {
+          "n": 2,
+          "rule_hits": 1,
+          "suggestions": 1,
+          "asr": 0
+        }
+      ],
+      "rule_logs": []
+    },
+    "24h": {
+      "tokens": [
+        {
+          "model": "grok-4.6",
+          "type": "realtime",
+          "n": 1105,
+          "mean_input": 12352.856108597285,
+          "mean_output": 2080.760180995475,
+          "max_output": 6241,
+          "input_total": 13649906,
+          "output_total": 2299240
+        }
+      ],
+      "perception": [
+        {
+          "n": 944,
+          "first": 1788588447160,
+          "last": 1788674673097
+        }
+      ],
+      "meaningful": [
+        {
+          "n": 5,
+          "rule_hits": 1,
+          "suggestions": 4,
+          "asr": 0
+        }
+      ],
+      "rule_logs": []
+    }
+  },
+  "baseline_counts": {
+    "1h": {
+      "cycles": 106,
+      "device_rows": 157,
+      "drops": 3341,
+      "dashboard_drop_rate": 0.9692486219901364,
+      "device_drop_rate": 0.955117209834191,
+      "omni_calls": 77,
+      "omni_errors": 5,
+      "skipped": 29,
+      "dashboard_p95": {
+        "rtf_e2e": 20.581,
+        "rtf_omni": 21.064
+      },
+      "errors": [
+        {
+          "omni_error_code": "ReadTimeout",
+          "cycles": 5,
+          "device_rows": 5
+        }
+      ],
+      "events": [
+        {
+          "event_type": "gate_hold_start",
+          "n": 23
+        },
+        {
+          "event_type": "gate_hold_recovered",
+          "n": 15
+        },
+        {
+          "event_type": "gate_hold_expired",
+          "n": 9
+        }
+      ],
+      "agent": []
+    },
+    "6h": {
+      "cycles": 2906,
+      "device_rows": 3162,
+      "drops": 16129,
+      "dashboard_drop_rate": 0.8473338586813765,
+      "device_drop_rate": 0.8360893680991136,
+      "omni_calls": 313,
+      "omni_errors": 21,
+      "skipped": 2593,
+      "dashboard_p95": {
+        "rtf_e2e": 11.992,
+        "rtf_omni": 11.66
+      },
+      "errors": [
+        {
+          "omni_error_code": "HTTPStatusError:429",
+          "cycles": 1,
+          "device_rows": 1
+        },
+        {
+          "omni_error_code": "ReadTimeout",
+          "cycles": 20,
+          "device_rows": 20
+        }
+      ],
+      "events": [
+        {
+          "event_type": "gate_hold_start",
+          "n": 91
+        },
+        {
+          "event_type": "gate_hold_recovered",
+          "n": 50
+        },
+        {
+          "event_type": "gate_hold_expired",
+          "n": 42
+        },
+        {
+          "event_type": "suggestion",
+          "n": 1
+        },
+        {
+          "event_type": "rule_match",
+          "n": 1
+        }
+      ],
+      "agent": [
+        {
+          "source": "suggestion",
+          "success": 1,
+          "n": 1,
+          "duration_ms": 64958.0
+        }
+      ]
+    },
+    "24h": {
+      "cycles": 18861,
+      "device_rows": 19783,
+      "drops": 50342,
+      "dashboard_drop_rate": 0.7274540121093016,
+      "device_drop_rate": 0.7178894830659537,
+      "omni_calls": 995,
+      "omni_errors": 52,
+      "skipped": 17866,
+      "dashboard_p95": {
+        "rtf_e2e": 1.643,
+        "rtf_omni": 0.892
+      },
+      "errors": [
+        {
+          "omni_error_code": "CircuitOpenError",
+          "cycles": 7,
+          "device_rows": 11
+        },
+        {
+          "omni_error_code": "HTTPStatusError:429",
+          "cycles": 4,
+          "device_rows": 5
+        },
+        {
+          "omni_error_code": "HTTPStatusError:502",
+          "cycles": 1,
+          "device_rows": 1
+        },
+        {
+          "omni_error_code": "ReadTimeout",
+          "cycles": 40,
+          "device_rows": 40
+        }
+      ],
+      "events": [
+        {
+          "event_type": "gate_hold_start",
+          "n": 315
+        },
+        {
+          "event_type": "gate_hold_expired",
+          "n": 194
+        },
+        {
+          "event_type": "gate_hold_recovered",
+          "n": 122
+        },
+        {
+          "event_type": "suggestion",
+          "n": 4
+        },
+        {
+          "event_type": "rule_match",
+          "n": 1
+        }
+      ],
+      "agent": [
+        {
+          "source": "suggestion",
+          "success": 1,
+          "n": 4,
+          "duration_ms": 32110.5
+        }
+      ]
+    }
+  },
+  "buffer_clear_reproduction": {
+    "before": {
+      "unique_window_keys": 4,
+      "ready": 3,
+      "keys": [
+        0,
+        4000,
+        8000,
+        12000
+      ]
+    },
+    "after": {
+      "unique_window_keys": 1,
+      "ready": 0,
+      "recorded_drops": 9,
+      "retained_key": [
+        16000
+      ],
+      "fully_lost_unique_windows": 4
+    }
+  },
+  "production_overflow_log_shapes": [
+    [
+      [
+        "clear",
+        4,
+        5,
+        3,
+        9
+      ],
+      369
+    ]
+  ],
+  "source_sha256": {
+    "observability/stats.py": "25466adba8c07bb10be54c340e57ed82320670fc480978e7681d3dd6440a5a3d",
+    "observability/aggregate.py": "cf7f844bf8188f60de2cc63635e7e7b139c4309bad87c0303e3092170d82cdd8",
+    "observability/metrics_db.py": "52532fa03f6f2c249fca7648b855f7dd2b4c97fb3b353f893d53a209df6b9ac9",
+    "perception/collect/stream_buffer.py": "f126d47788613acab237066f6f56bf712cef609f9dbedb2884728ebda3c84e2f",
+    "perception/runner.py": "b539f02140e56a86f0bfcc5e3715677c1115a823f134b164ffd1ccee0e8a5ebf",
+    "perception/engine/pipeline.py": "fcf4fc87ebc6b3cfacfcbd04869567f9be897416f230a647f87f031ccd4852a5",
+    "perception/client.py": "4be1c0746d1876a35c74abef93a772f735e548332a8d9ce8e3a44f5104f0c1c9",
+    "perception/engine/config.py": "29296912867fa367028a87c0dc9651efb871d20c3f99ee62ed3adea3eb313faf",
+    "config/settings.py": "bd24410d7f56d5f7924da3cd67e2f61f74ebbf2e55faa1d09e4b9ef2b00cd7d8",
+    "perception/engine/omni/prompt_builder.py": "0ade55c1f6b2ae0bee7190202d2ec86544200bcbd4d15b0835aafb713ca4b238",
+    "perception/engine/omni/omni.py": "e022f72af6d2fab48438cc732bfe75ae6e3f1540e16fa153093926aef4eeef0f",
+    "perception/collect/rtsp_session.py": "b6ad045ee176c8925d36df7c8a56d1f153261bf25478ee82aee70f4cbc7f880f",
+    "perception/collect/camera_adapter.py": "baed454e56c7a41c7c9ae4497140550b2ab8938b017cb6d302c17f60aa9d90c3",
+    "config/settings.yaml": "e3cbf97c653105c3dd29bf8019cba2b6870789a6505fa1724ff79c3f03b9188e",
+    "perception/service.py": "21d11d0be38be64b0adb7d1b0650e319f3b382f3e403665b815383f5a091d486"
+  },
+  "config_mtime_unchanged": true,
+  "health": {
+    "http_status": 200,
+    "body": {
+      "status": "ok"
+    }
+  },
+  "resource_pressure": {
+    "cpu": "some avg10=2.08 avg60=3.84 avg300=3.61 total=37417783718\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+    "memory": "some avg10=0.00 avg60=0.00 avg300=0.00 total=8063741\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=6648055",
+    "io": "some avg10=0.00 avg60=0.00 avg300=0.00 total=396589773\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=310889263"
+  },
+  "sample_time_ms": 1788675016880,
+  "config_mtime_first": 1788569755.1793978,
+  "config_mtime_last": 1788569755.1793978,
+  "co_status": "Successfully Closed"
+}
