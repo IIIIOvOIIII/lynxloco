@@ -1,0 +1,7 @@
+{
+  "concurrency": 8,
+  "synthetic_passed": true,
+  "live_passed": false,
+  "reason": "52/222 actual requests failed or canceled (23.42%), above frozen 10% limit",
+  "next": "one authorized 4-way trial and 30-minute live window"
+}

@@ -1,0 +1,29 @@
+{
+  "gateway_image": "ghcr.io/chenyme/grok2api@sha256:9446393fec917991919a12ca8ef9211560064c864952f0158c43694d9ca5144b",
+  "gateway_source_revision": "88ef5bd948001924a8f71c9e8ac8b8dfacace5b0",
+  "gateway_version_label": "v3.1.5-amd64",
+  "live_provider": "grok_build",
+  "live_upstream_model": "Build/grok-4.6",
+  "explicit_reasoning_effort": "not_set",
+  "eight_way_gateway_completed_200": 174,
+  "eight_way_gateway_request_canceled_499": 52,
+  "mean_success_output_tokens": 1894.4,
+  "mean_success_reasoning_tokens": 1811.4,
+  "mean_success_images": 2.6,
+  "mean_canceled_images": 3.92,
+  "source_findings": [
+    {
+      "file": "backend/internal/infra/provider/cli/normalize.go",
+      "finding": "Build Responses normalization preserves the request map, normalizes explicit reasoning effort and adds storage/include defaults; no default reasoning effort is inserted when absent."
+    },
+    {
+      "file": "backend/internal/domain/model/reasoning.go",
+      "finding": "grok-4.6 lists low, medium, high and xhigh; low is a bounded candidate for a later controlled workload experiment, not measured in this CO."
+    }
+  ],
+  "limits": [
+    "Image source revision comes from OCI label, not a byte-for-byte reconstruction of the running binary.",
+    "Upstream enforcement/meaning of max_output_tokens remains unmeasured; retained gateway source field does not prove provider adherence.",
+    "Gateway completion-time cohort differs from the Miloco started-and-completed fixed-window cohort."
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "phase": "rolled_back_verified",
+  "co": "CHG260906005",
+  "closure_code": "Failed",
+  "candidate_sha": "911c4b1bbcf6da9e4e56e30fe17cc74f0833d9bc",
+  "production_sha": "28d588c390198197539a168559e6d09ff4f6a6c5",
+  "synthetic_requests_used": 80,
+  "new_rows_preserved": 693,
+  "health_http_status": 200
+}

@@ -1,0 +1,7 @@
+{
+  "concurrency": 4,
+  "synthetic_passed": true,
+  "live_passed": false,
+  "reason": "75/139 actual requests failed or canceled (53.96%), above frozen 10% limit",
+  "next": "approved native rollback of candidate transaction 911c4b1"
+}

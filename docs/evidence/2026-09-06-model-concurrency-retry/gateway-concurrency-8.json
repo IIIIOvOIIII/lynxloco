@@ -1,0 +1,35 @@
+{
+  "since_utc": "2026-09-06 10:10:47",
+  "until_utc": "2026-09-06 10:40:47",
+  "client_filter": "Miloco user agent marker",
+  "status_groups": [
+    {
+      "status_code": 200,
+      "n": 174,
+      "mean_ms": 38314.4,
+      "mean_input_tokens": 11860.6,
+      "mean_output_tokens": 1894.4,
+      "mean_reasoning_tokens": 1811.4,
+      "max_attempts": 0
+    },
+    {
+      "status_code": 499,
+      "n": 52,
+      "mean_ms": 96588.8,
+      "mean_input_tokens": 0.0,
+      "mean_output_tokens": 0.0,
+      "mean_reasoning_tokens": 0.0,
+      "max_attempts": 1
+    }
+  ],
+  "errors": [
+    {
+      "error_code": "",
+      "n": 174
+    },
+    {
+      "error_code": "request_canceled",
+      "n": 52
+    }
+  ]
+}

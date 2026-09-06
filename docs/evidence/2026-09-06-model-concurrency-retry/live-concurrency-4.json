@@ -1,0 +1,159 @@
+{
+  "as_of_ms": 1788693143436,
+  "since_ms": 1788691317245,
+  "until_ms": 1788693117245,
+  "scope": "completed new-definition traces started in fixed window; in-flight excluded",
+  "model": "grok-4.6",
+  "configured_concurrency": 4,
+  "totals": {
+    "cycles": 264,
+    "camera_windows": 264,
+    "dropped_windows": 580,
+    "partial_windows": 0,
+    "gate_skipped": 102,
+    "requests": 139,
+    "request_errors": 75,
+    "success_windows": 64,
+    "problem_request_windows": 75,
+    "window_gaps": 76
+  },
+  "success_windows_per_minute": 2.133,
+  "problem_request_rate": 0.5396,
+  "success_latency": {
+    "cycle_total_ms": {
+      "p50": 104032.55,
+      "p95": 117332.96
+    },
+    "in_delay_ms": {
+      "p50": 225.15,
+      "p95": 4945.14
+    },
+    "omni_wall_ms": {
+      "p50": 33174.74,
+      "p95": 99404.28
+    }
+  },
+  "stage_latency": {
+    "http_ms": {
+      "n": 64,
+      "p50": 33174.74,
+      "p95": 99404.28
+    },
+    "slot_wait_ms": {
+      "n": 64,
+      "p50": 36490.02,
+      "p95": 72555.28
+    },
+    "reorder_wait_ms": {
+      "n": 64,
+      "p50": 3288.7,
+      "p95": 77720.12
+    }
+  },
+  "cameras": [
+    {
+      "room_name": "客厅",
+      "windows": 89,
+      "zero_video_windows": 14,
+      "mean_video_frames": 3.303370786516854,
+      "max_video_frames": 5
+    },
+    {
+      "room_name": "厨房",
+      "windows": 175,
+      "zero_video_windows": 6,
+      "mean_video_frames": 9.251428571428571,
+      "max_video_frames": 12
+    }
+  ],
+  "errors": [
+    {
+      "omni_error_code": "CancelledError",
+      "n": 75
+    }
+  ],
+  "agent": [
+    {
+      "source": "suggestion",
+      "success": 1,
+      "n": 1
+    }
+  ],
+  "events": [
+    {
+      "event_type": "gate_hold_expired",
+      "n": 4
+    },
+    {
+      "event_type": "gate_hold_recovered",
+      "n": 23
+    },
+    {
+      "event_type": "gate_hold_start",
+      "n": 27
+    },
+    {
+      "event_type": "rule_match",
+      "n": 1
+    },
+    {
+      "event_type": "suggestion",
+      "n": 1
+    }
+  ],
+  "input_buffer": [
+    {
+      "max_buffer_depth": 4,
+      "overflow_events": 145
+    }
+  ],
+  "health_http_status": 200,
+  "available_memory_mb": 3168,
+  "memory_pressure": "some avg10=0.00 avg60=0.00 avg300=0.00 total=8681093\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=7173079",
+  "pid": 85423,
+  "backend_rss_mb": 1433,
+  "concurrency_peak_log": [
+    {
+      "limit": 4,
+      "active": 0,
+      "waiting": 1,
+      "bytes": 2351722
+    },
+    {
+      "limit": 4,
+      "peak": 1,
+      "active": 1,
+      "waiting": 0,
+      "bytes": 2351722,
+      "submitted": 1,
+      "completed": 0
+    },
+    {
+      "limit": 4,
+      "peak": 2,
+      "active": 2,
+      "waiting": 0,
+      "bytes": 4978020,
+      "submitted": 2,
+      "completed": 0
+    },
+    {
+      "limit": 4,
+      "peak": 3,
+      "active": 3,
+      "waiting": 0,
+      "bytes": 8066322,
+      "submitted": 3,
+      "completed": 0
+    },
+    {
+      "limit": 4,
+      "peak": 4,
+      "active": 4,
+      "waiting": 0,
+      "bytes": 11516120,
+      "submitted": 4,
+      "completed": 0
+    }
+  ]
+}

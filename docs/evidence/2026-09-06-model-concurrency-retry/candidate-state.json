@@ -1,0 +1,16 @@
+{
+  "versions": {
+    "miloco": "2026.8.6.post1.dev308+g911c4b1bb",
+    "miloco-cli": "2026.8.6.post1.dev308+g911c4b1bb"
+  },
+  "health_http_status": 200,
+  "active_model": "grok-4.6",
+  "active_concurrency": 4,
+  "active_concurrency_explicit": true,
+  "matching_saved_profile_concurrency": [
+    4
+  ],
+  "observability_schema_marker": 5,
+  "retry_new_definition_rows_preserved": 607,
+  "config_matches_predeployment_backup": false
+}

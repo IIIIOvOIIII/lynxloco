@@ -1,0 +1,402 @@
+{
+  "scope": "SYNTHETIC endpoint visual/JSON contract and same-input concurrency smoke only; not representative of camera latency or people/pet accuracy. This does not verify the Miloco runtime HTTP cap or real-camera throughput.",
+  "dataset": "synthetic-geometric-cards-v1",
+  "seed": 20260906,
+  "concurrency": 8,
+  "deadline_seconds": 600,
+  "deadline_exceeded": false,
+  "configuration_error": false,
+  "capacity_assessed": true,
+  "planned_count": 40,
+  "request_count": 40,
+  "completed_count": 40,
+  "not_started_count": 0,
+  "image_count": 40,
+  "peak_inflight": 8,
+  "concurrency_exercised": true,
+  "matched_count": 40,
+  "failure_count": 0,
+  "passed": true,
+  "elapsed_ms": 23885.28,
+  "errors": {},
+  "labels": {
+    "red": {
+      "expected_count": 10,
+      "matched_count": 10
+    },
+    "blue": {
+      "expected_count": 10,
+      "matched_count": 10
+    },
+    "green": {
+      "expected_count": 10,
+      "matched_count": 10
+    },
+    "blank": {
+      "expected_count": 10,
+      "matched_count": 10
+    }
+  },
+  "windows": [
+    {
+      "window": 1,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 1692.06,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 2,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 1754.91,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 3,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 6015.87,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 4,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 5386.57,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 5,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 1723.15,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 6,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 2010.9,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 7,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 23823.57,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 8,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 1723.85,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 9,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 5295.94,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 10,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 1145.38,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 11,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 6483.77,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 12,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 1460.77,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 13,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 1478.13,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 14,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 1114.83,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 15,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 3219.79,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 16,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 6422.28,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 17,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 974.96,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 18,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 3386.29,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 19,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 4866.38,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 20,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 4748.97,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 21,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 1051.55,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 22,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 6230.46,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 23,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 5372.33,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 24,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 1068.43,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 25,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 1142.16,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 26,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 1105.22,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 27,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 13870.75,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 28,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 1077.59,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 29,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 6742.56,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 30,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 6562.2,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 31,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 1042.81,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 32,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 4993.52,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 33,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 1068.1,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 34,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 1125.7,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 35,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 4551.65,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 36,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 6820.04,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 37,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 1095.41,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 38,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 5006.59,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 39,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 5776.52,
+      "matched": true,
+      "image_count": 1
+    },
+    {
+      "window": 40,
+      "status": "passed",
+      "error_class": null,
+      "http_status": 200,
+      "latency_ms": 5231.62,
+      "matched": true,
+      "image_count": 1
+    }
+  ]
+}

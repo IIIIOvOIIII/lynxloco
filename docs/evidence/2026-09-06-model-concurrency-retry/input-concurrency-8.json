@@ -1,0 +1,40 @@
+{
+  "groups": [
+    {
+      "room_name": "客厅",
+      "input_group": "no_video",
+      "windows": 88,
+      "requests": 44,
+      "request_errors": 0,
+      "mean_omni_ms": 38530.3,
+      "mean_video_frames": 0.0
+    },
+    {
+      "room_name": "客厅",
+      "input_group": "with_video",
+      "windows": 75,
+      "requests": 72,
+      "request_errors": 44,
+      "mean_omni_ms": 80007.6,
+      "mean_video_frames": 3.92
+    },
+    {
+      "room_name": "厨房",
+      "input_group": "no_video",
+      "windows": 35,
+      "requests": 18,
+      "request_errors": 1,
+      "mean_omni_ms": 52476.0,
+      "mean_video_frames": 0.0
+    },
+    {
+      "room_name": "厨房",
+      "input_group": "with_video",
+      "windows": 200,
+      "requests": 88,
+      "request_errors": 7,
+      "mean_omni_ms": 34627.7,
+      "mean_video_frames": 8.21
+    }
+  ]
+}
