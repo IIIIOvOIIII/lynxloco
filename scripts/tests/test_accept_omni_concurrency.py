@@ -22,6 +22,39 @@ def load_runner():
     return module
 
 
+def test_runtime_metadata_preserves_full_prefix_and_rejects_manual_mismatch(tmp_path):
+    runner = load_runner()
+    metadata = tmp_path / "runtime.json"
+    metadata.write_text(json.dumps({
+        "base_url": "https://offline.test/v1", "model": "synthetic-model",
+        "api_protocol": "openai_responses",
+    }))
+    assert runner.resolve_target(None, None, metadata) == ("https://offline.test/v1", "synthetic-model")
+    with pytest.raises(ValueError):
+        runner.resolve_target("https://offline.test", "synthetic-model", metadata)
+
+
+@pytest.mark.parametrize("status", [401, 403, 404])
+def test_endpoint_configuration_errors_stop_without_assessing_capacity(status):
+    runner = load_runner()
+    calls = 0
+
+    async def endpoint(request):
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(.001)
+        return httpx.Response(status, json={"detail": "do not report provider data"})
+
+    report = asyncio.run(runner.run_acceptance(
+        base_url="https://offline.test/v1", model="synthetic-model", concurrency=8,
+        api_key="offline-only", transport=httpx.MockTransport(endpoint),
+    ))
+    assert calls <= 8
+    assert report["configuration_error"] is True
+    assert report["capacity_assessed"] is False
+    assert report["passed"] is False
+
+
 def payload(label):
     expected = {
         "red": {"object": "square", "color": "red", "event": True},

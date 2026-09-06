@@ -60,3 +60,17 @@ cd /Users/nicholasliao/clawd/xiaomi-miloco/.worktrees/model-concurrency
 ```
 
 Development evidence: initial ten tests failed before the runner existed; the concurrency-exercised regression separately failed before that acceptance condition was added. Final offline suite: **17 passed**. Ruff and whitespace checks passed. No real-provider run or production acceptance has been performed by this implementation worker.
+
+## Corrected production invocation after the 2026-09-06 invalid-route run
+
+The first production orchestration omitted the persisted `/v1` base path. Both8/4 runs received immediate404 and are invalid for capacity assessment. A401/403/404 now stops remaining requests, sets `configuration_error=true` and `capacity_assessed=false`, and returns exit2. It must not automatically trigger a lower-concurrency trial. Restore any paused service before pausing for operator correction.
+
+Production must use a non-secret metadata JSON captured from the saved runtime, containing exactly `base_url`, `model`, `api_protocol`. Preserve the entire base URL path. For this deployment the verified base is `http://ai.esxi:18090/v1` and the actual route is `/v1/responses`.
+
+```sh
+python scripts/accept-omni-concurrency.py \
+  --runtime-metadata docs/evidence/2026-09-06-model-concurrency/runtime-metadata.json \
+  --concurrency 8 --output synthetic-concurrency-8.json
+```
+
+Credential stdin still comes from the approved Vault pipe. If explicit `--base-url`/`--model` are also supplied they must match metadata exactly (apart from a terminal slash), otherwise the runner rejects before reading the key or sending any request. Refresh metadata under the newCO immediately before a new production trial. The original80-request budget is exhausted; no corrected production repeat has been performed without renewed user authorization.

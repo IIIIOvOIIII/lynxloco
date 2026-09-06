@@ -1,0 +1,27 @@
+[
+  {
+    "cli_version": "2026.8.6.post1.dev304+g28d588c39",
+    "miloco_version": "2026.8.6.post1.dev304+g28d588c39",
+    "preflight": "passed",
+    "python": "/root/.local/share/uv/tools/miloco/bin/python",
+    "python_base": "/usr/bin/python3.13",
+    "runtime_profile": "openclaw-root-v1",
+    "source_short_commit": "28d588c39"
+  },
+  {
+    "archive_sha256": "a36aa01908d845da3c972723d749db528fb1f45ef3a5bc64e818250844f04b4b",
+    "config_preserved": true,
+    "controller_sha256": "31881553ae3ec0350dcdf93c4abb0f8af1280f4f63be8499a3c8a4ce93f7b75a",
+    "health_http_status": 200,
+    "installed": {
+      "cli_version": "2026.8.6.post1.dev307+g9f572d2bd",
+      "miloco_version": "2026.8.6.post1.dev307+g9f572d2bd",
+      "python": "/root/.local/share/uv/tools/miloco/bin/python",
+      "python_base": "/usr/bin/python3.13",
+      "source_short_commit": "9f572d2bd"
+    },
+    "runtime_profile": "openclaw-root-v1",
+    "status": "deployed",
+    "transaction_sha": "9f572d2bd207e226ae60565e7ba8363d1e5fc22d"
+  }
+]

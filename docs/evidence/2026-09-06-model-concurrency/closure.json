@@ -1,0 +1,14 @@
+{
+  "co": "CHG260906004",
+  "closure": "Failed",
+  "deployment_sha": "9f572d2bd207e226ae60565e7ba8363d1e5fc22d",
+  "restored_source_sha": "28d588c390198197539a168559e6d09ff4f6a6c5",
+  "restored_version": "2026.8.6.post1.dev304+g28d588c39",
+  "health_http_status": 200,
+  "observability_marker": 4,
+  "new_metric_rows_preserved": 3,
+  "acceptance_http_requests": 80,
+  "valid_capacity_acceptance": false,
+  "live_camera_observation": "not_run",
+  "reason": "operator omitted /v1 from synthetic endpoint base URL; rollback verified"
+}

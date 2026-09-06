@@ -123,6 +123,25 @@ def parse_labels(raw: object) -> dict:
     return labels
 
 
+def resolve_target(base_url, model, runtime_metadata: Path | None):
+    if runtime_metadata is not None:
+        metadata = json.loads(runtime_metadata.read_text())
+        if (not isinstance(metadata, dict)
+                or set(metadata) != {"base_url", "model", "api_protocol"}
+                or metadata["api_protocol"] != "openai_responses"
+                or not isinstance(metadata["base_url"], str)
+                or not isinstance(metadata["model"], str)):
+            raise ValueError("invalid_runtime_metadata")
+        configured_url = metadata["base_url"].rstrip("/")
+        if ((base_url is not None and base_url.rstrip("/") != configured_url)
+                or (model is not None and model != metadata["model"])):
+            raise ValueError("runtime_target_mismatch")
+        base_url, model = configured_url, metadata["model"]
+    if not base_url or not model:
+        raise ValueError("missing_target")
+    return base_url, model
+
+
 async def run_acceptance(
     *,
     base_url: str,
@@ -159,6 +178,7 @@ async def run_acceptance(
     indices = iter(range(WINDOW_COUNT))
     inflight = peak = request_count = 0
     deadline_exceeded = False
+    configuration_error = False
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     async with httpx.AsyncClient(
         headers=headers,
@@ -170,8 +190,10 @@ async def run_acceptance(
     ) as client:
 
         async def worker():
-            nonlocal inflight, peak, request_count
+            nonlocal inflight, peak, request_count, configuration_error
             for index in indices:
+                if configuration_error:
+                    break
                 label, image_url = cards[index]
                 result = results[index]
                 call_started = time.monotonic()
@@ -194,6 +216,8 @@ async def run_acceptance(
                         },
                     )
                     result["http_status"] = response.status_code
+                    if response.status_code in (401, 403, 404):
+                        configuration_error = True
                     if not 200 <= response.status_code < 300:
                         raise ContractError(f"http_{response.status_code}")
                     try:
@@ -228,7 +252,7 @@ async def run_acceptance(
 
     for result in results:
         if result["status"] == "not_started":
-            result["error_class"] = "deadline_not_started"
+            result["error_class"] = "configuration_not_started" if configuration_error else "deadline_not_started"
     matched = sum(result["matched"] for result in results)
     completed = sum(
         result["status"] != "not_started" and result["error_class"] != "deadline"
@@ -241,6 +265,8 @@ async def run_acceptance(
         "concurrency": concurrency,
         "deadline_seconds": deadline_seconds,
         "deadline_exceeded": deadline_exceeded,
+        "configuration_error": configuration_error,
+        "capacity_assessed": not configuration_error,
         "planned_count": WINDOW_COUNT,
         "request_count": request_count,
         "completed_count": completed,
@@ -280,19 +306,22 @@ def write_report(path: Path, report: dict) -> None:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=SCOPE)
-    parser.add_argument("--base-url", required=True)
-    parser.add_argument("--model", required=True)
+    parser.add_argument("--base-url")
+    parser.add_argument("--model")
+    parser.add_argument("--runtime-metadata", type=Path,
+                        help="Non-secret saved runtime model/protocol/full-base-URL metadata")
     parser.add_argument("--concurrency", required=True, type=int, choices=range(1, 9))
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args(argv)
     logging.disable(logging.CRITICAL)
     try:
+        base_url, model = resolve_target(args.base_url, args.model, args.runtime_metadata)
         # The pipe must close after the key; no environment/argument credential fallback.
         api_key = sys.stdin.read(65537).strip()
         if len(api_key) > 65536:
             raise ValueError("invalid_input")
         report = asyncio.run(run_acceptance(
-            base_url=args.base_url, model=args.model, concurrency=args.concurrency,
+            base_url=base_url, model=model, concurrency=args.concurrency,
             api_key=api_key,
         ))
         write_report(args.output, report)
@@ -303,6 +332,8 @@ def main(argv=None) -> int:
         print(json.dumps({"scope": SCOPE, "passed": False, "error_class": "runner_error"}))
         return 2
     print(json.dumps(report, ensure_ascii=False))
+    if report.get("configuration_error"):
+        return 2
     return 0 if report["passed"] else 1
 
 

@@ -1,0 +1,403 @@
+{
+  "scope": "SYNTHETIC endpoint visual/JSON contract and same-input concurrency smoke only; not representative of camera latency or people/pet accuracy. This does not verify the Miloco runtime HTTP cap or real-camera throughput.",
+  "dataset": "synthetic-geometric-cards-v1",
+  "seed": 20260906,
+  "concurrency": 8,
+  "deadline_seconds": 600,
+  "deadline_exceeded": false,
+  "planned_count": 40,
+  "request_count": 40,
+  "completed_count": 40,
+  "not_started_count": 0,
+  "image_count": 40,
+  "peak_inflight": 8,
+  "concurrency_exercised": true,
+  "matched_count": 0,
+  "failure_count": 40,
+  "passed": false,
+  "elapsed_ms": 89.57,
+  "errors": {
+    "http_404": 40
+  },
+  "labels": {
+    "red": {
+      "expected_count": 10,
+      "matched_count": 0
+    },
+    "blue": {
+      "expected_count": 10,
+      "matched_count": 0
+    },
+    "green": {
+      "expected_count": 10,
+      "matched_count": 0
+    },
+    "blank": {
+      "expected_count": 10,
+      "matched_count": 0
+    }
+  },
+  "windows": [
+    {
+      "window": 1,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 14.58,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 2,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 9.83,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 3,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 10.7,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 4,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 9.66,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 5,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 11.12,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 6,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 13.29,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 7,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 10.26,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 8,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 13.23,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 9,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 2.83,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 10,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 4.56,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 11,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 2.6,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 12,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 4.36,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 13,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 2.37,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 14,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 6.6,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 15,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 5.03,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 16,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 4.41,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 17,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 3.63,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 18,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 4.9,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 19,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 6.68,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 20,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 16.16,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 21,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 4.12,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 22,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 4.38,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 23,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 9.88,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 24,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 6.9,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 25,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 5.83,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 26,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 3.96,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 27,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 13.72,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 28,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 12.69,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 29,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 3.77,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 30,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 3.52,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 31,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 3.74,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 32,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 3.85,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 33,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 3.69,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 34,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 3.69,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 35,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 3.83,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 36,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 3.66,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 37,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 3.46,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 38,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 3.05,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 39,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 2.73,
+      "matched": false,
+      "image_count": 1
+    },
+    {
+      "window": 40,
+      "status": "failed",
+      "error_class": "http_404",
+      "http_status": 404,
+      "latency_ms": 2.35,
+      "matched": false,
+      "image_count": 1
+    }
+  ],
+  "operator_interpretation": "INVALID endpoint route: operator omitted persisted /v1 prefix; not a Grok concurrency-capacity result"
+}
