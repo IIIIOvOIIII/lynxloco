@@ -1,0 +1,15 @@
+{
+  "phase": "accepted_and_retained",
+  "co": "CHG260906006",
+  "source_sha": "96c018f5df06e401e7849bad271699913e5d6fb5",
+  "concurrency": 8,
+  "window_age_seconds": 180,
+  "timeout_seconds": 180,
+  "since_ms": 1788697858380,
+  "until_ms": 1788699658380,
+  "automatic_rollback": false,
+  "synthetic_requests": 0,
+  "passed": true,
+  "co_closure": "Successfully Closed",
+  "rollback_performed": false
+}

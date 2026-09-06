@@ -1,0 +1,28 @@
+{
+  "co": "CHG260906006",
+  "closure": "Successfully Closed",
+  "deployed_sha": "96c018f5df06e401e7849bad271699913e5d6fb5",
+  "rollback_performed": false,
+  "files": {
+    "README.md": "ef4098f18d714f7921c827ca4c983abbee4739d6c788f6d34efbdbb5330c58c6",
+    "acceptance-state.json": "8236713d2cb6e745087247c91654648fd34e50b42b70a41004253bd3e736a13b",
+    "co-closure.json": "45551197910112705b4bc445380d0d2f485543beab52871cc52d65d17f71e709",
+    "config-change.json": "4a852b39033a4bb5df5a9f4cf8d4921d97e2d054cab18112c766215fe890138d",
+    "decision.json": "f12ad01afb0d29872c966d1ba3e3892188c553183151ca7235f57cd3f97d12f4",
+    "deploy.log": "9801004f153f6b6d45e1e57af7ead17f0d5034a384910bd21711df2289df9a2e",
+    "failure-timing-final.json": "fca2498dd96596b690d6c186ef9de287c19e221b63076c92df570bd223573d12",
+    "final-state.json": "dfe4403d75831c9fac203bc24ce1157e5f7005a874b82929f63f31acb2c2165a",
+    "gateway-final.json": "3cc6063e415d7b418a268f366fa2be3e05fd742e5b7a08e58f7d7039e2fc1503",
+    "initial-state.json": "d27b7c6167b31ddace57e54b8a7884c092e42d93916574ddb9399e738d801cb5",
+    "input-final.json": "85303d5e3f21be0ee274897c5903143ac51e71756e8d6b7e5cf522ac15962f09",
+    "live-final.json": "3ca5010d3cab112d8fdf8813b9a911a2f741390eee8543e3c3399a42ce7d60ad",
+    "native-verify.json": "073c2f6c8d71060621f53e341cb1ffa6011c5723b80feae76ee136d407e4dc4f",
+    "read-only-queries/failure-timing.py": "8f986e8f06e72de2273037e82ff242a3886f69a04235b4f7d1147f40fb7a9ddd",
+    "read-only-queries/gateway-observe.py": "bfbecc3d91e1b581dd4662f6ca51b945f8b23d5e78ac1c60c439612ffec3e67f",
+    "read-only-queries/input-observe.py": "05baa86d25aabbeb4dcb24f28b18025611d7c560404552a8d0f6d56841e37bc6",
+    "read-only-queries/observe.py": "d6b49ac9b0c404a0de36bea64da0a5836c56b09f07e0ed525474b736c2ad7e36",
+    "read-only-queries/verify-state.py": "325dd684d3e658c54151b15dbc2bad587e5f06121ea571f5b86f233d4a9632aa",
+    "release.json": "e6dba62b7b2918fd502941d107e3ef0fd1a250492c573838c2cf0dd359708f8a",
+    "samples.jsonl": "1108ddf468daeb5d81bb0f39debe0e26df5725721943b039d620d6911ac66323"
+  }
+}

@@ -1,0 +1,194 @@
+{
+  "as_of_ms": 1788699680018,
+  "since_ms": 1788697858380,
+  "until_ms": 1788699658380,
+  "scope": "completed new-definition traces started in fixed window; in-flight excluded",
+  "configured_timeout_seconds": 180.0,
+  "model": "grok-4.6",
+  "configured_concurrency": 8,
+  "totals": {
+    "cycles": 610,
+    "camera_windows": 610,
+    "dropped_windows": 292,
+    "partial_windows": 0,
+    "gate_skipped": 445,
+    "requests": 154,
+    "request_errors": 1,
+    "success_windows": 153,
+    "problem_request_windows": 1,
+    "window_gaps": 1
+  },
+  "success_windows_per_minute": 5.1,
+  "problem_request_rate": 0.0065,
+  "success_latency": {
+    "cycle_total_ms": {
+      "p50": 75949.39,
+      "p95": 134072.2
+    },
+    "in_delay_ms": {
+      "p50": 1116.37,
+      "p95": 8994.39
+    },
+    "omni_wall_ms": {
+      "p50": 50876.55,
+      "p95": 83050.48
+    }
+  },
+  "stage_latency": {
+    "http_ms": {
+      "n": 153,
+      "p50": 50876.55,
+      "p95": 83050.48
+    },
+    "slot_wait_ms": {
+      "n": 153,
+      "p50": 7844.48,
+      "p95": 42503.3
+    },
+    "reorder_wait_ms": {
+      "n": 153,
+      "p50": 2243.67,
+      "p95": 66076.34
+    }
+  },
+  "successful_cycles_over_120s": 15,
+  "successful_http_over_120s": 2,
+  "cameras": [
+    {
+      "room_name": "客厅",
+      "windows": 311,
+      "zero_video_windows": 46,
+      "mean_video_frames": 3.990353697749196,
+      "max_video_frames": 5
+    },
+    {
+      "room_name": "厨房",
+      "windows": 299,
+      "zero_video_windows": 26,
+      "mean_video_frames": 8.200668896321071,
+      "max_video_frames": 11
+    }
+  ],
+  "errors": [
+    {
+      "omni_error_code": "CancelledError",
+      "n": 1
+    }
+  ],
+  "agent": [
+    {
+      "source": "suggestion",
+      "success": 1,
+      "n": 1
+    }
+  ],
+  "events": [
+    {
+      "event_type": "gate_hold_expired",
+      "n": 6
+    },
+    {
+      "event_type": "gate_hold_recovered",
+      "n": 18
+    },
+    {
+      "event_type": "gate_hold_start",
+      "n": 24
+    },
+    {
+      "event_type": "suggestion",
+      "n": 1
+    }
+  ],
+  "input_buffer": [
+    {
+      "max_buffer_depth": 4,
+      "overflow_events": 73
+    }
+  ],
+  "health_http_status": 200,
+  "available_memory_mb": 2315,
+  "memory_pressure": "some avg10=0.00 avg60=0.04 avg300=0.01 total=9393878\nfull avg10=0.00 avg60=0.01 avg300=0.00 total=7674082",
+  "pid": 396367,
+  "backend_rss_mb": 2325,
+  "concurrency_peak_log": [
+    {
+      "limit": 8,
+      "active": 0,
+      "waiting": 1,
+      "bytes": 4483154
+    },
+    {
+      "limit": 8,
+      "peak": 1,
+      "active": 1,
+      "waiting": 0,
+      "bytes": 4483154,
+      "submitted": 1,
+      "completed": 0
+    },
+    {
+      "limit": 8,
+      "peak": 2,
+      "active": 2,
+      "waiting": 0,
+      "bytes": 8428976,
+      "submitted": 2,
+      "completed": 0
+    },
+    {
+      "limit": 8,
+      "peak": 3,
+      "active": 3,
+      "waiting": 0,
+      "bytes": 12306582,
+      "submitted": 3,
+      "completed": 0
+    },
+    {
+      "limit": 8,
+      "peak": 4,
+      "active": 4,
+      "waiting": 0,
+      "bytes": 16380380,
+      "submitted": 4,
+      "completed": 0
+    },
+    {
+      "limit": 8,
+      "peak": 5,
+      "active": 5,
+      "waiting": 0,
+      "bytes": 20354610,
+      "submitted": 5,
+      "completed": 0
+    },
+    {
+      "limit": 8,
+      "peak": 6,
+      "active": 6,
+      "waiting": 0,
+      "bytes": 24221216,
+      "submitted": 6,
+      "completed": 0
+    },
+    {
+      "limit": 8,
+      "peak": 7,
+      "active": 7,
+      "waiting": 0,
+      "bytes": 28141630,
+      "submitted": 7,
+      "completed": 0
+    },
+    {
+      "limit": 8,
+      "peak": 8,
+      "active": 8,
+      "waiting": 0,
+      "bytes": 32136230,
+      "submitted": 9,
+      "completed": 1
+    }
+  ]
+}

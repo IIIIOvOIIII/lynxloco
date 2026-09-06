@@ -1,0 +1,21 @@
+{
+  "co": "CHG260906006",
+  "passed": true,
+  "checks": {
+    "request_reliability": true,
+    "throughput_reference": true,
+    "health_all_samples": true,
+    "process_unchanged": true,
+    "actual_peak_8": true,
+    "configured_8_180": true,
+    "native_deployed": true
+  },
+  "sample_count": 20,
+  "rss_sample_peak_mb": 3053,
+  "available_memory_sample_min_mb": 1655,
+  "window_drop_rate": 0.3237250554323725,
+  "retained_production": true,
+  "rollback_performed": false,
+  "synthetic_requests_this_cycle": 0,
+  "scope": "one fixed30minute live operating acceptance, not household event recall"
+}

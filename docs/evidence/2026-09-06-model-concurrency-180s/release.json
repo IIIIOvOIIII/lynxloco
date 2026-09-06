@@ -1,0 +1,9 @@
+{
+  "sha": "96c018f5df06e401e7849bad271699913e5d6fb5",
+  "archive_sha256": "f604a79df1187b635dbd506f3a1377df0cfcfb5cead99ef1743d6b749223867b",
+  "runtime_version": "2026.8.6.post1.dev310+g96c018f5d",
+  "failure_policy": "retain",
+  "requested_concurrency": 8,
+  "requested_timeout_seconds": 180,
+  "window_age_seconds": 180
+}

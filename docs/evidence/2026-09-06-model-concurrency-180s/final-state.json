@@ -1,0 +1,18 @@
+{
+  "as_of_ms": 1788699681989,
+  "health_http_status": 200,
+  "versions": {
+    "miloco": "2026.8.6.post1.dev310+g96c018f5d",
+    "miloco-cli": "2026.8.6.post1.dev310+g96c018f5d"
+  },
+  "model": "grok-4.6",
+  "base_url": "http://ai.esxi:18090/v1",
+  "concurrency": 8,
+  "timeout_seconds": 180.0,
+  "matching_saved_profile": true,
+  "window_age_seconds": 180.0,
+  "engine_timeout_seconds": 180.0,
+  "loaded_concurrency": 8,
+  "observability_schema_marker": 5,
+  "rollback_performed": false
+}
