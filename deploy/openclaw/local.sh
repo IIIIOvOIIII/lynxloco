@@ -85,13 +85,16 @@ openclaw_dispatch() {
         preflight|verify|status) openclaw_remote "$operation" "$host" ;;
         rollback) openclaw_remote rollback "$host" "$rollback_sha" ;;
         deploy)
+            local failure_policy="${MILOCO_OPENCLAW_FAILURE_POLICY:-rollback}"
+            [[ "$failure_policy" == rollback || "$failure_policy" == retain ]] \
+                || die 2 "invalid native failure policy"
             openclaw_read_receipt "$clean_sha"
             openclaw_remote preflight "$host"
             openclaw_install_controller
             ssh "${ssh_args[@]}" -- "$host" env "${remote_profile_env_args[@]}" \
                 python3 "$OPENCLAW_ROOT/control/$native_controller_digest/remote-release.py" \
                 transaction "$host" "$clean_sha" "$receipt_archive_digest" \
-                "$native_controller_digest" "$receipt_allowlist_digest" \
+                "$native_controller_digest" "$receipt_allowlist_digest" "$failure_policy" \
                 < "$PROJECT_ROOT/$receipt_artifact_path"
             ;;
     esac

@@ -7,6 +7,13 @@ import pytest
 from miloco.perception import window_runtime as runtime
 
 
+def test_window_remains_actionable_after_120_seconds_until_180(monkeypatch):
+    monkeypatch.setattr(runtime.time, "time", lambda: 1000.0)
+    assert runtime.WindowJob("cam", 0, 0, 850_000).actionable
+    assert runtime.WindowJob("cam", 0, 1, 820_001).actionable
+    assert not runtime.WindowJob("cam", 0, 2, 819_999).actionable
+
+
 @pytest.mark.parametrize("cap", [4, 8])
 async def test_same_camera_http_requests_overlap_and_commit_in_order(cap):
     limiter = runtime.RequestLimiter(lambda: cap)
@@ -97,7 +104,7 @@ async def _wait_slot(limiter):
 def test_action_age_retains_normal_grok_latency_but_rejects_history():
     now = time.time() * 1000
     assert runtime.WindowJob("cam", 0, 1, now - 40_000).actionable
-    assert not runtime.WindowJob("cam", 0, 2, now - 121_000).actionable
+    assert not runtime.WindowJob("cam", 0, 2, now - 181_000).actionable
 
 
 @pytest.mark.parametrize("cap", [4, 8])
@@ -595,7 +602,7 @@ async def test_expired_identity_response_and_reused_track_cannot_mutate_current_
     engine = IdentityEngine.__new__(IdentityEngine)
     original = TrackIdentityState(track_id=1, status="confirmed", inflight=True)
     engine._states = {1: original}
-    job = runtime.WindowJob("cam", 0, 1, time.time() * 1000 - 121_000)
+    job = runtime.WindowJob("cam", 0, 1, time.time() * 1000 - 181_000)
     with runtime.window_scope(job):
         callback = engine._make_on_result(now_ts=time.time())
         await callback(OmniIdentityResult(1, None, 0.0, "late", no_person=True))
@@ -1022,7 +1029,7 @@ async def test_expired_before_prepare_keeps_window_and_buffer_drop_accounting(
     processor = PipelineProcessor.__new__(PipelineProcessor)
     processor._perf_enabled = True
     runner = PerceptionRunner(Mock(), processor, Mock())
-    end = int(time.time() * 1000 - 121_000)
+    end = int(time.time() * 1000 - 181_000)
     batch = PerceptionBatch(
         devices={
             "cam": DeviceData(

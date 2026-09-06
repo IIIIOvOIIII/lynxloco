@@ -34,9 +34,11 @@ The old CLI stops the service before either tool changes. Both installs use the 
 
 ## Recovery behavior
 
-A failed install/restart/verification triggers restoration of both backed-up tools and configuration, followed by prior-version and health verification. A failure of restoration itself stops with an operator-action error and retains the backup. Completed deployment records are stored in `state.json`; release archives, receipts and prior tools remain available for inspection. No automatic garbage collection runs.
+By default, a failed install/restart/verification triggers restoration of both backed-up tools and configuration, followed by prior-version and health verification. A failure of restoration itself stops with an operator-action error and retains the backup. Completed deployment records are stored in `state.json`; release archives, receipts and prior tools remain available for inspection. No automatic garbage collection runs.
 
-Explicit native rollback is accepted only for the current successful transaction. It snapshots current SQLite state again, stops the service, restores tools/configuration/entrypoint links and verifies the recorded prior package versions, configuration and health. Replaced tools are retained under the transaction backup.
+For an explicit user request to retain the result, set `MILOCO_OPENCLAW_FAILURE_POLICY=retain` on the native `deploy.sh deploy` invocation. The controller then records `deployment-failed-retained` and returns an error without restoring old tools/configuration on install/restart/verification failure. This cycle must not invoke rollback during acceptance. The prior default remains available for deployments without that opt-in.
+
+Explicit native rollback is accepted only for the current successful or failed-retained transaction, after later operator authorization. It snapshots current SQLite state again, stops the service, restores tools/configuration/entrypoint links and verifies the recorded prior package versions, configuration and health. Replaced tools are retained under the transaction backup.
 
 SQLite backups are **not copied over the live databases during application rollback**. All newly collected observability rows and additive columns remain in place. When the prior recorded schema is v4 and the live marker is v5, the controller first verifies the expected concurrency column names/types in `traces` and `traces_device`, then sets only `PRAGMA user_version=4`. It does not drop columns, replace tables or delete observations. Unsupported versions or an unrecognized v5 shape fail closed. The additive view is retained; a later v5 deployment can repeat its existing idempotent migration.
 

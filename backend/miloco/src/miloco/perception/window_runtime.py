@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 MAX_WAITING = 8
 MAX_WAITING_PER_CAMERA = 4
 MAX_PAYLOAD_BYTES = 128 * 1024 * 1024
-MAX_WINDOW_AGE_SECONDS = 120.0
+MAX_WINDOW_AGE_SECONDS = 180.0
 
 
 def concurrency() -> int:

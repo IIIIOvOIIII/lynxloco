@@ -138,6 +138,36 @@ class NativeContract(unittest.TestCase):
                 self.assertEqual(installed()["cli_version"], "old")
                 self.assertEqual(json.loads((controller.root / "state.json").read_text())["status"], "auto-rolled-back")
 
+    def test_failed_install_can_retain_state_without_automatic_rollback(self):
+        module = load_controller()
+        with TemporaryDirectory() as temporary:
+            controller, archive, version = self.fixture_transaction(Path(temporary), module)
+            def installed():
+                return {"miloco_version": "old", "cli_version": "old",
+                        "python_base": str(controller.python.resolve())}
+            def fail_install(args, **kwargs):
+                (controller.tools / "miloco/version").write_text("partial")
+                raise module.ReleaseError("simulated install failure")
+            with patch.object(controller, "preflight"), patch.object(controller, "installed", side_effect=installed), patch.object(controller, "run", side_effect=fail_install), patch.object(controller, "stop"), patch.object(controller, "service"), patch.object(controller, "health"), patch.object(controller, "restore", wraps=controller.restore) as restore:
+                with archive.open("rb") as stream, self.assertRaisesRegex(module.ReleaseError, "automatic rollback disabled"):
+                    controller.transaction(SHA, module.digest(archive), module.digest(NATIVE), module.ALLOWLIST_SHA256, stream, retain_on_failure=True)
+                restore.assert_not_called()
+                self.assertEqual((controller.tools / "miloco/version").read_text(), "partial")
+                self.assertEqual((controller.root / "backups" / SHA / "miloco/version").read_text(), "old")
+                state = json.loads((controller.root / "state.json").read_text())
+                self.assertEqual(state["status"], "deployment-failed-retained")
+                self.assertFalse(state["rollback_performed"])
+                controller.rollback(SHA)
+                restore.assert_called_once()
+                self.assertEqual((controller.tools / "miloco/version").read_text(), "old")
+
+    def test_transaction_command_forwards_retain_policy(self):
+        module = load_controller()
+        with patch.dict(os.environ, {"MILOCO_DEPLOY_PRODUCTION_HOST": "miloco-production.example.com"}), patch.object(module, "Controller") as factory, patch("sys.stdout", new_callable=io.StringIO):
+            factory.return_value.transaction.return_value = {"status": "deployed"}
+            module.main(["transaction", "miloco-production.example.com", SHA, "archive", "controller", "allowlist", "retain"])
+            self.assertTrue(factory.return_value.transaction.call_args.kwargs["retain_on_failure"])
+
     def test_unknown_runtime_fails_before_remote_commands(self):
         result = subprocess.run(
             ["bash", str(ROOT / "deploy.sh"), "preflight", "miloco-production.example.com"],

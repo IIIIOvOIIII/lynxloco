@@ -196,7 +196,8 @@ def test_model_defaults_align_with_schema() -> None:
     assert s.debug is False
 
 
-def test_model_omni_timeout_propagates_to_perception_engine() -> None:
+@pytest.mark.parametrize("timeout", [120.0, 180.0])
+def test_model_omni_timeout_propagates_to_perception_engine(timeout) -> None:
     settings = MilocoSettings(
         model=ModelSettings(
             omni=OmniModelSettings(
@@ -204,13 +205,13 @@ def test_model_omni_timeout_propagates_to_perception_engine() -> None:
                 base_url="http://127.0.0.1:8000/v1",
                 api_key="",
                 api_protocol="openai_responses",
-                timeout=120.0,
+                timeout=timeout,
             )
         )
     )
 
-    assert settings.model.omni.timeout == 120.0
-    assert settings.perception.engine["omni"]["timeout"] == 120.0
+    assert settings.model.omni.timeout == timeout
+    assert settings.perception.engine["omni"]["timeout"] == timeout
 
 
 def test_legacy_active_json_profile_keeps_protocol_missing_until_resolution(

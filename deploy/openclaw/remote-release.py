@@ -404,7 +404,7 @@ class Controller:
         self.health()
         require(digest(self.config) == metadata["config_sha256"], "restored configuration changed on restart")
 
-    def transaction(self, sha, archive_digest, controller_digest, allowlist_digest, stream):
+    def transaction(self, sha, archive_digest, controller_digest, allowlist_digest, stream, *, retain_on_failure=False):
         self.preflight()
         require(re.fullmatch(r"[0-9a-f]{40}", sha), "invalid transaction SHA")
         require(all(re.fullmatch(r"[0-9a-f]{64}", value) for value in (archive_digest, controller_digest, allowlist_digest)), "invalid release digest")
@@ -445,6 +445,12 @@ class Controller:
                 self.health()
                 require(digest(self.config) == metadata["config_sha256"], "native restart unexpectedly changed config")
             except Exception as error:
+                if retain_on_failure:
+                    atomic_json(self.root / "state.json", {
+                        "status": "deployment-failed-retained", "transaction_sha": sha,
+                        "runtime_profile": PROFILE, "rollback_performed": False,
+                    })
+                    raise ReleaseError("deployment failed; automatic rollback disabled by operator; current state and backup retained") from error
                 try:
                     # The new CLI may be unavailable after a failed install: use the unchanged supervisor.
                     if self.supervisor_socket_running():
@@ -467,7 +473,7 @@ class Controller:
         require(re.fullmatch(r"[0-9a-f]{40}", sha), "invalid rollback transaction SHA")
         with self.transition():
             state = json.loads((self.root / "state.json").read_text())
-            require(state.get("status") == "deployed" and state.get("transaction_sha") == sha, "rollback must name the current deployed transaction SHA")
+            require(state.get("status") in ("deployed", "deployment-failed-retained") and state.get("transaction_sha") == sha, "rollback must name the current deployed transaction SHA")
             backup = self.root / "backups" / sha
             metadata = json.loads((backup / "backup.json").read_text())
             require(metadata["transaction_sha"] == sha and metadata["runtime_profile"] == PROFILE, "rollback backup identity mismatch")
@@ -493,8 +499,10 @@ def main(argv):
         result = controller.preflight()
     elif operation in ("verify", "status") and not args:
         result = controller.verify()
-    elif operation == "transaction" and len(args) == 4:
-        result = controller.transaction(*args, sys.stdin.buffer)
+    elif operation == "transaction" and len(args) in (4, 5):
+        policy = args[4] if len(args) == 5 else "rollback"
+        require(policy in ("rollback", "retain"), "invalid native failure policy")
+        result = controller.transaction(*args[:4], sys.stdin.buffer, retain_on_failure=policy == "retain")
     elif operation == "rollback" and len(args) == 1:
         result = controller.rollback(args[0])
     else:
