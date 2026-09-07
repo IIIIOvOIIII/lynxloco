@@ -1,7 +1,7 @@
 # Copyright (C) 2025 Xiaomi Corporation
 # This software may be used and distributed according to the terms of the Xiaomi Miloco License Agreement.
 
-"""v2→v3 schema 迁移测试 (task 运行态重构 expand-contract 阶段 A).
+"""v3→v4 schema 迁移测试 (task 运行态重构 expand-contract 阶段 A).
 
 覆盖:
 - 只加列不删列: v2 的全部旧列在迁移后仍在 (阶段 A 的核心承诺)
@@ -13,7 +13,7 @@
 - on_target_desc → 补建 milestone rule; 查不到 target_minutes → 置 paused
 - 非 session 的 exit_debounce 非默认值重置
 - rule.enabled: 旧 bug 关掉的恢复成 1, 用户手工关掉的不动
-- 幂等: 已是 v3 的库不重复跑
+- 幂等: 已是 v4 的库不重复跑
 """
 
 from __future__ import annotations
@@ -200,7 +200,7 @@ def test_all_v2_columns_survive(v2_db):
     cols = {r[1] for r in conn.execute("PRAGMA table_info(rule)")}
     assert set(_V2_RULE_COLUMNS) <= cols
     assert {"direction", "condition_dnf"} <= cols
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
     conn.close()
 
 
@@ -297,7 +297,7 @@ def test_broken_condition_json_does_not_abort_migration(v2_db):
     _migrate(v2_db)
 
     conn = _raw(v2_db)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
     dnf = json.loads(
         conn.execute("SELECT condition_dnf FROM rule WHERE id='r1'").fetchone()[0]
     )
@@ -788,7 +788,7 @@ def test_null_enabled_is_restored_too(v2_db):
 # ── 幂等 ──────────────────────────────────────────────────────────────
 
 
-def test_migration_not_rerun_on_v3_db(v2_db):
+def test_migration_not_rerun_on_v4_db(v2_db):
     """第二次启动不该再补建一条 milestone rule。"""
     _seed(
         v2_db,
@@ -819,7 +819,7 @@ def test_a_v2_db_whose_version_number_was_lost_still_migrates(v2_db):
     """版本号丢了也要认出是 v2 —— sqlite3 .dump 恢复不保留 PRAGMA user_version。
 
     光看"有没有 task_link"会把它判成当前基线: task_link 早在 v1→v2 就删了。钉死
-    之后 v2→v3 永远不跑, 版本号说是最新而新列一个都没有。
+    之后 v3→v4 永远不跑, 版本号说是最新而新列一个都没有。
     """
     _seed(v2_db, lambda c: (
         _add_task(c, "t1"),
@@ -830,7 +830,7 @@ def test_a_v2_db_whose_version_number_was_lost_still_migrates(v2_db):
     _migrate(v2_db)
 
     conn = _raw(v2_db)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
     rule_columns = {r["name"] for r in conn.execute("PRAGMA table_info(rule)")}
     task_columns = {r["name"] for r in conn.execute("PRAGMA table_info(task)")}
     assert "direction" in rule_columns
@@ -845,8 +845,8 @@ def test_a_v2_db_whose_version_number_was_lost_still_migrates(v2_db):
     conn.close()
 
 
-def test_a_v3_db_whose_version_number_was_lost_is_not_migrated_again(v2_db):
-    """已经是 v3 形态的库, 版本号丢了要认成 v3, 不能退回 v2 重跑一遍。
+def test_a_v4_db_whose_version_number_was_lost_is_not_migrated_again(v2_db):
+    """已经是 v4 形态的库, 版本号丢了要认成 v4, 不能退回 v2 重跑一遍。
 
     退回重跑会把 direction 按 mode 重算 —— 存量里 exit 型的 mode 是 event, 重算
     等于把它打回 enter, 出路径静默消失。
@@ -870,8 +870,70 @@ def test_a_v3_db_whose_version_number_was_lost_is_not_migrated_again(v2_db):
     _migrate(v2_db)
 
     conn = _raw(v2_db)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
     assert conn.execute(
         "SELECT direction FROM rule WHERE id='r_exit'"
     ).fetchone()[0] == "exit"
+    conn.close()
+
+
+def _shape_only_db(tmp_path, tables: dict[str, list[str]]):
+    """只按列名建骨架 —— 形状识别只读 PRAGMA table_info, 不碰行。"""
+    conn = sqlite3.connect(str(tmp_path / "shape.db"))
+    for name, columns in tables.items():
+        conn.execute(f"CREATE TABLE {name} ({', '.join(f'{c} TEXT' for c in columns)})")
+    conn.commit()
+    return conn
+
+
+def test_a_v3_shaped_db_is_detected_as_v3_not_v2(tmp_path):
+    """v3 库 (只有 token_usage.base_url) 要认成 3 —— 认成 2 就会把 v2→v3 再跑一遍。
+
+    每加一级迁移都要在 _SCHEMA_VERSION_MARKERS 里补一行, 漏了就退到上一级重跑。
+    这条钉的是 v3 那一行在不在, 不是整条链跑不跑得动: 从启动路径看两种判定的终态
+    一样 (v2→v3 幂等), 分不开对错, 所以直接断识别函数的返回值。
+    """
+    from miloco.database.connector import _detect_schema_version
+
+    conn = _shape_only_db(
+        tmp_path,
+        {
+            "rule": ["id", "mode"],
+            "task": ["task_id", "status"],
+            "token_usage": ["model", "base_url"],
+        },
+    )
+    assert _detect_schema_version(conn) == 3
+    conn.close()
+
+
+def test_a_v2_shaped_db_is_detected_as_v2(tmp_path):
+    """一级标志都不全 → 退回 v2 让链整个跑一遍。"""
+    from miloco.database.connector import _detect_schema_version
+
+    conn = _shape_only_db(
+        tmp_path,
+        {
+            "rule": ["id", "mode"],
+            "task": ["task_id", "status"],
+            "token_usage": ["model"],
+        },
+    )
+    assert _detect_schema_version(conn) == 2
+    conn.close()
+
+
+def test_a_v4_shaped_db_is_detected_as_v4(tmp_path):
+    """v4 标志齐了就认 4, 不能被下一行的 v3 标志抢先命中 —— 判定必须从高到低。"""
+    from miloco.database.connector import _detect_schema_version
+
+    conn = _shape_only_db(
+        tmp_path,
+        {
+            "rule": ["id", "mode", "direction"],
+            "task": ["task_id", "status", "on_target_actions"],
+            "token_usage": ["model", "base_url"],
+        },
+    )
+    assert _detect_schema_version(conn) == 4
     conn.close()

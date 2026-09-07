@@ -334,7 +334,7 @@ async def test_a_paused_task_does_not_fire_after_restart(db):
 
     §19.9 之后停用 task 不再回写 rule.enabled, 所以 enabled 那一半恒为真 ——
     这个 seed 是唯一还拦得住的地方, 丢了就是停用的 task 照样对设备下指令。
-    v2→v3 迁移也依赖它: 迁移把不合法的 task 置 paused 但不动 enabled。
+    v3→v4 迁移也依赖它: 迁移把不合法的 task 置 paused 但不动 enabled。
     """
     boot1 = _Boot()
     rule_id = await boot1.service.create_rule(_session_rule())

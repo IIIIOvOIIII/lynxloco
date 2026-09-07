@@ -28,8 +28,8 @@ logger = logging.getLogger(__name__)
 
 # 当前 schema 版本。fresh-build 直接落到此值; 老库启动时按 _SCHEMA_MIGRATIONS
 # 步进跑到此值。历史基线 v1 (cron 挪出 task_link + rule 加 FK CASCADE 前)。
-# v3 = task 运行态重构的 expand-contract 阶段 A (只加列, 阶段 B 才删列)。
-_DB_SCHEMA_VERSION = 3
+# v4 = task 运行态重构的 expand-contract 阶段 A (只加列, 阶段 B 才删列)。
+_DB_SCHEMA_VERSION = 4
 
 
 def incremental_vacuum(
@@ -665,6 +665,11 @@ class SQLiteConnector:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp INTEGER NOT NULL,
                 model TEXT NOT NULL,
+                -- 模型的唯一身份是 (model, base_url)：同一个模型名完全可以挂在两个
+                -- 不同 endpoint 上。存**完整 URL 原文**，不做任何归一或截断——差异
+                -- 可能落在 URL 的任何位置（主机、路径、端口），截断是展示层的事。
+                -- '' = 该行早于本列引入，来源未记录（v3 迁移给老数据留的值，永不回填）。
+                base_url TEXT NOT NULL DEFAULT '',
                 type TEXT NOT NULL,
                 input_tokens INTEGER NOT NULL DEFAULT 0,
                 output_tokens INTEGER NOT NULL DEFAULT 0,
@@ -682,8 +687,11 @@ class SQLiteConnector:
     def _create_token_usage_daily_table(self, conn: sqlite3.Connection) -> None:
         """Create token_usage_daily table holding per-day rollup of older events.
 
-        Rows are keyed by (date, model, type) so historical trend / model / type
-        breakdown all stay queryable after the live table is pruned.
+        Rows are keyed by (date, model, base_url, type) so historical trend /
+        model / endpoint / type breakdown all stay queryable after the live table
+        is pruned. base_url is part of the key on purpose: a model name can be
+        served by more than one endpoint, and merging them here is unrecoverable
+        (the rollup UPSERT accumulates, then deletes the original rows).
         Field semantics identical to token_usage (modality columns ⊆ input_tokens).
         """
         cursor = conn.cursor()
@@ -691,6 +699,10 @@ class SQLiteConnector:
             CREATE TABLE IF NOT EXISTS token_usage_daily (
                 date TEXT NOT NULL,
                 model TEXT NOT NULL,
+                -- 见 token_usage.base_url 的说明。**进主键**：不进的话两个 endpoint
+                -- 的同日数据会在 rollup 的 UPSERT 里被静默累加成一行，而原始行紧接着
+                -- 就被 DELETE，不可恢复。
+                base_url TEXT NOT NULL DEFAULT '',
                 type TEXT NOT NULL,
                 calls INTEGER NOT NULL DEFAULT 0,
                 input_tokens INTEGER NOT NULL DEFAULT 0,
@@ -698,7 +710,7 @@ class SQLiteConnector:
                 cache_tokens INTEGER NOT NULL DEFAULT 0,
                 video_tokens INTEGER NOT NULL DEFAULT 0,
                 audio_tokens INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (date, model, type)
+                PRIMARY KEY (date, model, base_url, type)
             )
         """)
         cursor.execute(
@@ -1262,13 +1274,13 @@ def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
         cursor.execute("PRAGMA foreign_keys=ON")
 
 
-# v3 新增列。SQLite 的 ALTER TABLE ADD COLUMN 就地生效、不重建表, 老代码读旧列
+# v4 新增列。SQLite 的 ALTER TABLE ADD COLUMN 就地生效、不重建表, 老代码读旧列
 # 完全不受影响 —— 这是 expand-contract 阶段 A 的全部依据。删列在阶段 B 单独做。
-# 往这里追加列的前提是 v3 尚未发布 —— 线上没有 v3 的库, 加的列一定随首次
-# v2→v3 迁移落地。版本号已经是 3 的库 (开发机 / 验证机) 拿不到新列: 步进循环
-# range(4, 4) 是空的, 形状兜底那条路也按标志列认它是 3。那种库要手工 ALTER 或
-# 重建。v3 发出去之后再加列必须开 v4。
-_V3_TASK_COLUMNS: tuple[tuple[str, str], ...] = (
+# 往这里追加列的前提是 v4 尚未发布 —— 线上没有 v4 的库, 加的列一定随首次
+# v3→v4 迁移落地。版本号已经是 4 的库 (开发机 / 验证机) 拿不到新列: 步进循环
+# 那一级已经跑过, 形状兜底那条路也按标志列认它是 4。那种库要手工 ALTER 或
+# 重建。v4 发出去之后再加列必须开 v5。
+_V4_TASK_COLUMNS: tuple[tuple[str, str], ...] = (
     ("lifecycle", "TEXT NOT NULL DEFAULT 'permanent'"),
     ("expires_at", "INTEGER"),
     ("on_enter_actions", "TEXT NOT NULL DEFAULT '[]'"),
@@ -1279,12 +1291,12 @@ _V3_TASK_COLUMNS: tuple[tuple[str, str], ...] = (
     ("on_target_desc", "TEXT"),
 )
 
-_V3_RULE_COLUMNS: tuple[tuple[str, str], ...] = (
+_V4_RULE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("direction", "TEXT NOT NULL DEFAULT 'enter'"),
     ("condition_dnf", "TEXT"),
 )
 
-_V3_MODE_TO_DIRECTION = {"event": "enter", "state": "session"}
+_V4_MODE_TO_DIRECTION = {"event": "enter", "state": "session"}
 
 _DEFAULT_EXIT_DEBOUNCE_SECONDS = 60
 
@@ -1294,7 +1306,12 @@ def _table_columns(cursor: sqlite3.Cursor, table: str) -> set[str]:
     return {row[1] for row in cursor.execute(f"PRAGMA table_info({table})")}
 
 
-_SCHEMA_VERSION_MARKERS = (("rule", "direction"), ("task", "on_target_actions"))
+# 每级取该级迁移真正新加的列。判定从高到低, 全中即认这一级。新增迁移必须在这里
+# 补一行, 否则形状兜底那条路会把新库判成上一级、把该级迁移再跑一遍。
+_SCHEMA_VERSION_MARKERS: tuple[tuple[int, tuple[tuple[str, str], ...]], ...] = (
+    (4, (("rule", "direction"), ("task", "on_target_actions"))),
+    (3, (("token_usage", "base_url"),)),
+)
 
 
 def _detect_schema_version(conn: sqlite3.Connection) -> int:
@@ -1302,17 +1319,19 @@ def _detect_schema_version(conn: sqlite3.Connection) -> int:
 
     老库从没显式写过它, 而 ``sqlite3 .dump`` 重建也不保留它 —— 一个 v2 库经 dump
     恢复后版本号是 0 且 task_link 早被 v1→v2 删了, 光看"有没有 task_link"会把它
-    判成当前基线, v2→v3 从此不跑。所以标志按新版本真正加的那些列取。
+    判成当前基线, 后面的迁移从此不跑。所以标志按各级迁移真正加的那些列取。
 
-    认不出 v3 就退回 v2 让链跑一遍: 加列是幂等的, 少了的补上, 已有的跳过。
+    一级都认不出就退回 v2 让链整个跑一遍。
     """
     cursor = conn.cursor()
     if _table_columns(cursor, "task_link"):
         return 1
-    for table, marker in _SCHEMA_VERSION_MARKERS:
-        if marker not in _table_columns(cursor, table):
-            return 2
-    return _DB_SCHEMA_VERSION
+    for version, markers in _SCHEMA_VERSION_MARKERS:
+        if all(
+            marker in _table_columns(cursor, table) for table, marker in markers
+        ):
+            return version
+    return 2
 
 
 def _add_columns_if_missing(
@@ -1418,7 +1437,7 @@ def _create_milestone_rule(cursor: sqlite3.Cursor, task_id: str, now: int) -> No
     """给带 on_target_desc 的 task 补一条 direction=milestone 的 rule。
 
     形状与运行时代建共用同一份 (``milestone_condition_dnf`` 等), 不在这里抄 ——
-    本函数的执行时刻是未来某天的首次 v2→v3, 抄一份的话服务层改了形状不会有任何
+    本函数的执行时刻是未来某天的首次 v3→v4, 抄一份的话服务层改了形状不会有任何
     测试红, 而升上来的老 task 会静默不响。
     """
     dnf = milestone_condition_dnf(task_id)
@@ -1442,8 +1461,8 @@ def _create_milestone_rule(cursor: sqlite3.Cursor, task_id: str, now: int) -> No
     )
 
 
-def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
-    """v2 → v3 schema step —— expand-contract 阶段 A: 只加列、只复制, 不删列。
+def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
+    """v3 → v4 schema step —— expand-contract 阶段 A: 只加列、只复制, 不删列。
 
     与 v1→v2 的关键差别: 那一步重建表并 DROP 了列, 不可逆; 这一步全是
     ALTER TABLE ADD COLUMN + UPDATE, 旧代码读旧列照常跑, 出问题退代码版本即可。
@@ -1464,7 +1483,7 @@ def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
           「session 必须独占」, 撞上的 task 记入待暂停清单
       (h) 待暂停清单统一置 paused + paused_at。不连带写 rule.enabled=0 —— 置 paused
           已经让派生量为假, 再写 0 会让用户按报告处置完重新启用后这批永远起不来
-      (i) PRAGMA user_version = 3 (同事务)
+      (i) PRAGMA user_version = 4 (同事务)
       COMMIT
 
     crash 语义同 v1→v2: COMMIT 前 crash → rollback 到 v2 重跑; COMMIT 后 crash →
@@ -1489,9 +1508,9 @@ def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
     cursor.execute("BEGIN IMMEDIATE")
     try:
         # ── (a) 加列 ────────────────────────────────────────────────
-        added_task = _add_columns_if_missing(cursor, "task", _V3_TASK_COLUMNS)
-        added_rule = _add_columns_if_missing(cursor, "rule", _V3_RULE_COLUMNS)
-        logger.info("v2→v3 added columns: task=%s rule=%s", added_task, added_rule)
+        added_task = _add_columns_if_missing(cursor, "task", _V4_TASK_COLUMNS)
+        added_rule = _add_columns_if_missing(cursor, "rule", _V4_RULE_COLUMNS)
+        logger.info("v3→v4 added columns: task=%s rule=%s", added_task, added_rule)
 
         rules = cursor.execute(
             "SELECT * FROM rule ORDER BY task_id, created_at, id"
@@ -1499,7 +1518,7 @@ def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
 
         # ── (b) 逐条 rule ───────────────────────────────────────────
         for row in rules:
-            direction = _V3_MODE_TO_DIRECTION.get(row["mode"], "enter")
+            direction = _V4_MODE_TO_DIRECTION.get(row["mode"], "enter")
             cursor.execute(
                 "UPDATE rule SET direction=?, condition_dnf=?, updated_at=? WHERE id=?",
                 (direction, _condition_to_dnf(row["condition"]), now, row["id"]),
@@ -1514,7 +1533,7 @@ def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
             )
             if stale_debounce:
                 logger.info(
-                    "v2→v3 reset exit_debounce_seconds %s→%s on rule %s "
+                    "v3→v4 reset exit_debounce_seconds %s→%s on rule %s "
                     "(direction=%s, 该字段仅 session 有效)",
                     row["exit_debounce_seconds"],
                     _DEFAULT_EXIT_DEBOUNCE_SECONDS,
@@ -1539,7 +1558,7 @@ def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
             if is_conflict:
                 conflict_tasks.append(task_id)
                 logger.warning(
-                    "v2→v3 task %s 名下 %d 条 rule 动作不一致, 不写 task 动作列; "
+                    "v3→v4 task %s 名下 %d 条 rule 动作不一致, 不写 task 动作列; "
                     "置 paused, 动作原样留在 rule 列上等用户处置",
                     task_id,
                     len(task_rules),
@@ -1560,7 +1579,7 @@ def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
             others = {r["lifecycle"] for r in task_rules[1:]}
             if others - {first["lifecycle"]}:
                 logger.warning(
-                    "v2→v3 task %s 取首条 rule 的 lifecycle=%s, 忽略 %s",
+                    "v3→v4 task %s 取首条 rule 的 lifecycle=%s, 忽略 %s",
                     task_id,
                     first["lifecycle"],
                     sorted(others),
@@ -1584,7 +1603,7 @@ def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
                 # 永不生效的通知, 用户不会发现; 置 paused 让它出现在报告里。
                 on_target_broken_tasks.append(task_id)
                 logger.warning(
-                    "v2→v3 task %s 有 on_target_desc 但查不到 duration record 的 "
+                    "v3→v4 task %s 有 on_target_desc 但查不到 duration record 的 "
                     "target_minutes, 不补建 milestone rule, 置 paused",
                     task_id,
                 )
@@ -1625,7 +1644,7 @@ def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
             )
             counts["rule_enabled_restored"] = len(restored)
             logger.warning(
-                "v2→v3 restored %d rule.enabled=1: %s", len(restored), restored
+                "v3→v4 restored %d rule.enabled=1: %s", len(restored), restored
             )
 
         # ── (g) 迁移后校验: 变非法的 task 记入待暂停清单 ──────────────
@@ -1656,7 +1675,7 @@ def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
             if reason:
                 illegal_reasons[task_id] = reason
                 logger.warning(
-                    "v2→v3 task %s 迁移后不合法, 置 paused: %s", task_id, reason
+                    "v3→v4 task %s 迁移后不合法, 置 paused: %s", task_id, reason
                 )
 
         # ── (h) 置 paused ───────────────────────────────────────────
@@ -1675,19 +1694,19 @@ def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
         ).fetchall()
         for row in terminate_when_rules:
             logger.warning(
-                "v2→v3 rule %s (task %s) 的 terminate_when 不再生效: %s",
+                "v3→v4 rule %s (task %s) 的 terminate_when 不再生效: %s",
                 row["id"],
                 row["task_id"],
                 row["terminate_when"],
             )
 
-        cursor.execute("PRAGMA user_version = 3")
+        cursor.execute("PRAGMA user_version = 4")
         conn.commit()
     except Exception:
         conn.rollback()
         raise
 
-    _log_v3_report(
+    _log_v4_report(
         counts,
         conflict_tasks,
         on_target_broken_tasks,
@@ -1696,7 +1715,110 @@ def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
     )
 
 
-def _log_v3_report(
+def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
+    """v2 → v3: token_usage / token_usage_daily 增加 base_url，日表主键改四元组。
+
+    动机: 模型的唯一身份是 (model, base_url)。同一个模型名可以同时挂在两个
+    endpoint 上（实机就有 mimo-v2.5 同时配在 /v1 与 /v1-test），此前用量表只记
+    model，于是花在哪个 endpoint 上无从区分。
+
+    一次事务原子完成:
+      (a) ALTER TABLE token_usage ADD COLUMN base_url TEXT NOT NULL DEFAULT ''
+      (b) 重建 token_usage_daily: 主键 (date, model, type) → (date, model, base_url, type)
+          —— SQLite 改不了主键，只能建表-拷贝-删-改名-重建索引
+      (c) PRAGMA user_version = 3 (同事务)
+      COMMIT
+
+    **老数据一律留 '' 表示「来源未记录」，本迁移不做任何回填。**
+    回填只有两种可能来源，都不能用: 一是按「当前生效档案」猜——在任何换过
+    endpoint 的机器上都是错的; 二是按运维口述——那是关于某一台的事实，不该写进
+    发给所有装机的代码里。展示侧对 '' 直接说「旧版本数据未记录 URL」，诚实且不可
+    误读；把断言写进库则会让它和记录值长得一模一样，日后再也分不清哪个是量出来的。
+
+    为什么 base_url 必须进日表主键: 不进的话，rollup 的
+    ``ON CONFLICT(date, model, type) DO UPDATE SET x = x + excluded.x`` 会把两个
+    endpoint 的同日数据**静默累加成一行**，而 rollup 紧接着就 DELETE 原始行——
+    不可恢复。
+
+    crash 语义: 单事务原子，COMMIT 前 crash → rollback 到 v2，重启重跑;
+    COMMIT 后 crash → user_version=3，外层步进循环跳过，不重入。
+    """
+    cursor = conn.cursor()
+    try:
+        cursor.execute("BEGIN")
+
+        # ── (a) 实时表加列 ─────────────────────────────────────────
+        cols = {
+            r[1] for r in cursor.execute("PRAGMA table_info(token_usage)").fetchall()
+        }
+        if "base_url" not in cols:
+            cursor.execute(
+                "ALTER TABLE token_usage ADD COLUMN base_url TEXT NOT NULL DEFAULT ''"
+            )
+
+        # ── (b) 日表重建（改主键）────────────────────────────────────
+        dcols = {
+            r[1]
+            for r in cursor.execute("PRAGMA table_info(token_usage_daily)").fetchall()
+        }
+        if "base_url" not in dcols:
+            cursor.execute("""
+                CREATE TABLE token_usage_daily_v3 (
+                    date TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    base_url TEXT NOT NULL DEFAULT '',
+                    type TEXT NOT NULL,
+                    calls INTEGER NOT NULL DEFAULT 0,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_tokens INTEGER NOT NULL DEFAULT 0,
+                    video_tokens INTEGER NOT NULL DEFAULT 0,
+                    audio_tokens INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (date, model, base_url, type)
+                )
+            """)
+            # 老行 base_url 一律 ''。列名逐个写出，不用 SELECT *——
+            # 后者依赖列顺序，将来任何一次加列都会静默错位。
+            cursor.execute("""
+                INSERT INTO token_usage_daily_v3
+                    (date, model, base_url, type, calls,
+                     input_tokens, output_tokens, cache_tokens,
+                     video_tokens, audio_tokens)
+                SELECT date, model, '', type, calls,
+                       input_tokens, output_tokens, cache_tokens,
+                       video_tokens, audio_tokens
+                FROM token_usage_daily
+            """)
+            moved = cursor.execute(
+                "SELECT COUNT(*) FROM token_usage_daily_v3"
+            ).fetchone()[0]
+            before = cursor.execute(
+                "SELECT COUNT(*) FROM token_usage_daily"
+            ).fetchone()[0]
+            if moved != before:
+                raise RuntimeError(
+                    f"v2→v3 migration invariant broken: token_usage_daily "
+                    f"{before} rows in, {moved} rows out"
+                )
+            cursor.execute("DROP TABLE token_usage_daily")
+            cursor.execute(
+                "ALTER TABLE token_usage_daily_v3 RENAME TO token_usage_daily"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_token_usage_daily_date "
+                "ON token_usage_daily(date)"
+            )
+
+        # ── (c) 版本号与业务 DML 同事务 ──────────────────────────────
+        cursor.execute("PRAGMA user_version = 3")
+        conn.commit()
+        logger.info("v2→v3 migration done: base_url added to token usage tables")
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _log_v4_report(
     counts: dict[str, int],
     conflict_tasks: list[str],
     on_target_broken_tasks: list[str],
@@ -1705,7 +1827,7 @@ def _log_v3_report(
 ) -> None:
     """迁移报告。日志 + stdout 双出 —— 只写日志用户装完不会去翻。"""
     lines = [
-        "=== miloco schema v2→v3 迁移报告 ===",
+        "=== miloco schema v3→v4 迁移报告 ===",
         *(f"  {k}: {v}" for k, v in counts.items()),
         f"  terminate_when_no_longer_effective: {terminate_when_count}",
     ]
@@ -1745,6 +1867,7 @@ def _log_v3_report(
 _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     2: _migrate_v1_to_v2,
     3: _migrate_v2_to_v3,
+    4: _migrate_v3_to_v4,
 }
 
 
@@ -1760,6 +1883,11 @@ def rollback_v2_to_v1() -> dict[str, int]:
     **前置条件**: internal cron 必须已被 caller 手工清空 (v1 无 cron 表, rollback
     语义 = 彻底回到迁移前状态; internal 是 backend 建的用户数据, 不能盲目丢弃)。
     函数内断言 internal_count == 0, 否则 raise。
+
+    **只处理 v2 → v1 这一级**: 它不认识 v2 之后各级引入的表与列, 也不会去回退它们。
+    故库必须正好停在 v2; 在更高版本的库上跑会把 user_version 盖成 1 而表形态没退,
+    之后启动时步进循环会从 v1 重跑一遍 —— 函数内断言当前版本 == 2,
+    不满足直接 raise, 不做「猜一个中间状态」这种事。
     """
     stats: dict[str, int] = {
         "rule_reverted_to_link": 0,
@@ -1775,9 +1903,9 @@ def rollback_v2_to_v1() -> dict[str, int]:
             version = cursor.execute("PRAGMA user_version").fetchone()[0]
             if version != 2:
                 raise RuntimeError(
-                    f"rollback_v2_to_v1 refused: db is at v{version}, not v2. "
-                    f"本函数只反向 v1↔v2 那一步; v3+ 的库先按各自的反向路径退回 "
-                    f"v2 再调本函数, 否则 v3 列会被静默丢弃。"
+                    f"rollback_v2_to_v1 refused: user_version={version}, expected 2. "
+                    "本函数只反向 v1↔v2 那一步; 更高版本的库先按各自的反向路径退回 "
+                    "v2 再调本函数, 否则更高版本加的列会被静默丢弃。"
                 )
 
             internal_count = cursor.execute(
@@ -1839,7 +1967,7 @@ def rollback_v2_to_v1() -> dict[str, int]:
                 )
             """)
             # 显式列名而非 SELECT *: 后者按位置匹配, rule 表加一列就静默错位
-            # (v3 加 direction / condition_dnf 时就撞过一次)。
+            # (v4 加 direction / condition_dnf 时就撞过一次)。
             _v1_rule_cols = (
                 "id, name, task_id, mode, lifecycle, enabled, condition, "
                 "actions, action_descriptions, on_enter_actions, on_enter_desc, "
