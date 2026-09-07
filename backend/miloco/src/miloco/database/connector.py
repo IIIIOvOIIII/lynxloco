@@ -1486,8 +1486,8 @@ def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
       (i) PRAGMA user_version = 4 (同事务)
       COMMIT
 
-    crash 语义同 v1→v2: COMMIT 前 crash → rollback 到 v2 重跑; COMMIT 后 crash →
-    user_version=3, 外层步进循环跳过, 不重入。
+    crash 语义同 v1→v2: COMMIT 前 crash → rollback 到 v3 重跑; COMMIT 后 crash →
+    user_version=4, 外层步进循环跳过, 不重入。
 
     fail-soft: 单条数据无法处理时丢该条、继续跑完, 不中止启动 (§10.1)。
     """
