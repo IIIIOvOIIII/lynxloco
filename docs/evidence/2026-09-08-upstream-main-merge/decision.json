@@ -1,0 +1,23 @@
+{
+  "classification": "Deployment and functional acceptance passed; queue capacity limitation remains",
+  "passed": true,
+  "source_sha": "cb87f6c0ea17b0ea6b70d3172d12af37da4d7568",
+  "sample_count": 9,
+  "healthy_samples": 9,
+  "stable_pid": true,
+  "pid": 1298569,
+  "camera_progress_passed": true,
+  "enabled_camera_count": 2,
+  "all_enabled_cameras_had_success": true,
+  "actual_peak": 8,
+  "memory_rss_peak_mb": 2207,
+  "memory_available_min_mb": 2676,
+  "request_errors": 1,
+  "requests": 63,
+  "success_windows": 62,
+  "request_error_percent": 1.5873015873015872,
+  "drop_percent": 47.142857142857146,
+  "rollback_performed": false,
+  "four_way_fallback_performed": false,
+  "production_retained": true
+}

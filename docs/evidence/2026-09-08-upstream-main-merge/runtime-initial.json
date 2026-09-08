@@ -1,0 +1,20 @@
+{
+  "as_of_ms": 1788873550687,
+  "health_http_status": 200,
+  "versions": {
+    "miloco": "2026.8.6.post1.dev350+gcb87f6c0e",
+    "miloco-cli": "2026.8.6.post1.dev350+gcb87f6c0e"
+  },
+  "model": "grok-4.6",
+  "base_url": "http://ai.esxi:18090/v1",
+  "concurrency": 8,
+  "timeout_seconds": 180.0,
+  "matching_saved_profile": true,
+  "window_age_seconds": 180.0,
+  "engine_timeout_seconds": 180.0,
+  "loaded_concurrency": 8,
+  "observability_schema_marker": 5,
+  "config_sha256": "84ed2e81c1564d56b704238045076c636791658b402b8bb4bc41194fec3dd016",
+  "detector_sha256": "eb55fff61225c1e4d90312a0f70f675ce19632bae1b51b948a3c8dc96765bf2f",
+  "rollback_performed": false
+}

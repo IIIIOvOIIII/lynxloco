@@ -19,7 +19,9 @@
 
 - [x] Merge the 37 new upstream commits; resolve .gitignore by retaining both sets of rules. Review automatic merges around startup/shutdown, MIoT and packaging.
 - [x] Extend native delivery to include exact-built OpenClaw plugin and detector/model payload. Preserve current runtime config; back up old assets, verify installed asset digest/plugin version, keep explicit rollback possible. Add focused deployment tests for successful asset installation and retain-on-failure.
-- [ ] Run backend, CLI, web and OpenClaw regressions plus native deployment tests; build exact committed release using MILOCO_DEPLOY_RUNTIME=openclaw ./deploy.sh build. Review source merge and archive contents.
-- [ ] Push merged candidate to origin/main and verify remote SHA. Create exact-SHA Software CO for miloco.esxi with read-only preflight, backup, native install/restart and acceptance scope. Pause if human approval required.
-- [ ] After approval and live exact-SHA gate, deploy via deploy.sh with retain policy; verify code/plugin/model, health, unchanged configuration, 8/180 settings, RTSP progress and successful natural perception over ten minutes.
-- [ ] Record outcome, close CO truthfully, publish closeout documents, update progress and memory.
+- [x] Run backend, CLI, web and OpenClaw regressions plus native deployment tests; build exact committed release using MILOCO_DEPLOY_RUNTIME=openclaw ./deploy.sh build. Review source merge and archive contents.
+- [x] Push merged candidate to origin/main and verify remote SHA. Create exact-SHA Software CO for miloco.esxi with read-only preflight, backup, native install/restart and acceptance scope. Pause if human approval required.
+- [x] After approval and live exact-SHA gate, deploy via deploy.sh with retain policy; verify code/plugin/model, health, unchanged configuration, 8/180 settings, RTSP progress and successful natural perception over ten minutes.
+- [x] Record outcome, close CO truthfully, publish closeout documents, update progress and memory.
+
+Final result: deployedcb87f6c0 (backend/CLIdev350,plugin350,newdetector), functional acceptance passed with62/63successful requests,8-waypeak,health200,stable2RTSP. Queue drops47.14% remain. No rollback. BothCO003/004SuccessfullyClosed. Full [closeout](2026-09-08-upstream-main-merge-closeout.md).

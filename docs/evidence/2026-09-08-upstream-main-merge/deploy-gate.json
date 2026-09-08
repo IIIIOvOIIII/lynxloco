@@ -1,0 +1,9 @@
+{
+  "co_number": "CHG260908004",
+  "state": "Implement",
+  "pam_status": "active",
+  "target_host": "miloco.esxi",
+  "target_user": "root",
+  "expected_sha": "cb87f6c0ea17b0ea6b70d3172d12af37da4d7568",
+  "expires_at": "2026-09-08T17:15:33Z"
+}

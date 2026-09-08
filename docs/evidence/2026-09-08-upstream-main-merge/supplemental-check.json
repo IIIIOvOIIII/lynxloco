@@ -1,0 +1,37 @@
+{
+  "miloco_config_matches_backup": true,
+  "openclaw_changed_top_level_keys": [
+    "meta"
+  ],
+  "openclaw_channels_preserved": true,
+  "openclaw_agents_preserved": true,
+  "openclaw_models_preserved": true,
+  "openclaw_gateway_config_preserved": true,
+  "miloco_plugin_settings_preserved": true,
+  "dashboard_http_status": 200,
+  "auth_status_http_status": 200,
+  "auth_status": {
+    "needs_setup": false,
+    "authenticated": false
+  },
+  "anonymous_camera_http_status": 401,
+  "state_alignment": [
+    {
+      "devices": 95,
+      "offline": 19,
+      "written_devices": 66,
+      "requested": 227,
+      "written": 226,
+      "elapsed": 1.5
+    },
+    {
+      "devices": 95,
+      "offline": 19,
+      "written_devices": 66,
+      "requested": 227,
+      "written": 226,
+      "elapsed": 2.2
+    }
+  ],
+  "state_alignment_failure_count": 0
+}

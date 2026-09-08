@@ -1,0 +1,52 @@
+{
+  "merge_commit": "c1018bc5de9eb77b878e0c74cd036b2ce87c787b",
+  "upstream_commit": "646d19e7380c66c4a8db4ac2e14737938b376bdf",
+  "upstream_commit_count": 37,
+  "backend": {
+    "passed": 4477,
+    "skipped": 1,
+    "seconds": 166.13,
+    "test_environment": "MILOCO_SERVER__TOKEN synthetic local token, same convention as CI"
+  },
+  "cli": {
+    "passed": 663
+  },
+  "web": {
+    "passed": 523,
+    "skipped": 1
+  },
+  "openclaw_plugin": {
+    "passed": 191,
+    "typescript_check": "passed"
+  },
+  "scripts": {
+    "passed": 24
+  },
+  "changed_backend_ruff": "passed",
+  "detector": {
+    "sha256": "eb55fff61225c1e4d90312a0f70f675ce19632bae1b51b948a3c8dc96765bf2f",
+    "cpu_smoke": "passed",
+    "input_shape": [
+      1,
+      3,
+      416,
+      416
+    ],
+    "output_shape": [
+      1,
+      9,
+      3549
+    ],
+    "outputs_finite": true
+  },
+  "source_review": "no blocking findings; native deployment extension reviewed separately",
+  "native_deployment": {
+    "passed": 19,
+    "bash_syntax": "passed",
+    "ruff": "passed",
+    "review": "no blocking findings"
+  },
+  "docker_deploy_contract": {
+    "passed": 198
+  }
+}

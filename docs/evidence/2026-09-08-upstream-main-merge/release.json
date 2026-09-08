@@ -1,0 +1,25 @@
+{
+  "source_sha": "cb87f6c0ea17b0ea6b70d3172d12af37da4d7568",
+  "upstream_sha": "646d19e7380c66c4a8db4ac2e14737938b376bdf",
+  "versions": {
+    "miloco": "2026.8.6.post1.dev350+gcb87f6c0e",
+    "cli": "2026.8.6.post1.dev350+gcb87f6c0e",
+    "miot": "2026.8.6.post1.dev350+gcb87f6c0e"
+  },
+  "native_payload_path": "miloco-native-cb87f6c0ea17b0ea6b70d3172d12af37da4d7568.tar.gz",
+  "native_payload_sha256": "d9743ebb3c881c8ea8cc2d779954e4f388aac6012d733530e6df224ec6e2556a",
+  "native_payload_bytes": 69009052,
+  "controller_sha256": "e7294490a0b73072600695ec2594eedafd0c60f0554238b20a80f4b7965ca9cd",
+  "model_files": {
+    "bge-small-zh-v1.5-int8.onnx": "5f994d88aa50acc6218552cef84e8774e1a5991e1cb286a46af064ed491863f8",
+    "bge-small-zh-v1.5-tokenizer.json": "48cea5d44424912a6fd1ea647bf4fe50b55ab8b1e5879c3275f80e339e8fae26",
+    "det_4C.onnx": "eb55fff61225c1e4d90312a0f70f675ce19632bae1b51b948a3c8dc96765bf2f",
+    "human_body_reid_v2.onnx": "dc70121835336bcd342be0d3f5baba350e94c605b8da886a6efd2f3357fa3f29",
+    "silero_vad.onnx": "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3"
+  },
+  "plugin_version": "2026.8.6-post1.dev350",
+  "plugin_file_count": 34,
+  "plugin_has_dev_dependencies": false,
+  "native_receipt": "schema=2\ngit_sha=cb87f6c0ea17b0ea6b70d3172d12af37da4d7568\nruntime_profile=openclaw-root-v1\narchive_sha256=19d887a591ab91a99f9b12fddc1ff6e840ea4584e7b89331a6fe19b2fbb5cff6\ncontroller_sha256=e7294490a0b73072600695ec2594eedafd0c60f0554238b20a80f4b7965ca9cd\nallowlist_sha256=02852c989db9f4efd27d1df7e3872f60af982175eb7e1e9f4bf9b751f1754ddd\npayload_sha256=d9743ebb3c881c8ea8cc2d779954e4f388aac6012d733530e6df224ec6e2556a\n",
+  "artifact_validation": "passed"
+}

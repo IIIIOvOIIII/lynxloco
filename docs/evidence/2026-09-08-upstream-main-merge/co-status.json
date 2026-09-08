@@ -1,0 +1,18 @@
+{
+  "co_number": "CHG260908004",
+  "state": "Implement",
+  "risk": "Medium",
+  "impact": "Medium",
+  "approver_type": "AI",
+  "ai_approval": "Accepted",
+  "lynx_approval": null,
+  "expires_at": "2026-09-08T17:15:33Z",
+  "pam_status": "active",
+  "allowed_hosts": [
+    "miloco.esxi"
+  ],
+  "target_user": "root",
+  "message": "PAM keys distributed. Use ~/.ssh/id_co_openclaw to connect.",
+  "_token_source": "vault",
+  "_vault_ref": "shared.codex_skills.create_co.api_token"
+}

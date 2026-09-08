@@ -1,0 +1,11 @@
+{
+  "phase": "accepted_and_retained",
+  "co_number": "CHG260908004",
+  "source_sha": "cb87f6c0ea17b0ea6b70d3172d12af37da4d7568",
+  "since_ms": 1788873550687,
+  "until_ms": 1788874150687,
+  "rollback_policy": "retain; user decides",
+  "concurrency": 8,
+  "timeout": 180,
+  "passed": true
+}
