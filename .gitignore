@@ -102,3 +102,5 @@ docs/superpowers/
 docs/co/
 docs/ops/
 docs/*_PROGRESS.md
+# scripts/build.sh 打包期临时备份的 package.json（正常退出被 mv 掉，硬杀时残留）
+*.build-bak
