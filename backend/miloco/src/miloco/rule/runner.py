@@ -170,9 +170,6 @@ _FIRE_PREAMBLE_WITH_RECORD = """**处理流程**：（按时间序 1→2→3 执
 辅助工具：派生量历史 / 跨窗口查询用 compute <task_id> [--window all|day|week|month] [--date YYYY-MM-DD]；所有 CLI 响应自带 derived 字段直接读，禁止心算。"""
 
 
-# _select_task_slot 的第三态: None 已经表示"空槽", 需要另一个值表示"没接管"。
-_NO_TASK_ACTIONS: object = object()
-
 # 状态机判定为"该 fire"的结论。其余 (已在态内 / 被对侧条件拦住 / 不在会话中)
 # 都不 fire。
 _FIRING_OUTCOMES = frozenset(
@@ -223,21 +220,6 @@ def _edge_timestamp(slot: ActionSlot | None, edge_at: str) -> dict[str, str]:
 def _is_milestone(rule: Rule) -> bool:
     """这条 rule 是不是达标型。走 ``_slot_for`` 而不是自己判方向, 保持单一映射点。"""
     return _slot_for(rule, RuleEvent.ENTERED) is ActionSlot.ON_TARGET
-
-
-def _has_any_action(actions: dict) -> bool:
-    """六个槽里有没有任何一个非空。全空 = 没配动作 / 还没迁移, 该回退到 rule。"""
-    return any(
-        actions.get(k)
-        for k in (
-            "on_enter_actions",
-            "on_enter_desc",
-            "on_exit_actions",
-            "on_exit_desc",
-            "on_target_actions",
-            "on_target_desc",
-        )
-    )
 
 
 @dataclass
@@ -298,6 +280,7 @@ class RuleRunner:
         self._state_machine: TaskStateMachine | None = None
         # task 边界动作快照, 由接管方在登记拓扑时喂进来。runner 不查 DB:
         # _select_slot 在 fire 路径上, 查一次 DB 就把 hot path 拖进 IO。
+        # 这是动作的唯一来源, 没有条目 = 该 task 名下没有动作可派。
         self._task_actions: dict[str, dict] = {}
         # 停用中的 task。「有效启用」= rule.enabled AND task 不在这个集合里,
         # 是派生量、无人直接写 (§19.9)。放内存是因为 get_enabled_rules 每个判定
@@ -365,14 +348,15 @@ class RuleRunner:
         return self._record_source
 
     def set_task_actions(self, task_id: str, actions: dict | None) -> None:
-        """喂一份 task 边界动作快照。``None`` / 空 → 该 task 回退到 rule 上的旧字段。"""
-        if actions and _has_any_action(actions):
-            self._task_actions[task_id] = actions
-        else:
-            self._task_actions.pop(task_id, None)
+        """喂一份 task 边界动作快照。``None`` = 这个 task 没了, 清掉这份。
 
-    def task_owns_actions(self, task_id: str) -> bool:
-        return task_id in self._task_actions
+        六个槽全空照存: 那是一个有效状态 (规则只推状态、不做事), 不是"改读别处"
+        的信号。
+        """
+        if actions is None:
+            self._task_actions.pop(task_id, None)
+        else:
+            self._task_actions[task_id] = actions
 
     # ---- 状态机的注入点 (§15) ----
 
@@ -1536,81 +1520,31 @@ class RuleRunner:
     def _select_slot(
         self, rule: Rule, event: RuleEvent, action_slot: ActionSlot | None = None
     ) -> Slot:
-        """Return ``("static", actions)`` / ``("dynamic", prompt_text)`` for the
-        slot matching (direction, event), or ``None`` when the slot is empty.
+        """(direction, event) 对应的那个 task 动作槽; 空槽返回 ``None``。
 
-        Dispatch kind is inferred from field presence: 单方向的 rule 看
-        ``actions`` vs ``action_descriptions``; session 看 ``on_*_actions`` vs
-        ``on_*_desc``。Validation enforces these as mutually exclusive.
+        ``("static", actions)`` 走设备直控, ``("dynamic", prompt)`` 交给 agent。
+        同槽两列互斥, 静态优先。
+
+        动作只有 task 边界动作列一个来源。rule 上的旧动作列阶段 A 仍然留着 (为了
+        能退代码版本), 但运行时不读: 读了的话清空 task 的六个槽会让迁移前的旧动作
+        重新生效, 而 ``task get`` 显示的是空。
         """
-        task_slot = self._select_task_slot(rule, event, action_slot)
-        if task_slot is not _NO_TASK_ACTIONS:
-            return task_slot
-
-        # 达标槽在方向分支之前判: milestone 走下面的单方向分支就只认 ENTERED,
-        # 达标永远选不到槽。
-        if event == RuleEvent.TARGET_FIRED:
-            if rule.on_target_desc:
-                return ("dynamic", rule.on_target_desc)
-            return None
-
-        if rule.resolved_direction is not RuleDirection.SESSION:
-            if event != RuleEvent.ENTERED:
-                return None
-            if rule.actions:
-                return ("static", rule.actions)
-            if not rule.action_descriptions:
-                return None
-            joined = "\n".join(
-                f"{i + 1}. {d}" for i, d in enumerate(rule.action_descriptions)
-            )
-            return ("dynamic", joined)
-
-        # session
-        if event == RuleEvent.ENTERED:
-            if rule.on_enter_actions:
-                return ("static", rule.on_enter_actions)
-            if rule.on_enter_desc:
-                return ("dynamic", rule.on_enter_desc)
-            return None
-        if event == RuleEvent.EXITED:
-            if rule.on_exit_actions:
-                return ("static", rule.on_exit_actions)
-            if rule.on_exit_desc:
-                return ("dynamic", rule.on_exit_desc)
-            return None
-        return None
-
-    # ---- 设备直控路径（V1 direct dispatch） ----
-
-    def _select_task_slot(
-        self, rule: Rule, event: RuleEvent, action_slot: ActionSlot | None = None
-    ) -> Slot:
-        """从 task 的边界动作里选槽 (expand-contract 阶段 A: 读 task 优先)。
-
-        返回 ``_NO_TASK_ACTIONS`` 表示该 task 没有动作快照 —— 调用方回退到 rule
-        上的旧字段。返回 ``None`` 表示 task 接管了但这个方向是空槽, 不再回退:
-        回退会让"用户故意留空的方向"重新捡起 rule 上的存量动作。
-        """
-        actions = self._task_actions.get(rule.task_id)
-        if actions is None:
-            return _NO_TASK_ACTIONS
-
+        actions = self._task_actions.get(rule.task_id) or {}
         # 调用方给了槽就用它 —— 状态机自己发起的动作按槽名派, 方向反推只对
-        # "由某条 rule 的边沿引起"的动作成立。回退到 rule 旧列那条路不看覆盖值:
-        # 走到那里的只有迁移前的单 rule task, 方向反推本来就是对的。
+        # "由某条 rule 的边沿引起"的动作成立。
         slot = action_slot or _slot_for(rule, event)
         if slot is None:
             return None
-        static_key, desc_key = f"{slot.value}_actions", f"{slot.value}_desc"
 
-        raw_actions = actions.get(static_key) or []
+        raw_actions = actions.get(f"{slot.value}_actions") or []
         if raw_actions:
             return ("static", [RuleAction(**a) for a in raw_actions])
-        desc = actions.get(desc_key)
+        desc = actions.get(f"{slot.value}_desc")
         if desc:
             return ("dynamic", desc)
         return None
+
+    # ---- 设备直控路径（V1 direct dispatch） ----
 
     def _in_cooldown(self, rule_id: str, action: RuleAction) -> bool:
         """非幂等 action 是否还在冷却窗内。幂等 action 恒 False（走读现值比对）。"""

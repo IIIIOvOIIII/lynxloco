@@ -65,11 +65,10 @@ def _attach(runner, task_id, rules, actions):
     )
     runner.attach_state_machine(sm)
     runner.set_task_actions(task_id, actions)
-    if runner.task_owns_actions(task_id):
-        sm.register_task(
-            task_id,
-            derive_directions((r.id, r.resolved_direction.value) for r in rules),
-        )
+    sm.register_task(
+        task_id,
+        derive_directions((r.id, r.resolved_direction.value) for r in rules),
+    )
     return sm
 
 
@@ -84,14 +83,17 @@ async def _never_dispatch(*_a, **_kw):
 # ── 接管判据 ──────────────────────────────────────────────────────────
 
 
-def test_empty_task_actions_falls_back_to_rule(monkeypatch):
-    """六个槽全空 = 还没迁移 / 没配动作 → 逐字走旧路径。"""
+def test_empty_task_actions_do_not_fall_back_to_rule(monkeypatch):
+    """六个槽全空 → 选不到动作, 不去捡 rule 行上那份; task 照样接管。
+
+    捡回来的话, 清空动作槽会让迁移前的旧动作重新生效, 而 task get 显示的是空。
+    """
     r = _rule(action_descriptions=["rule 侧播报"])
     runner = _runner([r], monkeypatch)
     sm = _attach(runner, "t1", [r], {"on_enter_actions": [], "on_enter_desc": None})
 
-    assert sm.owns("t1") is False
-    assert runner._select_slot(r, RuleEvent.ENTERED) == ("dynamic", "1. rule 侧播报")
+    assert sm.owns("t1") is True
+    assert runner._select_slot(r, RuleEvent.ENTERED) is None
 
 
 def test_task_actions_take_priority_over_rule(monkeypatch):
@@ -408,8 +410,12 @@ def _seed_db(tmp_path, monkeypatch, task_actions: dict | None):
     return rule_repo
 
 
-def test_attach_skips_task_without_boundary_actions(tmp_path, monkeypatch):
-    """没配动作的 task 不接管 —— 未迁移的库启动后行为与接管前逐字相同。"""
+def test_attach_owns_task_without_boundary_actions(tmp_path, monkeypatch):
+    """没配动作的 task 照样接管 —— 接管与动作配没配无关。
+
+    绑在一起的话, 清空动作槽会连带把整条 task 退回旧的 per-rule 引擎, 而多 rule
+    的 task 在那条引擎上的语义是错的。
+    """
     rule_repo = _seed_db(tmp_path, monkeypatch, None)
     runner = _runner(rule_repo.get_all(), monkeypatch)
 
@@ -418,8 +424,9 @@ def test_attach_skips_task_without_boundary_actions(tmp_path, monkeypatch):
     attach_task_state_machine(runner, rule_repo)
 
     assert runner._state_machine is not None
-    assert runner._state_machine.owns("t1") is False
-    assert runner.task_owns_actions("t1") is False
+    assert runner._state_machine.owns("t1") is True
+    rule = rule_repo.get_all()[0]
+    assert runner._select_slot(rule, RuleEvent.ENTERED) is None
 
 
 def test_attach_owns_task_with_boundary_actions(tmp_path, monkeypatch):

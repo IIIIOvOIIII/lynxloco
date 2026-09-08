@@ -21,7 +21,7 @@ import pytest
 from miloco.database.rule_repo import RuleLogRepo, RuleRepo
 from miloco.database.task_repo import TaskRepo
 from miloco.middleware.exceptions import ResourceNotFoundException
-from miloco.rule.runner import _NO_TASK_ACTIONS, RuleRunner
+from miloco.rule.runner import RuleRunner
 from miloco.rule.schema import (
     Rule,
     RuleCondition,
@@ -242,13 +242,18 @@ async def test_reconfigure_refreshes_task_action_snapshot(env):
     assert runner._select_slot(rule, RuleEvent.ENTERED) == ("dynamic", "改过的")
 
 
-def test_reconfigure_on_task_without_actions_is_noop(env):
-    """没边界动作的 task 不该被登记 —— 那是接管判据。"""
-    service, runner, _ids, _ = _build(None, [_rule("[t1] s")])
+def test_reconfigure_owns_a_task_without_actions(env):
+    """没配动作的 task 照样登记 —— 接管判据是"名下有 rule", 与动作无关。
+
+    绑在一起的话, 清空动作槽会连带把整条 task 退回旧的 per-rule 引擎。
+    """
+    service, runner, ids, _ = _build(None, [_rule("[t1] s")])
 
     service.reconfigure_task("t1")
 
-    assert runner.state_machine.owns("t1") is False
+    assert runner.state_machine.owns("t1") is True
+    rule = RuleRepo().get_by_id(ids[0])
+    assert runner._select_slot(rule, RuleEvent.ENTERED) is None
 
 
 # ── task 启停走同一条 ─────────────────────────────────────────────────
@@ -486,24 +491,26 @@ def test_muted_report_catches_a_cleared_enter_slot(env):
     assert service.report_muted_enter_rules("t1") == ids
 
 
-def test_muted_report_catches_a_task_that_just_became_owned(env):
-    """给一个没接管的 task 补任意一个别的槽, 自带动作的 enter 规则也会变哑。
+def test_clearing_the_enter_slot_mutes_the_rule_and_the_report_says_so(env):
+    """清空 task 的进入槽 → 规则选不到动作, 而且诊断报得出来。
 
-    读侧是全有或全无地判归属: task 占了任意一个槽之后, 空的进入槽就当"用户故意
-    留空"、不再回退 rule 行。所以这次写入碰的是退出槽, 害的却是进入方向 —— 这个
-    入口任何"清进入槽"式的闸都拦不到, 正是把它做成收敛点诊断的理由。
+    这个入口任何"清进入槽"式的闸都拦不到 (task 侧动作接口上根本没有那道闸), 正是
+    把它做成收敛点诊断的理由。rule 行上还留着自己的动作 —— 读侧要是回退过去, 行为
+    上是"用户以为清空了、实际照旧执行", 而诊断问的正是同一条选槽链路, 会跟着一起
+    静默。
     """
     from miloco.task.schema import TaskActionsUpdateRequest
     from miloco.task.service import TaskService
 
-    service, _runner, ids, _ = _build(None, [_enter_rule("[t1] own")])
-    # 起点: task 一个槽都没有 → 读侧回退 rule 行 → 不哑
+    service, runner, ids, _ = _build(_ACTIONS, [_enter_rule("[t1] own")])
+    assert RuleRepo().get_by_id(ids[0]).action_descriptions == ["自己的动作"]
     assert service.report_muted_enter_rules("t1") == []
 
     TaskService(rule_repo=RuleRepo(), rule_service=service).set_boundary_actions(
-        "t1", TaskActionsUpdateRequest(on_exit_desc="关灯")
+        "t1", TaskActionsUpdateRequest(on_enter_desc=None)
     )
 
+    assert runner._select_slot(RuleRepo().get_by_id(ids[0]), RuleEvent.ENTERED) is None
     assert service.report_muted_enter_rules("t1") == ids
 
 
@@ -590,7 +597,7 @@ def test_target_slot_reads_task_column(env):
     rule = RuleRepo().get_by_id(ids[0])
     assert rule.on_target_desc is None
 
-    assert runner._select_task_slot(rule, RuleEvent.TARGET_FIRED) == (
+    assert runner._select_slot(rule, RuleEvent.TARGET_FIRED) == (
         "dynamic", "task 侧达标",
     )
 
@@ -606,20 +613,23 @@ def test_target_slot_does_not_fall_back_when_task_column_empty(env):
     rule = RuleRepo().get_by_id(ids[0])
     assert rule.on_target_desc == "rule 侧达标"
 
-    assert runner._select_task_slot(rule, RuleEvent.TARGET_FIRED) is None
+    assert runner._select_slot(rule, RuleEvent.TARGET_FIRED) is None
 
 
-def test_target_slot_falls_back_to_rule_when_task_not_owned(env):
-    """task 没有任何边界动作 → 不接管 → 按 rule 列取, 与接管前逐字相同。"""
+def test_empty_task_slots_do_not_revive_rule_column_actions(env):
+    """task 六个槽全空 → 选不到动作, 不去捡 rule 行上迁移前留下的那份。
+
+    捡回来的话, ``task set-actions --clear`` 清空之后旧动作会重新生效, 而
+    ``task get`` 显示的是空。
+    """
     _service, runner, ids, _ = _build(
         None, [_rule("[t1] s", on_target_desc="rule 侧达标")]
     )
     rule = RuleRepo().get_by_id(ids[0])
+    assert rule.on_target_desc == "rule 侧达标"
 
-    assert runner._select_task_slot(rule, RuleEvent.TARGET_FIRED) is _NO_TASK_ACTIONS
-    assert runner._select_slot(rule, RuleEvent.TARGET_FIRED) == (
-        "dynamic", "rule 侧达标",
-    )
+    assert runner._select_slot(rule, RuleEvent.TARGET_FIRED) is None
+    assert runner._select_slot(rule, RuleEvent.ENTERED) is None
 
 
 # ── 动作槽按 direction 分 ──────────────────────────────────────────────
@@ -697,7 +707,7 @@ def test_exit_rule_entered_edge_reads_the_exit_slot(env):
     runner.set_task_actions("t1", _ACTIONS)
     r = _single_edge_rule(RuleDirection.EXIT)
 
-    assert runner._select_task_slot(r, RuleEvent.ENTERED) == (
+    assert runner._select_slot(r, RuleEvent.ENTERED) == (
         "dynamic",
         "task 侧退出",
     )
@@ -708,7 +718,7 @@ def test_enter_rule_entered_edge_reads_the_enter_slot(env):
     runner.set_task_actions("t1", _ACTIONS)
     r = _single_edge_rule(RuleDirection.ENTER)
 
-    assert runner._select_task_slot(r, RuleEvent.ENTERED) == ("dynamic", "task 侧")
+    assert runner._select_slot(r, RuleEvent.ENTERED) == ("dynamic", "task 侧")
 
 
 def test_single_edge_rule_has_no_exited_slot(env):
@@ -718,7 +728,7 @@ def test_single_edge_rule_has_no_exited_slot(env):
 
     for direction in (RuleDirection.ENTER, RuleDirection.EXIT):
         r = _single_edge_rule(direction)
-        assert runner._select_task_slot(r, RuleEvent.EXITED) is None
+        assert runner._select_slot(r, RuleEvent.EXITED) is None
 
 
 def test_direction_flip_resets_runtime_state(env):
@@ -872,7 +882,7 @@ async def test_delete_task_forgets_the_task_dimension_state(env):
     runner._state_machine_allows(RuleRepo().get_by_id(ids[0]), RuleEvent.ENTERED)
     assert sm.owns("t1") is True
     assert sm.runtime_state("t1") is TaskRuntimeState.ON
-    assert runner.task_owns_actions("t1") is True
+    assert "t1" in runner._task_actions
     assert runner.tracker.last_decision("t1") is not None
     runner.record_source.arm("t1")
     assert "t1" in runner.record_source._arm_round
@@ -881,7 +891,7 @@ async def test_delete_task_forgets_the_task_dimension_state(env):
 
     assert sm.owns("t1") is False
     assert sm.runtime_state("t1") is TaskRuntimeState.OFF
-    assert runner.task_owns_actions("t1") is False
+    assert "t1" not in runner._task_actions
     assert runner.tracker.last_decision("t1") is None
     assert "t1" not in runner.record_source._arm_round
 
@@ -1159,7 +1169,7 @@ def test_state_machine_exit_reaches_the_exit_slot_on_a_non_mutual_task(env):
     runner.set_task_actions("t1", _ACTIONS)
     representative = _single_edge_rule(RuleDirection.ENTER)
 
-    assert runner._select_task_slot(
+    assert runner._select_slot(
         representative, RuleEvent.EXITED, ActionSlot.ON_EXIT
     ) == ("dynamic", "task 侧退出")
 
@@ -1173,7 +1183,7 @@ def test_state_machine_enter_does_not_pick_up_the_exit_slot(env):
     runner.set_task_actions("t1", _ACTIONS)
     representative = _single_edge_rule(RuleDirection.EXIT)
 
-    assert runner._select_task_slot(
+    assert runner._select_slot(
         representative, RuleEvent.ENTERED, ActionSlot.ON_ENTER
     ) == ("dynamic", "task 侧")
 

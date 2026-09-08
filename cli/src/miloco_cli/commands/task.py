@@ -235,7 +235,7 @@ _ACTION_SLOTS = (
     type=click.Choice(_ACTION_SLOTS),
     help=(
         "清空指定槽（可重复）。与同名赋值 flag 互斥；"
-        "名下有不带动作的 enter 规则时清 on_enter 会被拒"
+        "清掉 enter 规则唯一的动作来源不会被拒，但那些规则从此触发了也不做事"
     ),
 )
 @click.option("--pretty", is_flag=True)

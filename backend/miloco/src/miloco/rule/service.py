@@ -292,9 +292,10 @@ def _rule_action_slots(
 def attach_task_state_machine(rule_runner: RuleRunner, rule_repo: RuleRepo) -> None:
     """建 task 状态机并把每个 task 的拓扑与边界动作登记进去。
 
-    只登记**有边界动作**的 task —— 那是 expand-contract 阶段 A 的接管判据
-    (§10.3「读 task 优先、缺失回退 rule」)。没动作的 task 走旧路径, 行为与接管前
-    逐字相同, 所以这一步对未迁移的库、以及内存里直接构造 rule 的场景是无操作。
+    名下有 rule 就登记, 与"动作配没配"无关。两者绑在一起的话, 清空 task 的动作槽
+    会连带把整条 task 退回旧的 per-rule 引擎 —— 而多条 rule 的 task (非互反 / OR
+    聚合 / exit 方向) 在那条引擎上的语义本来就是错的。没配动作的 task 照样登记,
+    条件照判、状态照推, 只是选不到槽、不做事。
 
     重启一律从 ``off`` 起 (§7): 拓扑登记不恢复任何运行态。
     """
@@ -329,22 +330,13 @@ def attach_task_state_machine(rule_runner: RuleRunner, rule_repo: RuleRepo) -> N
     for row in task_repo.list_all():
         rule_runner.set_task_paused(row["task_id"], row["status"] != "active")
 
-    owned = 0
     for task_id, rules in rules_by_task.items():
-        actions = task_repo.get_boundary_actions(task_id)
-        rule_runner.set_task_actions(task_id, actions)
-        if not rule_runner.task_owns_actions(task_id):
-            continue
+        rule_runner.set_task_actions(task_id, task_repo.get_boundary_actions(task_id))
         state_machine.register_task(
             task_id,
             derive_directions((r.id, r.resolved_direction.value) for r in rules),
         )
-        owned += 1
-    logger.info(
-        "task state machine attached: %d/%d task(s) owned",
-        owned,
-        len(rules_by_task),
-    )
+    logger.info("task state machine attached: %d task(s)", len(rules_by_task))
     _seed_reached_targets(rule_runner)
 
 
@@ -476,15 +468,9 @@ class RuleService:
             ) from e
 
         if not (slots.get("on_enter_actions") or slots.get("on_enter_desc")):
-            fix = (
-                f'miloco-cli task set-actions {rule.task_id} --on-enter-desc "..."'
-            )
-            if not any(slots.values()):
-                # 六个槽都空 = task 没被接管, 读侧会回退到 rule 行 —— 这时自带
-                # 动作是有效的出路。已接管的 task 不回退, 那条出路给了也走不通。
-                fix = "自己带 --action / --action-desc, 或 " + fix
             raise ValidationException(
-                f"direction=enter 的规则没有动作可落。{fix}"
+                "direction=enter 的规则没有动作可落。"
+                f'miloco-cli task set-actions {rule.task_id} --on-enter-desc "..."'
             )
 
     def _task_has_target_action(self, task_id: str) -> bool:
@@ -516,9 +502,8 @@ class RuleService:
         做成收敛点诊断而不是写入闸: 这类不变式的破坏入口不止一条, 而闸只守得住
         写它时看见的那个 ——
 
-        - 哑的 enter 规则: 清进入槽、rule 换方向或改挂 task 的收尾清理、给一个没
-          接管的 task 补任意一个别的槽 (读侧从此不再回退)、同方向兄弟争槽导致
-          rule 侧动作根本没写进去
+        - 哑的 enter 规则: 清进入槽、rule 换方向或改挂 task 的收尾清理、同方向
+          兄弟争槽导致 rule 侧动作根本没写进去
         - 方向组合非法 (没有进路径 / session 与别人混挂 / 配了达标却没有出路径):
           写 rule 那条路上有闸, 而 ``rule delete`` 删掉最后一条 enter 规则造成同样
           的状态、一道校验都没有 —— 那条路上也不该有闸, 拒绝删除会把「先删掉它」
@@ -542,8 +527,7 @@ class RuleService:
         if muted:
             problems.append(
                 f"这些 enter 规则选不到动作, 触发后什么都不做: {', '.join(muted)}。"
-                "给它们各自装上 rule 侧动作 (task 未接管时才生效), 或把 task 的"
-                f'进入动作配回来: miloco-cli task set-actions {task_id} '
+                f'把 task 的进入动作配回来: miloco-cli task set-actions {task_id} '
                 '--on-enter-desc "..."'
             )
 
@@ -1090,9 +1074,9 @@ class RuleService:
         """把 rule 上的动作写进它所属 task 的边界动作列。
 
         §10.3 阶段 A 说「CLI 加新 flag，旧 flag 仍可用」——**旧 flag 仍可用意味着
-        它的写入必须落到新位置**。读侧的双路回退只解决了「读哪一份」, 写侧不透传
-        的话, 迁移后用现有 CLI 改动作会静默不生效: rule 列改了、fire 读的是 task
-        列的旧值, 而 CLI 返回成功、``rule get`` 也显示新值。
+        它的写入必须落到新位置**。读侧只认 task 列, 写侧不透传的话, 用现有 CLI 改
+        动作会静默不生效: rule 列改了、fire 读的是 task 列的旧值, 而 CLI 返回成功、
+        ``rule get`` 也显示新值。
 
         ``changed_fields`` 传 PATCH 显式动过的字段名, 决定透传哪几个槽 (见
         ``_rule_action_slots``)。不传按"只写自己填了值的槽"处理。
@@ -1259,8 +1243,8 @@ class RuleService:
         先跑 on_exit → 清运行态从 off 起。前三件由 ``TaskStateMachine.reconfigure``
         承担, 这里只负责把最新的拓扑与动作喂进去。
 
-        没接管该 task (没有边界动作 / 名下已无 rule) → 撤销登记, 回到旧路径。
-        不 reconfigure 而是 unregister: 前者会把没接管的 task 登记进去。
+        名下已无 rule → 撤销登记。动作配没配不参与这个判断 (理由见
+        ``attach_task_state_machine``)。
         """
         # 必须排在读拓扑之前: 代建 / 删掉的那条也要算进这次的拓扑。
         self.reconcile_milestone_rule(task_id)
@@ -1279,7 +1263,7 @@ class RuleService:
         # 从 DB 读而非内存: DB 是归属的权威源, 且删 rule 时行已落库、runner 内存
         # 还留着那条 —— 正需要这个错位, 空拓扑触发 on_exit 时动作还有 rule 可归属。
         rules = self._repo.list_by_task(task_id)
-        if not rules or not self._runner.task_owns_actions(task_id):
+        if not rules:
             if sm.owns(task_id):
                 # 空拓扑先走一次 reconfigure：删掉最后一条 rule 也是「失去全部
                 # 出路径」，task 在 on 时必须先跑 on_exit，直接 unregister 会让

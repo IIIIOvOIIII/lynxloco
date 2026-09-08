@@ -182,8 +182,8 @@ class TaskRepo:
     def get_boundary_actions(self, task_id: str) -> dict[str, Any] | None:
         """读 task 的三个动作槽 + lifecycle。task 不存在返回 None。
 
-        六个动作列全空 = 该 task 还没迁移过 (或就是没配动作), 调用方按
-        ``has_any_action`` 判断要不要回退到 rule 上的旧字段。
+        六个动作列全空 = 该 task 没配动作, 名下的规则条件照判、状态照推, 只是选不
+        到槽、不做事。rule 行上可能还留着迁移前的旧动作, 运行时不读它。
         """
         with self.db.get_connection() as conn:
             row = conn.execute(
