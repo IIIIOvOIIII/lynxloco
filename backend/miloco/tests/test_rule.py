@@ -46,6 +46,8 @@ from pydantic import ValidationError
 # ---- Helpers ----
 
 TASK_ID = "test_task"
+# 动态回调那条 rule 的 task —— 与 static 那条分开, 理由见 runner fixture。
+DYNAMIC_TASK_ID = "test_task_dyn"
 
 
 def _extra_info(prompt_text: str) -> dict:
@@ -76,12 +78,13 @@ def _name(task_id, suffix="rule"):
 
 def _make_static_rule(
     rule_id="rule-1",
-    task_id=TASK_ID,
+    task_id=None,
     name=None,
     enabled=True,
     actions=None,
     condition=None,
 ):
+    task_id = task_id or f"{TASK_ID}-{rule_id}"
     return Rule(
         id=rule_id,
         name=name if name is not None else _name(task_id, "static"),
@@ -96,11 +99,12 @@ def _make_static_rule(
 
 def _make_dynamic_rule(
     rule_id="rule-d1",
-    task_id=TASK_ID,
+    task_id=None,
     name=None,
     enabled=True,
     descriptions=None,
 ):
+    task_id = task_id or f"{TASK_ID}-{rule_id}"
     return Rule(
         id=rule_id,
         name=name if name is not None else _name(task_id, "dynamic"),
@@ -118,18 +122,20 @@ def _make_dynamic_rule(
 
 def _make_state_rule(
     rule_id="rule-s1",
-    task_id=TASK_ID,
+    task_id=None,
     name=None,
     enabled=True,
     on_enter_actions=None,
     on_enter_desc=None,
     on_exit_actions=None,
     on_exit_desc=None,
+    on_target_desc=None,
     exit_debounce_seconds=0,
     lifecycle=RuleLifecycle.PERMANENT,
     terminate_when=None,
     condition=None,
 ):
+    task_id = task_id or f"{TASK_ID}-{rule_id}"
     return Rule(
         id=rule_id,
         name=name if name is not None else _name(task_id, "state"),
@@ -142,6 +148,7 @@ def _make_state_rule(
         on_enter_desc=on_enter_desc,
         on_exit_actions=on_exit_actions or [],
         on_exit_desc=on_exit_desc,
+        on_target_desc=on_target_desc,
         exit_debounce_seconds=exit_debounce_seconds,
         terminate_when=terminate_when,
     )
@@ -231,11 +238,18 @@ def mock_task_record_service():
 
 @pytest.fixture
 def runner(mock_miot_proxy, mock_log_repo, mock_task_record_service):
-    rules = [_make_static_rule(), _make_dynamic_rule()]
-    return RuleRunner(
+    # 两条 rule 各归各的 task。动作归 task 之后, 共用一个 task 就是"两条 enter
+    # 规则争同一个动作槽" —— 生产遇到这个形状会跳过透传, 谁的动作都不写。
+    rules = [_make_static_rule(), _make_dynamic_rule(task_id=DYNAMIC_TASK_ID)]
+    r = RuleRunner(
         rules=rules, miot_proxy=mock_miot_proxy, rule_log_repo=mock_log_repo,
         task_record_service=mock_task_record_service,
     )
+    # 动作装在 task 上。生产里这份快照由 attach_task_state_machine 从库里灌进来,
+    # 本文件不建库, 用例自己写明。
+    r.set_task_actions('test_task-rule-1', {'on_enter_actions': [{'did': 'device-001', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None})
+    r.set_task_actions('test_task_dyn', {'on_enter_actions': [], 'on_enter_desc': '1. 打开客厅灯\n2. 调到暖白模式'})
+    return r
 
 
 @pytest.mark.asyncio
@@ -325,6 +339,7 @@ class TestTriggerOutcome:
         也会 FIRED —— 停用就成了空操作。
         """
         runner.add_rule(_make_static_rule(rule_id="rule-paused", task_id="task-paused"))
+        runner.set_task_actions('task-paused', {'on_enter_actions': [{'did': 'device-001', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None})
         runner.set_task_paused("task-paused", True)
 
         paused_out = await runner.update_state("rule-paused", "cam-001", True)
@@ -360,6 +375,7 @@ class TestTriggerOutcome:
             exit_debounce_seconds=60,
         )
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-st-absorb', {'on_enter_actions': [{'did': 'device-001', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None, 'on_exit_actions': [{'did': 'device-001', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_exit_desc': None})
         await runner.update_state("st-absorb", "cam-001", True)   # ENTER
         await runner.update_state("st-absorb", "cam-001", False)  # 单帧 False → pending_exit
         await runner.update_state("st-absorb", "cam-001", False)  # 确认 EXIT → 调度 debounce
@@ -371,12 +387,14 @@ class TestTriggerOutcome:
     @pytest.mark.asyncio
     async def test_disabled_rule_returns_not_fired(self, runner):
         runner.add_rule(_make_static_rule(rule_id="off-1", enabled=False))
+        runner.set_task_actions('test_task-off-1', {'on_enter_actions': [{'did': 'device-001', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None})
         out = await runner.update_state("off-1", "cam-001", True)
         assert out is TriggerOutcome.NOT_FIRED
 
     @pytest.mark.asyncio
     async def test_duration_counting_when_window_not_full(self, runner):
         runner.add_rule(_make_duration_rule("dur-count", duration_seconds=6))
+        runner.set_task_actions('test_task', {'on_enter_actions': [], 'on_enter_desc': '提醒一下'})
         out = await runner.update_state("dur-count", "cam-001", True)
         await runner.drain()
         assert out is TriggerOutcome.COUNTING
@@ -385,6 +403,7 @@ class TestTriggerOutcome:
     async def test_duration_fired_when_window_met(self, runner):
         # duration_seconds == sample_interval(3) → maxlen 1 → 首帧即达标
         runner.add_rule(_make_duration_rule("dur-fire", duration_seconds=3))
+        runner.set_task_actions('test_task', {'on_enter_actions': [], 'on_enter_desc': '提醒一下'})
         out = await runner.update_state("dur-fire", "cam-001", True)
         await runner.drain()
         assert out is TriggerOutcome.FIRED
@@ -399,6 +418,7 @@ class TestTriggerOutcome:
         语义相反。今天零后果只因唯一产生 EXITED 的调用点丢弃返回值；这里把它钉住。
         """
         runner.add_rule(_make_duration_rule("dur-exit", duration_seconds=3))
+        runner.set_task_actions('test_task', {'on_enter_actions': [], 'on_enter_desc': '提醒一下'})
         assert await runner.update_state("dur-exit", "cam-001", True) is TriggerOutcome.FIRED
         await runner.drain()
         # 首帧 False 只置 pending_exit（抗抖观察），第二帧才确认 EXIT
@@ -421,6 +441,7 @@ class TestTriggerOutcome:
         rule = _make_duration_rule("dur-exit-fire", duration_seconds=15)  # /3 → maxlen 5
         rule.duration_ratio = 0.6
         runner.add_rule(rule)
+        runner.set_task_actions('test_task', {'on_enter_actions': [], 'on_enter_desc': '提醒一下'})
         # round_id = int(time.time() / sample_interval)，同周期内的重复采样会被去重，
         # 故每帧都要推进一个采样周期（sample_interval=3）。
         with patch("miloco.rule.runner.time.time") as mt:
@@ -627,6 +648,7 @@ class TestRuleRunnerManagement:
     def test_add_rule(self, runner):
         new_rule = _make_static_rule(rule_id="rule-new", name="new")
         runner.add_rule(new_rule)
+        runner.set_task_actions('test_task-rule-new', {'on_enter_actions': [{'did': 'device-001', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None})
         assert runner.get_rule("rule-new") is not None
         assert len(runner.get_all_rules()) == 3
 
@@ -646,6 +668,7 @@ class TestRuleRunnerManagement:
         runner.add_rule(
             _make_static_rule(rule_id="disabled-1", name="off", enabled=False)
         )
+        runner.set_task_actions('test_task-disabled-1', {'on_enter_actions': [{'did': 'device-001', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None})
         enabled = runner.get_enabled_rules()
         assert all(r.enabled for r in enabled)
         assert len(enabled) == 2
@@ -665,6 +688,7 @@ class TestRuleRunnerTrigger:
         runner.add_rule(
             _make_static_rule(rule_id="disabled", name="off", enabled=False)
         )
+        runner.set_task_actions('test_task-disabled', {'on_enter_actions': [{'did': 'device-001', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None})
         result = await runner.trigger_rule("disabled", TRIGGER_CONTEXT)
         assert result is None
 
@@ -672,6 +696,7 @@ class TestRuleRunnerTrigger:
     async def test_trigger_rule_of_paused_task(self, runner):
         """手动触发也要过有效启用闸: rule.enabled 是 True, 但 task 停用。"""
         runner.add_rule(_make_static_rule(rule_id="rule-paused", task_id="task-paused"))
+        runner.set_task_actions('task-paused', {'on_enter_actions': [{'did': 'device-001', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None})
         runner.set_task_paused("task-paused", True)
 
         assert await runner.trigger_rule("rule-paused", TRIGGER_CONTEXT) is None
@@ -708,6 +733,7 @@ class TestRuleRunnerTrigger:
             descriptions=["打开客厅灯", "调到暖白模式"],
         )
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-d2', {'on_enter_actions': [], 'on_enter_desc': '1. 打开客厅灯\n2. 调到暖白模式'})
         result = await runner.trigger_rule("rule-d2", TRIGGER_CONTEXT)
         assert result is not None
         assert result.dynamic_rule_event_sent is True  # DYNAMIC: 回调已发送
@@ -724,6 +750,7 @@ class TestRuleRunnerTrigger:
             descriptions=["打开客厅灯", "调到暖白模式"],
         )
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-d3', {'on_enter_actions': [], 'on_enter_desc': '1. 打开客厅灯\n2. 调到暖白模式'})
         result = await runner.trigger_rule("rule-d3", TRIGGER_CONTEXT)
         assert result is not None
         assert result.dynamic_rule_event_sent is False
@@ -742,6 +769,7 @@ class TestRuleRunnerActionExecution:
             rule_id="rule-action", name="action-rule", actions=[action]
         )
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-action', {'on_enter_actions': [{'did': 'd1', 'iid': 'action.3.1', 'value': None, 'params': [1], 'idempotent': False, 'cooldown_minutes': None}], 'on_enter_desc': None})
         await runner.trigger_rule("rule-action", TRIGGER_CONTEXT)
         mock_miot_proxy.call_device_action.assert_called_once()
 
@@ -755,6 +783,7 @@ class TestRuleRunnerActionExecution:
         action = _make_action(value=True, idempotent=True)
         rule = _make_static_rule(rule_id="rule-idem", name="idem", actions=[action])
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-idem', {'on_enter_actions': [{'did': 'device-001', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None})
 
         result = await runner.trigger_rule("rule-idem", TRIGGER_CONTEXT)
         assert result.action_results[0].skipped is True
@@ -771,6 +800,7 @@ class TestRuleRunnerActionExecution:
         action = _make_action(value=True, idempotent=True)
         rule = _make_static_rule(rule_id="rule-idem2", name="idem2", actions=[action])
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-idem2', {'on_enter_actions': [{'did': 'device-001', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None})
 
         result = await runner.trigger_rule("rule-idem2", TRIGGER_CONTEXT)
         assert result.action_results[0].skipped is False
@@ -781,6 +811,7 @@ class TestRuleRunnerActionExecution:
         action = _make_action(idempotent=False, cooldown=10)
         rule = _make_static_rule(rule_id="rule-cd", name="cooldown", actions=[action])
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-cd', {'on_enter_actions': [{'did': 'device-001', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': False, 'cooldown_minutes': 10}], 'on_enter_desc': None})
 
         result1 = await runner.trigger_rule("rule-cd", TRIGGER_CONTEXT)
         assert result1.action_results[0].skipped is False
@@ -793,6 +824,7 @@ class TestRuleRunnerActionExecution:
         action = _make_action(idempotent=False, cooldown=1)
         rule = _make_static_rule(rule_id="rule-cd2", name="cooldown2", actions=[action])
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-cd2', {'on_enter_actions': [{'did': 'device-001', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': False, 'cooldown_minutes': 1}], 'on_enter_desc': None})
 
         await runner.trigger_rule("rule-cd2", TRIGGER_CONTEXT)
         runner._ensure_state("rule-cd2").action_cooldown[
@@ -807,6 +839,7 @@ class TestRuleRunnerActionExecution:
         action = RuleAction(did="d1", iid="bad-iid", value=True)
         rule = _make_static_rule(rule_id="rule-bad", name="bad-iid", actions=[action])
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-bad', {'on_enter_actions': [{'did': 'd1', 'iid': 'bad-iid', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None})
 
         result = await runner.trigger_rule("rule-bad", TRIGGER_CONTEXT)
         assert result.action_results[0].result is False
@@ -840,6 +873,7 @@ class TestRuleRunnerActionExecution:
         ]
         rule = _make_static_rule(rule_id="rule-multi", name="multi", actions=actions)
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-multi', {'on_enter_actions': [{'did': 'd1', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}, {'did': 'd2', 'iid': 'prop.3.2', 'value': 50, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None})
 
         result = await runner.trigger_rule("rule-multi", TRIGGER_CONTEXT)
         assert len(result.action_results) == 2
@@ -1558,6 +1592,7 @@ class TestRuleServiceTrigger:
     async def test_trigger_delegates_to_runner(self, service, mock_miot_proxy):
         rule = _make_static_rule(rule_id="r1")
         service._runner.add_rule(rule)
+        service._runner.set_task_actions('test_task-r1', {'on_enter_actions': [{'did': 'device-001', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None})
         result = await service.trigger_rule("r1", TRIGGER_CONTEXT)
         assert result is not None
         assert result.action_results  # STATIC dispatched
@@ -1636,6 +1671,7 @@ class TestRuleRunnerUpdateState:
             condition=_make_condition(device_ids=["cam-001", "cam-002"]),
         )
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-or', {'on_enter_actions': [{'did': 'device-001', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None})
         await runner.update_state("rule-or", "cam-001", True, "")
         await runner.update_state("rule-or", "cam-002", True, "")
         await runner.drain()
@@ -1650,6 +1686,7 @@ class TestRuleRunnerUpdateState:
         mock_send.return_value = True
         rule = _make_dynamic_rule(rule_id="rule-meta", name="dyn-meta")
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-meta', {'on_enter_actions': [], 'on_enter_desc': '1. 打开客厅灯\n2. 调到暖白模式'})
         await runner.update_state(
             "rule-meta", "perception", True, "进入",
             trigger_room="客厅", trigger_dids=["cam-001"],
@@ -1673,6 +1710,7 @@ class TestRuleRunnerUpdateState:
             exit_debounce_seconds=0,
         )
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-meta-exit', {'on_enter_actions': [], 'on_enter_desc': '进入提示', 'on_exit_actions': [], 'on_exit_desc': '离开提示'})
         await runner.update_state(
             "rule-meta-exit", "perception", True, "进",
             trigger_room="客厅", trigger_dids=["cam-001"],
@@ -1697,6 +1735,7 @@ class TestRuleRunnerUpdateState:
     async def test_disabled_rule_silent(self, runner, mock_miot_proxy):
         rule = _make_static_rule(rule_id="rule-off", enabled=False)
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-off', {'on_enter_actions': [{'did': 'device-001', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None})
         await runner.update_state("rule-off", "cam-001", True, "")
         await runner.drain()
         mock_miot_proxy.set_device_properties.assert_not_called()
@@ -1718,6 +1757,7 @@ class TestRuleRunnerStateMode:
             exit_debounce_seconds=0,
         )
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-s', {'on_enter_actions': [{'did': 'enter-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None, 'on_exit_actions': [{'did': 'exit-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_exit_desc': None})
         await runner.update_state("rule-s", "cam-001", True, "进")
         await runner.drain()
         assert mock_miot_proxy.set_device_properties.call_count == 1
@@ -1734,6 +1774,7 @@ class TestRuleRunnerStateMode:
             exit_debounce_seconds=0,  # 0 秒 debounce，需要 yield event loop 让 task 跑完
         )
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-deb', {'on_enter_actions': [{'did': 'enter-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None, 'on_exit_actions': [{'did': 'exit-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_exit_desc': None})
         await runner.update_state("rule-deb", "cam-001", True, "")
         await runner.update_state("rule-deb", "cam-001", False, "")  # pending
         await runner.update_state("rule-deb", "cam-001", False, "")  # 确认 EXIT → schedule debounce
@@ -1759,6 +1800,7 @@ class TestRuleRunnerStateMode:
             exit_debounce_seconds=10,  # 长 debounce 给我们时间打断
         )
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-cx', {'on_enter_actions': [{'did': 'enter-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None, 'on_exit_actions': [{'did': 'exit-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_exit_desc': None})
         await runner.update_state("rule-cx", "cam-001", True, "")  # ENTERED → fire on_enter
         await runner.update_state("rule-cx", "cam-001", False, "")  # pending
         await runner.update_state("rule-cx", "cam-001", False, "")  # 确认 EXIT → schedule debounce
@@ -1784,6 +1826,7 @@ class TestRuleRunnerStateMode:
             exit_debounce_seconds=0,  # 0 秒让 debounce 立刻到点
         )
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-hallu', {'on_enter_actions': [{'did': 'enter-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None, 'on_exit_actions': [{'did': 'exit-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_exit_desc': None})
         await runner.update_state("rule-hallu", "cam-001", True, "")  # ENTERED
         await runner.update_state("rule-hallu", "cam-001", False, "")  # exit pending
         await runner.update_state("rule-hallu", "cam-001", False, "")  # 确认 EXIT → schedule debounce
@@ -1812,6 +1855,7 @@ class TestRuleRunnerStateMode:
             exit_debounce_seconds=10,
         )
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-init', {'on_enter_actions': [{'did': 'enter-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None})
         # 冷启动 / 长期 inactive → 单帧 True 应立即 fire on_enter
         await runner.update_state("rule-init", "cam-001", True, "")
         await runner.drain()
@@ -1835,6 +1879,7 @@ class TestRuleRunnerStateMode:
             exit_debounce_seconds=0,
         )
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-clr', {'on_enter_actions': [{'did': 'enter-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None, 'on_exit_actions': [{'did': 'exit-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_exit_desc': None})
         await runner.update_state("rule-clr", "cam-001", True, "")  # ENTERED
         await runner.update_state("rule-clr", "cam-001", False, "")  # exit pending
         await runner.update_state("rule-clr", "cam-001", False, "")  # 确认 EXIT → schedule debounce
@@ -1864,6 +1909,7 @@ class TestRuleRunnerStateMode:
             exit_debounce_seconds=0,
         )
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-multi-h', {'on_enter_actions': [{'did': 'enter-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None, 'on_exit_actions': [{'did': 'exit-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_exit_desc': None})
         await runner.update_state("rule-multi-h", "cam-A", True, "")   # ENTERED
         await runner.update_state("rule-multi-h", "cam-A", False, "")  # exit pending
         await runner.update_state("rule-multi-h", "cam-A", False, "")  # schedule debounce
@@ -1890,6 +1936,7 @@ class TestRuleRunnerStateMode:
             on_enter_desc="开灯并播报",
         )
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-sd', {'on_enter_actions': [], 'on_enter_desc': '开灯并播报'})
         with patch(
             "miloco.rule.runner.dispatch_event", new_callable=AsyncMock
         ) as mock_send:
@@ -1940,6 +1987,7 @@ class TestRuleRunnerFlickerSuppression:
             exit_debounce_seconds=0,
         )
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-flicker', {'on_enter_actions': [{'did': 'enter-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None, 'on_exit_actions': [{'did': 'exit-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_exit_desc': None})
         await runner.update_state("rule-flicker", "cam-001", True, "")
         await runner.update_state("rule-flicker", "cam-001", False, "")  # pending
         await runner.update_state("rule-flicker", "cam-001", True, "")  # 抖动吸收
@@ -1958,6 +2006,7 @@ class TestRuleRunnerFlickerSuppression:
             condition=_make_condition(device_ids=["cam-A", "cam-B"]),
         )
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-multi', {'on_enter_actions': [{'did': 'device-001', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None})
         await runner.update_state("rule-multi", "cam-A", True, "")  # ENTERED
         await runner.drain()
         assert mock_miot_proxy.set_device_properties.call_count == 1
@@ -1978,6 +2027,7 @@ class TestRuleRunnerFlickerSuppression:
         # 重新加入同 id 的 rule
         rule = _make_static_rule(rule_id="rule-1")
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-1', {'on_enter_actions': [{'did': 'device-001', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None})
         mock_miot_proxy.set_device_properties.reset_mock()
         await runner.update_state("rule-1", "cam-001", True, "")
         await runner.drain()
@@ -2000,6 +2050,7 @@ class TestRuleRunnerDynamicCallback:
         rule.lifecycle = RuleLifecycle.TEMPORARY
         rule.terminate_when = "用户回家后"
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-tmp', {'on_enter_actions': [], 'on_enter_desc': '1. 打开客厅灯\n2. 调到暖白模式'})
 
         await runner.trigger_rule("rule-tmp", "测试")
 
@@ -2019,6 +2070,7 @@ class TestRuleRunnerDynamicCallback:
         # permanent 默认，terminate_when 设了也无效
         rule.terminate_when = "应该被忽略"
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-perm', {'on_enter_actions': [], 'on_enter_desc': '1. 打开客厅灯\n2. 调到暖白模式'})
 
         await runner.trigger_rule("rule-perm", "测试")
 
@@ -2230,6 +2282,7 @@ class TestRuleRunnerConcurrencyAndEdgeCases:
             condition=_make_condition(device_ids=["cam-001", "cam-002"]),
         )
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-conc', {'on_enter_actions': [{'did': 'device-001', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None})
 
         await asyncio.gather(
             runner.update_state("rule-conc", "cam-001", True, ""),
@@ -2252,6 +2305,7 @@ class TestRuleRunnerConcurrencyAndEdgeCases:
             exit_debounce_seconds=0,
         )
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-toggle', {'on_enter_actions': [{'did': 'enter-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None, 'on_exit_actions': [{'did': 'exit-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_exit_desc': None})
 
         for v in [True, False, False, True, False, False, True]:
             await runner.update_state("rule-toggle", "cam-001", v, "")
@@ -2279,6 +2333,7 @@ class TestRuleRunnerConcurrencyAndEdgeCases:
             condition=_make_condition(device_ids=["cam-001", "cam-002"]),
         )
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-mexit', {'on_enter_actions': [{'did': 'enter-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None, 'on_exit_actions': [{'did': 'exit-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_exit_desc': None})
 
         await runner.update_state("rule-mexit", "cam-001", True, "")  # ENTER
         await runner.update_state("rule-mexit", "cam-002", True, "")  # STILL_IN
@@ -2308,6 +2363,7 @@ class TestRuleRunnerConcurrencyAndEdgeCases:
             exit_debounce_seconds=10,
         )
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-rm', {'on_enter_actions': [{'did': 'enter-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None, 'on_exit_actions': [{'did': 'exit-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_exit_desc': None})
         await runner.update_state("rule-rm", "cam-001", True, "")
         await runner.drain()  # 等 enter fire 落定
         await runner.update_state("rule-rm", "cam-001", False, "")  # pending
@@ -2334,6 +2390,7 @@ class TestRuleRunnerConcurrencyAndEdgeCases:
         ]
         rule = _make_static_rule(rule_id="rule-mid", actions=actions)
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-mid', {'on_enter_actions': [{'did': 'd1', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': False, 'cooldown_minutes': None}, {'did': 'd2', 'iid': 'prop.3.1', 'value': True, 'params': None, 'idempotent': False, 'cooldown_minutes': None}, {'did': 'd3', 'iid': 'prop.4.1', 'value': True, 'params': None, 'idempotent': False, 'cooldown_minutes': None}], 'on_enter_desc': None})
 
         async def flaky_set(params):
             if params[0].did == "d2":
@@ -2363,6 +2420,7 @@ class TestRuleRunnerConcurrencyAndEdgeCases:
         action = _make_action(idempotent=False)
         rule = _make_static_rule(rule_id="rule-bad-code", actions=[action])
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-bad-code', {'on_enter_actions': [{'did': 'device-001', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': False, 'cooldown_minutes': None}], 'on_enter_desc': None})
 
         result = await runner.trigger_rule("rule-bad-code", "测试")
         assert result.action_results[0].result is False
@@ -2379,6 +2437,7 @@ class TestRuleRunnerConcurrencyAndEdgeCases:
         action = _make_action(idempotent=False, cooldown=5)
         rule = _make_static_rule(rule_id="rule-empty-res", actions=[action])
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-empty-res', {'on_enter_actions': [{'did': 'device-001', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': False, 'cooldown_minutes': 5}], 'on_enter_desc': None})
 
         result = await runner.trigger_rule("rule-empty-res", "测试")
         assert result.action_results[0].result is False
@@ -2394,6 +2453,7 @@ class TestRuleRunnerConcurrencyAndEdgeCases:
         action.params = []
         rule = _make_static_rule(rule_id="rule-none-res", actions=[action])
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-none-res', {'on_enter_actions': [{'did': 'device-001', 'iid': 'action.5.1', 'value': None, 'params': [], 'idempotent': False, 'cooldown_minutes': None}], 'on_enter_desc': None})
 
         result = await runner.trigger_rule("rule-none-res", "测试")
         assert result.action_results[0].result is False
@@ -2420,6 +2480,8 @@ class TestRuleRunnerConcurrencyAndEdgeCases:
         )
         rid = await service.create_rule(rule)
         assert rid == "rule-stc"
+        # task_repo 是 mock, service 的透传落不回内存快照, 这里补上它本该写的那份
+        service._runner.set_task_actions('test_task-', {'on_enter_actions': [], 'on_enter_desc': '开灯', 'on_exit_actions': [], 'on_exit_desc': '关灯'})
 
         # service.create_rule 已经把 rule 塞进 runner，直接触发
         await service._runner.update_state("rule-stc", "cam-001", True, "")
@@ -2469,6 +2531,7 @@ class TestRuleRunnerConcurrencyAndEdgeCases:
             exit_debounce_seconds=0,
         )
         runner.add_rule(replaced)
+        runner.set_task_actions('test_task-rule-1', {'on_enter_actions': [{'did': 'enter-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None, 'on_exit_actions': [{'did': 'exit-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_exit_desc': None})
 
         assert "rule-1" not in runner._last_rule_state
         assert ("rule-1", "cam-001") not in runner._last_source_state
@@ -2495,6 +2558,7 @@ class TestRuleRunnerConcurrencyAndEdgeCases:
             condition=_make_condition(device_ids=["cam-001", "cam-002"]),
         )
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-src', {'on_enter_actions': [{'did': 'enter-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None})
         await runner.update_state("rule-src", "cam-002", True, "")
         assert runner._last_rule_state["rule-src"] is True
 
@@ -2506,6 +2570,7 @@ class TestRuleRunnerConcurrencyAndEdgeCases:
             condition=_make_condition(device_ids=["cam-001"]),
         )
         runner.add_rule(replaced)
+        runner.set_task_actions('test_task-rule-src', {'on_enter_actions': [{'did': 'enter-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None})
         assert ("rule-src", "cam-002") not in runner._last_source_state
         assert "rule-src" not in runner._last_rule_state
 
@@ -2579,6 +2644,7 @@ class TestRuleRunnerEventDuration:
         """duration_seconds=None → 立即 fire（兼容回归）."""
         rule = _make_event_duration_rule(rule_id="rule-none", duration_seconds=None)
         runner_fast.add_rule(rule)
+        runner_fast.set_task_actions('test_task', {'on_enter_actions': [{'did': 'device-dur', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None})
         await runner_fast.update_state("rule-none", "cam-001", True, "")
         await runner_fast.drain()
         assert mock_miot_proxy.set_device_properties.call_count == 1
@@ -2596,6 +2662,7 @@ class TestRuleRunnerEventDuration:
         # 改用 sample_interval=0.5、duration_seconds=1 → maxlen=2
         runner_fast._sample_interval = 0.5
         runner_fast.add_rule(rule)
+        runner_fast.set_task_actions('test_task', {'on_enter_actions': [{'did': 'device-dur', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None})
         with patch("miloco.rule.runner.time.time") as mt:
             mt.return_value = 100.0  # round_id = 200
             await runner_fast.update_state("rule-full", "cam-001", True, "")
@@ -2614,6 +2681,7 @@ class TestRuleRunnerEventDuration:
         )
         runner_fast._sample_interval = 0.5  # maxlen = 1/0.5 = 2
         runner_fast.add_rule(rule)
+        runner_fast.set_task_actions('test_task', {'on_enter_actions': [{'did': 'device-dur', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None})
         with patch("miloco.rule.runner.time.time") as mt:
             mt.return_value = 100.0
             await runner_fast.update_state("rule-part", "cam-001", True, "")
@@ -2631,6 +2699,7 @@ class TestRuleRunnerEventDuration:
         )
         runner_fast._sample_interval = 0.5  # maxlen = 2/0.5 = 4
         runner_fast.add_rule(rule)
+        runner_fast.set_task_actions('test_task', {'on_enter_actions': [{'did': 'device-dur', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None})
         with patch("miloco.rule.runner.time.time") as mt:
             for i, val in enumerate([True, False, True, True]):
                 mt.return_value = 100.0 + i * 0.5
@@ -2651,6 +2720,7 @@ class TestRuleRunnerEventDuration:
         )
         runner_fast._sample_interval = 0.5  # maxlen = 5/0.5 = 10
         runner_fast.add_rule(rule)
+        runner_fast.set_task_actions('test_task', {'on_enter_actions': [{'did': 'device-dur', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None})
         with patch("miloco.rule.runner.time.time") as mt:
             # 前 8 个 T：sum/maxlen=0.8 已达 ratio，但 len(win)=8 < maxlen=10 → 不 fire
             for i in range(8):
@@ -2679,6 +2749,7 @@ class TestRuleRunnerEventDuration:
         )
         runner_fast._sample_interval = 0.5  # maxlen=2
         runner_fast.add_rule(rule)
+        runner_fast.set_task_actions('test_task', {'on_enter_actions': [{'did': 'device-dur', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None})
         with patch("miloco.rule.runner.time.time") as mt:
             # round 200: T → win=[1]，sum/2=0.5 不达
             mt.return_value = 100.0
@@ -2708,6 +2779,7 @@ class TestRuleRunnerEventDuration:
         )
         runner_fast._sample_interval = 0.5  # maxlen=4, threshold=4
         runner_fast.add_rule(rule)
+        runner_fast.set_task_actions('test_task', {'on_enter_actions': [{'did': 'device-dur', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None})
         with patch("miloco.rule.runner.time.time") as mt:
             for i in range(4):  # round 200..203 凑齐 fire
                 mt.return_value = 100.0 + i * 0.5
@@ -2737,6 +2809,7 @@ class TestRuleRunnerEventDuration:
         rule.condition = _make_condition(device_ids=["cam-001", "cam-002"])
         runner_fast._sample_interval = 1.0  # maxlen=10
         runner_fast.add_rule(rule)
+        runner_fast.set_task_actions('test_task', {'on_enter_actions': [{'did': 'device-dur', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None})
         with patch("miloco.rule.runner.time.time") as mt:
             mt.return_value = 100.0  # round_id = 100
             await runner_fast.update_state("rule-dedup", "cam-001", True, "")
@@ -2756,6 +2829,7 @@ class TestRuleRunnerEventDuration:
         )
         runner_fast._sample_interval = 0.5  # maxlen=2, threshold=2
         runner_fast.add_rule(rule)
+        runner_fast.set_task_actions('test_task', {'on_enter_actions': [{'did': 'device-dur', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None})
         with patch("miloco.rule.runner.time.time") as mt:
             mt.return_value = 100.0
             await runner_fast.update_state("rule-dis", "cam-001", True, "")
@@ -2780,6 +2854,7 @@ class TestRuleRunnerEventDuration:
         )
         runner_fast._sample_interval = 0.5  # maxlen=4
         runner_fast.add_rule(rule)
+        runner_fast.set_task_actions('test_task', {'on_enter_actions': [{'did': 'device-dur', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None})
         with patch("miloco.rule.runner.time.time") as mt:
             for i in range(2):
                 mt.return_value = 100.0 + i * 0.5
@@ -2790,6 +2865,7 @@ class TestRuleRunnerEventDuration:
             assert "rule-rm" not in runner_fast._last_duration_round
             # 重新加 → 干净窗口
             runner_fast.add_rule(rule)
+            runner_fast.set_task_actions('test_task', {'on_enter_actions': [{'did': 'device-dur', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None})
             mt.return_value = 102.0
             await runner_fast.update_state("rule-rm", "cam-001", True, "")
             assert len(runner_fast._duration_window["rule-rm"]) == 1
@@ -2804,6 +2880,7 @@ class TestRuleRunnerEventDuration:
         )
         runner_fast._sample_interval = 0.5  # maxlen=6
         runner_fast.add_rule(rule1)
+        runner_fast.set_task_actions('test_task', {'on_enter_actions': [{'did': 'device-dur', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None})
         with patch("miloco.rule.runner.time.time") as mt:
             for i in range(3):
                 mt.return_value = 100.0 + i * 0.5
@@ -2813,6 +2890,7 @@ class TestRuleRunnerEventDuration:
                 rule_id="rule-cfg", duration_seconds=1, duration_ratio=1.0
             )
             runner_fast.add_rule(rule2)
+            runner_fast.set_task_actions('test_task', {'on_enter_actions': [{'did': 'device-dur', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None})
             assert "rule-cfg" not in runner_fast._duration_window
             assert "rule-cfg" not in runner_fast._last_duration_round
 
@@ -2835,6 +2913,7 @@ class TestRuleRunnerEventDuration:
             rule_id="rule-meta", duration_seconds=12, duration_ratio=0.75
         )
         runner.add_rule(rule)
+        runner.set_task_actions('test_task', {'on_enter_actions': [], 'on_enter_desc': '1. 播报久坐提醒'})
         with patch("miloco.rule.runner.time.time") as mt:
             # maxlen=4, sum needs >=3 to reach ratio 0.75
             for i, val in enumerate([True, False, True, True]):
@@ -2866,6 +2945,7 @@ class TestRuleRunnerEventDuration:
             rule_id="rule-gap", duration_seconds=21, duration_ratio=1.0
         )
         runner.add_rule(rule)
+        runner.set_task_actions('test_task', {'on_enter_actions': [{'did': 'device-dur', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None})
         with patch("miloco.rule.runner.time.time") as mt:
             # 5 个连续 T (round 0..4)
             for r in range(5):
@@ -2958,6 +3038,7 @@ class TestRuleRunnerStateDuration:
         )
         # maxlen=2, threshold=2
         runner_fast.add_rule(rule)
+        runner_fast.set_task_actions('test_task', {'on_enter_actions': [{'did': 'enter-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None, 'on_exit_actions': [{'did': 'exit-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_exit_desc': None})
         with patch("miloco.rule.runner.time.time") as mt:
             mt.return_value = 100.0
             await runner_fast.update_state("rule-sd-noent", "cam-001", True, "")
@@ -2975,6 +3056,7 @@ class TestRuleRunnerStateDuration:
             rule_id="rule-sd-fire", duration_seconds=1, duration_ratio=1.0
         )
         runner_fast.add_rule(rule)
+        runner_fast.set_task_actions('test_task', {'on_enter_actions': [{'did': 'enter-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None, 'on_exit_actions': [{'did': 'exit-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_exit_desc': None})
         with patch("miloco.rule.runner.time.time") as mt:
             mt.return_value = 100.0
             await runner_fast.update_state("rule-sd-fire", "cam-001", True, "")
@@ -2996,6 +3078,7 @@ class TestRuleRunnerStateDuration:
             rule_id="rule-sd-still", duration_seconds=1, duration_ratio=1.0
         )
         runner_fast.add_rule(rule)
+        runner_fast.set_task_actions('test_task', {'on_enter_actions': [{'did': 'enter-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None, 'on_exit_actions': [{'did': 'exit-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_exit_desc': None})
         with patch("miloco.rule.runner.time.time") as mt:
             # 凑齐 fire
             for i in range(2):
@@ -3030,6 +3113,7 @@ class TestRuleRunnerStateDuration:
         )
         # sample_interval=0.5, maxlen=4, threshold=3
         runner_fast.add_rule(rule)
+        runner_fast.set_task_actions('test_task', {'on_enter_actions': [{'did': 'enter-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None, 'on_exit_actions': [{'did': 'exit-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_exit_desc': None})
         with patch("miloco.rule.runner.time.time") as mt:
             # 累 2 个 T（未达标 2/4 < 0.75）
             for i in range(2):
@@ -3067,6 +3151,7 @@ class TestRuleRunnerStateDuration:
         )
         # sample_interval=0.5, maxlen=4, threshold=3（sum>=3 时 3/4=0.75 达标）
         runner_fast.add_rule(rule)
+        runner_fast.set_task_actions('test_task', {'on_enter_actions': [{'did': 'enter-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None, 'on_exit_actions': [{'did': 'exit-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_exit_desc': None})
         with patch("miloco.rule.runner.time.time") as mt:
             # 2 个 T（窗口 [1,1]，未达标）
             for i in range(2):
@@ -3103,6 +3188,7 @@ class TestRuleRunnerStateDuration:
             exit_debounce_seconds=0,
         )
         runner_fast.add_rule(rule)
+        runner_fast.set_task_actions('test_task', {'on_enter_actions': [{'did': 'enter-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None, 'on_exit_actions': [{'did': 'exit-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_exit_desc': None})
         with patch("miloco.rule.runner.time.time") as mt:
             for i in range(2):
                 mt.return_value = 100.0 + i * 0.5
@@ -3140,6 +3226,7 @@ class TestRuleRunnerStateDuration:
             exit_debounce_seconds=10,  # 长 debounce 给 cancel 机会
         )
         runner_fast.add_rule(rule)
+        runner_fast.set_task_actions('test_task', {'on_enter_actions': [{'did': 'enter-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None, 'on_exit_actions': [{'did': 'exit-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_exit_desc': None})
         with patch("miloco.rule.runner.time.time") as mt:
             for i in range(2):
                 mt.return_value = 100.0 + i * 0.5
@@ -3173,6 +3260,7 @@ class TestRuleRunnerStateDuration:
             exit_debounce_seconds=0,
         )
         runner_fast.add_rule(rule)
+        runner_fast.set_task_actions('test_task', {'on_enter_actions': [{'did': 'enter-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None, 'on_exit_actions': [{'did': 'exit-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_exit_desc': None})
         with patch("miloco.rule.runner.time.time") as mt:
             # 第一轮 enter→fire→exit→fire
             for i in range(2):
@@ -3212,6 +3300,7 @@ class TestRuleRunnerStateDuration:
             rule_id="rule-sd-cfg", duration_seconds=2, duration_ratio=1.0
         )
         runner_fast.add_rule(rule1)
+        runner_fast.set_task_actions('test_task', {'on_enter_actions': [{'did': 'enter-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None, 'on_exit_actions': [{'did': 'exit-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_exit_desc': None})
         with patch("miloco.rule.runner.time.time") as mt:
             # 凑齐 fire（maxlen=4，threshold=4）
             for i in range(4):
@@ -3226,6 +3315,7 @@ class TestRuleRunnerStateDuration:
                 rule_id="rule-sd-cfg", duration_seconds=1, duration_ratio=1.0
             )
             runner_fast.add_rule(rule2)
+            runner_fast.set_task_actions('test_task', {'on_enter_actions': [{'did': 'enter-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None, 'on_exit_actions': [{'did': 'exit-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_exit_desc': None})
             assert "rule-sd-cfg" not in runner_fast._duration_window
             assert "rule-sd-cfg" not in runner_fast._last_duration_round
             assert "rule-sd-cfg" not in runner_fast._state_duration_fired
@@ -3239,6 +3329,7 @@ class TestRuleRunnerStateDuration:
             rule_id="rule-sd-en", duration_seconds=1, duration_ratio=1.0
         )
         runner_fast.add_rule(rule)
+        runner_fast.set_task_actions('test_task', {'on_enter_actions': [{'did': 'enter-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None, 'on_exit_actions': [{'did': 'exit-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_exit_desc': None})
         with patch("miloco.rule.runner.time.time") as mt:
             # 凑齐 fire（maxlen=2，threshold=2）
             for i in range(2):
@@ -3255,12 +3346,14 @@ class TestRuleRunnerStateDuration:
             )
             disabled.enabled = False
             runner_fast.add_rule(disabled)
+            runner_fast.set_task_actions('test_task', {'on_enter_actions': [{'did': 'enter-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None, 'on_exit_actions': [{'did': 'exit-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_exit_desc': None})
             assert "rule-sd-en" not in runner_fast._duration_window
             assert "rule-sd-en" not in runner_fast._state_duration_fired
             assert "rule-sd-en" not in runner_fast._last_rule_state
 
             # enable 回来：状态机干净
             runner_fast.add_rule(rule)
+            runner_fast.set_task_actions('test_task', {'on_enter_actions': [{'did': 'enter-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None, 'on_exit_actions': [{'did': 'exit-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_exit_desc': None})
             assert "rule-sd-en" not in runner_fast._state_duration_fired
 
 
@@ -3288,6 +3381,7 @@ class TestActualExitedAt:
             exit_debounce_seconds=0,  # 立即到点
         )
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-aex', {'on_enter_actions': [], 'on_enter_desc': '进入业务语义\n\ntask_id=t1', 'on_exit_actions': [], 'on_exit_desc': '离开业务语义\n\ntask_id=t1'})
 
         # ENTER → 1 帧 True
         await runner.update_state("rule-aex", "cam-001", True, "")
@@ -3319,6 +3413,7 @@ class TestActualExitedAt:
             exit_debounce_seconds=0,
         )
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-aen', {'on_enter_actions': [], 'on_enter_desc': '进入业务语义\n\ntask_id=t2', 'on_exit_actions': [], 'on_exit_desc': '离开业务语义\n\ntask_id=t2'})
 
         await runner.update_state("rule-aen", "cam-001", True, "")
         await runner.drain()
@@ -3371,6 +3466,7 @@ class TestActualStartedAt:
         )
         runner_fast._sample_interval = 0.5  # maxlen = 2
         runner_fast.add_rule(rule)
+        runner_fast.set_task_actions('test_task', {'on_enter_actions': [], 'on_enter_desc': '1. 播报久坐提醒'})
 
         with patch("miloco.rule.runner.time.time") as mt:
             mt.return_value = 100.0  # round_id = 200
@@ -3410,6 +3506,7 @@ class TestActualStartedAt:
         )
         runner_fast._sample_interval = 0.5  # maxlen = 8
         runner_fast.add_rule(rule)
+        runner_fast.set_task_actions('test_task', {'on_enter_actions': [], 'on_enter_desc': '1. 播报久坐提醒'})
 
         sequence = [False, False, True, True, False, True, True, True]
         with patch("miloco.rule.runner.time.time") as mt:
@@ -3443,6 +3540,7 @@ class TestActualStartedAt:
         )
         runner_fast._sample_interval = 0.5  # maxlen = 2
         runner_fast.add_rule(rule)
+        runner_fast.set_task_actions('test_task', {'on_enter_actions': [], 'on_enter_desc': '1. 播报久坐提醒'})
 
         with patch("miloco.rule.runner.time.time") as mt:
             mt.return_value = 100.0
@@ -3490,6 +3588,7 @@ class TestActualStartedAt:
             exit_debounce_seconds=0,
         )
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-as-flip', {'on_enter_actions': [], 'on_enter_desc': '进入业务\n\ntask_id=t1', 'on_exit_actions': [], 'on_exit_desc': '离开业务\n\ntask_id=t1'})
 
         before = datetime.now(timezone.utc)
         await runner.update_state("rule-as-flip", "cam-001", True, "")
@@ -3531,11 +3630,13 @@ class TestPreambleSelection:
         )
         rule = _make_state_rule(
             rule_id="rule-pre-rec",
+            task_id=TASK_ID,
             on_enter_desc="进入业务语义（无 marker）",
             on_exit_desc="离开业务语义（无 marker）",
             exit_debounce_seconds=0,
         )
         runner.add_rule(rule)
+        runner.set_task_actions('test_task', {'on_enter_actions': [], 'on_enter_desc': '进入业务语义（无 marker）', 'on_exit_actions': [], 'on_exit_desc': '离开业务语义（无 marker）'})
 
         await runner.update_state("rule-pre-rec", "cam-001", True, "")
         await runner.update_state("rule-pre-rec", "cam-001", False, "")
@@ -3569,6 +3670,7 @@ class TestPreambleSelection:
             exit_debounce_seconds=0,
         )
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-pre-pure', {'on_enter_actions': [], 'on_enter_desc': '进入业务语义（无 marker）', 'on_exit_actions': [], 'on_exit_desc': '离开业务语义（无 marker）'})
 
         await runner.update_state("rule-pre-pure", "cam-001", True, "")
         await runner.update_state("rule-pre-pure", "cam-001", False, "")
@@ -3650,6 +3752,9 @@ def _make_milestone_rule(rule_id="rule-ms", task_id=TASK_ID, on_target_desc=None
 
     ``spec.value`` 故意写成一个错的阈值: 真阈值读 record 上的 ``target_minutes``,
     抄进条件项那份只是迁移遗留。写对了就分不出读的是哪一份。
+
+    达标规则是 task 的派生物, 必须与产生会话的那条 rule 同 task —— 本组用例统一
+    把两者都挂在 ``TASK_ID`` 上, 用例里的 arm / 断言用的也是它。
     """
     return Rule(
         id=rule_id,
@@ -3690,9 +3795,11 @@ class TestRecordMilestoneFire:
         """进 session 时累计已达标 → 立即发达标。"""
         mock_send.return_value = True
         r = _make_runner_with_record((60, 60), mock_miot_proxy, mock_log_repo)
-        main = _make_state_rule(rule_id="rule-main", on_enter_desc="进入")
-        ms = _make_milestone_rule(on_target_desc="达标了")
+        main = _make_state_rule(rule_id="rule-main", task_id=TASK_ID, on_enter_desc="进入",
+                                 on_target_desc="达标了")
+        ms = _make_milestone_rule()
         r.add_rule(main)
+        r.set_task_actions('test_task', {'on_enter_actions': [], 'on_enter_desc': '进入', 'on_target_actions': [], 'on_target_desc': '达标了'})
         r.add_rule(ms)
 
         await r.update_state("rule-main", "cam-001", True, "")
@@ -3709,10 +3816,12 @@ class TestRecordMilestoneFire:
         """milestone rule 自己没配达标文案、task 列配了 —— 也要发。"""
         mock_send.return_value = True
         r = _make_runner_with_record((60, 60), mock_miot_proxy, mock_log_repo)
-        main = _make_state_rule(rule_id="rule-main", on_enter_desc="进入")
+        main = _make_state_rule(rule_id="rule-main", task_id=TASK_ID, on_enter_desc="进入",
+                                 on_target_desc="达标了")
         ms = _make_milestone_rule()
         assert ms.on_target_desc is None
         r.add_rule(main)
+        r.set_task_actions('test_task', {'on_enter_actions': [], 'on_enter_desc': '进入', 'on_target_actions': [], 'on_target_desc': '达标了'})
         r.add_rule(ms)
         r.set_task_actions(TASK_ID, _TASK_SLOTS_WITH_TARGET)
 
@@ -3730,9 +3839,11 @@ class TestRecordMilestoneFire:
         """阈值取 record 上的当前值。取条件项里抄的那份 (999999) 就永远发不出。"""
         mock_send.return_value = True
         r = _make_runner_with_record((60, 60), mock_miot_proxy, mock_log_repo)
-        main = _make_state_rule(rule_id="rule-main", on_enter_desc="进入")
+        main = _make_state_rule(rule_id="rule-main", task_id=TASK_ID, on_enter_desc="进入",
+                                 on_target_desc="达标了")
         r.add_rule(main)
-        r.add_rule(_make_milestone_rule(on_target_desc="达标了"))
+        r.set_task_actions('test_task', {'on_enter_actions': [], 'on_enter_desc': '进入', 'on_target_actions': [], 'on_target_desc': '达标了'})
+        r.add_rule(_make_milestone_rule())
 
         await r.update_state("rule-main", "cam-001", True, "")
         await asyncio.sleep(0.05)
@@ -3749,9 +3860,11 @@ class TestRecordMilestoneFire:
         """达标文案要用真实数字，所以目标 / 实际累计 / 达标时刻都得进 prompt。"""
         mock_send.return_value = True
         r = _make_runner_with_record((60, 75), mock_miot_proxy, mock_log_repo)
-        main = _make_state_rule(rule_id="rule-main", on_enter_desc="进入")
+        main = _make_state_rule(rule_id="rule-main", task_id=TASK_ID, on_enter_desc="进入",
+                                 on_target_desc="达标了")
         r.add_rule(main)
-        r.add_rule(_make_milestone_rule(on_target_desc="达标了"))
+        r.set_task_actions('test_task', {'on_enter_actions': [], 'on_enter_desc': '进入', 'on_target_actions': [], 'on_target_desc': '达标了'})
+        r.add_rule(_make_milestone_rule())
 
         await r.update_state("rule-main", "cam-001", True, "")
         await asyncio.sleep(0.05)
@@ -3772,9 +3885,11 @@ class TestRecordMilestoneFire:
         """达标不是 session 起点 —— 注入 actual_started_at 会让 agent 去建 session。"""
         mock_send.return_value = True
         r = _make_runner_with_record((60, 60), mock_miot_proxy, mock_log_repo)
-        main = _make_state_rule(rule_id="rule-main", on_enter_desc="进入")
+        main = _make_state_rule(rule_id="rule-main", task_id=TASK_ID, on_enter_desc="进入",
+                                 on_target_desc="达标了")
         r.add_rule(main)
-        r.add_rule(_make_milestone_rule(on_target_desc="达标了"))
+        r.set_task_actions('test_task', {'on_enter_actions': [], 'on_enter_desc': '进入', 'on_target_actions': [], 'on_target_desc': '达标了'})
+        r.add_rule(_make_milestone_rule())
 
         await r.update_state("rule-main", "cam-001", True, "")
         await asyncio.sleep(0.05)
@@ -3793,8 +3908,10 @@ class TestRecordMilestoneFire:
         """条件已为真 → 再喂真不产生边沿。这就是原先那个内存标记的全部作用。"""
         mock_send.return_value = True
         r = _make_runner_with_record((60, 60), mock_miot_proxy, mock_log_repo)
-        r.add_rule(_make_state_rule(rule_id="rule-main", on_enter_desc="进入"))
-        r.add_rule(_make_milestone_rule(on_target_desc="达标了"))
+        r.add_rule(_make_state_rule(rule_id="rule-main", task_id=TASK_ID, on_enter_desc="进入",
+                                 on_target_desc="达标了"))
+        r.set_task_actions('test_task', {'on_enter_actions': [], 'on_enter_desc': '进入', 'on_target_actions': [], 'on_target_desc': '达标了'})
+        r.add_rule(_make_milestone_rule())
 
         r.record_source.arm(TASK_ID)
         await asyncio.sleep(0.05)
@@ -3812,8 +3929,10 @@ class TestRecordMilestoneFire:
         """归零把条件翻假 → 第二天达标是一次全新的边沿, 必须再发一次。"""
         mock_send.return_value = True
         r = _make_runner_with_record((60, 60), mock_miot_proxy, mock_log_repo)
-        r.add_rule(_make_state_rule(rule_id="rule-main", on_enter_desc="进入"))
-        r.add_rule(_make_milestone_rule(on_target_desc="达标了"))
+        r.add_rule(_make_state_rule(rule_id="rule-main", task_id=TASK_ID, on_enter_desc="进入",
+                                 on_target_desc="达标了"))
+        r.set_task_actions('test_task', {'on_enter_actions': [], 'on_enter_desc': '进入', 'on_target_actions': [], 'on_target_desc': '达标了'})
+        r.add_rule(_make_milestone_rule())
 
         r.record_source.arm(TASK_ID)
         await asyncio.sleep(0.05)
@@ -3835,8 +3954,10 @@ class TestRecordMilestoneFire:
         """
         mock_send.return_value = True
         r = _make_runner_with_record((60, 60), mock_miot_proxy, mock_log_repo)
-        ms = _make_milestone_rule(on_target_desc="达标了")
-        r.add_rule(_make_state_rule(rule_id="rule-main", on_enter_desc="进入"))
+        ms = _make_milestone_rule()
+        r.add_rule(_make_state_rule(rule_id="rule-main", task_id=TASK_ID, on_enter_desc="进入",
+                                 on_target_desc="达标了"))
+        r.set_task_actions('test_task', {'on_enter_actions': [], 'on_enter_desc': '进入', 'on_target_actions': [], 'on_target_desc': '达标了'})
         r.add_rule(ms)
 
         r.record_source.arm(TASK_ID)
@@ -3857,8 +3978,10 @@ class TestRecordMilestoneFire:
 
         mock_send.return_value = True
         r = _make_runner_with_record((60, 60), mock_miot_proxy, mock_log_repo)
-        ms = _make_milestone_rule(on_target_desc="达标了")
-        r.add_rule(_make_state_rule(rule_id="rule-main", on_enter_desc="进入"))
+        ms = _make_milestone_rule()
+        r.add_rule(_make_state_rule(rule_id="rule-main", task_id=TASK_ID, on_enter_desc="进入",
+                                 on_target_desc="达标了"))
+        r.set_task_actions('test_task', {'on_enter_actions': [], 'on_enter_desc': '进入', 'on_target_actions': [], 'on_target_desc': '达标了'})
         r.add_rule(ms)
         sm = MagicMock()
         sm.owns.return_value = True
@@ -3888,8 +4011,10 @@ class TestRecordMilestoneFire:
 
         mock_send.return_value = True
         r = _make_runner_with_record((60, 60), mock_miot_proxy, mock_log_repo)
-        ms = _make_milestone_rule(on_target_desc="达标了")
-        r.add_rule(_make_state_rule(rule_id="rule-main", on_enter_desc="进入"))
+        ms = _make_milestone_rule()
+        r.add_rule(_make_state_rule(rule_id="rule-main", task_id=TASK_ID, on_enter_desc="进入",
+                                 on_target_desc="达标了"))
+        r.set_task_actions('test_task', {'on_enter_actions': [], 'on_enter_desc': '进入', 'on_target_actions': [], 'on_target_desc': '达标了'})
         r.add_rule(ms)
         sm = MagicMock()
         sm.owns.return_value = True
@@ -3917,7 +4042,9 @@ class TestRecordMilestoneFire:
         """task 下没有 record 条件项 → 进 session 不排任何 timer。"""
         mock_send.return_value = True
         r = _make_runner_with_record((60, 0), mock_miot_proxy, mock_log_repo)
-        r.add_rule(_make_state_rule(rule_id="rule-main", on_enter_desc="进入"))
+        r.add_rule(_make_state_rule(rule_id="rule-main", task_id=TASK_ID, on_enter_desc="进入",
+                                 on_target_desc="达标了"))
+        r.set_task_actions('test_task', {'on_enter_actions': [], 'on_enter_desc': '进入', 'on_target_actions': [], 'on_target_desc': '达标了'})
 
         await r.update_state("rule-main", "cam-001", True, "")
         await asyncio.sleep(0.05)
@@ -3931,8 +4058,10 @@ class TestRecordMilestoneFire:
     ):
         mock_send.return_value = True
         r = _make_runner_with_record((60, 0), mock_miot_proxy, mock_log_repo)
-        ms = _make_milestone_rule(on_target_desc="达标了")
-        r.add_rule(_make_state_rule(rule_id="rule-main", on_enter_desc="进入"))
+        ms = _make_milestone_rule()
+        r.add_rule(_make_state_rule(rule_id="rule-main", task_id=TASK_ID, on_enter_desc="进入",
+                                 on_target_desc="达标了"))
+        r.set_task_actions('test_task', {'on_enter_actions': [], 'on_enter_desc': '进入', 'on_target_actions': [], 'on_target_desc': '达标了'})
         r.add_rule(ms)
 
         await r.update_state("rule-main", "cam-001", True, "")
@@ -3949,8 +4078,10 @@ class TestRecordMilestoneFire:
     ):
         mock_send.return_value = True
         r = _make_runner_with_record(None, mock_miot_proxy, mock_log_repo)
-        r.add_rule(_make_state_rule(rule_id="rule-main", on_enter_desc="进入"))
-        r.add_rule(_make_milestone_rule(on_target_desc="达标了"))
+        r.add_rule(_make_state_rule(rule_id="rule-main", task_id=TASK_ID, on_enter_desc="进入",
+                                 on_target_desc="达标了"))
+        r.set_task_actions('test_task', {'on_enter_actions': [], 'on_enter_desc': '进入', 'on_target_actions': [], 'on_target_desc': '达标了'})
+        r.add_rule(_make_milestone_rule())
 
         await r.update_state("rule-main", "cam-001", True, "")
         await asyncio.sleep(0.05)
@@ -3967,10 +4098,10 @@ class TestRecordMilestoneFire:
         """一个 task 发过达标不该让另一个 task 的达标被吞掉。"""
         mock_send.return_value = True
         r = _make_runner_with_record((60, 60), mock_miot_proxy, mock_log_repo)
-        r.add_rule(_make_milestone_rule(rule_id="ms-a", task_id="task_a",
-                                        on_target_desc="A 达标"))
-        r.add_rule(_make_milestone_rule(rule_id="ms-b", task_id="task_b",
-                                        on_target_desc="B 达标"))
+        r.add_rule(_make_milestone_rule(rule_id="ms-a", task_id="task_a"))
+        r.set_task_actions('task_a', {'on_target_actions': [], 'on_target_desc': 'A 达标'})
+        r.add_rule(_make_milestone_rule(rule_id="ms-b", task_id="task_b"))
+        r.set_task_actions('task_b', {'on_target_actions': [], 'on_target_desc': 'B 达标'})
 
         r.record_source.arm("task_a")
         r.record_source.arm("task_b")
@@ -3987,7 +4118,7 @@ class TestRecordMilestoneFire:
         """timer 存在 record 源那边, 不在 per-rule 的 state 里 —— 删 rule 要连带撤。"""
         mock_send.return_value = True
         r = _make_runner_with_record((60, 0), mock_miot_proxy, mock_log_repo)
-        ms = _make_milestone_rule(on_target_desc="达标了")
+        ms = _make_milestone_rule()
         r.add_rule(ms)
         r.record_source.arm(TASK_ID)
         await asyncio.sleep(0.05)
@@ -4028,10 +4159,12 @@ class TestRecordMilestoneAtExit:
         r, holder = self._runner_with_switchable_record(
             (5, 0), mock_miot_proxy, mock_log_repo,
         )
-        main = _make_state_rule(rule_id="rule-main", on_enter_desc="进入",
+        main = _make_state_rule(rule_id="rule-main", task_id=TASK_ID, on_enter_desc="进入",
+                                 on_target_desc="达标了",
                                 on_exit_desc="离开", exit_debounce_seconds=0)
         r.add_rule(main)
-        r.add_rule(_make_milestone_rule(on_target_desc="达标了"))
+        r.set_task_actions('test_task', {'on_enter_actions': [], 'on_enter_desc': '进入', 'on_exit_actions': [], 'on_exit_desc': '离开', 'on_target_actions': [], 'on_target_desc': '达标了'})
+        r.add_rule(_make_milestone_rule())
         await r.update_state("rule-main", "cam-001", True, "")
         await asyncio.sleep(0.05)
 
@@ -4052,10 +4185,12 @@ class TestRecordMilestoneAtExit:
         r, _holder = self._runner_with_switchable_record(
             (60, 10), mock_miot_proxy, mock_log_repo,
         )
-        main = _make_state_rule(rule_id="rule-main", on_enter_desc="进入",
+        main = _make_state_rule(rule_id="rule-main", task_id=TASK_ID, on_enter_desc="进入",
+                                 on_target_desc="达标了",
                                 on_exit_desc="离开", exit_debounce_seconds=0)
         r.add_rule(main)
-        r.add_rule(_make_milestone_rule(on_target_desc="达标了"))
+        r.set_task_actions('test_task', {'on_enter_actions': [], 'on_enter_desc': '进入', 'on_exit_actions': [], 'on_exit_desc': '离开', 'on_target_actions': [], 'on_target_desc': '达标了'})
+        r.add_rule(_make_milestone_rule())
         await r.update_state("rule-main", "cam-001", True, "")
         await asyncio.sleep(0.05)
 
@@ -4076,10 +4211,12 @@ class TestRecordMilestoneAtExit:
         r, _holder = self._runner_with_switchable_record(
             (5, 5), mock_miot_proxy, mock_log_repo,
         )
-        main = _make_state_rule(rule_id="rule-main", on_enter_desc="进入",
+        main = _make_state_rule(rule_id="rule-main", task_id=TASK_ID, on_enter_desc="进入",
+                                 on_target_desc="达标了",
                                 on_exit_desc="离开", exit_debounce_seconds=0)
         r.add_rule(main)
-        r.add_rule(_make_milestone_rule(on_target_desc="达标了"))
+        r.set_task_actions('test_task', {'on_enter_actions': [], 'on_enter_desc': '进入', 'on_exit_actions': [], 'on_exit_desc': '离开', 'on_target_actions': [], 'on_target_desc': '达标了'})
+        r.add_rule(_make_milestone_rule())
         await r.update_state("rule-main", "cam-001", True, "")
         await asyncio.sleep(0.05)
 
@@ -4107,6 +4244,7 @@ class TestRuleForceCrossDayResetNoSessionTimestamps:
         )
         rule = _make_state_rule_with_target(rule_id="rule-xday-no-ts")
         r.add_rule(rule)
+        r.set_task_actions('test_task', {'on_enter_actions': [], 'on_enter_desc': '开始计时\ntask_id=tgt', 'on_exit_actions': [], 'on_exit_desc': '结束计时\ntask_id=tgt', 'on_target_actions': [], 'on_target_desc': '使用手机推送通知:累计达标\ntask_id=tgt'})
         await r.update_state("rule-xday-no-ts", "cam-001", True, "")
         await asyncio.sleep(0.05)
         r.force_cross_day_reset(rule.task_id)
@@ -4143,6 +4281,7 @@ class TestRuleSelectSlotTargetFired:
             on_target_desc="累计达标通知\ntask_id=slot-tgt",
         )
         r.add_rule(rule)
+        r.set_task_actions('test_task', {'on_enter_actions': [], 'on_enter_desc': '开始计时\ntask_id=tgt', 'on_exit_actions': [], 'on_exit_desc': '结束计时\ntask_id=tgt', 'on_target_actions': [], 'on_target_desc': '累计达标通知\ntask_id=slot-tgt'})
         slot = r._select_slot(rule, RuleEvent.TARGET_FIRED)
         assert slot is not None
         assert slot[0] == "dynamic"
@@ -4312,6 +4451,7 @@ class TestRuleExitedMetadata:
             exit_debounce_seconds=0,
         )
         r.add_rule(rule)
+        r.set_task_actions('test_task-rule-exit-meta', {'on_enter_actions': [], 'on_enter_desc': '开始计时', 'on_exit_actions': [], 'on_exit_desc': '结束计时；若今日累计已达目标则使用手机推送通知：今日累计已达目标时长'})
         await r.update_state("rule-exit-meta", "cam-001", True, "")
         await r.update_state("rule-exit-meta", "cam-001", False, "")
         await r.update_state("rule-exit-meta", "cam-001", False, "")
@@ -4339,6 +4479,7 @@ class TestRuleExitedMetadata:
             exit_debounce_seconds=0,
         )
         r.add_rule(rule)
+        r.set_task_actions('test_task-rule-exit-no-rec', {'on_enter_actions': [], 'on_enter_desc': '进入', 'on_exit_actions': [], 'on_exit_desc': '离开'})
         await r.update_state("rule-exit-no-rec", "cam-001", True, "")
         await r.update_state("rule-exit-no-rec", "cam-001", False, "")
         await r.update_state("rule-exit-no-rec", "cam-001", False, "")
@@ -4366,6 +4507,7 @@ class TestRuleExitedMetadata:
             exit_debounce_seconds=0,
         )
         r.add_rule(rule)
+        r.set_task_actions('test_task-rule-exit-no-target', {'on_enter_actions': [], 'on_enter_desc': '开始计时', 'on_exit_actions': [], 'on_exit_desc': '结束计时'})
         await r.update_state("rule-exit-no-target", "cam-001", True, "")
         await r.update_state("rule-exit-no-target", "cam-001", False, "")
         await r.update_state("rule-exit-no-target", "cam-001", False, "")
@@ -4391,10 +4533,12 @@ class TestRecordMilestoneCrossDay:
         """
         mock_send.return_value = True
         r = _make_runner_with_record((60, 0), mock_miot_proxy, mock_log_repo)
-        main = _make_state_rule(rule_id="rule-main", on_enter_desc="进入",
+        main = _make_state_rule(rule_id="rule-main", task_id=TASK_ID, on_enter_desc="进入",
+                                 on_target_desc="达标了",
                                 on_exit_desc="离开")
         r.add_rule(main)
-        r.add_rule(_make_milestone_rule(on_target_desc="达标了"))
+        r.set_task_actions('test_task', {'on_enter_actions': [], 'on_enter_desc': '进入', 'on_exit_actions': [], 'on_exit_desc': '离开', 'on_target_actions': [], 'on_target_desc': '达标了'})
+        r.add_rule(_make_milestone_rule())
         r._ensure_state(main.id).last_rule_state = True
 
         r.force_cross_day_reset(TASK_ID, pre_rollover_state=(60, 90))
@@ -4410,10 +4554,12 @@ class TestRecordMilestoneCrossDay:
     ):
         mock_send.return_value = True
         r = _make_runner_with_record((60, 0), mock_miot_proxy, mock_log_repo)
-        main = _make_state_rule(rule_id="rule-main", on_enter_desc="进入",
+        main = _make_state_rule(rule_id="rule-main", task_id=TASK_ID, on_enter_desc="进入",
+                                 on_target_desc="达标了",
                                 on_exit_desc="离开")
         r.add_rule(main)
-        r.add_rule(_make_milestone_rule(on_target_desc="达标了"))
+        r.set_task_actions('test_task', {'on_enter_actions': [], 'on_enter_desc': '进入', 'on_exit_actions': [], 'on_exit_desc': '离开', 'on_target_actions': [], 'on_target_desc': '达标了'})
+        r.add_rule(_make_milestone_rule())
         r._ensure_state(main.id).last_rule_state = True
 
         r.force_cross_day_reset(TASK_ID, pre_rollover_state=(60, 30))
@@ -4430,10 +4576,12 @@ class TestRecordMilestoneCrossDay:
         """归零后按 accumulated=0 重排, 否则新一天永远发不出达标。"""
         mock_send.return_value = True
         r = _make_runner_with_record((60, 0), mock_miot_proxy, mock_log_repo)
-        main = _make_state_rule(rule_id="rule-main", on_enter_desc="进入",
+        main = _make_state_rule(rule_id="rule-main", task_id=TASK_ID, on_enter_desc="进入",
+                                 on_target_desc="达标了",
                                 on_exit_desc="离开")
-        ms = _make_milestone_rule(on_target_desc="达标了")
+        ms = _make_milestone_rule()
         r.add_rule(main)
+        r.set_task_actions('test_task', {'on_enter_actions': [], 'on_enter_desc': '进入', 'on_exit_actions': [], 'on_exit_desc': '离开', 'on_target_actions': [], 'on_target_desc': '达标了'})
         r.add_rule(ms)
         r._ensure_state(main.id).last_rule_state = True
 
@@ -4460,6 +4608,7 @@ class TestRuleRunnerPerDeviceStateIndependence:
             exit_debounce_seconds=0,
         )
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-or-hold', {'on_enter_actions': [{'did': 'enter-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None, 'on_exit_actions': [{'did': 'exit-d', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_exit_desc': None})
         await runner.update_state("rule-or-hold", "cam-A", True, "")  # ENTERED via A
         await runner.drain()
         assert mock_miot_proxy.set_device_properties.call_count == 1
@@ -4495,6 +4644,7 @@ class TestRuleRunnerPerDeviceStateIndependence:
             condition=_make_condition(device_ids=["cam-A", "cam-B"]),
         )
         runner.add_rule(rule)
+        runner.set_task_actions('test_task-rule-pex-iso', {'on_enter_actions': [{'did': 'device-001', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None})
         await runner.update_state("rule-pex-iso", "cam-A", True, "")
         await runner.update_state("rule-pex-iso", "cam-B", True, "")
         await runner.drain()
@@ -4535,6 +4685,7 @@ class TestRuleRunnerPerDeviceStateIndependence:
         # 绑双 source 让 OR 聚合参与
         rule.condition = _make_condition(device_ids=["cam-A", "cam-B"])
         runner_fast.add_rule(rule)
+        runner_fast.set_task_actions('test_task', {'on_enter_actions': [{'did': 'device-dur', 'iid': 'prop.2.1', 'value': True, 'params': None, 'idempotent': True, 'cooldown_minutes': None}], 'on_enter_desc': None})
         with patch("miloco.rule.runner.time.time") as mt:
             mt.return_value = 100.0  # round_id = 200
             await runner_fast.update_state("rule-dur-cross", "cam-A", True, "")
@@ -5476,6 +5627,7 @@ class TestExitRuleEdgeTimestamp:
     async def test_instant_edge_reports_exited_at(self, mock_send, runner):
         mock_send.return_value = True
         runner.add_rule(self._exit_rule("rule-exit-ts"))
+        runner.set_task_actions('test_task', {'on_exit_actions': [], 'on_exit_desc': '1. 孩子离开书桌'})
 
         await runner.update_state("rule-exit-ts", "cam-001", True, "")
         await runner.drain()
@@ -5493,6 +5645,7 @@ class TestExitRuleEdgeTimestamp:
         mock_send.return_value = True
         # duration_seconds == sample_interval(3) → maxlen 1 → 首帧即达标
         runner.add_rule(self._exit_rule("rule-exit-dur", duration_seconds=3))
+        runner.set_task_actions('test_task', {'on_exit_actions': [], 'on_exit_desc': '1. 孩子离开书桌'})
 
         await runner.update_state("rule-exit-dur", "cam-001", True, "")
         await runner.drain()
