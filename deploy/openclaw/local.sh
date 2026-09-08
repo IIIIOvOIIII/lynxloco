@@ -4,6 +4,20 @@
 readonly OPENCLAW_PROFILE="openclaw-root-v1"
 readonly OPENCLAW_ROOT="/opt/miloco-openclaw"
 native_controller_digest=""
+native_payload_digest=""
+
+openclaw_build_payload() {
+    local sha="$1" plugin archive payload
+    plugin="$(select_one "OpenClaw plugin" "$PROJECT_ROOT/dist/miloco-openclaw-plugin-"*.tgz)"
+    archive="$PROJECT_ROOT/dist/lab/$sha/miloco-lab-${sha}.tar.gz"
+    payload="$PROJECT_ROOT/dist/lab/$sha/miloco-native-${sha}.tar.gz"
+    python3 - "$PROJECT_ROOT/deploy/openclaw/remote-release.py" "$archive" "$plugin" "$sha" "$payload" <<'PY'
+from pathlib import Path
+import runpy
+import sys
+runpy.run_path(sys.argv[1])["prepare_payload"](Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4], Path(sys.argv[5]))
+PY
+}
 
 openclaw_assert_clean() {
     assert_clean_controller
@@ -19,9 +33,12 @@ openclaw_write_receipt() {
     destination="$PROJECT_ROOT/dist/lab/$sha/miloco-lab-${sha}.openclaw.receipt"
     [[ ! -e "$destination" && ! -L "$destination" ]] || die 4 "immutable native receipt already exists"
     temporary="$(mktemp "${destination}.XXXXXX")"
-    printf 'schema=1\ngit_sha=%s\nruntime_profile=%s\narchive_sha256=%s\ncontroller_sha256=%s\nallowlist_sha256=%s\n' \
+    local payload="$PROJECT_ROOT/dist/lab/$sha/miloco-native-${sha}.tar.gz"
+    [[ -f "$payload" && ! -L "$payload" ]] || die 4 "native asset payload is missing"
+    printf 'schema=2\ngit_sha=%s\nruntime_profile=%s\narchive_sha256=%s\ncontroller_sha256=%s\nallowlist_sha256=%s\npayload_sha256=%s\n' \
         "$sha" "$OPENCLAW_PROFILE" "$receipt_archive_digest" \
         "$(sha256_file "$PROJECT_ROOT/deploy/openclaw/remote-release.py")" "$receipt_allowlist_digest" \
+        "$(sha256_file "$payload")" \
         > "$temporary"
     chmod 0444 "$temporary"
     mv -- "$temporary" "$destination"
@@ -33,6 +50,7 @@ openclaw_read_receipt() {
     receipt="$PROJECT_ROOT/dist/lab/$sha/miloco-lab-${sha}.openclaw.receipt"
     [[ -f "$receipt" && ! -L "$receipt" ]] || die 4 "native build receipt is missing"
     native_controller_digest=""
+    native_payload_digest=""
     while IFS= read -r line || [[ -n "$line" ]]; do
         count=$((count + 1))
         key="${line%%=*}"; value="${line#*=}"
@@ -44,13 +62,17 @@ openclaw_read_receipt() {
             archive_sha256) [[ -z "$archive" ]] || die 4 "duplicate native receipt field"; archive="$value" ;;
             controller_sha256) [[ -z "$native_controller_digest" ]] || die 4 "duplicate native receipt field"; native_controller_digest="$value" ;;
             allowlist_sha256) [[ -z "$allowlist" ]] || die 4 "duplicate native receipt field"; allowlist="$value" ;;
+            payload_sha256) [[ -z "$native_payload_digest" ]] || die 4 "duplicate native receipt field"; native_payload_digest="$value" ;;
             *) die 4 "unknown native receipt field" ;;
         esac
     done < "$receipt"
-    [[ "$count" -eq 6 && "$schema" == 1 && "$receipt_sha" == "$sha" \
+    local payload="$PROJECT_ROOT/dist/lab/$sha/miloco-native-${sha}.tar.gz"
+    [[ -f "$payload" && ! -L "$payload" ]] || die 4 "native asset payload is missing"
+    [[ "$count" -eq 7 && "$schema" == 2 && "$receipt_sha" == "$sha" \
         && "$profile" == "$OPENCLAW_PROFILE" && "$archive" == "$receipt_archive_digest" \
         && "$allowlist" == "$receipt_allowlist_digest" \
-        && "$native_controller_digest" == "$(sha256_file "$PROJECT_ROOT/deploy/openclaw/remote-release.py")" ]] \
+        && "$native_controller_digest" == "$(sha256_file "$PROJECT_ROOT/deploy/openclaw/remote-release.py")" \
+        && "$native_payload_digest" == "$(sha256_file "$payload")" ]] \
         || die 4 "native receipt identity or content mismatch"
 }
 
@@ -75,6 +97,7 @@ openclaw_dispatch() {
     openclaw_assert_clean
     if [[ "$operation" == build ]]; then
         build_release
+        openclaw_build_payload "$clean_sha"
         openclaw_assert_clean
         openclaw_write_receipt "$clean_sha"
         return
@@ -93,9 +116,9 @@ openclaw_dispatch() {
             openclaw_install_controller
             ssh "${ssh_args[@]}" -- "$host" env "${remote_profile_env_args[@]}" \
                 python3 "$OPENCLAW_ROOT/control/$native_controller_digest/remote-release.py" \
-                transaction "$host" "$clean_sha" "$receipt_archive_digest" \
+                transaction "$host" "$clean_sha" "$native_payload_digest" \
                 "$native_controller_digest" "$receipt_allowlist_digest" "$failure_policy" \
-                < "$PROJECT_ROOT/$receipt_artifact_path"
+                < "$PROJECT_ROOT/dist/lab/$clean_sha/miloco-native-${clean_sha}.tar.gz"
             ;;
     esac
 }

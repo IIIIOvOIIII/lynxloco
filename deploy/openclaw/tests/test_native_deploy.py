@@ -41,11 +41,51 @@ def load_controller():
 
 
 class NativeContract(unittest.TestCase):
-    def fixture_transaction(self, root, module):
+    def test_native_release_rejects_omitted_plugin_and_model_manifest(self):
+        module = load_controller()
+        with TemporaryDirectory() as temporary:
+            controller, archive, _ = self.fixture_transaction(Path(temporary), module, native_assets=False)
+            release = Path(temporary) / "extracted"
+            module.extract_archive(archive, release)
+            with self.assertRaisesRegex(module.ReleaseError, "native asset manifest"):
+                controller.validate_release(release, SHA)
+
+    def test_native_build_selects_openclaw_without_changing_docker_packages(self):
+        source = (ROOT / "deploy.sh").read_text()
+        self.assertIn('native_build_suffix=",openclaw"', source)
+        self.assertIn('./scripts/build.sh --packages web,miloco-miot,miloco,miloco-cli', source)
+
+    def test_plugin_package_rejects_development_dependencies(self):
+        module = load_controller()
+        self.assertTrue(hasattr(module, "inspect_asset_archive"), "native plugin package validation is missing")
+        with TemporaryDirectory() as temporary:
+            archive = Path(temporary) / "plugin.tgz"
+            with tarfile.open(archive, "w:gz") as bundle:
+                content = json.dumps({"name": "miloco-openclaw-plugin", "version": "old", "devDependencies": {"openclaw": "*"}}).encode()
+                member = tarfile.TarInfo("package/package.json")
+                member.size = len(content)
+                bundle.addfile(member, io.BytesIO(content))
+            with self.assertRaisesRegex(module.ReleaseError, "development dependencies"):
+                module.inspect_asset_archive(archive, "plugin")
+
+    def test_native_payload_rejects_stale_plugin_version(self):
+        module = load_controller()
+        with TemporaryDirectory() as temporary, self.assertRaisesRegex(module.ReleaseError, "plugin version does not match backend release"):
+            self.fixture_transaction(Path(temporary), module, plugin_version="2026.8.6-post1.dev304")
+
+    def fixture_transaction(self, root, module, native_assets=True, plugin_version=None):
         root = root.resolve()
         controller = module.Controller(root / "control", root / "home", root / "tools", root / "bin")
         controller.home.mkdir()
         controller.bin_dir.mkdir()
+        controller.models.mkdir()
+        for name in module.MODEL_FILES:
+            (controller.models / name).write_bytes(b"old model")
+        (controller.plugin / "dist").mkdir(parents=True)
+        (controller.plugin / "package.json").write_text(json.dumps({"name": module.PLUGIN_ID, "version": "old"}))
+        (controller.plugin / "openclaw.plugin.json").write_text(json.dumps({"id": module.PLUGIN_ID}))
+        (controller.plugin / "dist/index.mjs").write_bytes(b"old plugin")
+        controller.openclaw_config.write_text('{"plugins":{"entries":{"miloco-openclaw-plugin":{"enabled":true}}}}')
         for name, command in (("miloco", "miloco-backend"), ("miloco-cli", "miloco-cli")):
             folder = controller.tools / name
             (folder / "bin").mkdir(parents=True)
@@ -53,7 +93,7 @@ class NativeContract(unittest.TestCase):
             (folder / "bin/python").write_text("fixed-python")
             (folder / "bin" / command).write_text("entrypoint")
             (controller.bin_dir / command).symlink_to(folder / "bin" / command)
-        controller.config.write_text('{"model":{"omni":{"max_concurrency":1}}}')
+        controller.config.write_text('{"model":{"omni":{"max_concurrency":8,"timeout":180}},"perception":{"collect":{"window_size":180}}}')
         controller.supervisor.write_text("original supervisor")
         with database(controller.observability) as connection:
             connection.executescript("CREATE TABLE traces(id TEXT); CREATE TABLE traces_device(id TEXT); INSERT INTO traces VALUES('baseline'); PRAGMA user_version=4;")
@@ -70,11 +110,32 @@ class NativeContract(unittest.TestCase):
             artifacts[key] = filename
         for name in ("backend", "cli"):
             (source / "requirements" / (name + ".txt")).write_text("example==1\n")
+        if native_assets:
+            new_models = root / "new-models"
+            new_models.mkdir()
+            for name in module.MODEL_FILES:
+                (new_models / name).write_bytes(b"new model")
+            (source / "models").mkdir()
+            artifacts["models"] = "miloco-models-" + version + ".tar.gz"
+            with tarfile.open(source / "models" / artifacts["models"], "w:gz") as bundle:
+                bundle.add(new_models, arcname=".")
+            new_plugin = root / "new-plugin"
+            (new_plugin / "dist").mkdir(parents=True)
+            (new_plugin / "package.json").write_text(json.dumps({"name": module.PLUGIN_ID, "version": plugin_version or version.replace(".post", "-post")}))
+            (new_plugin / "openclaw.plugin.json").write_text(json.dumps({"id": module.PLUGIN_ID}))
+            (new_plugin / "dist/index.mjs").write_bytes(b"new plugin")
+            plugin_archive = root / "plugin.tgz"
+            with tarfile.open(plugin_archive, "w:gz") as bundle:
+                bundle.add(new_plugin, arcname="package")
         (source / "release.json").write_text(json.dumps({"git_sha": SHA, "platform": "linux/amd64", "artifacts": artifacts}))
         (source / "SHA256SUMS").write_text("".join(f"{module.digest(path)}  {path.relative_to(source)}\n" for path in sorted(source.rglob("*")) if path.is_file()))
         archive = root / "artifact.tar.gz"
         with tarfile.open(archive, "w:gz") as bundle:
             bundle.add(source, arcname=".")
+        if native_assets:
+            payload = root / "native.tar.gz"
+            module.prepare_payload(archive, plugin_archive, SHA, payload)
+            archive = payload
         return controller, archive, version
 
     def test_transaction_and_rollback_preserve_latest_evidence(self):
@@ -82,6 +143,7 @@ class NativeContract(unittest.TestCase):
         with TemporaryDirectory() as temporary:
             controller, archive, version = self.fixture_transaction(Path(temporary), module)
             config = controller.config.read_bytes()
+            openclaw_config = controller.openclaw_config.read_bytes()
             events = []
             def installed():
                 return {"miloco_version": (controller.tools / "miloco/version").read_text(),
@@ -89,6 +151,12 @@ class NativeContract(unittest.TestCase):
                         "python": str(controller.python), "python_base": str(controller.python.resolve()),
                         "source_short_commit": "prior" if (controller.tools / "miloco/version").read_text() == "old" else SHA[:9]}
             def install(args, **kwargs):
+                if args[0] == "openclaw":
+                    if args[1:3] == ["plugins", "install"]:
+                        module.extract_asset(Path(args[-1]), controller.plugin, "plugin")
+                        controller.openclaw_config.write_text('{"plugins":{"installs":{"miloco-openclaw-plugin":{"version":"new"}}}}')
+                        events.append("install-plugin")
+                    return ""
                 self.assertIn("stopped", events)
                 self.assertTrue((controller.root / "backups" / SHA / "miloco/version").exists())
                 self.assertIn("--constraints", args)
@@ -98,11 +166,13 @@ class NativeContract(unittest.TestCase):
                 (controller.tools / name / "version").write_text(version)
                 events.append("install-" + name)
                 return ""
-            with patch.object(controller, "preflight"), patch.object(controller, "installed", side_effect=installed), patch.object(controller, "run", side_effect=install), patch.object(controller, "stop", side_effect=lambda: events.append("stopped")), patch.object(controller, "service", side_effect=lambda operation: events.append(operation)), patch.object(controller, "health"):
+            with patch.object(controller, "preflight"), patch.object(controller, "installed", side_effect=installed), patch.object(controller, "run", side_effect=install), patch.object(controller, "stop", side_effect=lambda: events.append("stopped")), patch.object(controller, "service", side_effect=lambda operation: events.append(operation)), patch.object(controller, "health"), patch.object(controller, "capability_flags", return_value=[]), patch.object(controller, "restart_gateway"):
                 with archive.open("rb") as stream:
                     result = controller.transaction(SHA, module.digest(archive), module.digest(NATIVE), module.ALLOWLIST_SHA256, stream)
                 self.assertEqual(result["status"], "deployed")
                 self.assertEqual(controller.config.read_bytes(), config)
+                self.assertEqual((controller.models / "det_4C.onnx").read_bytes(), b"new model")
+                self.assertEqual((controller.plugin / "dist/index.mjs").read_bytes(), b"new plugin")
                 with database(controller.observability) as connection:
                     for table, columns in module.V5_COLUMNS.items():
                         for name, kind in columns.items():
@@ -114,6 +184,9 @@ class NativeContract(unittest.TestCase):
                 self.assertEqual(result["status"], "rolled-back")
                 self.assertEqual(installed()["miloco_version"], "old")
                 self.assertEqual(controller.config.read_bytes(), config)
+                self.assertEqual(controller.openclaw_config.read_bytes(), openclaw_config)
+                self.assertEqual((controller.models / "det_4C.onnx").read_bytes(), b"old model")
+                self.assertEqual((controller.plugin / "dist/index.mjs").read_bytes(), b"old plugin")
                 with database(controller.observability) as connection:
                     self.assertEqual(connection.execute("SELECT id FROM traces").fetchall(), [("baseline",), ("new-live-evidence",)])
                     self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 4)
@@ -129,9 +202,11 @@ class NativeContract(unittest.TestCase):
                         "cli_version": (controller.tools / "miloco-cli/version").read_text(),
                         "python_base": str(controller.python.resolve())}
             def fail_install(args, **kwargs):
+                if args[0] == "openclaw":
+                    return ""
                 (controller.tools / "miloco/version").write_text("partial")
                 raise module.ReleaseError("simulated install failure")
-            with patch.object(controller, "preflight"), patch.object(controller, "installed", side_effect=installed), patch.object(controller, "run", side_effect=fail_install), patch.object(controller, "stop"), patch.object(controller, "service"), patch.object(controller, "health"):
+            with patch.object(controller, "preflight"), patch.object(controller, "installed", side_effect=installed), patch.object(controller, "run", side_effect=fail_install), patch.object(controller, "stop"), patch.object(controller, "service"), patch.object(controller, "health"), patch.object(controller, "restart_gateway"):
                 with archive.open("rb") as stream, self.assertRaisesRegex(module.ReleaseError, "prior native tools and config restored"):
                     controller.transaction(SHA, module.digest(archive), module.digest(NATIVE), module.ALLOWLIST_SHA256, stream)
                 self.assertEqual(installed()["miloco_version"], "old")
@@ -146,9 +221,11 @@ class NativeContract(unittest.TestCase):
                 return {"miloco_version": "old", "cli_version": "old",
                         "python_base": str(controller.python.resolve())}
             def fail_install(args, **kwargs):
+                if args[0] == "openclaw":
+                    return ""
                 (controller.tools / "miloco/version").write_text("partial")
                 raise module.ReleaseError("simulated install failure")
-            with patch.object(controller, "preflight"), patch.object(controller, "installed", side_effect=installed), patch.object(controller, "run", side_effect=fail_install), patch.object(controller, "stop"), patch.object(controller, "service"), patch.object(controller, "health"), patch.object(controller, "restore", wraps=controller.restore) as restore:
+            with patch.object(controller, "preflight"), patch.object(controller, "installed", side_effect=installed), patch.object(controller, "run", side_effect=fail_install), patch.object(controller, "stop"), patch.object(controller, "service"), patch.object(controller, "health"), patch.object(controller, "restart_gateway"), patch.object(controller, "restore", wraps=controller.restore) as restore:
                 with archive.open("rb") as stream, self.assertRaisesRegex(module.ReleaseError, "automatic rollback disabled"):
                     controller.transaction(SHA, module.digest(archive), module.digest(NATIVE), module.ALLOWLIST_SHA256, stream, retain_on_failure=True)
                 restore.assert_not_called()
@@ -167,6 +244,62 @@ class NativeContract(unittest.TestCase):
             factory.return_value.transaction.return_value = {"status": "deployed"}
             module.main(["transaction", "miloco-production.example.com", SHA, "archive", "controller", "allowlist", "retain"])
             self.assertTrue(factory.return_value.transaction.call_args.kwargs["retain_on_failure"])
+
+    def test_failed_plugin_install_retains_new_assets_until_explicit_rollback(self):
+        module = load_controller()
+        with TemporaryDirectory() as temporary:
+            controller, archive, version = self.fixture_transaction(Path(temporary), module)
+            config = controller.config.read_bytes()
+            openclaw_config = controller.openclaw_config.read_bytes()
+            def installed():
+                return {"miloco_version": (controller.tools / "miloco/version").read_text(),
+                        "cli_version": (controller.tools / "miloco-cli/version").read_text(),
+                        "python_base": str(controller.python.resolve())}
+            def command(args, **kwargs):
+                if args[0] == "uv":
+                    name = "miloco-cli" if Path(args[3]).name.startswith("miloco_cli-") else "miloco"
+                    (controller.tools / name / "version").write_text(version)
+                elif args[:3] == ["openclaw", "plugins", "install"]:
+                    module.extract_asset(Path(args[-1]), controller.plugin, "plugin")
+                    controller.openclaw_config.write_text('{"pluginInstallAttempt":"retained"}')
+                    raise module.ReleaseError("simulated plugin install failure")
+                return ""
+            with patch.object(controller, "preflight"), patch.object(controller, "installed", side_effect=installed), patch.object(controller, "run", side_effect=command), patch.object(controller, "stop"), patch.object(controller, "service"), patch.object(controller, "health"), patch.object(controller, "capability_flags", return_value=[]), patch.object(controller, "restart_gateway"), patch.object(controller, "restore", wraps=controller.restore) as restore:
+                with archive.open("rb") as stream, self.assertRaisesRegex(module.ReleaseError, "automatic rollback disabled"):
+                    controller.transaction(SHA, module.digest(archive), module.digest(NATIVE), module.ALLOWLIST_SHA256, stream, retain_on_failure=True)
+                restore.assert_not_called()
+                self.assertEqual((controller.models / "det_4C.onnx").read_bytes(), b"new model")
+                self.assertEqual((controller.plugin / "dist/index.mjs").read_bytes(), b"new plugin")
+                self.assertEqual(controller.config.read_bytes(), config)
+                self.assertNotEqual(controller.openclaw_config.read_bytes(), openclaw_config)
+                controller.rollback(SHA)
+                restore.assert_called_once()
+                self.assertEqual((controller.models / "det_4C.onnx").read_bytes(), b"old model")
+                self.assertEqual((controller.plugin / "dist/index.mjs").read_bytes(), b"old plugin")
+                self.assertEqual(controller.openclaw_config.read_bytes(), openclaw_config)
+                self.assertEqual(controller.config.read_bytes(), config)
+
+    def test_capability_probe_supports_old_new_and_partial_timeout_help(self):
+        module = load_controller()
+        controller = module.Controller()
+        for output, expected in (("Options: --force", []), ("Options: --accept-capabilities", ["--accept-capabilities"])):
+            with self.subTest(output=output), patch.object(module.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, output, "")):
+                self.assertEqual(controller.capability_flags(), expected)
+        with patch.object(module.subprocess, "run", side_effect=subprocess.TimeoutExpired([], 30, output=b"--accept-capabilities")):
+            self.assertEqual(controller.capability_flags(), ["--accept-capabilities"])
+        with patch.object(module.subprocess, "run", side_effect=subprocess.TimeoutExpired([], 30)), self.assertRaisesRegex(module.ReleaseError, "probe timed out"):
+            controller.capability_flags()
+
+    def test_gateway_validation_checks_loaded_plugin_version_and_source(self):
+        module = load_controller()
+        controller = module.Controller()
+        gateway = {"service": {"loaded": True, "runtime": {"status": "running"}}, "rpc": {"ok": True}}
+        plugin = {"plugins": [{"id": module.PLUGIN_ID, "version": "candidate", "source": str(controller.plugin / "dist/index.mjs"), "enabled": True, "status": "loaded", "error": None}]}
+        with patch.object(controller, "run", side_effect=["[log preface]\n" + json.dumps(gateway), json.dumps(plugin)]):
+            self.assertTrue(controller.gateway_identity("candidate")["plugin_loaded"])
+        plugin["plugins"][0]["version"] = "old"
+        with patch.object(controller, "run", side_effect=[json.dumps(gateway), json.dumps(plugin)]), self.assertRaisesRegex(module.ReleaseError, "version or source mismatch"):
+            controller.gateway_identity("candidate")
 
     def test_unknown_runtime_fails_before_remote_commands(self):
         result = subprocess.run(
@@ -220,6 +353,7 @@ openclaw_dispatch
             output.mkdir(parents=True)
             archive = output / f"miloco-lab-{SHA}.tar.gz"
             archive.write_bytes(b"bounded archive")
+            (output / f"miloco-native-{SHA}.tar.gz").write_bytes(b"bounded native payload")
             definitions = (ROOT / "deploy.sh").read_text().split('\nparse_arguments "$@"')[0]
             definitions_path = root / "definitions.sh"
             definitions_path.write_text(definitions)

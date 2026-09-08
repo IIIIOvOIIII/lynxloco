@@ -457,6 +457,10 @@ build_release() (
     install -d -m 0755 "$staging/wheels" "$staging/models" "$staging/requirements"
 
     cd "$PROJECT_ROOT"
+    local native_build_suffix=""
+    if [[ "${MILOCO_DEPLOY_RUNTIME:-docker}" == openclaw ]]; then
+        native_build_suffix=",openclaw"
+    fi
     env \
         -u MILOCO_MODEL__OMNI__API_KEY \
         -u MILOCO_RESPONSES_API_KEY \
@@ -468,7 +472,7 @@ build_release() (
         -u MILOCO_RTSP_TEST_URL \
         -u MILOCO_RTSP_TEST_USERNAME \
         -u MILOCO_RTSP_TEST_PASSWORD \
-        ./scripts/build.sh --packages web,miloco-miot,miloco,miloco-cli
+        ./scripts/build.sh --packages web,miloco-miot,miloco,miloco-cli"${native_build_suffix}"
 
     local miloco_wheel cli_wheel miot_wheel models_archive
     miloco_wheel="$(select_one "Miloco wheel" "$PROJECT_ROOT/dist/miloco-"*.whl)"
