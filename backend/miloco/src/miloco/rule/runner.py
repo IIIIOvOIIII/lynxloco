@@ -275,8 +275,8 @@ class RuleRunner:
         # `sample_interval` 锁在 init，避免运行中 settings 漂移。
         self._sample_interval = sample_interval_seconds
 
-        # task 状态机。为 None 时全部走旧的「rule 自己 fire」路径 —— expand-contract
-        # 阶段 A 的回退闸, 单测与未迁移的库都走这条。attach_state_machine 接管。
+        # task 状态机。为 None 时全部走旧的「rule 自己 fire」路径 —— 只有不装
+        # 状态机的单测会留 None; 线上每个名下有 rule 的 task 都装。
         self._state_machine: TaskStateMachine | None = None
         # task 边界动作快照, 由接管方在登记拓扑时喂进来。runner 不查 DB:
         # _select_slot 在 fire 路径上, 查一次 DB 就把 hot path 拖进 IO。

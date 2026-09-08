@@ -282,7 +282,7 @@ def test_apply_task_status_pauses_and_reconfigures(env):
 async def test_rule_action_edit_reaches_task_column(env, monkeypatch):
     """迁移后用现有 CLI 改动作必须生效。
 
-    读侧回退只解决"读哪一份"; 写侧不透传的话 rule 列改了、fire 读的是 task 列的
+    读侧只认 task 列; 写侧不透传的话 rule 列改了、fire 读的是 task 列的
     旧值, 而 CLI 返回成功、rule get 也显示新值 —— 静默不生效。
     """
     from miloco.rule.schema import RuleUpdate

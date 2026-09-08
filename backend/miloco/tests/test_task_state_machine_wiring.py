@@ -3,13 +3,12 @@
 
 """task 状态机接进 RuleRunner 的集成测试.
 
-这些用例是唯一走"接管后"那条路的 —— 存量 test_rule.py 的 225 个用例在内存里造
-Rule、不建 task 动作, 全部命中回退分支 (expand-contract 阶段 A 的接管判据)。
-所以接管路径的覆盖只能靠本文件, 少一条就是一条没人跑过的生产代码。
+test_rule.py 那批用例不装状态机, 走的是 ``_state_machine is None`` 那条; 接管
+之后的行为只有本文件覆盖, 少一条就是一条没人跑过的生产代码。
 
 覆盖:
-- 接管判据: 有 task 动作才接管, 没有则逐字走旧路径
-- 动作取数: task 优先; task 接管后某方向留空不回退到 rule
+- 接管判据: 名下有 rule 就接管, 与动作配没配无关
+- 动作取数: 只读 task 的动作槽; 某方向留空就是留空, 不看 rule 行
 - 许可闸: 四个 fire 点各自被状态机吞掉时的行为
 - 注入点: is_condition_satisfied 的三态
 """
@@ -90,9 +89,10 @@ def test_empty_task_actions_do_not_fall_back_to_rule(monkeypatch):
     """
     r = _rule(action_descriptions=["rule 侧播报"])
     runner = _runner([r], monkeypatch)
-    sm = _attach(runner, "t1", [r], {"on_enter_actions": [], "on_enter_desc": None})
+    _attach(runner, "t1", [r], {"on_enter_actions": [], "on_enter_desc": None})
 
-    assert sm.owns("t1") is True
+    # 接管判据本身由 test_attach_owns_task_without_boundary_actions 覆盖 (走真
+    # 的 attach_task_state_machine); 这里 _attach 是无条件登记的, 断它没有判别力。
     assert runner._select_slot(r, RuleEvent.ENTERED) is None
 
 

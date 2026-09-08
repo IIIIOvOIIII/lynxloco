@@ -1349,7 +1349,7 @@ def _add_columns_if_missing(
 
 
 def _join_action_descriptions(raw: str | None) -> str | None:
-    """多条 agent 回调描述合成一条 —— 与 runner._select_slot 的拼接逐字一致。
+    """多条 agent 回调描述合成一条 —— 与 service._rule_action_slots 的拼接一致。
 
     单条也带 "1. " 前缀: 现状就是无条件编号。迁移只把这次拼接从执行时提到存储时,
     改了前缀就等于改了 agent 收到的文本。

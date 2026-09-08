@@ -246,7 +246,7 @@ def _rule_action_slots(
 
     单方向的 rule (enter / exit) 只有一个边沿, 动作就填在 ``actions`` /
     ``action_descriptions`` 上, 不区分进出; 方向决定它落 on_enter 还是 on_exit。
-    多条 agent 回调描述合成一条时的编号规则必须与 runner 的选槽逻辑逐字一致。
+    多条 agent 回调描述在这里合成一条 —— 读侧只读合成后的那份, 不再自己拼。
     """
     direction = rule.resolved_direction
     if direction is RuleDirection.MILESTONE:
@@ -485,8 +485,8 @@ class RuleService:
     def report_muted_enter_rules(self, task_id: str) -> list[str]:
         """哪些 enter 规则此刻选不到动作 —— 条件照判、状态照推, 就是不做事。
 
-        判据不自己写: 直接问读侧那条选槽链路 (``runner._select_slot``, 它内部含
-        「task 没接管就回退 rule 行」那一步)。所以这里永远与真正执行时一致。
+        判据不自己写: 直接问读侧那条选槽链路 (``runner._select_slot``, 只读 task
+        的动作槽)。所以这里永远与真正执行时一致。
         """
         muted = [
             rule.id
@@ -919,8 +919,8 @@ class RuleService:
             if moved_home:
                 # 换方向或改挂 task = 这份动作整体换了个家。旧的那份必须清 ——
                 # 留着就是一份没有 rule 认领、也再没人读得到的动作; 新的那份必须
-                # 写 —— 不写就是"规则照常触发、一个动作都选不到", 而 task 一旦被
-                # 接管就不会回退到 rule 列。这里不传动过的字段: 动作字段本身没变,
+                # 写 —— 不写就是"规则照常触发、一个动作都选不到", 读侧只认 task
+                # 列、不看 rule 行。这里不传动过的字段: 动作字段本身没变,
                 # 变的是它该落哪个槽。
                 self._clear_task_slots(previous)
                 self.sync_rule_actions_to_task(existing)
@@ -1029,8 +1029,8 @@ class RuleService:
         """rule 不再管辖时会被清掉的那些槽。兄弟 rule 也管着的排掉 —— 否则会把
         别人的动作一起抹掉。
 
-        提成只读函数是为了让「预演写后视图」的校验与真正执行清空的那段共用同一
-        份判据, 两边分叉的话校验放行的正是它没算到的那次清空。
+        只服务 ``_clear_task_slots``: 换方向 / 改挂 task 时要清掉旧家那份, 而
+        "兄弟也管着"这一层判断只此一份。
         """
         stale = set(_rule_action_slots(rule))
         if not stale:
@@ -1045,8 +1045,9 @@ class RuleService:
     def _slots_contended_by_siblings(self, rule: Rule, slots: set[str]) -> list[str]:
         """slots 里有哪些槽兄弟 rule 也管着 —— 争用的那些透传会整体跳过。
 
-        与 ``_slots_cleared_by`` 同一个理由: 预演写后视图的校验和真正执行透传的
-        那段必须问同一份判据, 否则校验会拦下一次根本不会发生的写入。
+        与 ``_slots_cleared_by`` 问的是同一层"兄弟也管着吗", 服务的却是另一条路:
+        这里决定透传跳不跳, 那里决定清空清哪几个。争用的槽整体跳过 —— 从一条
+        rule 单向覆盖会把另一条的动作悄悄冲掉。
         """
         return sorted(
             slots
@@ -1114,7 +1115,7 @@ class RuleService:
         except Exception as e:  # noqa: BLE001
             logger.warning(
                 "把 rule %s 的动作同步到 task %s 失败: %s; "
-                "该 task 若已被状态机接管, 这次动作改动不会生效",
+                "这次动作改动不会生效 —— 读侧只认 task 列",
                 rule.id,
                 rule.task_id,
                 e,

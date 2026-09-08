@@ -3821,7 +3821,6 @@ class TestRecordMilestoneFire:
         ms = _make_milestone_rule()
         assert ms.on_target_desc is None
         r.add_rule(main)
-        r.set_task_actions('test_task', {'on_enter_actions': [], 'on_enter_desc': '进入', 'on_target_actions': [], 'on_target_desc': '达标了'})
         r.add_rule(ms)
         r.set_task_actions(TASK_ID, _TASK_SLOTS_WITH_TARGET)
 
