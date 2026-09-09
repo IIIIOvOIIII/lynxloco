@@ -337,6 +337,98 @@ class TestSession:
         assert view["record"]["target_minutes"] is None
 
 
+# ── close_active_session（停止观测时服务端自己收段） ─────────────────────────
+
+
+def _raw_active_start(db, task_id: str):
+    """绕开读取路径直连主表 —— 派生累计把「段收了」和「段还开着」算成同一个数。"""
+    with db.get_connection() as conn:
+        row = conn.execute(
+            "SELECT active_session_start_at FROM task_record_duration "
+            "WHERE task_id = ? AND archived_at IS NULL",
+            (task_id,),
+        ).fetchone()
+    return row["active_session_start_at"]
+
+
+def _settled_seconds(db, task_id: str) -> int:
+    with db.get_connection() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(duration_seconds), 0) AS s "
+            "FROM task_record_duration_session "
+            "WHERE task_id = ? AND archived_at IS NULL",
+            (task_id,),
+        ).fetchone()
+    return row["s"]
+
+
+def _mark_task_paused(db, task_id: str) -> None:
+    with db.get_connection() as conn:
+        conn.execute(
+            "UPDATE task SET status = 'paused' WHERE task_id = ?", (task_id,)
+        )
+        conn.commit()
+
+
+class TestCloseActiveSession:
+    def test_settles_open_session(self, service, db, monkeypatch):
+        """起点留着就是「还在观测」, 落账秒数分开「收了段」和「把这段丢了」。"""
+        import miloco.task_record.service as record_module
+        from miloco.task_record.schema import RecordKind
+
+        _insert_task(db, "d1")
+        service.init_record("d1", RecordKind.DURATION, {"target_minutes": 60})
+        service.session_start("d1", at="2026-06-10T09:00:00+08:00")
+        # 结束时刻取自 _now_iso, 锁住它才能断精确秒数
+        monkeypatch.setattr(
+            record_module, "_now_iso", lambda: "2026-06-10T09:25:00+08:00"
+        )
+
+        assert service.close_active_session("d1") == 25 * 60
+
+        assert _raw_active_start(db, "d1") is None
+        assert _settled_seconds(db, "d1") == 25 * 60
+
+    def test_ignores_task_paused_guard(self, service, db):
+        """生产调用点在 task 表已写成 paused 之后 —— 照 session_end 的守卫走会
+        静默 noop, 段一直开着。"""
+        from miloco.task_record.schema import RecordKind
+
+        _insert_task(db, "d1")
+        service.init_record("d1", RecordKind.DURATION, {"target_minutes": 60})
+        service.session_start("d1", at="2026-06-10T09:00:00+08:00")
+        _mark_task_paused(db, "d1")
+
+        assert service.close_active_session("d1") is not None
+
+        assert _raw_active_start(db, "d1") is None
+
+    def test_no_open_session_returns_none(self, service, db):
+        from miloco.task_record.schema import RecordKind
+
+        _insert_task(db, "d1")
+        service.init_record("d1", RecordKind.DURATION, {"target_minutes": 60})
+
+        assert service.close_active_session("d1") is None
+        assert _settled_seconds(db, "d1") == 0
+
+    def test_non_duration_record_returns_none(self, service, db):
+        """停用走的是所有 task 共用的路径 —— 抛出去会让每次停用都刷一条错误日志。"""
+        from miloco.task_record.schema import RecordKind
+
+        _insert_task(db, "p1")
+        service.init_record(
+            "p1", RecordKind.PROGRESS, {"target": 8, "unit": "杯", "window": "day"}
+        )
+
+        assert service.close_active_session("p1") is None
+
+    def test_task_without_record_returns_none(self, service, db):
+        _insert_task(db, "bare")
+
+        assert service.close_active_session("bare") is None
+
+
 # ── event_append ─────────────────────────────────────────────────────────────
 
 

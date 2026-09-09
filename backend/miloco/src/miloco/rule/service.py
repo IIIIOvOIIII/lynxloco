@@ -1308,6 +1308,12 @@ class RuleService:
             _seed_reached_targets(self._runner, task_id)
             return
         self._runner.record_source.disarm(task_id)
+        # 不派发 on_exit 是对的 (见 suspend), 但计时段的收尾也挂在那个槽上, 得自
+        # 己收。收段失败不能拖垮下面的 suspend —— 那一步不做, 停用就只写了 DB。
+        try:
+            self._task_record_service.close_active_session(task_id)
+        except Exception:
+            logger.exception("停用 task %s 时收尾计时段失败", task_id)
         sm = self._runner.state_machine
         if sm is not None and sm.owns(task_id):
             sm.suspend(task_id)

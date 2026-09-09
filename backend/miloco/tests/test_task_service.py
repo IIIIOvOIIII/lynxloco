@@ -343,6 +343,44 @@ def test_disable_task_cancels_target_timers(real_db, monkeypatch):
     assert cancelled == ["t1"]
 
 
+def _duration_task_in_session(svc, *, at: str):
+    """建一个 duration record 并开一段计时 —— 停用时正开着的那种。"""
+    from miloco.task_record.schema import RecordKind
+    from miloco.task_record.service import TaskRecordService
+
+    _setup_task_with_rule(svc)
+    record_service = TaskRecordService()
+    record_service.init_record("t1", RecordKind.DURATION, {"target_minutes": 60})
+    record_service.session_start("t1", at=at)
+    return record_service
+
+
+def test_disable_task_stops_duration_accumulating(real_db, monkeypatch):
+    """住户看到的学习时长和达标判断读的是这个累计 —— 停用后它不能再涨。
+
+    停用不派发 on_exit（现实里条件可能还成立），而收尾计时段也挂在那个槽上，
+    所以停用时段还开着。落账秒数的精确断言在 ``TestCloseActiveSession``，这里
+    钉的是那一步在真实停用路径上被调到了。
+    """
+    import miloco.task_record.service as record_module
+    from miloco.task.service import TaskService
+
+    rule_service, _ = _real_rule_service()
+    svc = TaskService(rule_repo=RuleRepo(), rule_service=rule_service)
+    monkeypatch.setattr(
+        record_module, "_now_iso", lambda: "2026-06-10T09:25:00+08:00"
+    )
+    record_service = _duration_task_in_session(svc, at="2026-06-10T09:00:00+08:00")
+
+    svc.disable_task("t1")
+
+    # 把"现在"推后一小时: 段没收的话 in-flight 会把这一小时也算成在学
+    monkeypatch.setattr(
+        record_module, "_now_iso", lambda: "2026-06-10T10:25:00+08:00"
+    )
+    assert record_service.read_duration_target_state("t1") == (60, 25)
+
+
 def test_enable_task_restores_effective_enabled(real_db):
     from miloco.task.service import TaskService
 
