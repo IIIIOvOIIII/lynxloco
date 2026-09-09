@@ -16,6 +16,7 @@ Reference: rule-design.md §6.1
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
 from miloco.database.rule_repo import RuleLogRepo, RuleRepo
@@ -289,6 +290,22 @@ def _rule_action_slots(
     return slots
 
 
+def _live_topology(rules: Iterable[Rule]) -> dict:
+    """算状态机拓扑 —— 只收还会喂条件层的 rule。
+
+    停用的 rule 被 ``update_state`` 第一道闸挡回去, 它的条件此后恒为"没观测到"。
+    留在拓扑里, ``_should_stay_on`` 会把它算成一条活着的出路径: task 卡在 on 出
+    不去, 挂在退出槽上的计时段收尾也跟着永远不发。
+
+    全都停用时拓扑为空, 走"失去全部出路径"那条分支正常退出。
+    """
+    from miloco.task.state_machine import derive_directions
+
+    return derive_directions(
+        (r.id, r.resolved_direction.value) for r in rules if r.enabled
+    )
+
+
 def attach_task_state_machine(rule_runner: RuleRunner, rule_repo: RuleRepo) -> None:
     """建 task 状态机并把每个 task 的拓扑与边界动作登记进去。
 
@@ -300,7 +317,7 @@ def attach_task_state_machine(rule_runner: RuleRunner, rule_repo: RuleRepo) -> N
     重启一律从 ``off`` 起 (§7): 拓扑登记不恢复任何运行态。
     """
     from miloco.database.task_repo import TaskRepo
-    from miloco.task.state_machine import TaskStateMachine, derive_directions
+    from miloco.task.state_machine import TaskStateMachine
     from miloco.task.tracking import DecisionTracker
     from miloco.utils.time_utils import now_ms
 
@@ -332,10 +349,7 @@ def attach_task_state_machine(rule_runner: RuleRunner, rule_repo: RuleRepo) -> N
 
     for task_id, rules in rules_by_task.items():
         rule_runner.set_task_actions(task_id, task_repo.get_boundary_actions(task_id))
-        state_machine.register_task(
-            task_id,
-            derive_directions((r.id, r.resolved_direction.value) for r in rules),
-        )
+        state_machine.register_task(task_id, _live_topology(rules))
     logger.info("task state machine attached: %d task(s)", len(rules_by_task))
     _seed_reached_targets(rule_runner)
 
@@ -1263,7 +1277,7 @@ class RuleService:
         if sm is None:
             return
 
-        from miloco.task.state_machine import TaskRuntimeState, derive_directions
+        from miloco.task.state_machine import TaskRuntimeState
 
         self._runner.set_task_actions(
             task_id, self._task_repo.get_boundary_actions(task_id)
@@ -1281,10 +1295,7 @@ class RuleService:
                 sm.reconfigure(task_id, {})
                 sm.unregister_task(task_id)
             return
-        sm.reconfigure(
-            task_id,
-            derive_directions((r.id, r.resolved_direction.value) for r in rules),
-        )
+        sm.reconfigure(task_id, _live_topology(rules))
         # 排 timer 只挂在「进入会话」那个边沿上, 而装配是分步的 —— 三样齐备的那
         # 一刻可能落在会话开始之后, 那时进入边沿早过去了, 这一天的达标就只能靠
         # 退出兜底或跨零点补发, 而这条通知的全部意义是到点提醒。已经在态内就补

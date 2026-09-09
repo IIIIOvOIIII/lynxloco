@@ -259,6 +259,64 @@ def test_reconfigure_owns_a_task_without_actions(env):
     assert runner._select_slot(rule, RuleEvent.ENTERED) is None
 
 
+# ── 停用唯一出边 rule ─────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_disabling_last_exit_rule_fires_on_exit(env, monkeypatch):
+    """停用唯一那条出边 rule 也是「失去全部出路径」。
+
+    停用的 rule 被 ``update_state`` 第一道闸挡回去, 条件此后恒为"没观测到"。拓扑
+    里留着它就是留了一条永不成立的出口 —— task 卡在 on 出不去, 挂在退出槽上的计
+    时段收尾也跟着永远不发。
+    """
+    from miloco.rule.schema import RuleUpdate
+
+    service, runner, ids, dispatched = _build(
+        _ACTIONS,
+        [
+            _event_rule("[t1] enter", RuleDirection.ENTER, with_action=False),
+            _event_rule("[t1] exit", RuleDirection.EXIT, with_action=False),
+        ],
+    )
+    monkeypatch.setattr(RuleService, "_validate_perceive_device_ids", _anoop)
+    monkeypatch.setattr(RuleService, "_validate_scene_ids", _anoop)
+    runner._state_machine_allows(RuleRepo().get_by_id(ids[0]), RuleEvent.ENTERED)
+    assert runner.state_machine.runtime_state("t1") is TaskRuntimeState.ON
+
+    await service.patch_rule(ids[1], RuleUpdate(enabled=False))
+
+    assert ("t1", ActionSlot.ON_EXIT) in dispatched
+    assert runner.state_machine.runtime_state("t1") is TaskRuntimeState.OFF
+
+
+def test_startup_topology_skips_disabled_rules(env):
+    """启动时的拓扑同样只收有效启用的 rule —— 漏掉这个调用点, 重启之后 task 一
+    进 on 就再也退不出来。"""
+    task_repo = TaskRepo()
+    task_repo.create_task("t1", "d")
+    task_repo.set_boundary_actions("t1", **_ACTIONS)
+    rule_repo = RuleRepo()
+    enter_id = rule_repo.create(
+        _event_rule("[t1] enter", RuleDirection.ENTER, with_action=False)
+    )
+    disabled_exit = _event_rule("[t1] exit", RuleDirection.EXIT, with_action=False)
+    disabled_exit.enabled = False
+    rule_repo.create(disabled_exit)
+
+    runner = RuleRunner(
+        rules=rule_repo.get_all(enabled_only=False),
+        miot_proxy=None,
+        rule_log_repo=RuleLogRepo(),
+    )
+    attach_task_state_machine(runner, rule_repo)
+
+    runner._state_machine_allows(rule_repo.get_by_id(enter_id), RuleEvent.ENTERED)
+
+    # 出路径为空 → 事件型, 运行态恒 off。停用那条留在拓扑里的话这里会是 ON
+    assert runner.state_machine.runtime_state("t1") is TaskRuntimeState.OFF
+
+
 # ── task 启停走同一条 ─────────────────────────────────────────────────
 
 
@@ -389,7 +447,8 @@ def test_task_full_view_exposes_runtime_state(env):
 # ── 哑规则诊断 ──────────────────────────────────────────────────────
 
 
-def _enter_rule(name, with_action=True, task_id="t1"):
+def _event_rule(name, direction, with_action=True, task_id="t1"):
+    """event mode 的单方向 rule —— 动作只能填在自己的 action_descriptions 上。"""
     r = Rule(
         name=name,
         task_id=task_id,
@@ -397,8 +456,12 @@ def _enter_rule(name, with_action=True, task_id="t1"):
         condition=RuleCondition(perceive_device_ids=["cam1"], query="有人"),
         action_descriptions=["自己的动作"] if with_action else [],
     )
-    r.direction = RuleDirection.ENTER
+    r.direction = direction
     return r
+
+
+def _enter_rule(name, with_action=True, task_id="t1"):
+    return _event_rule(name, RuleDirection.ENTER, with_action, task_id)
 
 
 def test_muted_report_is_empty_when_actions_are_reachable(env):
