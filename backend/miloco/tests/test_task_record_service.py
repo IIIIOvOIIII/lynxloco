@@ -457,9 +457,12 @@ class TestCloseActiveSession:
         # 段留着: 时钟追上来之后 agent 那条路仍能正常收尾
         assert _raw_active_start(db, "d1") is not None
 
-    def test_does_not_flip_record_completed(self, service, db, monkeypatch):
-        """停止观测不等于这一期完成了, 而此刻达标提醒的 timer 已经撤掉 —— 翻了
-        没有任何一处会告诉用户。同样条件下 agent 报退出那条路是要翻的。"""
+    def test_settled_seconds_reaching_target_marks_completed(
+        self, service, db, monkeypatch
+    ):
+        """住户看到的完成徽标读的是 record 状态, 不是派生累计 —— 收段把累计推过
+        目标, 徽标就得跟着亮。断在 list_active_summaries 上, 那是前端读的那张表。
+        """
         import miloco.task_record.service as record_module
         from miloco.task_record.schema import RecordKind
 
@@ -472,7 +475,48 @@ class TestCloseActiveSession:
 
         assert service.close_active_session("d1") == 35 * 60
 
-        assert service.get_active_record("d1")["record"]["status"] == "active"
+        assert service.list_active_summaries("day")["d1"].completed is True
+
+    def test_settled_seconds_below_target_stays_active(
+        self, service, db, monkeypatch
+    ):
+        """没到目标不能亮 —— 否则"收段就算完成"和"累计够了才算完成"分不开。"""
+        import miloco.task_record.service as record_module
+        from miloco.task_record.schema import RecordKind
+
+        _insert_task(db, "d1")
+        service.init_record("d1", RecordKind.DURATION, {"target_minutes": 30})
+        service.session_start("d1", at="2026-06-10T09:00:00+08:00")
+        monkeypatch.setattr(
+            record_module, "_now_iso", lambda: "2026-06-10T09:20:00+08:00"
+        )
+
+        assert service.close_active_session("d1") == 20 * 60
+
+        assert service.list_active_summaries("day")["d1"].completed is False
+
+    def test_recurring_reaching_target_stays_active(
+        self, service, db, monkeypatch
+    ):
+        """周期任务没有"完成"终点, 收段推过目标也不翻 —— 本周期已达标靠达标条件
+        项自身的边沿防重复, 翻了跨天归零反而要把它翻回来。"""
+        import miloco.task_record.service as record_module
+        from miloco.task_record.schema import RecordKind
+
+        _insert_task(db, "d1")
+        service.init_record(
+            "d1",
+            RecordKind.DURATION,
+            {"target_minutes": 30, "recurring_pattern": {"window": "day"}},
+        )
+        service.session_start("d1", at="2026-06-10T09:00:00+08:00")
+        monkeypatch.setattr(
+            record_module, "_now_iso", lambda: "2026-06-10T09:35:00+08:00"
+        )
+
+        assert service.close_active_session("d1") == 35 * 60
+
+        assert service.list_active_summaries("day")["d1"].completed is False
 
 
 # ── event_append ─────────────────────────────────────────────────────────────
