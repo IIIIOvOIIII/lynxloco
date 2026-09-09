@@ -27,6 +27,7 @@ gate 拦下零帧窗口时 ``gate_hold_{did}_pass`` 必须为 0，否则 process
 from __future__ import annotations
 
 import time
+from unittest.mock import patch
 
 import numpy as np
 from miloco.perception.engine import api as engine_api
@@ -35,6 +36,7 @@ from miloco.perception.engine.config import GateConfig, PerceptionConfig
 from miloco.perception.engine.gate.gate import run_gate
 from miloco.perception.engine.gate.visual_gate import _preprocess
 from miloco.perception.engine.input.video_splitter import create_input_slice
+from miloco.perception.engine.types import BatchPipelineResult
 from miloco.perception.types import (
     AudioFrame,
     AudioStream,
@@ -243,6 +245,34 @@ class TestDropEmptySnapshots:
 
         assert result is not None
         assert result.skipped is True
+
+    async def test_realtime_entry_drops_empty_device_from_rule_map(self, monkeypatch):
+        """混合批走真入口:被剔的 device 不进 result.device_rule_map。
+
+        整批剔空那条走的是紧随其后的 batch.empty,拆掉剔除调用照样返 skipped ——
+        真正只靠剔除撑着的是混合批,而 device_rule_map 是这道闸唯一的对外可见后果:
+        client.py 的 EXITED 阶段按它决定给哪些 (rule, did) 喂 False,不在表里的桶
+        保持上一帧。stub 掉 run_batch_pipeline 让入口接线跑真的、推理不跑。
+        """
+        monkeypatch.setattr(engine_api, "_voice_allowed_dids", lambda: set())
+        eng = _make_engine()
+        batch = BatchedSnapshot(snapshots=[
+            _snapshot("cam_empty", with_video=False, with_audio=True),
+            _snapshot("cam_ok", with_video=True, with_audio=True),
+        ])
+        rule = {"id": "r_broadcast", "name": "r", "condition": {"query": "q"}}
+
+        async def stub_pipeline(*args, **kwargs):
+            return BatchPipelineResult()
+
+        with patch(
+            "miloco.perception.engine.pipeline.run_batch_pipeline",
+            side_effect=stub_pipeline,
+        ):
+            result = await eng.realtime_perceive(batch, rules=[rule])
+
+        assert result is not None
+        assert result.device_rule_map == {"cam_ok": ["r_broadcast"]}
 
     async def test_query_path_drops_frameless_even_with_audio(self, monkeypatch):
         """主动查询 + 拾音开启 + 零帧 + 有音频 → 返回空答案。

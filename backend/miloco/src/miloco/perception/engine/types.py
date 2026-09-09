@@ -73,8 +73,8 @@ class GateTiming:
     # 原始滞回判定,只看时间不看有没有帧。给 pipeline 的 HOLD_START / HOLD_EXPIRED /
     # HOLD_RECOVERED 状态机用 —— 置假会让零帧窗口凭空触发一次 HOLD_EXPIRED。
     hold_pass: bool = False
-    # 滞回真把本窗开出来了(hold_pass 且本窗有帧)。落 traces_device.gate_hold_pass 那一列,
-    # 该列须恒等于「本窗建了包」,见 knowledge/03-features/perception-pipeline.md 的 Gate 小节。
+    # 滞回真把本窗开出来了(hold_pass 且本窗有帧)。落 traces_device.gate_hold_pass 那一列。
+    # 该列的等价关系与适用范围见 knowledge/03-features/perception-pipeline.md 的 Gate 小节。
     hold_opened_window: bool = False
     # visual_score 拆分:窗内邻帧 max vs 跨窗(上窗末帧↔本窗首帧)的 max。
     # 诊断用:cross >> intra 持续高,基本是 ISP 长周期漂移(AGC/IR/AWB)误判 motion。

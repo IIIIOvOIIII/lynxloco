@@ -87,37 +87,40 @@ Gate 层（`perception/engine/gate/gate.py`）对每个窗口做双模态判定�
 
 **Hold 滞回**：视觉刚通过后的一段时间内，即使本窗视觉/音频都无变化也继续放行并在 `GateTrigger.hold` 打标，让下游保持 video 路由——避免人短暂静止时 route 在 video / audio 间来回抖动；on-demand 单次调用不触发 hold（时长配置见 `settings.yaml::perception`）。
 
-##### hold 的三处取值（本节是唯一出处）
-
-> 公式、取值对照与消费者清单**只在本节维护**。代码里那几处字段注释只说「这个字段是什么」加一句指回本节，不复述公式——此前四处文字拷贝各自漂移过，连续四次漏改。
-
-三个字段各对一个消费者，互不共用（这是刻意解耦：`hold` 是**路由决策**，`hold_opened_window` 是**记账**，两者今天取值相同但会因路由需求分叉）：
-
-| 字段                            | 公式                           | 唯一消费者                                                         | 零帧+音频过闸+滞回期    | 零帧+音频未过闸+滞回期 |
-| ------------------------------- | ------------------------------ | ------------------------------------------------------------------ | ----------------------- | ---------------------- |
-| `GateTrigger.hold`              | `hold_active and bool(frames)` | `_is_audio_only` 选路                                              | `False`（→ audio 路由） | 不建 packet            |
-| `GateTiming.hold_pass`          | `hold_active`（只看时间）      | `pipeline.py` 的 HOLD_START / HOLD_EXPIRED / HOLD_RECOVERED 状态机 | `True`                  | `True`                 |
-| `GateTiming.hold_opened_window` | `hold_active and bool(frames)` | 落 `traces_device.gate_hold_pass` 列                               | `False`                 | `False`                |
-
-`hold_pass` 必须保持「只看时间」：否则仍在滞回期的相机会被误判成滞回结束，刷出假的 `HOLD_EXPIRED` 事件。
-
-`hold_opened_window` 保证了 `traces_v.gate_passed ≡ 「本窗建了包」`（建包判据就是 `video_pass or audio_pass or hold_opened_window`），这条等价关系由 `test_gate_passed_equals_packet_built` 钉住，不靠人验算。
-
-落库的 `traces_device.gate_hold_pass` 列往下有三条链路，改它之前三条都要过一遍：
-
-1. `processor._publish_trace` 用它（连同 video / audio 两个 pass）反推 `gate_skipped`，据此决定建不建 identity / omni 的 trace。写错会让零帧窗口凭空多记一次 omni 调用——稀释 `omni_error_rate` 分母、`skip_rate` 偏低、`p95_rtf_omni` 被 0 拉低
-2. web 通道列用它反推 route，且 `holdPass` 判断排在 `audioPass` **之前**（`PerfTraceList.tsx`）。写错会把 audio 路由的窗口标成 `video (hold)`
-3. `aggregate.py` 把它 OR 汇总进 `traces.gate_hold_pass`，再经 `traces_v.gate_passed = video OR audio OR hold` 喂 `stats` 的 `AVG(gate_passed)` 与前端「整体过滤率」曲线（`PerfGateChart.tsx`）
-
-第 3 条最容易漏：前两条错了肉眼能看见（某行通道列标签不对、某行 `identity_ms=0 / omni_ms=0` 读起来像跑得飞快），第三条错了只是把一条曲线整体挪一点，单看任何一行都正常。所以它靠测试守而不靠人记（见上方 `test_gate_passed_equals_packet_built`）。
-
-这一列**不能**当「滞回发生频次」的统计口径用：它漏掉全部零帧窗口（表里最后两列都是 0，而滞回判定本身在这两格都成立），统计系统性偏低，且偏低幅度正好集中在相机不稳定的时段。要统计滞回本身的频率，用 `gate_hold_start` / `gate_hold_expired` / `gate_hold_recovered` 事件。
-
-> **但这三个事件的 `held_for_ms` 也有已知缺口**：状态机是「每窗每设备比对一次」的增量式设计，状态存在 `gate_hold_active[did]` 里。设备不在本窗批次内时（掉线，或被引擎入口按空窗剔除）循环遍历不到它，状态原地冻结，直到设备恢复才补发一次 `HOLD_EXPIRED`——`held_for_ms` 于是把设备不在场的整段时长算进了滞回。实测某次线上日志里最大值达 2476202 ms（41 分钟），而 `hold_duration_sec` 只有 90 秒，物理上限约 90000 ms。
->
-> 做滞回时长分布时先按 `held_for_ms <= hold_duration_sec * 1000 * 1.2` 过滤，或改用事件计数而非时长。根治需要在逐设备循环之外补一次「本窗缺席设备」的收尾扫描按超时收敛状态，属独立改动。
-
 音频过能量门后再跑一道语音活动检测（VAD，`gate/speech_vad.py`，silero 模型）：判定本窗音频是否含真人声，无人声则从下游 schema 剥掉 `speeches` 字段——这是对输出字段的子门控，不改变窗口整体是否放行。
+
+##### hold 字段的取值与消费者（本节是唯一出处）
+
+> 公式、取值对照与消费者清单**只在本节维护**。代码里那几处字段注释只说「这个字段是什么」加一句指回本节，不复述公式——散在各处的文字拷贝会各自漂移。
+
+hold 分成路由决策与记账两件事，各自独立字段、互不共用（今天取值相同，但会因路由需求分叉）：
+
+| 字段                            | 公式                                | 消费者                                                             | 零帧+音频过闸+滞回期    | 零帧+音频未过闸+滞回期 |
+| ------------------------------- | ----------------------------------- | ------------------------------------------------------------------ | ----------------------- | ---------------------- |
+| `GateTrigger.hold`              | `hold_active and bool(frames)`      | `_is_audio_only` 选路                                              | `False`（→ audio 路由） | 不建 packet            |
+| `GateTiming.hold_pass`          | `hold_active`（只看时间）           | `pipeline.py` 的 HOLD_START / HOLD_EXPIRED / HOLD_RECOVERED 状态机 | `True`                  | `True`                 |
+| `GateTiming.hold_opened_window` | `hold_active and bool(frames)`      | 落 `traces_device.gate_hold_pass` 列                               | `False`                 | `False`                |
+| `GateTrace.hold_pass`           | 持久层镜像，收 `hold_opened_window` | 写 `traces_device.gate_hold_pass` 列                               | `False`                 | `False`                |
+
+最后一行是**按字段名 grep 的陷阱**：`observability/types.py` 的 `GateTrace.hold_pass` 与 `GateTiming.hold_pass` 同名，公式却正好相反——前者收的是「滞回真开出了窗口」，后者是不看帧的原始判定。
+
+`GateTiming.hold_pass` 必须保持「只看时间」：否则仍在滞回期的相机会被误判成滞回结束，刷出假的 `HOLD_EXPIRED` 事件。
+
+`hold_opened_window` 保证了 `traces_v.gate_passed ≡ 「本窗建了包」`（建包判据就是 `video_pass or audio_pass or hold_opened_window`），这条等价关系由 `test_gate_passed_equals_packet_built` 钉住，不靠人验算。**适用范围是正常 cycle 路径**，查询时要带 `cycle_error_msg IS NULL`：系统异常路径的 trace 由 `processor._publish_failed_trace` 以空 timing 发布，三个 pass 列全落 0，而异常可能发生在包已建好之后。
+
+落库的 `traces_device.gate_hold_pass` 列往下有这些链路，改它之前每条都要过一遍：
+
+- `processor._publish_trace` 用它（连同 video / audio 两个 pass）反推 `gate_skipped`，据此决定建不建 identity / omni 的 trace。写错会让零帧窗口凭空多记一次 omni 调用——稀释 `omni_error_rate` 分母、`skip_rate` 偏低、`p95_rtf_omni` 被 0 拉低
+- web 通道列用它反推 route，且 `holdPass` 判断排在 `audioPass` **之前**（`PerfTraceList.tsx`）。写错会把 audio 路由的窗口标成 `video (hold)`
+- `aggregate.py` 把它 OR 汇总进 `traces.gate_hold_pass`，再经 `traces_v.gate_passed = video OR audio OR hold` 喂 `stats` 的 `AVG(gate_passed)` 与前端「整体过滤率」曲线（`PerfGateChart.tsx`）
+
+`AVG(gate_passed)` 跨这一列语义改动的上线点不连续：改前的口径是 `hold_active`（只看时间），零帧滞回窗口在旧口径下算「通过」。做长跨度趋势时按上线点分段看。
+
+聚合曲线那条最容易漏：前两条错了肉眼能看见（某行通道列标签不对、某行 `identity_ms=0 / omni_ms=0` 读起来像跑得飞快），它错了只是把一条曲线整体挪一点，单看任何一行都正常。所以它靠测试守而不靠人记（见上方 `test_gate_passed_equals_packet_built`）。
+
+这一列**不能**当「滞回发生频次」的统计口径用：零帧窗口在它这里恒为 0（见表格右两列），而滞回判定本身在那两格都成立，统计因此系统性偏低，且偏低幅度正好集中在相机不稳定的时段。要统计滞回本身的频率，用 `gate_hold_start` / `gate_hold_expired` / `gate_hold_recovered` 事件。
+
+> 这三个事件的 `held_for_ms` **不能直接做时长分布**：状态机是「每窗每设备比对一次」的增量式设计，状态存在 `gate_hold_active[did]` 里。设备不在本窗批次内时（掉线，或被引擎入口按空窗剔除）循环遍历不到它，状态原地冻结，直到设备恢复才补发一次 `HOLD_EXPIRED`——`held_for_ms` 于是把设备不在场的整段时长也算进了滞回，实测出现过远超 `hold_duration_sec` 物理上限的值。做分布前先按 `held_for_ms <= hold_duration_sec * 1000 * 1.2` 过滤，或改用事件计数。
 
 #### Identity — 跟踪与身份识别
 

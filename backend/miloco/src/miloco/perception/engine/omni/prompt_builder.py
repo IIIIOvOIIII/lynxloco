@@ -183,6 +183,15 @@ def build_query_prompt(
     video_b64, media_info = _encode_batch_video(
         identity_packets, short_edge=_effective_panorama_short_edge()
     )
+    if not video_b64:
+        # query 路径只有 video 一个媒体块,拼不出就是纯文本问模型"现在怎么样",而 prompt 里
+        # 还注入了上一窗的 last_caption。零帧已由引擎入口的 _drop_frameless_snapshots 挡在
+        # 外面,走到这里说明编码本身失败。event 名与 fused 两条路由一致。
+        logger.warning(
+            "event=fused_no_media_block route=query reason=empty_video room=%s, "
+            "本窗口未拼出 video 块、走 text-only",
+            (identity_packets[0].room_name if identity_packets else None) or "-",
+        )
     return {
         "system_prompt": "\n\n".join(parts),
         "user_content": _build_query_user_content(identity_packets, query, last_caption, label_lookup),
@@ -266,6 +275,15 @@ def build_fused_payload(
                 "event=fused_audio_b64_too_short size=%d (< %d), 跳过 input_audio 块, "
                 "本窗口走 text-only",
                 len(audio_b64), _MIN_AUDIO_B64_LEN,
+            )
+        else:
+            # 编不出音频(_encode_audio_only_mp4 对过短采样返回 None)。audio route 的
+            # user_content 里没有参考图,一个媒体块都没有时模型手里只剩时间和房间名。
+            # 与 video route 同一个 event 名,一次 grep 覆盖两条路由。
+            logger.warning(
+                "event=fused_no_media_block route=audio reason=empty_audio room=%s, "
+                "本窗口未拼出 input_audio 块、走 text-only",
+                context.room_name or "-",
             )
         return {
             "messages": _assemble_fused_messages(
@@ -907,8 +925,8 @@ def _build_fused_user_content(
     else:
         # 走到 video 路由却一帧都没有。正常态由 gate 的空输入闸 + 引擎入口的
         # _drop_empty_snapshots / _drop_frameless_snapshots 挡住,能到这里说明上游某道闸
-        # 失效(或 _AUDIO_ONLY_ENABLED 被回滚、或编码异常)。必须留痕,否则这类幻觉无从
-        # 发现(本次修复之所以难定位,就是因为这条路径此前完全静默)。
+        # 失效(或 _AUDIO_ONLY_ENABLED 被回滚、或编码异常)。不留痕这类幻觉就只能靠人
+        # 逐条读 caption 才发现。
         #
         # 不能笼统说「无任何媒体块」:宠物参考图(4.5 段)与 gallery 参考图都在主 video 之前
         # 就已进 content。带上剩余媒体块数是为了区分两种排查方向 —— 0 是「模型什么都没看到」,
