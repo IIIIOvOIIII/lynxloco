@@ -1210,7 +1210,9 @@ class RuleRunner:
     def _state_machine_allows(self, rule: Rule, event: RuleEvent) -> bool:
         """问 task 状态机: 这次已确认的边沿该不该 fire。
 
-        未接管该 task → 恒 True, 完全是旧行为 (expand-contract 阶段 A 的回退闸)。
+        未接管该 task → 恒 True。线上走不到: 名下有 rule 的 task 在启动
+        (``attach_task_state_machine``) 与每次 rule 增删改 (``reconfigure_task``)
+        都会登记, 所以判别力全在 ``sm is None``, 那只有不装状态机的单测会走。
 
         接管后状态机同时维护 ``runtime_state``, 所以这个调用有副作用, 每次边沿
         只能调一次。

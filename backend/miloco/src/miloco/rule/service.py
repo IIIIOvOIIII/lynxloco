@@ -900,12 +900,21 @@ class RuleService:
             existing.duration_ratio = update.duration_ratio
 
         _validate_rule_consistency(existing)
-        self._validate_target_record(existing)
         self._validate_task_rule_set(existing, previous)
-        self._validate_action_reachable(existing)
-        # 与上面 perceive_device_ids 同口径:只校验这次 PATCH 真的动了的东西。
-        # 无条件跑的话,场景被删 / 家庭被关之后连 `rule disable`(它本身就是一次
-        # PATCH)都会 400 —— 规则坏掉的那一刻正好把「先关掉它」这条路堵死。
+        # 下面三道都依赖 rule 之外的状态 (task 的动作槽 / record 的阈值 / 场景是否
+        # 还在), 一律按"这次 PATCH 真的动了什么"跑, 口径同上面的 perceive_device_ids。
+        # 无条件跑的话, 那些状态一变, 连 `rule disable` (它本身就是一次 PATCH) 都会
+        # 400 —— 规则坏掉的那一刻正好把「先关掉它」这条自救路堵死。清空 task 的进入
+        # 槽是本模型认可的合法操作 (由 report_muted_enter_rules 诊断, 不由闸拦),
+        # 更不该让它把名下的规则变成既不做事、也关不掉。
+        if fields & {"on_target_desc", "task_id"}:
+            self._validate_target_record(existing)
+        if fields & {
+            "mode", "direction", "task_id",
+            "actions", "action_descriptions",
+            "on_enter_actions", "on_enter_desc",
+        }:
+            self._validate_action_reachable(existing)
         if {"actions", "on_enter_actions", "on_exit_actions"} & fields:
             await self._validate_scene_ids(existing)
 

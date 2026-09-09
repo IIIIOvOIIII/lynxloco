@@ -20,7 +20,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from miloco.database.rule_repo import RuleLogRepo, RuleRepo
 from miloco.database.task_repo import TaskRepo
-from miloco.middleware.exceptions import ResourceNotFoundException
+from miloco.middleware.exceptions import (
+    ResourceNotFoundException,
+    ValidationException,
+)
 from miloco.rule.runner import RuleRunner
 from miloco.rule.schema import (
     Rule,
@@ -512,6 +515,56 @@ def test_clearing_the_enter_slot_mutes_the_rule_and_the_report_says_so(env):
 
     assert runner._select_slot(RuleRepo().get_by_id(ids[0]), RuleEvent.ENTERED) is None
     assert service.report_muted_enter_rules("t1") == ids
+
+
+@pytest.mark.asyncio
+async def test_a_muted_rule_can_still_be_disabled(env, monkeypatch):
+    """变哑之后还得关得掉 —— PATCH 上的闸只校验这次真动了的东西。
+
+    「enter 规则没动作可落」在本模型里是合法状态: 清 task 的进入槽没有闸, 由收敛点
+    诊断报出来。那么用户看到诊断之后最自然的动作 `rule disable` 就必须走得通; 闸无
+    条件跑的话, 规则变哑的那一刻正好把「先关掉它」这条自救路一起堵死, 只剩「把动作
+    配回去」或「删掉它」两条。
+
+    这条规则自己不带动作 —— 那正是同方向多条 enter 共用 task 侧动作时的推荐装法。
+    """
+    from miloco.rule.schema import RuleUpdate
+    from miloco.task.schema import TaskActionsUpdateRequest
+    from miloco.task.service import TaskService
+
+    service, _runner, ids, _ = _build(
+        _ACTIONS, [_enter_rule("[t1] naked", with_action=False)]
+    )
+    monkeypatch.setattr(RuleService, "_validate_perceive_device_ids", _anoop)
+    monkeypatch.setattr(RuleService, "_validate_scene_ids", _anoop)
+
+    TaskService(rule_repo=RuleRepo(), rule_service=service).set_boundary_actions(
+        "t1", TaskActionsUpdateRequest(on_enter_desc=None)
+    )
+    assert service.report_muted_enter_rules("t1") == ids
+
+    assert await service.patch_rule(ids[0], RuleUpdate(enabled=False)) is True
+    assert RuleRepo().get_by_id(ids[0]).enabled is False
+
+
+@pytest.mark.asyncio
+async def test_patching_the_action_of_a_task_without_enter_slot_still_checked(env, monkeypatch):
+    """闸没被条件跑关掉: 这次 PATCH 真动了动作字段, 依旧拦。"""
+    from miloco.rule.schema import RuleUpdate
+    from miloco.task.schema import TaskActionsUpdateRequest
+    from miloco.task.service import TaskService
+
+    service, _runner, ids, _ = _build(
+        _ACTIONS, [_enter_rule("[t1] naked", with_action=False)]
+    )
+    monkeypatch.setattr(RuleService, "_validate_perceive_device_ids", _anoop)
+    monkeypatch.setattr(RuleService, "_validate_scene_ids", _anoop)
+    TaskService(rule_repo=RuleRepo(), rule_service=service).set_boundary_actions(
+        "t1", TaskActionsUpdateRequest(on_enter_desc=None)
+    )
+
+    with pytest.raises(ValidationException):
+        await service.patch_rule(ids[0], RuleUpdate(action_descriptions=[]))
 
 
 def test_muted_report_catches_a_direction_change_that_strips_a_sibling(env):
