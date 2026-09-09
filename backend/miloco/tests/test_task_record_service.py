@@ -362,6 +362,17 @@ def _settled_seconds(db, task_id: str) -> int:
     return row["s"]
 
 
+def _session_rows(db, task_id: str) -> list:
+    """落账的段本身 —— 秒数被 max(..., 0) 夹过, 断总和分不出「没落账」和「落了
+    一条时间倒挂的」。"""
+    with db.get_connection() as conn:
+        return conn.execute(
+            "SELECT start_at, end_at FROM task_record_duration_session "
+            "WHERE task_id = ? AND archived_at IS NULL",
+            (task_id,),
+        ).fetchall()
+
+
 def _mark_task_paused(db, task_id: str) -> None:
     with db.get_connection() as conn:
         conn.execute(
@@ -427,6 +438,41 @@ class TestCloseActiveSession:
         _insert_task(db, "bare")
 
         assert service.close_active_session("bare") is None
+
+    def test_future_start_is_not_settled(self, service, db, monkeypatch):
+        """起点落在未来时不落账 —— 照落会写出一条 end 早于 start 的倒挂区间。"""
+        import miloco.task_record.service as record_module
+        from miloco.task_record.schema import RecordKind
+
+        _insert_task(db, "d1")
+        service.init_record("d1", RecordKind.DURATION, {"target_minutes": 60})
+        service.session_start("d1", at="2026-06-10T09:00:00+08:00")
+        monkeypatch.setattr(
+            record_module, "_now_iso", lambda: "2026-06-10T08:00:00+08:00"
+        )
+
+        assert service.close_active_session("d1") is None
+
+        assert _session_rows(db, "d1") == []
+        # 段留着: 时钟追上来之后 agent 那条路仍能正常收尾
+        assert _raw_active_start(db, "d1") is not None
+
+    def test_does_not_flip_record_completed(self, service, db, monkeypatch):
+        """停止观测不等于这一期完成了, 而此刻达标提醒的 timer 已经撤掉 —— 翻了
+        没有任何一处会告诉用户。同样条件下 agent 报退出那条路是要翻的。"""
+        import miloco.task_record.service as record_module
+        from miloco.task_record.schema import RecordKind
+
+        _insert_task(db, "d1")
+        service.init_record("d1", RecordKind.DURATION, {"target_minutes": 30})
+        service.session_start("d1", at="2026-06-10T09:00:00+08:00")
+        monkeypatch.setattr(
+            record_module, "_now_iso", lambda: "2026-06-10T09:35:00+08:00"
+        )
+
+        assert service.close_active_session("d1") == 35 * 60
+
+        assert service.get_active_record("d1")["record"]["status"] == "active"
 
 
 # ── event_append ─────────────────────────────────────────────────────────────
