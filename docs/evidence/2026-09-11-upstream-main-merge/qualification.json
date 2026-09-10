@@ -1,0 +1,22 @@
+{
+  "source_sha": "71dacdcb422e8bde660efe1c4e737b7b6fec5661",
+  "upstream_sha": "75aed171",
+  "upstream_commit_count": 111,
+  "published": true,
+  "native_build": true,
+  "backend_passed": 4995,
+  "backend_skipped": 1,
+  "cli_passed": 680,
+  "web_passed": 525,
+  "web_skipped": 1,
+  "plugin_passed": 191,
+  "miot_subscription_passed": 75,
+  "deployment_scripts_hermes_passed": 428,
+  "deployment_scripts_hermes_skipped": 2,
+  "co_number": "CHG260911002",
+  "co_state": "Assess",
+  "ai_approval": "Denied",
+  "approver_type": "AI+Lynx",
+  "production_accessed": false,
+  "production_deployed": false
+}

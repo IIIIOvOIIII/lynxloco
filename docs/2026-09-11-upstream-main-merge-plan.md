@@ -17,7 +17,9 @@
 
 - [x] Merge upstream and resolve six conflicting files. Keep both imports and methods in admin/rule code; combine empty-window filtering with fork concurrency wrapper and image payload mode.
 - [x] Reconcile connector migrations: fork v3-v4 remains; upstream task schema becomes v5, already-migrated shapes retain task actions, missing-version detection does not skip auth reconciliation. Verify legacy fork v4 upgrade, idempotence and upstream migration suite.
-- [ ] Run backend/MIoT, CLI, web, OpenClaw and native deployment regression suites, changed Python lint, and build using MILOCO_DEPLOY_RUNTIME=openclaw ./deploy.sh build. Review fork customizations and generated artifacts.
-- [ ] Commit and push candidate to origin/main using existing GitHub credential helper over HTTPS; bind exact SHA, artifacts, host and native deploy command to Software CO.
+- [x] Run backend/MIoT, CLI, web, OpenClaw and native deployment regression suites, changed Python lint, and build using MILOCO_DEPLOY_RUNTIME=openclaw ./deploy.sh build. Review fork customizations and generated artifacts.
+- [x] Commit and push candidate to origin/main using existing GitHub credential helper over HTTPS; bind exact SHA, artifacts, host and native deploy command to Software CO.
 - [ ] After Implement/active PAM and verify-deploy, inspect existing deployment read-only, check configuration and database shape, deploy via deploy.sh with retain policy, verify version/assets/auth and ten minutes of natural camera progress.
 - [ ] Record actual outcome and limitations, close CO truthfully, publish progress/closeout, update memory note.
+
+Current result: source and immutable dev463 release complete; CHG260911002 AI Denied / AI+Lynx awaits user action. Production work has not started. See the progress document for exact receipt and resume instructions.
