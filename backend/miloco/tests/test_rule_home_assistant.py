@@ -91,3 +91,26 @@ async def test_ha_rule_action_reports_control_disabled() -> None:
     assert result.result is False
     assert result.error is not None
     assert "ha_control_disabled" in result.error
+
+
+@pytest.mark.asyncio
+async def test_ha_scene_alias_without_cooldown_never_dispatches() -> None:
+    devices = _FakeDevicesService()
+    result = await _runner(devices)._execute_action(
+        "task-rule", RuleAction(did="ha:primary:scene.test", iid="scene")
+    )
+    assert result.result is False
+    assert devices.calls == []
+
+
+@pytest.mark.asyncio
+async def test_ha_scene_alias_with_cooldown_dispatches_once() -> None:
+    devices = _FakeDevicesService()
+    runner = _runner(devices)
+    action = RuleAction(did="ha:primary:scene.test", iid="scene", idempotent=False, cooldown_minutes=1)
+    first = await runner._execute_action("task-rule", action)
+    second = await runner._execute_action("task-rule", action)
+    assert first.result is True
+    assert second.skipped is True
+    assert len(devices.calls) == 1
+    assert devices.calls[0][2] == "activate"

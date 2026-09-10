@@ -305,7 +305,7 @@ async def test_real_engine_serial_preparation_concurrent_http_ordered_results(
         monkeypatch.setattr(
             "miloco.manager.get_manager",
             lambda: SimpleNamespace(
-                rule_service=SimpleNamespace(get_all_rules=AsyncMock(return_value=[]))
+                rule_service=SimpleNamespace(get_effectively_enabled_rules=AsyncMock(return_value=[]))
             ),
         )
         processor = PipelineProcessor(collector, proxy, Mock())
