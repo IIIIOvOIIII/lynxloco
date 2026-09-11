@@ -1,6 +1,6 @@
 # LynxLoco upstream merge — release prepared, deployment awaiting approval
 
-The upstream integration, publication and immutable release are complete. Deployment is blocked by a live-data compatibility issue found after user approval and before installation. CHG260911002 is closed Not Executed; production is unchanged.
+The upstream integration, publication and immutable release are complete. The user explicitly approved direct upgrade and accepted the known single-task pause. Successor CO CHG260911006 is awaiting Lynx approval in ITSM after AI denial; deployment has not started.
 
 ## Published source
 
@@ -42,3 +42,9 @@ Live data contained five active tasks and nine rules. One task grouped five hete
 A proposed alternative was rehearsed in memory: split the affected group into five independent tasks, retain its original task as paused history, and preserve all rule IDs, conditions, enabled flags, actions and authentication data. The result was nine active tasks plus one retained paused task, nine rules, matching migrated actions, quick_check ok and zero foreign-key violations. The affected task had no cron/progress/duration/event records requiring redistribution. This proves the data transformation; runtime/notification acceptance remains unmeasured.
 
 CHG260911002 was closed **Not Executed** after these read-only checks. There were no production database/configuration changes, installs, restarts, device actions or rollbacks. The proposed task data adjustment requires user confirmation and a revised CO scope before proceeding. Private task details and the proposal remain in the ignored CO directory and are not published in this repository. See [progress](2026-09-11-upstream-main-merge_PROGRESS.md) for continuation pointers.
+
+## Superseding user decision: direct upgrade
+
+The user explicitly approved direct upgrade after the task impact was explained. The proposed task split is not selected and must not be implemented. The existing task pause and resulting five inactive reminders are accepted outcomes; expected database state is five tasks total, four active and one paused, with all nine rule definitions retained.
+
+Successor CO **CHG260911006** (id1902) binds the same exact71dacdcb/dev463 candidate and explicitly records this accepted effect. Its current status is Assess/High risk/High impact/AI Denied/AI+Lynx, awaiting user approval in ITSM. No additional production access or mutation occurred. After approval, run the normal exact-SHA deployment gate and native deployment, preserve8/180 and retain-on-failure, verify the known pause as accepted, and complete the planned natural camera observation.

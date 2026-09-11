@@ -35,3 +35,18 @@
 - Expected result: Deploy candidate71dacdcb without disabling existing active tasks.
 - Result: Not achieved. User approval verified as Force Approved/Implement/active PAM; exact-SHA gate and native preflight passed. Existing production remains cb87f6c0/dev350, healthy, 8concurrency/180timeout, two enabled cameras connected. Application schema4, observability5; five active tasks/nine rules. One task groups five heterogeneous rules with differing actions and would be paused by upstream migration. Exact candidate migration run on an in-memory read-only snapshot confirmed this; direct upgrade gives four active/one paused and action mismatch. Alternative in-memory task split yields nine active/one retained paused task, nine rules, preserved rule behavior fields/actions/auth users, quick_check ok and zero FK violations. No production mutations, deployment, restart or rollback occurred.
 - Next step: User confirms proposed five-task split before revised CO scope and deployment. CHG260911002 closed Not Executed; no further access under it. Private proposal and rehearsal are in the candidate checkout docs/co/2026-09-11-upstream-main/.
+
+## 2026-09-11 08:22 +0800
+
+- Current work: User explicitly approved direct upgrade, accepting the known task pause; successor CO submitted.
+- Expected result: Deploy exact71dacdcb/dev463 directly without task splitting or manual data restructuring.
+- Result: Partial. Immutable candidate payload reverified. New CHG260911006(id1902) explicitly records the user's accepted loss of the affected task's five reminders; expected migration result is five tasks total, four active/one paused and nine retained rules. CO006 currently Assess/High risk/High impact/AI Denied/AI+Lynx, awaiting Lynx approval in ITSM. No production access or mutation occurred in this turn. OriginalCO002 remains closed and was not reused.
+- Next step: User approves CHG260911006 in ITSM. Then verify Implement/activePAM and exact-SHA receipt, deploy through native deploy.sh with retain policy, validate four active/one paused as accepted, other functions and ten-minute natural camera observation, and close truthfully. The user has rejected the need for a split; do not propose or implement one again.
+
+### Current authorization and artifacts (supersedes earlier resume pointers)
+
+- Deployment decision: direct upgrade, known single task pause accepted. No splitting, reactivation, alternate automations or changes to8/180 are authorized.
+- Current CO: CHG260911006; candidate checkout remains71dacdcb422e8bde660efe1c4e737b7b6fec5661.
+- Candidate checkout current CO artifacts: `docs/co/2026-09-11-upstream-direct/payload.json` and `receipt.json`, plus English implementation/rollback plans.
+- The prior `docs/co/2026-09-11-upstream-main/` directory is historical evidence only for CO002; its inspect.py can still be reused as a read-only helper under a new valid CO.
+- Use itsm_co.py verify-deploy with CHG260911006, the new upstream-direct payload/receipt, exact71dacdcb, hostmiloco.esxi and userroot immediately before approved deployment.

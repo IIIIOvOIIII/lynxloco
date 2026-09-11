@@ -85,5 +85,15 @@
         }
       ]
     }
+  },
+  "successor": {
+    "co_number": "CHG260911006",
+    "co_id": 1902,
+    "co_state": "Assess",
+    "ai_approval": "Denied",
+    "approver_type": "AI+Lynx",
+    "user_decision": "Direct upgrade; known single-task pause accepted",
+    "production_accessed": false,
+    "production_deployed": false
   }
 }

@@ -23,3 +23,5 @@
 - [ ] Record actual outcome and limitations, close CO truthfully, publish progress/closeout, update memory note.
 
 Current result: source and immutable dev463 release complete. CHG260911002 was manually approved; read-only preflight found an existing task would be paused by upstream migration. It is now closed Not Executed, with no production mutations. A compatible task split was rehearsed only in memory and awaits user confirmation and revised CO scope. See the progress document.
+
+Superseding decision: user approved direct upgrade and accepted the known single-task pause. No split will run. CHG260911006 awaits Lynx approval in ITSM; use its new upstream-direct payload/receipt for the existing71dacdcb candidate.
