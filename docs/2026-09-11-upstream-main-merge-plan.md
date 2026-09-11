@@ -19,9 +19,11 @@
 - [x] Reconcile connector migrations: fork v3-v4 remains; upstream task schema becomes v5, already-migrated shapes retain task actions, missing-version detection does not skip auth reconciliation. Verify legacy fork v4 upgrade, idempotence and upstream migration suite.
 - [x] Run backend/MIoT, CLI, web, OpenClaw and native deployment regression suites, changed Python lint, and build using MILOCO_DEPLOY_RUNTIME=openclaw ./deploy.sh build. Review fork customizations and generated artifacts.
 - [x] Commit and push candidate to origin/main using existing GitHub credential helper over HTTPS; bind exact SHA, artifacts, host and native deploy command to Software CO.
-- [ ] After Implement/active PAM and verify-deploy, inspect existing deployment read-only, check configuration and database shape, deploy via deploy.sh with retain policy, verify version/assets/auth and ten minutes of natural camera progress.
-- [ ] Record actual outcome and limitations, close CO truthfully, publish progress/closeout, update memory note.
+- [x] After Implement/active PAM and verify-deploy, inspect existing deployment read-only, check configuration and database shape, deploy via deploy.sh with retain policy, verify version/assets/auth and ten minutes of natural camera progress.
+- [x] Record actual outcome and limitations, close CO truthfully, publish progress/closeout, update memory note.
 
 Current result: source and immutable dev463 release complete. CHG260911002 was manually approved; read-only preflight found an existing task would be paused by upstream migration. It is now closed Not Executed, with no production mutations. A compatible task split was rehearsed only in memory and awaits user confirmation and revised CO scope. See the progress document.
 
 Superseding decision: user approved direct upgrade and accepted the known single-task pause. No split will run. CHG260911006 awaits Lynx approval in ITSM; use its new upstream-direct payload/receipt for the existing71dacdcb candidate.
+
+Final outcome: user-approved direct upgrade deployed71dacdcb/dev463 through CO006, all scoped acceptance passed, CO Successfully Closed. Known single-task pause is accepted and remains in effect. No splitting or rollback. See final result/progress for evidence.

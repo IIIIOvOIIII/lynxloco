@@ -18,10 +18,10 @@
   "ai_approval": "Denied",
   "approver_type": "AI+Lynx",
   "production_accessed": true,
-  "production_deployed": false,
+  "production_deployed": true,
   "closure_code": "Not Executed",
   "lynx_approval": "Force Approved",
-  "production_mutated": false,
+  "production_mutated": true,
   "blocker": "Existing active task would be paused by upstream migration",
   "rehearsal": {
     "affected_task_related_records": {
@@ -89,11 +89,18 @@
   "successor": {
     "co_number": "CHG260911006",
     "co_id": 1902,
-    "co_state": "Assess",
+    "co_state": "Closed",
     "ai_approval": "Denied",
     "approver_type": "AI+Lynx",
     "user_decision": "Direct upgrade; known single-task pause accepted",
-    "production_accessed": false,
-    "production_deployed": false
-  }
+    "production_accessed": true,
+    "production_deployed": true,
+    "lynx_approval": "Force Approved",
+    "closure_code": "Successfully Closed"
+  },
+  "final_source_sha": "71dacdcb422e8bde660efe1c4e737b7b6fec5661",
+  "final_co_number": "CHG260911006",
+  "final_co_closure": "Successfully Closed",
+  "final_acceptance_passed": true,
+  "known_single_task_pause_accepted": true
 }

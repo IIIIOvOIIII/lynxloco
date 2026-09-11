@@ -50,3 +50,17 @@
 - Candidate checkout current CO artifacts: `docs/co/2026-09-11-upstream-direct/payload.json` and `receipt.json`, plus English implementation/rollback plans.
 - The prior `docs/co/2026-09-11-upstream-main/` directory is historical evidence only for CO002; its inspect.py can still be reused as a read-only helper under a new valid CO.
 - Use itsm_co.py verify-deploy with CHG260911006, the new upstream-direct payload/receipt, exact71dacdcb, hostmiloco.esxi and userroot immediately before approved deployment.
+
+## 2026-09-11 08:37 +0800
+
+- Current work: Exact candidate deployed under approved CO006; natural observation in progress.
+- Expected result: dev463 installed, accepted task pause only, configuration/auth/RTSP preserved and ten-minute functional observation complete.
+- Result: Deployment passed. CO006 ForceApproved/Implement/activePAM and exact gate verified. Native deploy.sh exited0; backend/CLIdev463/plugin463 installed, model/plugin files verified and health200. Application schema5 with4active/1paused,5tasks/9rules matches user-approved direct upgrade. Configbytes,authusers,legacyrulefields,OpenClaw coresections preserved; only OpenClaw meta changed.8concurrency/180timeout/sharedwindow retained. Both enabledRTSPconnected and successful naturalresults already observed; runtime API readytrue and realpeak8. Immutable backup /opt/miloco-openclaw/backups/71dacdcb422e8bde660efe1c4e737b7b6fec5661. No rollback/task split/devicecommands.
+- Next step: Finish the observation window starting1789086878429ms, ending1789087478429ms; aggregate samples in candidate docs/co/2026-09-11-upstream-direct/observations.jsonl, finalverify and closeCOtruthfully. Do not close before actualacceptance completes.
+
+## 2026-09-11 08:46 +0800
+
+- Current work: Deployment and agreed acceptance completed; CO closed.
+- Expected result: Exactdev463 direct upgrade with the known single-task pause accepted, preserved configuration and working camera perception.
+- Result: Achieved. CHG260911006 Successfully Closed after normal native deploy.sh and18acceptancechecks passed. Source71dacdcb422e8bde660efe1c4e737b7b6fec5661, backend/CLIdev463,plugin463; appDB5/obsDB5,4active+1paused tasks/9rules. No task split or rollback. Twelve healthsamples200,PID2456467stable; bothenabledRTSPconnected/advanced with23and26successful windows; HAconnected and engine ready. Fixed600seconds 2026-09-11T08:34:38.429+08:00 to 2026-09-11T08:44:38.429+08:00:50requests/0requesterrors,224cycles,172skipped,80droppedwindows(26.32percent by dropped/(cycles+dropped)),realpeak8,RSSpeak2532.9MiB/final2459.0MiB,minavailable2366.5MiB. Knownfiveinactive reminders explicitlyaccepted; no notificationdelivery/all-daystabilityclaim. Config/auth/rules/OpenClawcorepreservationverified; onlyOpenClawmeta changed.
+- Next step: None for this release. Backup retained at /opt/miloco-openclaw/backups/71dacdcb422e8bde660efe1c4e737b7b6fec5661. CO006 closed; no furtherproductionaccess authorized by it. Candidateworktree remains exactSHA and main may advance with documentationonly.
