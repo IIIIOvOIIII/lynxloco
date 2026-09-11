@@ -14,9 +14,76 @@
   "deployment_scripts_hermes_passed": 428,
   "deployment_scripts_hermes_skipped": 2,
   "co_number": "CHG260911002",
-  "co_state": "Assess",
+  "co_state": "Closed",
   "ai_approval": "Denied",
   "approver_type": "AI+Lynx",
-  "production_accessed": false,
-  "production_deployed": false
+  "production_accessed": true,
+  "production_deployed": false,
+  "closure_code": "Not Executed",
+  "lynx_approval": "Force Approved",
+  "production_mutated": false,
+  "blocker": "Existing active task would be paused by upstream migration",
+  "rehearsal": {
+    "affected_task_related_records": {
+      "cron": 0,
+      "task_record_duration": 0,
+      "task_record_event": 0,
+      "task_record_progress": 0
+    },
+    "before": {
+      "auth_users": 1,
+      "fk_violations": 0,
+      "integrity": "ok",
+      "rules": 9,
+      "schema": 4,
+      "tasks_by_status": [
+        {
+          "count": 5,
+          "status": "active"
+        }
+      ]
+    },
+    "candidate_sha": "71dacdcb422e8bde660efe1c4e737b7b6fec5661",
+    "direct_upgrade": {
+      "auth_users": 1,
+      "fk_violations": 0,
+      "integrity": "ok",
+      "legacy_rule_behavior_fields_preserved": true,
+      "migrated_actions_match_original_rules": false,
+      "parent_status": "paused",
+      "rules": 9,
+      "schema": 5,
+      "tasks_by_status": [
+        {
+          "count": 4,
+          "status": "active"
+        },
+        {
+          "count": 1,
+          "status": "paused"
+        }
+      ]
+    },
+    "in_memory_only": true,
+    "proposed_split_then_upgrade": {
+      "auth_users": 1,
+      "fk_violations": 0,
+      "integrity": "ok",
+      "legacy_rule_behavior_fields_preserved": true,
+      "migrated_actions_match_original_rules": true,
+      "parent_status": "paused",
+      "rules": 9,
+      "schema": 5,
+      "tasks_by_status": [
+        {
+          "count": 9,
+          "status": "active"
+        },
+        {
+          "count": 1,
+          "status": "paused"
+        }
+      ]
+    }
+  }
 }

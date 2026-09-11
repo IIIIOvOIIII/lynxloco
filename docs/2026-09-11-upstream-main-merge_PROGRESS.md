@@ -28,3 +28,10 @@
 - Exact native release: `dist/lab/71dacdcb422e8bde660efe1c4e737b7b6fec5661/`.
 - Post-approval command: `python3 /Users/nicholasliao/.agents/skills/lynx-skills/itsm-co/scripts/itsm_co.py verify-deploy CHG260911002 --payload-file docs/co/2026-09-11-upstream-main/payload.json --receipt-file docs/co/2026-09-11-upstream-main/receipt.json --expected-sha 71dacdcb422e8bde660efe1c4e737b7b6fec5661 --host miloco.esxi --user root`.
 - Native environment: `MILOCO_DEPLOY_RUNTIME=openclaw MILOCO_DEPLOY_PRODUCTION_HOST=miloco.esxi MILOCO_SSH_IDENTITY=/Users/nicholasliao/.ssh/id_co_openclaw MILOCO_OPENCLAW_FAILURE_POLICY=retain`. Use deploy.sh preflight/deploy/verify as the approved plan requires.
+
+## 2026-09-11 08:17 +0800
+
+- Current work: Approved production preflight completed; live task compatibility blocker found before deployment.
+- Expected result: Deploy candidate71dacdcb without disabling existing active tasks.
+- Result: Not achieved. User approval verified as Force Approved/Implement/active PAM; exact-SHA gate and native preflight passed. Existing production remains cb87f6c0/dev350, healthy, 8concurrency/180timeout, two enabled cameras connected. Application schema4, observability5; five active tasks/nine rules. One task groups five heterogeneous rules with differing actions and would be paused by upstream migration. Exact candidate migration run on an in-memory read-only snapshot confirmed this; direct upgrade gives four active/one paused and action mismatch. Alternative in-memory task split yields nine active/one retained paused task, nine rules, preserved rule behavior fields/actions/auth users, quick_check ok and zero FK violations. No production mutations, deployment, restart or rollback occurred.
+- Next step: User confirms proposed five-task split before revised CO scope and deployment. CHG260911002 closed Not Executed; no further access under it. Private proposal and rehearsal are in the candidate checkout docs/co/2026-09-11-upstream-main/.

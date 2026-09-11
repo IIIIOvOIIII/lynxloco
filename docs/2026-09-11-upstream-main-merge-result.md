@@ -1,6 +1,6 @@
 # LynxLoco upstream merge — release prepared, deployment awaiting approval
 
-As of 2026-09-11 00:42 +0800, upstream integration and publication are complete. Production deployment is not complete: CHG260911002 requires Lynx approval after AI denial. No production access occurred.
+The upstream integration, publication and immutable release are complete. Deployment is blocked by a live-data compatibility issue found after user approval and before installation. CHG260911002 is closed Not Executed; production is unchanged.
 
 ## Published source
 
@@ -33,10 +33,12 @@ As of 2026-09-11 00:42 +0800, upstream integration and publication are complete.
 
 Backend e2e/agent directories require a running environment and are excluded from local qualification. Live SDK integration tests requiring unavailable external credentials were stopped; changed MIoT subscription units passed separately. Existing warning output and one transient model-load timing failure were observed; the complete final backend run passed without changing thresholds.
 
-## Approval and deployment boundary
+## Approved preflight and deployment boundary
 
-CO `CHG260911002` (id1898): `Assess`, risk `High`, impact `High`, `AI Denied`, approver `AI+Lynx`, awaiting Lynx approval. The status endpoint provides no detailed rejection rationale. The existing CO remains for user handling; there was no replacement or bypass.
+User approval was verified as Force Approved, Implement and active PAM. Exact-SHA verify-deploy and native preflight passed. Current source was freshly verified as cb87f6c0/dev350, health200, active/saved8concurrency and180timeout, application schema4 and observability schema5. Two enabled cameras were connected. No deployment or restart was performed.
 
-No production SSH, deployment preflight, restart, database migration or camera/device changes were performed. Production version, health and retention of settings have not been freshly measured in this task. The planned deployment preserves concurrency8, timeout/shared-window180 and the user's retain-on-failure policy, with no automatic rollback or four-way fallback.
+Live data contained five active tasks and nine rules. One task grouped five heterogeneous rules with different actions. The new upstream task migration would pause it and leave those five reminders inactive. A read-only SQLite snapshot copied into memory and migrated with the exact candidate functions confirmed the behavior.
 
-After user approval, recheck live Implement/active PAM and exact payload binding, deploy the candidate through native deploy.sh, verify the release/assets/auth/configuration/database, and observe ten minutes of natural camera activity. Close the CO only after the actual result is known. See [progress](2026-09-11-upstream-main-merge_PROGRESS.md) for local artifacts and continuation details.
+A proposed alternative was rehearsed in memory: split the affected group into five independent tasks, retain its original task as paused history, and preserve all rule IDs, conditions, enabled flags, actions and authentication data. The result was nine active tasks plus one retained paused task, nine rules, matching migrated actions, quick_check ok and zero foreign-key violations. The affected task had no cron/progress/duration/event records requiring redistribution. This proves the data transformation; runtime/notification acceptance remains unmeasured.
+
+CHG260911002 was closed **Not Executed** after these read-only checks. There were no production database/configuration changes, installs, restarts, device actions or rollbacks. The proposed task data adjustment requires user confirmation and a revised CO scope before proceeding. Private task details and the proposal remain in the ignored CO directory and are not published in this repository. See [progress](2026-09-11-upstream-main-merge_PROGRESS.md) for continuation pointers.
