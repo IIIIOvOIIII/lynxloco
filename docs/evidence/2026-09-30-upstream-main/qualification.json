@@ -1,0 +1,66 @@
+{
+  "source_sha": "cf5f9dae4a25d3b35138d2f938acbad1a319d78a",
+  "upstream_sha": "cad239dca9b7a2dd3bf0e6565a26cf9eef6581b8",
+  "upstream_commits": 51,
+  "gate_status": "passed",
+  "coverage": {
+    "backend": {
+      "format": "cobertura",
+      "path": ".tmp/coverage/backend.xml",
+      "dimensions": {
+        "lines": {
+          "covered": 30872,
+          "total": 37603,
+          "percent": 82.09983246017605
+        },
+        "branches": {
+          "covered": 8121,
+          "total": 11230,
+          "percent": 72.31522707034729
+        }
+      }
+    },
+    "frontend": {
+      "format": "istanbul-json-summary",
+      "path": ".tmp/coverage/web/coverage-summary.json",
+      "dimensions": {
+        "statements": {
+          "covered": 1100,
+          "total": 6865,
+          "percent": 16.02
+        },
+        "branches": {
+          "covered": 785,
+          "total": 5463,
+          "percent": 14.36
+        },
+        "functions": {
+          "covered": 277,
+          "total": 2005,
+          "percent": 13.81
+        },
+        "lines": {
+          "covered": 978,
+          "total": 6078,
+          "percent": 16.09
+        }
+      }
+    }
+  },
+  "backend_functional_passed": 5225,
+  "backend_timing_passed": 33,
+  "backend_skipped": 1,
+  "cli_passed": 715,
+  "frontend_passed": 559,
+  "frontend_skipped": 1,
+  "plugin_passed": 191,
+  "sdk_unit_passed": 156,
+  "deploy_scripts_hermes_passed": 428,
+  "deploy_scripts_hermes_skipped": 2,
+  "native_build": "passed",
+  "native_linux_camera_library_sha256": "fde805072a663d975da26e1b91836acad2da9c9e19038e382ad4118871c65ecc",
+  "co_number": "CHG260930001",
+  "closure_code": "Successfully Closed",
+  "published": true,
+  "deployed": true
+}

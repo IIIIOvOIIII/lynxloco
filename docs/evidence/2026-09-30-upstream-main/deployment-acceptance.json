@@ -1,0 +1,63 @@
+{
+  "passed": true,
+  "checks": {
+    "exact_source": true,
+    "assets_verified": true,
+    "full_observation_elapsed": true,
+    "health_all_samples": true,
+    "pid_stable": true,
+    "config_preserved": true,
+    "auth_and_rules_preserved": true,
+    "openclaw_core_preserved": true,
+    "limits_preserved": true,
+    "task_state_preserved": true,
+    "integrity": true,
+    "protected_api_denies_anonymous": true,
+    "cameras_connected": true,
+    "camera_frames_advance": true,
+    "both_cameras_successful": true,
+    "engine_ready": true,
+    "ha_connected": true
+  },
+  "source_sha": "cf5f9dae4a25d3b35138d2f938acbad1a319d78a",
+  "co_number": "CHG260930001",
+  "window_start_ms": 1790701950899,
+  "window_end_ms": 1790702550899,
+  "window_seconds": 600,
+  "health_samples": 14,
+  "pid": "1467329",
+  "metrics": {
+    "cycles": 198,
+    "dropped_windows": 76,
+    "request_errors": 0,
+    "requests": 97,
+    "skipped": 98
+  },
+  "request_error_percent": 0.0,
+  "drop_percent": 27.74,
+  "device_metrics": [
+    {
+      "frames": 258,
+      "last_ms": 1790702515076,
+      "successful": 52,
+      "windows": 107,
+      "source_alias": "camera_1"
+    },
+    {
+      "frames": 500,
+      "last_ms": 1790702487076,
+      "successful": 45,
+      "windows": 90,
+      "source_alias": "camera_2"
+    }
+  ],
+  "actual_peak_concurrency": 8,
+  "rss_peak_kib": 2247428,
+  "rss_final_kib": 2247428,
+  "min_mem_available_kib": 2755492,
+  "existing_paused_task_preserved": true,
+  "rollback_performed": false,
+  "task_split_performed": false,
+  "synthetic_provider_requests": false,
+  "manual_device_commands": false
+}
