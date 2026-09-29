@@ -102,6 +102,10 @@ const I18N = {
     wsError: "WebSocket 错误",
     camConnectedWaiting: "已连接摄像头，等待画面…",
     camUnreachable: "连不上摄像头（可能不在同一局域网，或摄像头离线）",
+    // 与 web/src/i18n/locales/zh/hero.json 的 hero.streamErrorCrossSubnetNat 是同一句
+    // 的两份独立副本（播放页查这张表，「家里此刻」卡片查 hero.json）。改措辞要同时改。
+    // tests/crossSubnetCopySync.test.ts 会断言两份相等，漏改一处会红。
+    camUnreachableCrossSubnet: "跨网段拉流失败，建议将摄像头与主机接入同一网络，或把路由器设置为 全锥/开放 NAT",
     decoding: "正在解码…",
     decoderConfigFailed: (msg) => "解码器配置失败：" + msg,
     mseFeedFailed: (msg) => "MSE 喂帧失败:" + msg,
@@ -141,6 +145,9 @@ const I18N = {
     wsError: "WebSocket error",
     camConnectedWaiting: "Camera connected, waiting for video…",
     camUnreachable: "Couldn't reach the camera (it may be on another network, or offline)",
+    // Keep in sync with hero.streamErrorCrossSubnetNat in
+    // web/src/i18n/locales/en/hero.json — see tests/crossSubnetCopySync.test.ts.
+    camUnreachableCrossSubnet: "Cross-subnet streaming failed. Try putting the camera and host on the same network, or set the router to Full Cone / Open NAT",
     decoding: "Decoding…",
     decoderConfigFailed: (msg) => "Couldn't set up the decoder: " + msg,
     mseFeedFailed: (msg) => "Couldn't feed MSE: " + msg,
@@ -619,7 +626,30 @@ function onMessage(ev) {
   if (ev.currentTarget !== ws) return;
   stats.lastWsTs = Date.now();
 
-  if (typeof ev.data === "string") return;
+  if (typeof ev.data === "string") {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch { return; }
+    if (msg.type === "init") {
+      codecHint = msg.codec || "h264";
+      $("codec").textContent = codecHint + " / " + (msg.container || "annexb");
+      // 收到 init 才是真"连上摄像头了"——后端已拿到该 cam 的流并广播了编码信息。
+      setState(t("camConnectedWaiting"));
+    } else if (msg.type === "error") {
+      // 后端首帧看门狗判定连不上(camera_unreachable 等)→ 明确告知住户,不再死等。
+      // serverWillClose 标志让随后的 close 事件不要再覆盖成"已断开 (1011)",保留这条
+      // 更有信息量的文案。
+      // 后端 message 是中文;信令带机器码 reason,已知 reason 改用本地译文(随 UI 语言),
+      // 未知 reason 才回退后端 message —— 否则英文模式下仍会显后端那句中文。
+      serverWillClose = true;
+      const REASON_KEY = {
+        camera_unreachable: "camUnreachable",
+        camera_unreachable_cross_subnet: "camUnreachableCrossSubnet",
+      };
+      const rk = REASON_KEY[msg.reason];
+      setState(rk ? t(rk) : (msg.message || t("camUnreachable")), true);
+    }
+    return;
+  }
 
   const payload = new Uint8Array(ev.data);
   if (useJpegCanvas) {

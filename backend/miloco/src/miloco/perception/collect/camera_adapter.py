@@ -70,6 +70,25 @@ def _unix_ms() -> int:
 _CAMERA_TRACKS = ["decoded_video", "decoded_audio"]
 _RTSP_VIDEO_BUFFER_BYTES = 128 * 1024 * 1024
 
+# 按需补建 refresh_cameras 的最小间隔：无设备态下 sync 循环 1s 一轮，
+# 不节流会变成每秒一次重 SDK 调用 + 建连尝试。10s 足够让相机就绪后及时恢复。
+_ONDEMAND_REFRESH_MIN_INTERVAL_MS = 10_000
+
+# 静默检测：感知视频流 N 秒无帧 → 判僵尸连接。miss 层对「连接在但不出帧」的静默
+# 无解（keepalive 只探连接活性、不探数据流），只能上层检测 + destroy/create 重拉。
+# 正常流 ~1fps，30s 无帧基本确定是断；再短会误伤正常低帧。
+_SILENCE_THRESHOLD_MS = 30_000
+
+# 首帧专用上界：原生建连 + 首个 IDR 最慢约 15s，留足余量。超过它仍一帧未到 →
+# 与「出过帧后静默」同等对待，走 destroy+create 自愈。没有这个上界，
+# last_video_frame_ms 恒为 0 的通道（原生会话建起来了但媒体流一帧不来，正是跨网段 /
+# 严格 NAT 最典型的僵尸态）会被「等首帧」分支无条件跳过 → 故障越彻底越救不回来。
+_FIRST_FRAME_THRESHOLD_MS = 90_000
+
+# 重连防抖：同台相机重连后 N 秒内不再重连，避免真坏相机 30s 一轮空转。
+_RECONNECT_COOLDOWN_MS = 5 * 60_000
+
+
 
 def _normalize_perception_fps(raw: object) -> int:
     """Return a safe, positive perception frame rate."""
@@ -105,6 +124,11 @@ class _CameraDeviceState:
     last_rtsp_video_admit_ms: int | None = None
     rtsp_admitted_frames: int = 0
     rtsp_dropped_frames: int = 0
+    # 最近一帧视频的 monotonic wall_ms，静默检测用。
+    last_video_frame_ms: int = 0
+    # 订阅完成时刻的 monotonic wall_ms。首帧未到（last_video_frame_ms == 0）时
+    # 替代它参与静默判定，给「等首帧」一个上界，见 _FIRST_FRAME_THRESHOLD_MS。
+    connected_at_ms: int = 0
 
 
 class CameraDeviceAdapter(BaseDeviceAdapter):
@@ -140,6 +164,9 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
         self._did_sources: dict[str, CameraSourceDriver] = {}
         self._did_source_types: dict[str, str] = {}
         self._known_devices: dict[str, PerceptionDevice] = {}
+        self._last_ondemand_refresh_ms = 0
+        # 静默重连防抖标记：did -> 最近一次重连的 monotonic ms。
+        self._last_reconnect_ms: dict[str, int] = {}
 
     async def discover_devices(
         self,
@@ -158,6 +185,24 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
                 require_lan=require_lan,
                 cap=cap,
             )
+            if camera_source.source_type == "miot" and any(
+                not device.online for device in discovered.values()
+            ):
+                proxy = getattr(camera_source, "_miot_proxy", None)
+                cameras = (
+                    all_devices
+                    if all_devices
+                    else await proxy.get_cameras() if proxy is not None else {}
+                )
+                for did, device in discovered.items():
+                    physical_did, _ = split_channel_did(did)
+                    camera = cameras.get(physical_did)
+                    if (
+                        camera is not None
+                        and getattr(camera, "online", False)
+                        and getattr(camera, "connected", False)
+                    ):
+                        device.online = True
             for did in sorted(discovered):
                 if did in merged:
                     raise RuntimeError(
@@ -204,19 +249,39 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
                 )
         raise RuntimeError("No MIoT camera source is configured")
 
-    async def sync_devices(self, all_devices: dict | None = None) -> None:
+    async def sync_devices(
+        self,
+        all_devices: dict | None = None,
+        disconnect_require_lan: bool = False,
+    ) -> None:
         """周期 sync 入口：先做「按需补建」，再走基类热插拔同步。
 
         登录瞬间相机 LAN 未就绪时 `refresh_cameras` 建不成 camera_img_manager，
         之后无任何机制补建 → 永久不拉流（需重启进程）。这里在周期 sync 路径
-        （`all_devices is None`）检测到「scope 内应连相机数 > 已连数」时，先触发
-        一次 `refresh_cameras` 补建 manager 再交基类连接。应连数用
-        `online_only=True, require_lan=False`：放过 lan_online 陈旧成 false 的卡死态
-        相机（要救），但排除云端就离线的相机（救不活，避免它让判据永真致 refresh
-        空转）。scope 内相机要么已连、要么云端离线时不触发，零额外开销。
+        （`all_devices is None`）检测到「scope 内应连**集合**里还有成员没连上」时，
+        先触发一次 `refresh_cameras` 补建 manager 再交基类连接。
+
+        两条判据都别照直觉改，理由都写在下方注释里：
+
+        - 应连集合用**严格门**（`online_only=True`，`require_lan` 保持默认 True），
+          与 `refresh_cameras` 建销 manager 的 `select_active_camera_dids` 完全同口径
+          —— 补建问的是「refresh_cameras 会不会真为它建 manager」，用宽松门只会让判据
+          永真、每轮空转打一次云端接口。
+        - 判据取**集合差**而非数量比较：数量看不见「数量相等、成员不同」。
+
+        scope 内相机全部已连时不触发，零额外开销。
+
+        ``disconnect_require_lan`` 默认 **False**，与基类的 True 刻意不同：相机的
+        断开判据走宽松门，理由见下方 super 调用处的注释。注意它**不是签名占位**
+        ——取值原样透传给基类（见下方 ``super().sync_devices``），显式传 True 会
+        把断开判据切回严格门，保留集就不再是发现集的超集（超上限家庭里唯一可达
+        的相机会每轮连上、下一轮又被断，永不自愈）。当前没有任何调用方传它，
+        加调用点前先读一遍那条不变量。（兄弟方法 ``discover_devices`` 的
+        ``online_only`` / ``require_lan`` / ``cap`` 同理也是透传生效的——基类
+        重算保留集用的 ``require_lan=False, cap=False`` 正是这条不变量的实现。）
         """
         async with self._sync_lock:
-            await self._sync_devices_unlocked(all_devices)
+            await self._sync_devices_unlocked(all_devices, disconnect_require_lan)
 
     async def reconcile_and_sync(
         self,
@@ -244,10 +309,13 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
                 self._remove_pruned_devices(pruned)
             return success
 
-    async def _sync_devices_unlocked(self, all_devices: dict | None = None) -> None:
+    async def _sync_devices_unlocked(
+        self, all_devices: dict | None = None, disconnect_require_lan: bool = False
+    ) -> None:
         pruned = await self._prune_inactive_pending_devices()
         try:
             if all_devices is None:
+                await self._check_stalled_cameras()
                 recovery_retry_dids = await self._advance_auto_recovery(_monotonic_ms())
                 if recovery_retry_dids:
                     retry_pruned = {
@@ -263,33 +331,41 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
                     refresh_if_needed = getattr(
                         camera_source, "refresh_if_needed", None
                     )
-                    if refresh_if_needed is None:
+                    if refresh_if_needed is None and not self._legacy_miot_constructor:
                         continue
                     try:
                         if self._legacy_miot_constructor:
-                            expected = await self.discover_devices(
-                                online_only=True, require_lan=False
-                            )
-                            connected_count = len(self._devices)
+                            expected = await self.discover_devices(online_only=True)
+                            missing = set(expected) - self._devices.keys()
+                            now_ms = _monotonic_ms()
+                            if (
+                                missing
+                                and self._miot_proxy.is_authenticated
+                                and now_ms - self._last_ondemand_refresh_ms
+                                >= _ONDEMAND_REFRESH_MIN_INTERVAL_MS
+                            ):
+                                self._last_ondemand_refresh_ms = now_ms
+                                await self._miot_proxy.refresh_cameras()
                         else:
                             expected = await camera_source.discover_devices(
-                                online_only=True, require_lan=False
+                                online_only=True
                             )
-                            connected_count = sum(
-                                owner is camera_source
-                                for did, owner in self._did_sources.items()
-                                if did in self._devices
+                            connected_count = len(expected) - len(
+                                set(expected) - self._devices.keys()
                             )
-                        await refresh_if_needed(
-                            expected_count=len(expected),
-                            connected_count=connected_count,
-                            now_ms=_monotonic_ms(),
-                        )
+                            await refresh_if_needed(
+                                expected_count=len(expected),
+                                connected_count=connected_count,
+                                now_ms=_monotonic_ms(),
+                            )
                     except Exception as error:  # noqa: BLE001
                         logger.warning(
                             "On-demand camera manager refresh failed: %s", error
                         )
-            await super().sync_devices(all_devices)
+            await super().sync_devices(
+                all_devices, disconnect_require_lan=disconnect_require_lan
+            )
+            await self._converge_feed_cap(all_devices)
         finally:
             self._remove_pruned_devices(pruned)
 
@@ -327,6 +403,180 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
                 disabled_count,
             )
         return frozenset(retry_dids)
+
+    async def _converge_feed_cap(self, all_devices: dict | None = None) -> None:
+        """把超出投喂上限的通道断掉,口径与 select_active_camera_dids 完全一致。
+
+        为什么上限收敛不能寄生在基类的断开判据里:那个「保留集」为了满足
+        「保留集 ⊇ 发现集」的不变量必须 ``cap=False``（截断按合成 did 升序取前 N,
+        ``sorted(超集)[:N]`` 不含 ``sorted(子集)[:N]``），于是它再也收不住已连集的
+        规模;而连接侧走的是带截断的发现集、``connect_device`` 自己不认上限。两边
+        一叠加:低字典序相机上线被发现集纳入并新连,先前占位的高字典序相机仍在保留
+        集里不被断开 ⇒ 已连路数单调越过上限,且被挤出活跃集的那路会在
+        ``refresh_cameras``(销 manager) 与静默检测(建 manager) 之间无限震荡,白占
+        相机有限的并发流名额。所以上限收敛独立收在这里,基类对投喂上限保持无感知。
+
+        淘汰顺序先看「本轮还通过严格门吗」、再看字典序。只按字典序排会把优先级反转:
+        保留集刻意放宽了 LAN 门（正是本 PR 要救的那类:云端在线但 LAN 已探不到、原生也
+        没连上），这种僵尸通道若字典序靠前,就会挤掉字典序靠后、刚刚真连上的健康通道 ——
+        日志每轮刷一条 over feed cap、那一路的投喂反复中断,而占着名额的僵尸一帧不出。
+        （该链有兜底:僵尸静默满 30s / 首帧满 90s 后被静默检测连带断开、名额释放,所以
+        表现是「另一台掉线后的 30~90s 窗口内健康相机被反复断连 3~9 次」而非永不自愈,
+        但优先级反转本身与本方法要消灭的抖动是同一类失败模式。）
+        """
+        from miloco.miot.filter import MAX_ENABLED_CAMERAS
+
+        miot_dids = [
+            did for did in self._devices
+            if (
+                self._did_sources.get(did)
+                or (self._sources[0] if len(self._sources) == 1 else None)
+            ) is not None
+            and (
+                self._did_sources.get(did)
+                or self._sources[0]
+            ).source_type == "miot"
+        ]
+        if len(miot_dids) <= MAX_ENABLED_CAMERAS:
+            # 未超限直接退,省掉下面那次 discover(常态路径零开销)。
+            return
+        try:
+            # 严格门 + 截断,与 refresh_cameras 的 manager 建销同口径;传入本轮的
+            # all_devices 快照,热插拔路径不另取一份可能已漂移的相机表。
+            preferred = set(await self.discover_devices(all_devices))
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "Feed-cap converge discover failed (%s); falling back to did order", e
+            )
+            preferred = set()
+        ordered = sorted(miot_dids, key=lambda d: (d not in preferred, d))
+        for did in ordered[MAX_ENABLED_CAMERAS:]:
+            logger.warning(
+                "Camera %s over feed cap (%d), disconnecting overflow channel",
+                did,
+                MAX_ENABLED_CAMERAS,
+            )
+            try:
+                await self.disconnect_device(did)
+            except Exception as e:  # noqa: BLE001
+                logger.error("Overflow disconnect failed %s: %s", did, e)
+
+    async def _check_stalled_cameras(self) -> None:
+        """静默检测：感知视频流超阈值无帧 → 判僵尸连接并触发重连。
+
+        miss 层对「连接在但不出帧」的静默无解（keepalive 只探连接活性、不探数据流），
+        只能上层检测 + 主动 destroy/create 重拉。只在周期 sync 路径跑，避免热插拔
+        语义被静默检测打断。
+        """
+        now_ms = _monotonic_ms()
+        # 先按物理 did 归并本轮所有静默通道：多镜头相机的 ch0/ch1 共用同一个 native
+        # 会话，一次 destroy+create 就够；按通道 did 各触发一次等于重复重建（重建的
+        # 还是同一个物理会话，几毫秒内 destroy 两次，四镜头就是四次）。
+        stalled_by_physical: dict[str, list[str]] = {}
+        for did, state in list(self._devices.items()):
+            camera_source = self._did_sources.get(did)
+            if camera_source is None and len(self._sources) == 1:
+                camera_source = self._sources[0]
+            if camera_source is None or camera_source.source_type != "miot":
+                continue
+            # 首帧未到 → 用「订阅时刻」判，阈值放宽到 _FIRST_FRAME_THRESHOLD_MS
+            # （连接刚建立确实要等十几秒）；首帧已到 → 用「最后一帧时刻」判，
+            # 阈值 _SILENCE_THRESHOLD_MS。
+            # 这里必须有上界:last_video_frame_ms 只有帧到达才脱离 0，若无条件跳过，
+            # 「一帧都没出」这个最坏的僵尸态会永久免疫检测（连日志都不留）。
+            if state.last_video_frame_ms == 0:
+                if (
+                    state.connected_at_ms == 0
+                    or now_ms - state.connected_at_ms < _FIRST_FRAME_THRESHOLD_MS
+                ):
+                    continue
+            elif now_ms - state.last_video_frame_ms < _SILENCE_THRESHOLD_MS:
+                continue
+            physical_did, _ = split_channel_did(did)
+            proxy = getattr(camera_source, "_miot_proxy", None)
+            cam = proxy.get_cached_camera(physical_did) if proxy is not None else None
+            # 云端已离线 → 救不活，交给基类按在线态断开，别白重连。
+            if cam is not None and not cam.online:
+                continue
+            # 带上判定依据:「从未出帧」多半是路由/NAT 建不起媒体流,「出过帧后静默」
+            # 多半是相机侧打嗝——两者运维处置不同,日志里要能一眼分开。
+            stalled_by_physical.setdefault(physical_did, []).append(
+                f"{did}(no-first-frame in {now_ms - state.connected_at_ms}ms)"
+                if state.last_video_frame_ms == 0
+                else f"{did}(silent {now_ms - state.last_video_frame_ms}ms)"
+            )
+
+        for physical_did, stalled_dids in stalled_by_physical.items():
+            # 防抖按物理 did 计：同一台相机 5min 内只重建一次。
+            if (
+                now_ms - self._last_reconnect_ms.get(physical_did, 0)
+                < _RECONNECT_COOLDOWN_MS
+            ):
+                continue
+            logger.warning(
+                "Camera %s stalled (channels=%s), reconnecting",
+                physical_did,
+                stalled_dids,
+            )
+            await self._reconnect_stalled(physical_did)
+
+    async def _reconnect_stalled(self, physical_did: str) -> None:
+        """重建一台静默相机：停该相机全部通道的解码订阅 → 重建 native 会话。
+
+        三层重建缺一不可：disconnect_device 只 unregister 解码回调（不动 native miss
+        会话）；reconnect_camera 才 destroy+create manager 真正断掉僵尸 MTP/PPCS 会话、
+        重走 miss_client_connect 的建连重试；解码订阅由**同一轮** sync 紧随其后的
+        connect_device 补齐（``sync_devices`` 先跑静默检测再跑基类同步，本方法已把这些
+        通道从 ``_devices`` 摘掉，它们当轮就落进「发现集 − 已连集」）。
+        必须把同一物理相机的所有已连通道一起断开：destroy 会连带作废兄弟通道在旧
+        实例上的 reg_id，而 connect_device 对已在 _devices 里的 did 直接 early-return，
+        不先断开就永远补不回订阅。
+        """
+        self._last_reconnect_ms[physical_did] = _monotonic_ms()
+        miot_source = next(
+            (source for source in self._sources if source.source_type == "miot"), None
+        )
+        proxy = getattr(miot_source, "_miot_proxy", None)
+        if proxy is None:
+            return
+        siblings = [
+            d for d in list(self._devices)
+            if split_channel_did(d)[0] == physical_did
+            and (
+                self._did_sources.get(d)
+                or (self._sources[0] if len(self._sources) == 1 else None)
+            ) is miot_source
+        ]
+        for d in siblings:
+            try:
+                await self.disconnect_device(d)
+            except Exception as e:  # noqa: BLE001
+                logger.error("Stalled camera disconnect failed %s: %s", d, e)
+        try:
+            await proxy.reconnect_camera(physical_did)
+        except Exception as e:  # noqa: BLE001
+            logger.error(
+                "Stalled camera reconnect failed %s: %s", physical_did, e
+            )
+            return
+        # 感知侧的解码订阅由同一轮 sync 的基类同步补齐，但 watch 直播 / record_clip /
+        # 播放页音频的订阅也一样死在被 destroy 的旧实例上，且它们没有 sync 这条兜底
+        # （见两个 manager 的 resubscribe_camera 说明）。局部 import 防循环依赖，也避免
+        # client → ws 的反向依赖。视频与音频各自独立 try：一条失败不该挡住另一条。
+        try:
+            from miloco.miot.ws import miot_video_stream_manager
+
+            await miot_video_stream_manager.resubscribe_camera(physical_did)
+        except Exception as e:  # noqa: BLE001
+            logger.error(
+                "Resubscribe live/record streams failed %s: %s", physical_did, e
+            )
+        try:
+            from miloco.miot.ws import miot_audio_stream_manager
+
+            await miot_audio_stream_manager.resubscribe_camera(physical_did)
+        except Exception as e:  # noqa: BLE001
+            logger.error("Resubscribe audio streams failed %s: %s", physical_did, e)
 
     async def connect_device(
         self, did: str, source: PerceptionDevice | None = None
@@ -382,8 +632,8 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
         try:
             await camera_source.connect_device(
                 did,
-                self._make_decoded_video_callback(did),
-                self._make_decoded_audio_callback(did),
+                self._make_decoded_video_callback(did, state),
+                self._make_decoded_audio_callback(did, state),
             )
         except Exception:
             self._devices.pop(did, None)
@@ -395,6 +645,8 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
             _, pending_registered = self._pending_registration_decision(
                 camera_source, did
             )
+        if source_state.connected and isinstance(camera_source, MiotCameraSource):
+            state.connected_at_ms = _monotonic_ms()
         if not source_state.connected and not pending_registered:
             self._devices.pop(did, None)
             state.sync_buffer.clear()
@@ -573,6 +825,16 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
         get_cached_device = getattr(camera_source, "get_cached_device", None)
         cached = get_cached_device(did) if get_cached_device is not None else None
         if cached is not None:
+            if camera_source is not None and camera_source.source_type == "miot":
+                proxy = getattr(camera_source, "_miot_proxy", None)
+                physical_did, _ = split_channel_did(did)
+                camera = proxy.get_cached_camera(physical_did) if proxy is not None else None
+                if (
+                    camera is not None
+                    and getattr(camera, "online", False)
+                    and getattr(camera, "connected", False)
+                ):
+                    cached.online = True
             return cached
         known = self._known_devices.get(did)
         if known is not None:
@@ -712,10 +974,16 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
         state.rtsp_admitted_frames += 1
         return True
 
-    def _make_decoded_video_callback(self, did: str):
+    def _make_decoded_video_callback(self, did: str, state: _CameraDeviceState):
         """Decoded video frame callback: feeds decoded_video track in sync buffer.
 
         Receives BGR numpy arrays (already converted from PyAV in decoder thread).
+
+        ``state`` 是回调订阅时刻绑定的设备状态对象。回调只向**这个** state 的
+        buffer 写帧：若 ``self._devices[did]`` 已不是它（静默自愈重连换了新
+        状态），说明帧来自已失效的流，直接丢弃。这是对 disconnect→reconnect
+        竞态的根本防护——unregister 后原生解码线程仍可能有在途帧 dispatch，
+        若只按「did 有无 state」判活，旧流的在途帧会混进新 buffer。
         """
 
         async def _on_decoded_video(
@@ -727,9 +995,9 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
             decoded_unix_ms: int = 0,
         ):
             async with get_monitor().track_async(NodeName.CAMERA, "decode_video") as h:
-                state = self._devices.get(did)
-                if not state:
-                    # 设备已断开但回调仍在排队的 race: 不计入 fps_60s,
+                current = self._devices.get(did)
+                if current is not state:
+                    # state 已被替换/移除: 帧来自已失效的流。丢弃且不计入 fps_60s,
                     # 避免 stale 回调虚高 SOURCE 节点的处理速率指标。
                     h.skip_rolling()
                     return
@@ -749,16 +1017,20 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
                     decoded_unix_ms=decoded_unix_ms,
                     decode_latency_ms=decode_latency_ms,
                 )
+                state.last_video_frame_ms = wall_ms
                 state.sync_buffer.put(
                     "decoded_video", decoded, stream_ts=ts, wall_ms=wall_ms
                 )
 
         return _on_decoded_video
 
-    def _make_decoded_audio_callback(self, did: str):
+    def _make_decoded_audio_callback(self, did: str, state: _CameraDeviceState):
         """Decoded audio frame callback: feeds decoded_audio track in sync buffer.
 
         Receives PCM numpy arrays (already resampled from PyAV in decoder thread).
+
+        ``state`` 语义同 video 回调: 只向订阅时刻绑定的 state 写帧,state 被替换
+        (disconnect→重连) 后丢弃,防 stale 音频帧混入新 buffer。
         """
 
         async def _on_decoded_audio(
@@ -770,8 +1042,8 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
             decoded_unix_ms: int = 0,
         ):
             async with get_monitor().track_async(NodeName.CAMERA, "decode_audio") as h:
-                state = self._devices.get(did)
-                if not state:
+                current = self._devices.get(did)
+                if current is not state:
                     # 设备已断开但回调仍在排队的 race: 不计入 fps_60s,
                     # 避免 stale 回调虚高 SOURCE 节点的处理速率指标。
                     h.skip_rolling()

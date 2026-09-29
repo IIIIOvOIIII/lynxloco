@@ -1,0 +1,55 @@
+schema_version: 2.0.0
+project: lynxloco
+artifacts:
+  dir: .tmp/quality-gate
+coverage:
+  backend:
+    format: cobertura
+    path: .tmp/coverage/backend.xml
+    # Whole production-source baseline is 81.56% (tests excluded). Hardware/live
+    # paths are not covered by the upstream local suite; retain an 81% floor.
+    minimum: {lines: 81}
+  frontend:
+    format: istanbul-json-summary
+    path: .tmp/coverage/web/coverage-summary.json
+    # The upstream node-only suite mostly checks UI contracts as source text;
+    # first measured whole-frontend baseline is 16.09%. Freeze a 16% floor
+    # for this integration rather than claim unmeasured browser-render coverage.
+    minimum: {lines: 16}
+commands:
+  backend:
+    argv: [bash, scripts/check_backend.sh]
+    timeout_seconds: 900
+    side_effect: local
+  frontend:
+    argv: [bash, -c, "cd web && pnpm exec vitest run --coverage.enabled --coverage.provider=v8 --coverage.include='src/**/*.{ts,tsx}' --coverage.include='public/*.js' --coverage.reporter=json-summary --coverage.reportsDirectory=../.tmp/coverage/web"]
+    timeout_seconds: 300
+    side_effect: local
+  cli:
+    argv: [bash, -c, "cd cli && uv run --frozen pytest tests -q --tb=short"]
+    timeout_seconds: 300
+    side_effect: local
+  plugin:
+    argv: [bash, -c, "cd plugins/openclaw && pnpm test && pnpm check"]
+    timeout_seconds: 300
+    side_effect: local
+  lint:
+    argv: [backend/.venv/bin/ruff, check, backend, cli]
+    timeout_seconds: 300
+    side_effect: local
+  build:
+    argv: [bash, -c, "cd web && pnpm build"]
+    timeout_seconds: 300
+    side_effect: local
+  deploy_contracts:
+    argv: [backend/.venv/bin/python, -m, pytest, deploy/openclaw/tests, deploy/ai-lab/tests, scripts/tests, plugins/hermes/tests, -q, --tb=short]
+    timeout_seconds: 600
+    side_effect: local
+  e2e_prod_smoke:
+    argv: [python3, scripts/prod_smoke.py]
+    timeout_seconds: 60
+    side_effect: production-readonly
+required:
+  local: [backend, frontend, cli, plugin, lint, build]
+  deploy-preflight: [backend, frontend, cli, plugin, lint, build, deploy_contracts]
+  post-deploy-readonly: [e2e_prod_smoke]

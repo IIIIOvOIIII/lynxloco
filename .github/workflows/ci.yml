@@ -45,6 +45,8 @@ jobs:
           MILOCO_CONFIG_SEARCH_PATH: /tmp/miloco-nonexistent-ci
           MILOCO_SERVER__TOKEN: local-ci-service-token
         run: cd backend && uv sync --all-packages && uv run pytest -v
+      - name: miot 单元测试
+        run: cd backend && uv run pytest miot/tests/ -m unit -v
 
   cli-test:
     runs-on: ubuntu-latest
