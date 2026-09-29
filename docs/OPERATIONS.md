@@ -6,7 +6,7 @@ Production uses the existing native OpenClaw/supervisor profile on miloco.esxi, 
 
 Install locked dependencies with `uv sync --frozen` in backend and CLI, and `pnpm install --frozen-lockfile` in web and plugins/openclaw. The shared v4 runner is loaded from `~/clawd/DevOps_Practice/tools/quality_gate`; the backend environment supplies its Python dependencies.
 
-Run `scripts/run_quality_gate.sh --gate deploy-preflight` before any deployment SSH. It runs backend, CLI, web, plugin, lint, web build and native/Docker/script/Hermes contracts. Backend coverage measures only production source (not test code); timed model-load/concurrency tests run separately without instrumentation, with their assertions unchanged.
+Run `scripts/run_quality_gate.sh --gate deploy-preflight` before any deployment SSH. It runs backend, CLI, web, plugin, lint, web build and native/Docker/script/Hermes contracts. Backend coverage measures only production source (not test code); timed model-load/concurrency tests run in a separate process with their assertions unchanged, appending their real coverage to the functional suite.
 
 This upstream fork's existing local suite measures about81.56% of backend production lines and16.09% of all frontend source/public-JS lines. The v4 config records81%/16% floors, rather than adding unrelated tests or claiming the standard85%/80% defaults were met. Frontend tests primarily cover pure functions, APIs and source contracts, not rendered component behavior. Branch coverage is reporting-only. New functionality should improve these baselines.
 
