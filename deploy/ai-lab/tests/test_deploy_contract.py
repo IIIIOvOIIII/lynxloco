@@ -397,6 +397,7 @@ def _run_miloco_build_sequence(
             f"build_miloco() {{ printf 'miloco\\n' >> {shlex.quote(str(trace))}; }}\n"
             f"validate_miloco_wheel_static_assets() {{ printf 'validate\\n' >> {shlex.quote(str(trace))}; return {validator_exit}; }}\n"
             "build_miloco_cli() { :; }\n"
+            "build_miloco_launcher() { :; }\n"
             "build_openclaw() { :; }\n"
             "build_hermes() { :; }\n"
             'update_manifest() { printf \'fresh manifest\\n\' > "$DIST_DIR/fresh-manifest.json"; }\n'
