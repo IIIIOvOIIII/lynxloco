@@ -86,7 +86,12 @@ def config_get(path: str, pretty: bool, value_only: bool):
         print(json.dumps({"error": f"path not found: {path}"}), file=sys.stderr)
         sys.exit(1)
     if value_only:
-        print("" if value is None else value)
+        if isinstance(value, list):
+            # 裸 repr(['a','b']) 对脚本没用；用与 `config set` 相同的逗号分隔形式，
+            # 保证 get --value-only 的输出能直接喂回 set。
+            print(",".join(str(x) for x in value))
+        else:
+            print("" if value is None else value)
         return
     print_result({"path": path, "value": value}, pretty)
 
@@ -111,7 +116,7 @@ def config_set(ctx, items: tuple[str, ...], no_restart: bool, pretty: bool):
       miloco-cli config set server.url https://192.168.1.100:1810
       miloco-cli config set model.omni.api_key sk-xxxxx
       miloco-cli config set debug true --no-restart
-      miloco-cli config set model.omni.model xiaomi/mimo-v2.5 \\
+      miloco-cli config set model.omni.model mimo-v2.6-flash \\
                             model.omni.base_url https://api.xiaomimimo.com/v1 \\
                             model.omni.api_key sk-xxxxx --no-restart
     """

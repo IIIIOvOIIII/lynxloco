@@ -166,8 +166,8 @@ class OmniModelSettings(BaseModel):
         description="档案显示名（可选，仅供 web 展示）；为空时前端回退为 model · 域名。",
     )
     model: str = Field(
-        default="xiaomi/mimo-v2.5",
-        description="多模态模型标识（provider/model）",
+        default="mimo-v2.6-flash",
+        description="多模态模型标识，如 mimo-v2.6-flash",
     )
     base_url: str = Field(
         default="https://api.xiaomimimo.com/v1",
@@ -271,6 +271,24 @@ class MiotSettings(BaseModel):
 
     cloud_server: str = Field(
         default="cn", description="MIoT 云区域（cn/de/i2/ru/sg/us）"
+    )
+    central_hub_enabled: bool = Field(
+        default=True,
+        description=(
+            "本地中枢网关总开关。false 时完全不启用本地中枢"
+            "（不签证书/不 mDNS/不连网关），设备控制全部走云端。"
+        ),
+    )
+    central_hub_gateways: list[str] = Field(
+        default_factory=list,
+        description=(
+            "静态中枢网关地址（mDNS 发现不到时用，如容器/跨网段隔离环境）。"
+            "每项为 'ip' 或 'ip:port'，端口缺省 8883。"
+            "注意：经环境变量覆盖时必须用 JSON 数组形式"
+            '（MILOCO_MIOT__CENTRAL_HUB_GATEWAYS=\'["192.168.1.152"]\'），'
+            "pydantic-settings 对 list 字段只接受 JSON；逗号分隔仅 "
+            "`miloco-cli config set` 支持，用在 env 上会让后端启动即 SettingsError。"
+        ),
     )
 
 

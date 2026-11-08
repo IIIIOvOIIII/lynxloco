@@ -170,5 +170,9 @@ def _redact_debug_argv(argv: list[str]) -> list[str]:
 
 
 def main() -> None:
+    # Resolve the installed runtime before debug logging or any command loads config.
+    from miloco_cli.config import bootstrap_runtime_env
+
+    bootstrap_runtime_env()
     _debug_log_invocation()
     cli()

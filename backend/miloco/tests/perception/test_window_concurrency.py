@@ -428,6 +428,9 @@ async def test_runner_fair_bounded_admission_while_one_camera_is_slow(monkeypatc
             )
 
     class Processor:
+        def retain_flow_devices(self, active_device_ids):
+            pass
+
         def drive_omni_probe(self):
             pass
 

@@ -78,6 +78,20 @@ def test_state_missing_returns_empty(tmp_path: Path):
     assert tn.get_deliver_target(ctx) is None
 
 
+def test_channel_directory_fallback_uses_custom_hermes_home(
+    tmp_path: Path, monkeypatch
+):
+    hermes_home = tmp_path / "custom-hermes"
+    hermes_home.mkdir()
+    (hermes_home / "channel_directory.json").write_text(
+        json.dumps({"platforms": {"feishu": [{"id": "oc_custom"}]}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    assert tn._detect_im_platforms_simple() == ["feishu"]
+
+
 def test_state_with_deliver_key_but_no_target(tmp_path: Path):
     state_file = tmp_path / "state.json"
     state_file.write_text(json.dumps({"deliver": {"auto_configured": True}}), encoding="utf-8")

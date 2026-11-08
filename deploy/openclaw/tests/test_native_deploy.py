@@ -415,15 +415,93 @@ openclaw_dispatch
                 self.assertEqual(connection.execute("SELECT id FROM traces").fetchall(), [("new-evidence",)])
                 self.assertIn("metric_version", {row[1] for row in connection.execute("PRAGMA table_info(traces)")})
 
+    def current_observability(self, path):
+        spec = importlib.util.spec_from_file_location(
+            "native_test_metrics_db", ROOT / "backend/miloco/src/miloco/observability/metrics_db.py",
+        )
+        metrics = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(metrics)
+        with database(path) as connection:
+            metrics.init_schema(connection)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 7)
+            connection.execute("INSERT INTO traces(trace_id,timestamp,metric_version) VALUES ('new-evidence',1,2)")
+            connection.execute(
+                "INSERT INTO action_ledger(id,timestamp,action_type,did,success,phase,trigger_event_id,auth_state) "
+                "VALUES ('action',1,'set_property','camera',0,'enter','event','degraded')"
+            )
+
+    def test_schema_v7_marker_restoration_preserves_real_schema_and_evidence(self):
+        module = load_controller()
+        for prior_version in (4, 5, 7):
+            with self.subTest(prior_version=prior_version), TemporaryDirectory() as temporary:
+                db = Path(temporary) / "observability.db"
+                self.current_observability(db)
+                with database(db) as connection:
+                    columns_before = {
+                        table: connection.execute(f"PRAGMA table_info({table})").fetchall()
+                        for table in module.V7_COLUMNS
+                    }
+                module.compatible_observability_marker(db, prior_version, check_only=True)
+                with database(db) as connection:
+                    self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 7)
+                module.compatible_observability_marker(db, prior_version)
+                with database(db) as connection:
+                    self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], prior_version)
+                    self.assertEqual(connection.execute("SELECT trace_id,metric_version FROM traces").fetchall(), [("new-evidence", 2)])
+                    self.assertEqual(
+                        connection.execute("SELECT id,phase,trigger_event_id,auth_state FROM action_ledger").fetchall(),
+                        [("action", "enter", "event", "degraded")],
+                    )
+                    for table, columns in columns_before.items():
+                        self.assertEqual(connection.execute(f"PRAGMA table_info({table})").fetchall(), columns)
+
+    def test_native_preflight_accepts_valid_v7_without_changing_marker(self):
+        module = load_controller()
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            controller = module.Controller(root / "control", root / "home", root / "tools", root / "bin")
+            controller.home.mkdir()
+            controller.config.write_text(json.dumps({"server": {"python_bin": str(controller.python)}}))
+            controller.supervisor.write_text(
+                "[program:miloco-backend]\n"
+                f"command={controller.python} -m miloco.main\n"
+                f'environment=MILOCO_HOME="{controller.home}"\n'
+            )
+            self.current_observability(controller.observability)
+            with patch.object(module.os, "geteuid", return_value=0), patch.object(module.platform, "system", return_value="Linux"), patch.object(module.platform, "machine", return_value="x86_64"), patch.object(controller, "validate_paths"), patch.object(module.shutil, "which", return_value="/registered/tool"), patch.object(module.shutil, "disk_usage") as disk, patch.object(controller, "run", return_value=str(controller.tools)), patch.object(controller, "installed", return_value={}), patch.object(controller, "asset_preflight", return_value={}):
+                disk.return_value.free = module.MIN_FREE_BYTES * 2
+                self.assertEqual(controller.preflight(require_running=False)["preflight"], "passed")
+            with database(controller.observability) as connection:
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 7)
+
+    def test_v7_missing_or_mistyped_additive_columns_is_rejected(self):
+        module = load_controller()
+        for column, kind in (("auth_state", None), ("phase", "INTEGER"), ("metric_version", "TEXT")):
+            with self.subTest(column=column), TemporaryDirectory() as temporary:
+                db = Path(temporary) / "observability.db"
+                self.current_observability(db)
+                table = "traces" if column == "metric_version" else "action_ledger"
+                with database(db) as connection:
+                    connection.execute("DROP VIEW traces_v")
+                    connection.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+                    if kind:
+                        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
+                for check_only in (True, False):
+                    with self.assertRaises(module.ReleaseError):
+                        module.compatible_observability_marker(db, 5, check_only=check_only)
+                with database(db) as connection:
+                    self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 7)
+
     def test_schema_rollback_refuses_unrecognized_v5_and_future_schema(self):
         module = load_controller()
-        for version in (5, 6):
+        for version in (5, 6, 7, 8):
             with self.subTest(version=version), TemporaryDirectory() as temporary:
                 db = Path(temporary) / "observability.db"
                 with database(db) as connection:
                     connection.execute(f"PRAGMA user_version={version}")
-                with self.assertRaises(module.ReleaseError):
-                    module.compatible_observability_marker(db, 4)
+                for prior_version in (4, version):
+                    with self.assertRaises(module.ReleaseError):
+                        module.compatible_observability_marker(db, prior_version)
                 with database(db) as connection:
                     self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], version)
 

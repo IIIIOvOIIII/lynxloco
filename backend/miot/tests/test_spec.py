@@ -6,6 +6,7 @@ Unit test miot spec.
 """
 
 import logging
+import pathlib
 
 import pytest
 import yaml
@@ -93,8 +94,14 @@ async def test_spec_type(test_cache_path: str):
     spec_type = MIoTSpecTypeClass(storage=miot_storage)
     await spec_type.init_async()
 
-    with open("./types_default.yaml", "w", encoding="utf-8") as f:
-        yaml.dump(spec_type.data.model_dump(by_alias=True), f, allow_unicode=True)
+    # 落到测试自己的缓存目录（.gitignore 里），别写进 cwd —— 跑一次测试就在仓库里
+    # 落一份几千行的生成物，`git add -A` 会误带进提交。
+    out = pathlib.Path(test_cache_path) / "types_default.yaml"
+    out.write_text(
+        yaml.dump(spec_type.data.model_dump(by_alias=True), allow_unicode=True),
+        encoding="utf-8",
+    )
+    _LOGGER.info("device_types dumped to %s", out)
     # _LOGGER.info('device_types: %s', spec_type.data.model_dump_json(by_alias=True))
 
 

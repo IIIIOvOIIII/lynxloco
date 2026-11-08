@@ -184,7 +184,7 @@ def test_directory_paths_derive_from_miloco_home(tmp_path: Path) -> None:
 
 def test_model_defaults_align_with_schema() -> None:
     s = get_settings()
-    assert s.model.omni.model == "xiaomi/mimo-v2.5"
+    assert s.model.omni.model == "mimo-v2.6-flash"
     assert s.model.omni.base_url == "https://api.xiaomimimo.com/v1"
     assert s.model.omni.api_key == ""
     assert s.model.omni.api_protocol == "openai_chat_completions"

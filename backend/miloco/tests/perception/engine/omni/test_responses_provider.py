@@ -589,6 +589,7 @@ async def test_live_switch_to_keyless_responses_never_sends_old_cloud_key(
         "local-vlm",
         "http://127.0.0.1:8000/v1",
         "",
+        "video",
     )
 
 

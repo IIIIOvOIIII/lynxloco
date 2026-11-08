@@ -17,6 +17,11 @@ from miloco.observability.context import (
     set_device_context,
 )
 from miloco.observability.metrics_client import get_metrics_client
+from miloco.observability.perception_flow import (
+    GraphStatus,
+    PerceptionFlowCycleDiagnostics,
+    PerDeviceFlowDiagnostics,
+)
 from miloco.perception.engine.config import PerceptionConfig
 from miloco.perception.engine.gate.gate import run_gate
 from miloco.perception.engine.identity.identity import run_identity
@@ -64,7 +69,50 @@ from miloco.perception.types import (
 )
 from miloco.utils.time_utils import deploy_timezone
 
+
+def _model_input_size(model: object | None) -> tuple[int | None, int | None]:
+    session = getattr(model, "session", None)
+    if session is None:
+        return None, None
+    inputs = session.get_inputs()
+    if not inputs:
+        return None, None
+    shape = inputs[0].shape
+    if len(shape) < 2:
+        return None, None
+    height, width = shape[-2:]
+    valid_width = width if isinstance(width, int) and width > 0 else None
+    valid_height = height if isinstance(height, int) and height > 0 else None
+    return valid_width, valid_height
+
+
+def _tracking_models(
+    tracking_service: object | None,
+) -> tuple[object | None, object | None]:
+    if tracking_service is None:
+        return None, None
+    detector = getattr(tracking_service, "_detector", None)
+    tracker = getattr(tracking_service, "_tracker", None)
+    reid = getattr(tracker, "human_reid", None)
+    return detector, reid
+
 logger = logging.getLogger(__name__)
+
+
+def _resolve_visual_input_mode(default: str) -> str:
+    """Resolve the mode once for a perception cycle; old configs default to video."""
+    try:
+        from miloco.config import get_settings
+
+        value = get_settings().perception.engine.get("input", {}).get(
+            "omni_visual_input_mode", default
+        )
+    except Exception:  # noqa: BLE001
+        value = default
+    if value not in ("video", "image"):
+        logger.warning("invalid omni_visual_input_mode=%r, fallback to video", value)
+        return "video"
+    return value
 
 
 def downsample_snapshot(snapshot: DeviceSnapshot, target_fps: float) -> DeviceSnapshot:
@@ -108,6 +156,28 @@ def _publish_gate_event(event_type: str, device_id: str, payload: dict) -> None:
 
 def _ms_since(start: float) -> float:
     return (time.monotonic() - start) * 1000
+
+
+def _mark_omni_stages_skipped(diagnostics: PerDeviceFlowDiagnostics) -> None:
+    diagnostics.omni_sample_status = GraphStatus.SKIPPED
+    diagnostics.media_transform_status = GraphStatus.SKIPPED
+    diagnostics.media_encode_status = GraphStatus.SKIPPED
+    diagnostics.omni_request_status = GraphStatus.SKIPPED
+
+
+def _mark_failed_omni_stage(diagnostics: PerDeviceFlowDiagnostics) -> None:
+    if diagnostics.media_encode_status is GraphStatus.OK:
+        diagnostics.omni_request_status = GraphStatus.ERROR
+    elif diagnostics.audio_only:
+        diagnostics.media_encode_status = GraphStatus.ERROR
+        diagnostics.omni_request_status = GraphStatus.SKIPPED
+    elif diagnostics.media_transform_status is GraphStatus.OK:
+        diagnostics.media_encode_status = GraphStatus.ERROR
+        diagnostics.omni_request_status = GraphStatus.SKIPPED
+    else:
+        diagnostics.media_transform_status = GraphStatus.ERROR
+        diagnostics.media_encode_status = GraphStatus.SKIPPED
+        diagnostics.omni_request_status = GraphStatus.SKIPPED
 
 
 def _reraise_first(results: list[Any]) -> None:
@@ -154,10 +224,28 @@ def _downsample_for_omni(
     n = len(packet.all_frames)
     idxs = list(range(n - 1, -1, -step))[::-1]  # 含末帧, 反向取再翻正
     frames = [packet.all_frames[i] for i in idxs]
+    # per_frame_track_boxes 与 all_frames **同序同长、按下标一一对应**, 必须用同一组下标
+    # 同步抽 —— 只抽帧不抽框会让"第 j 帧"配到"第 j 个框"(那是抽稀前另一个时刻的框),
+    # 错位量 = idxs[j] - j: 自 step-1 起随 j 递增, 上界 n - len(idxs)(因 idxs[-1] 恒为
+    # n-1)。出厂档 12 帧抽成 4 帧时末帧错位 8 帧、约两秒半。下游单帧人像注入正是拿这
+    # 两者配对裁图, 错位就等于用旧时刻的框去裁当前帧: 人已走开 → 裁到背景或隔壁那个人,
+    # 而那张图是绑 track_id 的, 等于给模型喂一个错的身份证据。
+    # 长度不符(理论上不该发生: 同一趟 analyze 逐帧 append 而来)时**整份弃用**而非按下标
+    # 截断 —— 截断只会换一种错位, 而弃用会让注入侧退回候选自带的末帧人像, 宁缺勿错。
+    boxes = packet.per_frame_track_boxes
+    if boxes and len(boxes) != n:
+        logger.warning(
+            "event=per_frame_boxes_len_mismatch n_frames=%d n_boxes=%d 弃用逐帧框(注入退末帧兜底)",
+            n, len(boxes),
+        )
+        per_frame_boxes = []
+    else:
+        per_frame_boxes = [boxes[i] for i in idxs] if boxes else []
     eff_fps = max(1, round(src_fps / step))
     return replace(
         packet,
         all_frames=frames,
+        per_frame_track_boxes=per_frame_boxes,
         frame_info=replace(packet.frame_info, fps=eff_fps),
     )
 
@@ -332,16 +420,19 @@ async def run_pipeline(
     omni_packet = _downsample_for_omni(identity_packet, config.input.fps, config.input.omni_fps)
     # omni 配置热更新:每周期从当前 settings 刷新 model/base_url/api_key,web 改完下个周期生效。
     omni_cfg = resolve_live_omni_config(config.omni)
+    visual_input_mode = _resolve_visual_input_mode(config.input.omni_visual_input_mode)
     if use_fused:
         # fused 模式：identity_assignments 合并进主调用
         omni_output = await run_omni_fused(
             [omni_packet], context, omni_cfg, identity_engine,
+            visual_input_mode=visual_input_mode,
         )
     elif omni_cfg.stream:
         omni_output = await run_omni_stream(
             omni_packet,
             context,
             omni_cfg,
+            visual_input_mode=visual_input_mode,
             on_early_speeches=_wrap_speeches_cb(
                 on_early_speeches, room_name, source_device_ids, device_name, time_window
             ),
@@ -357,7 +448,9 @@ async def run_pipeline(
             ),
         )
     else:
-        omni_output = await run_omni(omni_packet, context, omni_cfg)
+        omni_output = await run_omni(
+            omni_packet, context, omni_cfg, visual_input_mode=visual_input_mode
+        )
     timing["omni_ms"] = _ms_since(t)
 
     _inject_source_meta(omni_output, room_name, source_device_ids, device_name, time_window)
@@ -397,6 +490,9 @@ async def run_batch_pipeline(
     gate_last_audio_pass_ts: "dict[str, float] | None" = None,
     gate_hold_active: "dict[str, bool] | None" = None,
     gate_hold_started_at: "dict[str, float] | None" = None,
+    trace_id: str | None = None,
+    device_trace_ids: dict[str, str] | None = None,
+    collect_flow_diagnostics: bool = False,
 ) -> BatchPipelineResult:
     """Run perception pipeline for a batch of devices, grouped by room.
 
@@ -431,6 +527,7 @@ async def run_batch_pipeline(
     """
     batch_timing: dict[str, float] = {}
     t_total = time.monotonic()
+    visual_input_mode = _resolve_visual_input_mode(config.input.omni_visual_input_mode)
 
     # 多相机运行态:展示本窗参与感知的相机数与 <did>-<设备名>,便于盯并发是否按预期
     # 把全部相机一起跑(如 "n_cam=2 | 1178866901-小米智能摄像机C700 | xxxx-yyyy")。
@@ -451,8 +548,42 @@ async def run_batch_pipeline(
         跨设备串号(否则 trace 全记到最后一个 device 名下)。reset 在 per-Task
         下已非必需(副本随 Task 丢弃)，但成对保留无害。
         """
+        did = snapshot.device.did
+        source_frames = snapshot.frames
+        source_height, source_width = (
+            source_frames[0].shape[:2] if source_frames else (None, None)
+        )
+        duration_ms = max(0.0, snapshot.end_timestamp - snapshot.start_timestamp)
+        device_trace_id = (
+            device_trace_ids[did]
+            if device_trace_ids is not None and did in device_trace_ids
+            else str(uuid.uuid4())
+        )
+        diagnostics = (
+            PerDeviceFlowDiagnostics(
+                device_id=did,
+                room_name=room_name,
+                trace_id=trace_id or "",
+                device_trace_id=device_trace_id,
+                observed_at=int(time.time() * 1000),
+                status=GraphStatus.OK,
+                source_width=source_width,
+                source_height=source_height,
+                source_frame_count=len(source_frames),
+                source_window_duration_ms=duration_ms,
+                pipeline_input_frame_count=len(source_frames),
+            )
+            if collect_flow_diagnostics
+            else None
+        )
+
         # Downsample to target fps at pipeline entry
         snapshot = downsample_snapshot(snapshot, config.input.fps)
+        if diagnostics is not None:
+            diagnostics.pipeline_output_frame_count = len(snapshot.frames)
+            diagnostics.pipeline_fps = (
+                len(snapshot.frames) * 1000 / duration_ms if duration_ms > 0 else None
+            )
 
         did = snapshot.device.did
         from miloco.perception.window_runtime import current_job
@@ -465,6 +596,16 @@ async def run_batch_pipeline(
         tracking_service = (
             get_tracking_service(did, room_name) if get_tracking_service else None
         )
+        if diagnostics is not None:
+            detector, reid = _tracking_models(tracking_service)
+            (
+                diagnostics.detector_input_width,
+                diagnostics.detector_input_height,
+            ) = _model_input_size(detector)
+            (
+                diagnostics.reid_input_width,
+                diagnostics.reid_input_height,
+            ) = _model_input_size(reid)
         identity_engine = (
             get_identity_engine(did, room_name) if get_identity_engine else None
         )
@@ -473,7 +614,6 @@ async def run_batch_pipeline(
         if identity_engine is not None:
             identity_engine.device_name = snapshot.device.name
 
-        device_trace_id = str(uuid.uuid4())
         # 同一 cycle 同一 device 在 traces_device(SQLite)行用这把 UUID,
         # processor._publish_trace 从 timing 读出复用,避免双钥匙。
         room_timing[f"_device_trace_id_{did}"] = device_trace_id
@@ -487,12 +627,45 @@ async def run_batch_pipeline(
             gate_last_audio_pass_ts.get(did)
             if gate_last_audio_pass_ts is not None else None
         )
-        gate_packet, gate_timing, last_checked, new_last_v, new_last_a = await run_gate(
-            snapshot, config.gate, config.input.fps,
-            prev_frame=prev_frame,
-            last_visual_pass_ts=last_v,
-            last_audio_pass_ts=last_a,
-        )
+        try:
+            gate_packet, gate_timing, last_checked, new_last_v, new_last_a = await run_gate(
+                snapshot, config.gate, config.input.fps,
+                prev_frame=prev_frame,
+                last_visual_pass_ts=last_v,
+                last_audio_pass_ts=last_a,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if diagnostics is None:
+                raise
+            diagnostics.status = GraphStatus.ERROR
+            diagnostics.gate_status = GraphStatus.ERROR
+            diagnostics.identity_status = GraphStatus.SKIPPED
+            diagnostics.omni_status = GraphStatus.SKIPPED
+            _mark_omni_stages_skipped(diagnostics)
+            diagnostics.error_stage = "gate"
+            diagnostics.error_code = type(exc).__name__
+            logger.error(
+                "[device](room=%s device=%s) gate failed",
+                room_name,
+                did,
+                exc_info=True,
+            )
+            return DevicePipelineResult(
+                device_id=did,
+                input_slice=snapshot,
+                skipped=True,
+                flow_diagnostics=diagnostics,
+            )
+        if diagnostics is not None:
+            diagnostics.gate_checked_frame_count = gate_timing.checked_frame_count
+            if last_checked is not None and last_checked.ndim >= 2:
+                diagnostics.gate_output_height = int(last_checked.shape[0])
+                diagnostics.gate_output_width = int(last_checked.shape[1])
+            diagnostics.gate_status = (
+                GraphStatus.OK if gate_packet is not None else GraphStatus.SKIPPED
+            )
         # 跨窗 gate 状态各 device 用 per-did key、读写均在同步段、键不相交 → 并发 gather 下安全(同 room_timing)。
         # 无论 gate 是否通过都更新基准——始终是"最近实际比较过的画面"。
         if gate_prev_frames is not None and last_checked is not None:
@@ -573,19 +746,54 @@ async def run_batch_pipeline(
         room_timing[f"gate_video_cross_score_{did}"] = gate_timing.video_cross_score
 
         if gate_packet is None:
+            if diagnostics is not None:
+                diagnostics.status = GraphStatus.SKIPPED
+                diagnostics.identity_status = GraphStatus.SKIPPED
+                diagnostics.omni_status = GraphStatus.SKIPPED
+                _mark_omni_stages_skipped(diagnostics)
             return DevicePipelineResult(
                 device_id=did,
                 input_slice=snapshot,
                 skipped=True,
+                flow_diagnostics=diagnostics,
             )
 
         t = time.monotonic()
-        identity_packet = await run_identity(
-            gate_packet, config.identity, tracking_service,
-            identity_engine=identity_engine,
-            frame_index_offset=(frame_index_offsets or {}).get(did, frame_index_offset),
-        )
+        try:
+            identity_packet = await run_identity(
+                gate_packet, config.identity, tracking_service,
+                identity_engine=identity_engine,
+                frame_index_offset=(frame_index_offsets or {}).get(did, frame_index_offset),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if diagnostics is None:
+                raise
+            room_timing[f"identity_{did}_ms"] = _ms_since(t)
+            diagnostics.status = GraphStatus.ERROR
+            diagnostics.identity_status = GraphStatus.ERROR
+            diagnostics.omni_status = GraphStatus.SKIPPED
+            _mark_omni_stages_skipped(diagnostics)
+            diagnostics.error_stage = "identity"
+            diagnostics.error_code = type(exc).__name__
+            logger.error(
+                "[device](room=%s device=%s) identity failed",
+                room_name,
+                did,
+                exc_info=True,
+            )
+            return DevicePipelineResult(
+                device_id=did,
+                input_slice=snapshot,
+                gate_packet=gate_packet,
+                skipped=True,
+                flow_diagnostics=diagnostics,
+            )
         room_timing[f"identity_{did}_ms"] = _ms_since(t)
+        if diagnostics is not None:
+            diagnostics.identity_frame_count = len(gate_packet.frames)
+            diagnostics.identity_status = GraphStatus.OK
 
         # omni 阶段:把 per-device 元数据塞进 ContextVar,供 traces_device 等观测路径读取。
         device_ctx_token = set_device_context(DeviceContext(
@@ -593,6 +801,11 @@ async def run_batch_pipeline(
             device_id=did,
             room_name=room_name,
         ))
+        flow_token = None
+        if diagnostics is not None:
+            from miloco.perception.flow_context import set_flow_diagnostics
+
+            flow_token = set_flow_diagnostics(diagnostics)
         t = time.monotonic()
         try:
             # Omni per device —— 按 omni_call_mode 分流
@@ -620,6 +833,10 @@ async def run_batch_pipeline(
                         packet.audio_clip = np.zeros(0, dtype=np.int16)
                         packet.targets = []
                 job.release_media.append(release_window_media)
+            if diagnostics is not None:
+                diagnostics.omni_frame_count = len(omni_packet.all_frames)
+                diagnostics.omni_fps = float(omni_packet.frame_info.fps)
+                diagnostics.omni_sample_status = GraphStatus.OK
             # omni 配置热更新:每周期从当前 settings 刷新,web 改完下个周期生效。
             omni_cfg = resolve_live_omni_config(config.omni)
             if job is not None:
@@ -632,12 +849,14 @@ async def run_batch_pipeline(
             if use_fused:
                 omni_output = await run_omni_fused(
                     [omni_packet], context, omni_cfg, identity_engine,
+                    visual_input_mode=visual_input_mode,
                 )
             elif omni_cfg.stream:
                 omni_output = await run_omni_batch_stream(
                     [omni_packet],
                     context,
                     omni_cfg,
+                    visual_input_mode=visual_input_mode,
                     on_early_speeches=_wrap_speeches_cb(
                         on_early_speeches, room_name, [did], device_name, time_window
                     ),
@@ -655,8 +874,17 @@ async def run_batch_pipeline(
             else:
                 omni_output = await run_omni_batch(
                     [omni_packet], context, omni_cfg,
+                    visual_input_mode=visual_input_mode,
                 )
             room_timing[f"omni_{did}_ms"] = _ms_since(t)
+            if diagnostics is not None:
+                diagnostics.omni_status = GraphStatus.OK
+                if omni_output.skipped:
+                    diagnostics.status = GraphStatus.WARNING
+                # 音频编码失败时请求退化为 text-only:encode 已标 ERROR,request
+                # 保持 SKIPPED,不在这里覆盖成 OK。
+                if diagnostics.media_encode_status is GraphStatus.OK:
+                    diagnostics.omni_request_status = GraphStatus.OK
         except OmniError as omni_err:
             # partial 结果:单设备 omni 失败(超时/429/模型错)→ 记 omni_ms + 失败标记 + log,
             # **不连累整窗**——返回 skipped(omni_output=None;_merge_results line855 会跳过该设备),
@@ -669,6 +897,12 @@ async def run_batch_pipeline(
             # "HTTPStatusError:429" / "ReadTimeout")让 dashboard 错误分类 SQL 能精确
             # 命中,错误详情留给下一行的 logger.warning。
             room_timing[f"_omni_error_{did}"] = omni_err.code
+            if diagnostics is not None:
+                diagnostics.status = GraphStatus.ERROR
+                diagnostics.omni_status = GraphStatus.ERROR
+                _mark_failed_omni_stage(diagnostics)
+                diagnostics.error_stage = "omni"
+                diagnostics.error_code = omni_err.code
             logger.warning(
                 "[omni](room=%s device=%s) 感知API调用失败，错误码=%s(skipped) | %s",
                 room_name, f"{device_name}({did})", omni_err.code, omni_err,
@@ -677,10 +911,17 @@ async def run_batch_pipeline(
                 device_id=did, input_slice=snapshot,
                 gate_packet=gate_packet, identity_packet=identity_packet,
                 omni_output=None, skipped=True,
+                flow_diagnostics=diagnostics,
             )
         except Exception as e:  # noqa: BLE001 —— 非 omni 的意外错也不连累整窗(同 partial 处理)
             room_timing[f"omni_{did}_ms"] = _ms_since(t)
             room_timing[f"_omni_error_{did}"] = f"{type(e).__name__}: {e}"
+            if diagnostics is not None:
+                diagnostics.status = GraphStatus.ERROR
+                diagnostics.omni_status = GraphStatus.ERROR
+                _mark_failed_omni_stage(diagnostics)
+                diagnostics.error_stage = "omni"
+                diagnostics.error_code = type(e).__name__
             logger.error(
                 "[device](room=%s device=%s) 单相机处理异常(skipped) | %s",
                 room_name, f"{device_name}({did})", e, exc_info=True,
@@ -689,8 +930,13 @@ async def run_batch_pipeline(
                 device_id=did, input_slice=snapshot,
                 gate_packet=gate_packet, identity_packet=identity_packet,
                 omni_output=None, skipped=True,
+                flow_diagnostics=diagnostics,
             )
         finally:
+            if flow_token is not None:
+                from miloco.perception.flow_context import reset_flow_diagnostics
+
+                reset_flow_diagnostics(flow_token)
             reset_device_context(device_ctx_token)
         from miloco.perception.window_runtime import current_job
         job = current_job()
@@ -731,6 +977,7 @@ async def run_batch_pipeline(
             gate_packet=gate_packet,
             identity_packet=identity_packet,
             omni_output=omni_output,
+            flow_diagnostics=diagnostics,
         )
 
     async def _run_room(
@@ -797,7 +1044,23 @@ async def run_batch_pipeline(
 
     batch_timing["total_ms"] = _ms_since(t_total)
 
-    return BatchPipelineResult(rooms=rooms, timing=batch_timing)
+    flow_diagnostics = None
+    if collect_flow_diagnostics:
+        flow_diagnostics = PerceptionFlowCycleDiagnostics(
+            cycle_id=trace_id or "",
+            observed_at=int(time.time() * 1000),
+            devices={
+                did: device_result.flow_diagnostics
+                for room in rooms.values()
+                for did, device_result in room.device_results.items()
+                if device_result.flow_diagnostics is not None
+            },
+        )
+    return BatchPipelineResult(
+        rooms=rooms,
+        timing=batch_timing,
+        flow_diagnostics=flow_diagnostics,
+    )
 
 
 # =============================================================================
@@ -814,6 +1077,7 @@ async def run_query_pipeline(
     last_captions: dict[str, str] | None = None,
     frame_index_offset: int = 0,
     frame_index_offsets: dict[str, int] | None = None,
+    label_lookup: dict[str, str] | None = None,
 ) -> dict[str, QueryOutput]:
     """Active query pipeline: skip Gate, run Identity, Omni with query prompt.
 
@@ -823,10 +1087,8 @@ async def run_query_pipeline(
     Returns dict[room_name, answer_text].
 
     Note: query 路径 omni 调用仍是 **per-room 一次**（产品语义：用户对房间问问题，
-    答案是单份文本）—— 此时 ``prompt_builder._encode_batch_video`` 只编首个有 frames
-    的 device 视频（已知遗留 degenerate：候选列表含同 room 多 device 的 track，但 omni
-    只看到首镜头视频，对非首镜头 track 是"无视觉信息硬猜"）。主路径 realtime_perceive
-    已改 per-device omni 规避；query 路径暂保留，后续若产品要求改多视角输入再升级。
+    答案是单份文本）—— 查询只提供实际编码设备的视频，身份定位线索随该视频来源限制，
+    不能据此推断房间其他视角的人员。多视角输入不在这条路径的能力范围内。
     """
     import uuid
 
@@ -836,6 +1098,7 @@ async def run_query_pipeline(
     from miloco.perception.engine.types import QueryOutput
 
     captions = last_captions or {}
+    visual_input_mode = _resolve_visual_input_mode(config.input.omni_visual_input_mode)
 
     async def _run_room_query(
         room_name: str, snapshots: list[DeviceSnapshot]
@@ -887,16 +1150,8 @@ async def run_query_pipeline(
         if not room_identity_packets:
             return None
 
-        # Resolve the device whose video will be encoded by build_query_prompt.
-        # _encode_batch_video loops edge_packets and returns the first one _encode_video
-        # can encode — and _encode_video bails with (None, None) only when all_frames is
-        # empty, while push_clip_bytes fires at the tail of _encode_video_mp4 after a
-        # successful encode. So this is the same predicate evaluated twice: attribution
-        # is exact, not best-effort.
-        # Note: neither _encode_batch_video nor _encode_video_mp4 has an except clause
-        # (only try/finally to unlink the temp file), so a PyAV failure on THIS packet
-        # propagates out of build_query_prompt → room task raises → _reraise_first below
-        # → the whole (possibly multi-room) query degrades to answer="".
+        # Select the first device with frames for the artifact context before encoding.
+        # Query identity text is scoped separately by the builder's actual encode result.
         primary_idx = next(
             (i for i, ep in enumerate(room_identity_packets) if ep.all_frames),
             0,
@@ -922,6 +1177,8 @@ async def run_query_pipeline(
                 query=query,
                 last_caption=captions.get(room_name),
                 media_mode=adapter.media_mode,
+                label_lookup=label_lookup,
+                visual_input_mode=visual_input_mode,
             )
             raw_response = await call_omni(
                 payload, live_omni_config, type="on_demand"

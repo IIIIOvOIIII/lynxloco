@@ -113,7 +113,7 @@ export function PerfKpiCards({ state, embedded = false }: Props) {
         sub={[
           {
             label: t("perf.kpiShouldProcess"),
-            value: legacyOnly ? "—" : (s.expected_window_count ?? (s.cycle_count + s.dropped_count)).toLocaleString(),
+            value: legacyOnly ? "—" : (s.expected_window_count ?? ((s.processed_device_window_count ?? s.cycle_count) + s.dropped_count)).toLocaleString(),
           },
           ...(!legacyApi ? [{ label: t("perf.kpiBatches"), value: s.cycle_count.toLocaleString() }] : []),
         ]}

@@ -20,6 +20,7 @@ Miloco 2.0 能感知家中发生的事件，能基于常识主动判断并操控
 ## 最新动态
 
 - **LynxLoco 构建** — 在原有 Miloco 家庭面板与 OpenClaw 插件流程基础上，补充支持 OpenAI 兼容 LLM 端点进行 Omni 推理、RTSP 摄像头接入，以及 Home Assistant 集成与控制。
+- **2026-10-16** — 发布 v2026.10.16：新增本地中枢网关局域网控制（低延迟 mTLS 控制选路，优先走中枢而非云端，macOS 亦绕开本地网络隐私权限）、IoT 属性变化直接驱动规则、规则 guard 方向（作为同任务其它规则进入的前提）；并新增感知运行时流图、动作台账挂回触发事件、Omni 图片序列输入与逐 track 身份识别外观单帧、直播 WebSocket 背压，以及默认 Omni 模型切换为 mimo-v2.6-flash。
 - **2026-09-11** — 发布 v2026.9.11：新增规则 / 任务分层重构（一个任务可挂多条规则，进入与退出不必互为反面）、统一的进程内状态容器（由设备上下线与属性推送保持实时）、规则动作直接触发米家场景；并恢复相机 IP 直连（原生库已修复崩溃）与拉流静默自愈、用量按模型与 endpoint 分开记账、HEIC/HEIF 上传，以及 Smart Crop 逐机位开关。
 - **2026-08-06** — 发布 v2026.8.6：v2026.8.5 的紧急修复版，回退相机 IP 直连（随其更新的原生库会让部分老款相机的相机进程 SIGSEGV 崩溃）；v2026.8.5 其余内容保持不变，并将 Smart Crop 缩放改为逐轴贴住同档全景画面。
 - **2026-08-05** — 发布 v2026.8.5：新增实验性宠物识别（含完整注册与花名册流程）、Smart Crop 自适应分辨率（Omni 推理前裁切活动区域）、面板一键自升级；并新增相机 IP 直连与跨 NAT 拉流诊断、agent 行动台账、Perf 页进程 CPU / 线程数图表，以及削减默认空闲线程池。
@@ -48,7 +49,7 @@ Miloco 2.0 能感知家中发生的事件，能基于常识主动判断并操控
 - **操作系统**：macOS / Linux（Windows 请在 WSL 中运行）
 - **OpenClaw** — Miloco 以插件形式运行其上，需先[安装](https://openclaw.ai)且版本 ≥ 2026.5.2
 - **摄像头来源**：可以是小米账号中已接入米家的摄像头，也可以是局域网内可访问的 RTSP / RTSPS 摄像头地址
-- **多模态大模型访问方式** — 仍推荐使用[小米 MiMo](https://platform.xiaomimimo.com)：感知用 MiMo-v2.5，Agent 用 MiMo-v2.5-pro（在 OpenClaw 中配置）。也可以改用 OpenAI 兼容端点，例如本地网关、Ollama 风格网关、vLLM 代理或其它 provider proxy
+- **多模态大模型访问方式** — 仍推荐使用[小米 MiMo](https://platform.xiaomimimo.com)：感知用 MiMo-v2.6-flash，Agent 用 MiMo-v2.5-pro（在 OpenClaw 中配置）。也可以改用 OpenAI 兼容端点，例如本地网关、Ollama 风格网关、vLLM 代理或其它 provider proxy
 - **可选 Home Assistant 实例**：如果希望 Miloco 查看或控制 Home Assistant 设备，请提前准备 Home Assistant 地址和 Long-Lived Access Token
 
 > [!CAUTION]

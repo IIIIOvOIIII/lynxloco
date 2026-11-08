@@ -14,23 +14,32 @@ from miot.error import MIoTClientError
 from miot.spec import MIoTSpecParser
 from miot.storage import MIoTStorage
 
+from .action_result import (
+    SOURCE_CLOUD,
+    SOURCE_LOCAL_CENTRAL,
+    build_action_result,
+    fill_missing_out_piids,
+)
 from .camera import (
     MIoTCamera,
     MIoTCameraInstance,
     get_camera_extra_info,
     is_camera_model,
 )
+from .central_hub import CentralHubManager
 from .cloud import MIoTHttpClient, MIoTOAuth2Client
 from .const import (
     CLOUD_SERVER_DEFAULT,
     OAUTH2_CLIENT_ID,
     SYSTEM_LANGUAGE_DEFAULT,
 )
+from .error import MIoTErrorCode
 from .i18n import MIoTI18n
 from .lan import MIoTLan
 from .mips_cloud import MIoTMipsCloud
 from .network import MIoTNetwork
 from .types import (
+    MIoTActionParam,
     MIoTAppNotify,
     MIoTCameraExtraInfo,
     MIoTCameraInfo,
@@ -39,11 +48,13 @@ from .types import (
     MIoTDeviceInfo,
     MIoTDevicePropsEvent,
     MIoTDeviceStateEvent,
+    MIoTGetPropertyParam,
     MIoTHomeInfo,
     MIoTLanDeviceInfo,
     MIoTManualSceneInfo,
     MIoTOauthInfo,
     MIoTSceneChangedEvent,
+    MIoTSetPropertyParam,
     MIoTUserInfo,
     MipsConnectionError,
     MipsSubscribeRejectedError,
@@ -87,6 +98,66 @@ async def _replay_subscriptions(
 
     results = await asyncio.gather(*(_one(k) for k in keys))
     return sum(results)
+
+
+def _declared_action_out_piids(spec: Any, siid: int, aiid: int) -> list[int]:
+    """从设备 spec 取某条 action 声明的 ``out`` piid 列表（按声明顺序）。
+
+    取不到（spec 里没有这个服务/动作）返回空列表 —— 调用方据此放弃补全，
+    而不是拿空列表去按位对齐。
+    """
+    for service in getattr(spec, "services", None) or []:
+        if service.iid != siid:
+            continue
+        for action in service.actions or []:
+            if action.iid == aiid:
+                return [prop.iid for prop in (action.out or [])]
+    return []
+
+
+# Local (central hub) transport/RPC-layer failure codes — the local RPC did not
+# cleanly complete. A local failure is split into two classes by whether the
+# request could have already reached and run on the device:
+#
+# RPC reply timeout: ambiguous — the request may have been delivered and
+# executed. A non-idempotent set/action is therefore NOT retried on cloud
+# (avoids double-executing a maybe-delivered request); an idempotent read (get)
+# still falls back to cloud. Either way a timeout arms the per-did cooldown, so
+# subsequent requests for that did skip local for a window (a flaky device's
+# batch pays the timeout at most once).
+_LOCAL_TIMEOUT_CODE = MIoTErrorCode.CODE_TIMEOUT.value  # -10006
+# Local failures where the request definitely did NOT execute on the device
+# (gateway could not process / rejected before dispatch). Safe to retry on
+# cloud, and cheap (no timeout wait) so they do NOT arm the cooldown.
+# 本地通道上「请求明确没落到设备上」的**码**集合 —— 目前是空的,这是事实而非遗漏。
+# 历史上这里列过 -10040 / -10001,但两者在本地路径都到不了这里:-10040 由
+# mips_local 的 __request_async 产生(应答非合法 JSON),而 -10001 本地根本没有产出点。
+# 更要紧的是,-10040 的前提也是**网关已回包**,按本模块第一原则它属于"结果未知"
+# (见 _LOCAL_AMBIGUOUS_CODES)而不是"肯定没执行",所以即便它能到这里也不该放进来。
+# 于是本地判定"肯定没执行"只剩两种真实形态:调用抛异常、以及回包里连 code 都没有。
+# 保留这个空集合(而不是删掉判断)是为了给后来人一个明确的落点与理由:往里加码前
+# 先确认"该码产生时请求是否可能已经执行过"。
+_LOCAL_FALLBACK_CODES: frozenset[int] = frozenset()
+# 「网关已回包,但指令是否已在设备上执行未知」——与超时同侧处理(写/动作不重发云端),
+# 因为重发会让非幂等指令执行两次(开关无害,但"窗帘 +10%"/"音量 +1"这类累加动作用户
+# 会看到走了两步)。两个成员都以"请求已经到过网关"为前提:
+#   -10041 回包了但结构不认识(mips_local 三个方法的收尾)
+#   -10040 回包了但不是合法 JSON(__request_async 自产,现已原样上抛不再被覆写)
+# 与 -10006 的差别只在冷却:超时白等了 5s,值得冷却避免整批反复付;这两个是快速返回,
+# 冷却只会白白把设备赶去云端,所以不武装冷却。
+_LOCAL_AMBIGUOUS_CODES = frozenset(
+    {
+        MIoTErrorCode.CODE_MIPS_RESULT_UNKNOWN.value,  # -10041
+        MIoTErrorCode.CODE_MIPS_INVALID_RESULT.value,  # -10040
+    }
+)
+# Local success codes (shared by set/get/action routing; named *OK* not *SET*
+# because it also gates GET reads).
+_LOCAL_OK_CODES = frozenset({0, 1})
+# Sentinel distinguishing "local call never returned" (exception) from "local
+# call returned None" — a non-idempotent action returning None must NOT be
+# retried on cloud (double-fire).
+_UNSET = object()
 
 
 class MIoTClient:
@@ -149,10 +220,23 @@ class MIoTClient:
     # Home ids whose `home/{home_id}/scene/#` topic is (intended to be)
     # subscribed. Same ownership model as _meta_sub_dids, but per home.
     _scene_sub_home_ids: set
-    # Dids whose `device/{did}/up/properties_changed/#` topic is (intended to
-    # be) subscribed. Same ownership/replay model as _meta_sub_dids.
+    # Dids whose property push is (intended to be) subscribed — on **whichever
+    # channel** _props_sub_sources says. Same ownership/replay model as
+    # _meta_sub_dids, and the unit the upper layer's intent mirror is keyed by:
+    # the mirror is a plain set, so one did must appear here once regardless of
+    # which channel currently carries it.
     _props_sub_dids: set
+    # did -> the channel its property push is **actually** subscribed on, or absent
+    # when nothing is in place (see `_invalidate_local_props_sources`). Deliberately
+    # not in lockstep with `_props_sub_dids`: that set is the intent, this is the fact.
+    _props_sub_sources: Dict[str, str]
+    _props_source_lock: asyncio.Lock
     _callback_scene_changed: Optional[Callable[[MIoTSceneChangedEvent], Any]]
+    # Business-layer consumer of the central hub's device-list changes. The hub
+    # carries a single callback slot and the SDK owns it (it re-routes property
+    # push sources there), so this is the fan-out target rather than the slot
+    # itself.
+    _callback_dev_list_changed: Optional[Callable[[list, list], Any]]
 
     _init_done: bool
     _lifecycle_lock: asyncio.Lock
@@ -165,6 +249,10 @@ class MIoTClient:
         lang: Optional[str] = None,
         oauth_info: Optional[MIoTOauthInfo | Dict] = None,
         cloud_server: Optional[str] = None,
+        central_hub_enabled: bool = True,
+        central_hub_gateways: Optional[list[tuple[str, int]]] = None,
+        central_hub_virtual_did: Optional[str] = None,
+        central_hub_home_ids_provider: Optional[Callable[[], set[str]]] = None,
         loop: Optional[asyncio.AbstractEventLoop] = None,
     ) -> None:
         """MIoT Client init.
@@ -210,6 +298,20 @@ class MIoTClient:
         # mips_cloud state
         self._mips_cloud = None
         self._mips_user_sub_error = None
+        # Central hub gateway (local control) coordinator. Built lazily in
+        # _setup_mips_async once OAuth is done; stays None outside cn.
+        self._central_hub: Optional[CentralHubManager] = None
+        # Master switch: when False the central hub is never built (no cert /
+        # mDNS / gateway connection) and all control falls back to cloud.
+        self._central_hub_enabled = central_hub_enabled
+        # Optional static gateway endpoints [(host, port), ...] used in addition
+        # to mDNS discovery (for mDNS-isolated environments).
+        self._central_hub_gateways = list(central_hub_gateways or [])
+        # Optional injected virtual did (client identity). When absent the
+        # coordinator generates+persists its own (file-backed), keeping the SDK
+        # usable standalone.
+        self._central_hub_virtual_did = central_hub_virtual_did
+        self._central_hub_home_ids_provider = central_hub_home_ids_provider
         self._callback_user_bind = None
         self._callback_device_meta_changed = None
         self._callback_device_state_changed = None
@@ -218,7 +320,14 @@ class MIoTClient:
         self._state_sub_dids = set()
         self._scene_sub_home_ids = set()
         self._props_sub_dids = set()
+        self._props_sub_sources = {}
+        # 来源搬运会被多个任务并发触发（网关断开、重连 sweep、设备表变化推送各在
+        # 自己的任务里）。没有这把锁，两轮并发的搬运会按同一个旧镜像各自算出差集，
+        # 对同一台设备重复订/重复退——transport 侧幂等所以不会坏，但日志和镜像
+        # 的中间态没法看。锁只覆盖「算差集 → 订新 → 退旧」这段。
+        self._props_source_lock = asyncio.Lock()
         self._callback_scene_changed = None
+        self._callback_dev_list_changed = None
         self._callback_mips_connect: Optional[Callable[[], Any]] = None
         self._callback_subscription_reset: Optional[
             Callable[[set[str], set[str], set[str], set[str]], Any]
@@ -279,6 +388,482 @@ class MIoTClient:
     def http_client(self) -> MIoTHttpClient:
         """HTTP client."""
         return self._http_client
+
+    @property
+    def central_hub(self) -> Optional[CentralHubManager]:
+        """Central hub gateway coordinator (None outside cn / before login)."""
+        return self._central_hub
+
+    @property
+    def central_hub_virtual_did(self) -> Optional[str]:
+        """The virtual did the central hub coordinator uses to sign its cert."""
+        return self._central_hub_virtual_did
+
+    @central_hub_virtual_did.setter
+    def central_hub_virtual_did(self, value: str) -> None:
+        self._central_hub_virtual_did = value
+
+    async def teardown_central_hub_async(self) -> None:
+        """Teardown the current coordinator so the next ``_setup_central_hub_async``
+        rebuilds it with fresh identity.
+
+        Needed when ``authorize_with_code`` rotates the account without
+        recreating the ``MIoTClient`` — the coordinator holds a stale uid and
+        virtual did from the old account.
+        """
+        hub = self._central_hub
+        if hub is None:
+            return
+        self._central_hub = None
+        # 本地订阅随 hub 的 client 实例一起消失，镜像还记着「订在本地」—— 抹掉，
+        # 否则差集为空、永远重订不上。见 _invalidate_local_props_sources。
+        self._invalidate_local_props_sources()
+        try:
+            await hub.deinit_async()
+        except Exception as e:
+            _LOGGER.warning("central hub teardown failed: %s", e)
+
+    def _invalidate_local_props_sources(self) -> None:
+        """把来源镜像里标着「本地」的条目删掉（**不是**改标成云端）。
+
+        删掉后取值为 ``None``，含义是「有意图但一条都没建立」—— 与「确实订在云端」
+        区分开，切源逻辑才不会去退一条根本不存在的云端订阅。
+        """
+        for did, source in list(self._props_sub_sources.items()):
+            if source == SOURCE_LOCAL_CENTRAL:
+                del self._props_sub_sources[did]
+
+    async def setup_central_hub_async(self) -> None:
+        """(Re)build the central hub coordinator if possible (idempotent).
+
+        Public counterpart to :meth:`teardown_central_hub_async`, for callers
+        that tore the coordinator down in preparation for an identity change and
+        then failed to complete it — without a rebuild path the process keeps
+        ``_central_hub is None`` (all control silently cloud-only) until the next
+        successful login or a restart.
+        """
+        await self._setup_central_hub_async()
+
+    async def refresh_central_hub_scope_async(self) -> None:
+        """Re-evaluate the central hub's connectable-home scope (e.g. after a
+        home switch). No-op when the hub isn't built (outside cn / disabled)."""
+        ch = self._central_hub
+        if ch is not None:
+            await ch.refresh_scope_async()
+
+    # ---------------------------------------------------------- control routing
+    # Unified device control that routes per-did. Failures are classified by
+    # whether the request could already have run on the device (see the
+    # _LOCAL_* codes above):
+    #   - device NOT locally controllable (not behind a live gateway / offline /
+    #     no spec-v2 access) → cloud. Nothing is sent locally, so this is safe.
+    #   - device in a local-failure cooldown window → cloud (a recent local
+    #     timeout cooled the did down; skip local to avoid paying the timeout
+    #     again, and keep the device controllable via cloud).
+    #   - device locally controllable → try local, then:
+    #       * timeout → the set/action may have run; return the error WITHOUT a
+    #         cloud retry (avoid double-execution) and arm the cooldown. A get is
+    #         idempotent, so it still falls back to cloud (cooldown still armed).
+    #       * gateway replied but the reply is unusable (-10041 unrecognised
+    #         shape / -10040 not valid JSON) → the request DID reach the gateway,
+    #         so the result is unknown: same no-cloud-retry treatment as timeout
+    #         for set/action, but no cooldown (fast return, nothing to save). A
+    #         get still falls back to cloud (idempotent).
+    #       * exception, or a reply carrying no code at all → the request clearly
+    #         did not run; retry on cloud, no cooldown.
+    #       * success / device-level rejection → returned as-is (no cloud).
+    # Result shape matches the cloud API so callers are transport-agnostic.
+
+    async def set_props_async(
+        self, params: list[MIoTSetPropertyParam]
+    ) -> list:
+        """Set device properties. Local-controllable dids go local; local
+        failures split by **whether the request could already have executed**:
+
+        - **timeout** (``-10006``) — result unknown → no cloud retry (avoid
+          double-send), and the did's cooldown is armed (a timeout costs 5s,
+          worth skipping next time);
+        - **gateway replied but unusable** (``-10041`` unrecognised shape,
+          ``-10040`` not valid JSON) — also result unknown → no cloud retry;
+          no cooldown, these are fast returns with no timeout cost to save;
+        - **exception, or a reply carrying no code at all** — the request
+          clearly did not execute → retry on cloud, without cooldown;
+        - success / device-level rejection → returned as-is.
+
+        Not locally-controllable dids (or dids in cooldown) go cloud.
+
+        Do not widen the "retry on cloud" side without first establishing that
+        the code in question cannot be produced *after* the gateway received the
+        request — that is exactly how a double-send gets reintroduced."""
+        ch = self._central_hub
+        if not ch or not ch.enabled:
+            return await self._http_client.set_props_async(params)
+
+        results: list = [None] * len(params)
+        cloud_idx: list[int] = []
+        for i, p in enumerate(params):
+            if not ch.can_control(p.did):
+                cloud_idx.append(i)  # not locally controllable → cloud
+                continue
+            if ch.in_local_cooldown(p.did):  # recent local timeout → cloud during cooldown
+                cloud_idx.append(i)
+                continue
+            try:
+                r = await ch.set_prop_async(p.did, p.siid, p.piid, p.value)
+            except Exception as e:
+                # local call errored → clearly not delivered → retry cloud, no cooldown
+                _LOGGER.warning("local set_prop errored did=%s → cloud: %s", p.did, e)
+                cloud_idx.append(i)
+                continue
+            code = r.get("code") if isinstance(r, dict) else None
+            if code == _LOCAL_TIMEOUT_CODE:
+                # timeout — may have been delivered → no cloud retry, cool down
+                _LOGGER.info("local set_prop timeout did=%s (no cloud fallback)", p.did)
+                ch.note_local_failure(p.did)
+                results[i] = {
+                    "did": p.did, "siid": p.siid, "piid": p.piid,
+                    "code": code,
+                }
+                continue
+            if code in _LOCAL_AMBIGUOUS_CODES:
+                # 网关已回包但结构不认识 → 可能已执行 → 写属性绝不云端重发。
+                # 不冷却:这是快速返回,没有超时代价可省。
+                _LOGGER.warning(
+                    "local set_prop ambiguous did=%s code=%s (no cloud fallback)",
+                    p.did, code,
+                )
+                results[i] = {
+                    "did": p.did, "siid": p.siid, "piid": p.piid,
+                    "code": code,
+                }
+                continue
+            if code is None or code in _LOCAL_FALLBACK_CODES:
+                # clearly did not execute → retry on cloud, no cooldown
+                _LOGGER.info("local set_prop failed did=%s code=%s → cloud", p.did, code)
+                cloud_idx.append(i)
+                continue
+            # success (0/1) or device-level result → return as-is
+            results[i] = {
+                "did": p.did, "siid": p.siid, "piid": p.piid,
+                "code": 0 if code in _LOCAL_OK_CODES else code,
+            }
+
+        if cloud_idx:
+            try:
+                cloud_res = await self._http_client.set_props_async(
+                    [params[i] for i in cloud_idx]
+                )
+            except Exception:
+                # Cloud batch failed. If every item was cloud-routed (nothing
+                # handled locally) preserve the cloud-only contract and raise;
+                # otherwise keep the items that already succeeded locally and
+                # report the cloud ones as errors.
+                if len(cloud_idx) == len(params):
+                    raise
+                _LOGGER.warning(
+                    "cloud set_props fallback failed; keeping %d local result(s)",
+                    len(params) - len(cloud_idx),
+                )
+                self._fill_cloud_error(params, cloud_idx, results)
+                return results
+            self._backfill_cloud_results(params, cloud_idx, cloud_res, results)
+        return results
+
+    @staticmethod
+    def _backfill_cloud_results(
+        params: list, cloud_idx: list[int], cloud_res: list, results: list
+    ) -> None:
+        """Match cloud results back to their original slots by (did, siid, piid).
+
+        Positional backfill (``cloud_res[j]`` for the j-th cloud-routed item)
+        assumes the cloud returns results in request order — an assumption the
+        ``/app/v2/miotspec/prop/{set,get}`` contract does not actually make. If
+        the cloud ever reorders (e.g. aggregating per device) or omits an entry,
+        positional matching silently mis-attributes results: the caller builds
+        its ``iid`` from ``siid``/``piid`` of the *slot*, so a mismatch reports
+        one device's failure under another device's identity — in the action
+        ledger the agent then tells the user the wrong thing about the wrong
+        device. Each cloud entry carries its own did/siid/piid, so key on those.
+
+        Unmatched slots get an internal-error result rather than staying empty.
+        """
+        # key -> FIFO bucket. A bucket rather than a single entry because the
+        # request body may legitimately repeat an iid (an agent can send
+        # ["prop.2.1", "prop.2.1"]) and the cloud then returns one result per
+        # occurrence: with one slot per key the second occurrence would find the
+        # key already consumed and get mislabelled as an internal error even
+        # though it was executed.
+        by_key: dict[tuple, list[dict]] = {}
+        for item in cloud_res or []:
+            if isinstance(item, dict):
+                key = (item.get("did"), item.get("siid"), item.get("piid"))
+                by_key.setdefault(key, []).append(item)
+        for i in cloud_idx:
+            p = params[i]
+            bucket = by_key.get((p.did, p.siid, p.piid))
+            hit = bucket.pop(0) if bucket else None
+            results[i] = (
+                hit
+                if hit is not None
+                else {
+                    "did": p.did,
+                    "siid": p.siid,
+                    "piid": p.piid,
+                    "code": MIoTErrorCode.CODE_INTERNAL_ERROR.value,
+                }
+            )
+
+    @staticmethod
+    def _fill_cloud_error(params: list, cloud_idx: list[int], results: list) -> None:
+        """Fill the cloud-routed slots with an internal-error result (used when
+        the cloud fallback batch itself raised but some local results must be
+        preserved)."""
+        for i in cloud_idx:
+            results[i] = {
+                "did": params[i].did,
+                "siid": params[i].siid,
+                "piid": params[i].piid,
+                "code": MIoTErrorCode.CODE_INTERNAL_ERROR.value,
+            }
+
+    async def get_props_async(
+        self, params: list[MIoTGetPropertyParam]
+    ) -> list:
+        """Get device properties. Local-controllable dids read local; a read is
+        idempotent, so on any local failure the item falls back to cloud
+        in-call. A local timeout additionally arms the did's cooldown, so its
+        subsequent requests read from cloud for a window. Not locally-
+        controllable dids read cloud."""
+        ch = self._central_hub
+        if not ch or not ch.enabled:
+            return await self._http_client.get_props_async(params)
+
+        results: list = [None] * len(params)
+        cloud_idx: list[int] = []
+        for i, p in enumerate(params):
+            if not ch.can_control(p.did):
+                cloud_idx.append(i)  # not locally controllable → cloud
+                continue
+            if ch.in_local_cooldown(p.did):  # recent local timeout → cloud during cooldown
+                cloud_idx.append(i)
+                continue
+            try:
+                r = await ch.get_prop_async(p.did, p.siid, p.piid)
+            except Exception as e:
+                # local read errored → cloud (reads are idempotent), no cooldown
+                _LOGGER.warning("local get_prop errored did=%s → cloud: %s", p.did, e)
+                cloud_idx.append(i)
+                continue
+            code = r.get("code") if isinstance(r, dict) else None
+            if code == _LOCAL_TIMEOUT_CODE:
+                # timeout — may have been delivered → cloud, cool down
+                _LOGGER.info("local get_prop timeout did=%s → cloud (cooldown)", p.did)
+                ch.note_local_failure(p.did)
+                cloud_idx.append(i)
+                continue
+            # get_prop_async 恒返回非 None code(成功 value/网关 error/兜底
+            # CODE_MIPS_RESULT_UNKNOWN -10041,见 mips_local.get_prop_async 末尾);
+            # 防御性 guard 防将来 SDK 改契约,不用 assert
+            # (-O 下会被剥离)。
+            if code is None:
+                _LOGGER.error("local get_prop returned no code did=%s → cloud", p.did)
+                cloud_idx.append(i)
+                continue
+            # fast error (gateway-level rejection, code != timeout) → cloud, no
+            # cooldown. 读是**幂等**的,所以这里不必像 set/action 那样区分
+            # "结果未知"(-10041 结构不认识 / -10040 非合法 JSON):重读一次无副作用,
+            # 拿到确定值比返回未知更有用。
+            # 注意 -10004 **不**属于"结果未知":本 PR 已把它收窄为"本地与云端都没给出
+            # 这一条的结果"(_backfill_cloud_results 给回填不到的槽位贴的标签),本地
+            # 路径根本产不出它。别把它加进 _LOCAL_AMBIGUOUS_CODES —— 那会让"云端没
+            # 回填"被误判成"可能已执行"而不再重试。见 error.py 的枚举注释。
+            if code not in _LOCAL_OK_CODES:
+                _LOGGER.info("local get_prop error did=%s code=%s → cloud", p.did, code)
+                cloud_idx.append(i)
+                continue
+            results[i] = {
+                "did": p.did, "siid": p.siid, "piid": p.piid,
+                "value": r.get("value"), "code": 0,
+            }
+
+        if cloud_idx:
+            try:
+                cloud_res = await self._http_client.get_props_async(
+                    [params[i] for i in cloud_idx]
+                )
+            except Exception:
+                # Cloud batch failed — see set_props_async for the rationale.
+                if len(cloud_idx) == len(params):
+                    raise
+                _LOGGER.warning(
+                    "cloud get_props fallback failed; keeping %d local result(s)",
+                    len(params) - len(cloud_idx),
+                )
+                self._fill_cloud_error(params, cloud_idx, results)
+                return results
+            self._backfill_cloud_results(params, cloud_idx, cloud_res, results)
+        return results
+
+    async def action_async(self, param: MIoTActionParam) -> dict:
+        """Call a device action. Locally-controllable + not in cooldown → local.
+
+        Local failures follow the same idempotency split as ``set_props_async``:
+        a **timeout** (``-10006``) or an **unusable gateway reply** (``-10041``
+        unrecognised shape / ``-10040`` not valid JSON) both mean the action may
+        already have run, so neither retries on cloud — only the timeout arms the
+        cooldown. An exception, or a reply carrying no code at all, means it
+        clearly did not run and retries on cloud. Not locally-controllable or in
+        cooldown → cloud.
+
+        Actions are the least forgiving case for a double-send: accumulating ones
+        ("curtain +10%", "volume +1") visibly move twice."""
+        ch = self._central_hub
+        if (
+            ch and ch.enabled and ch.can_control(param.did)
+            and not ch.in_local_cooldown(param.did)
+        ):
+            local_result = _UNSET
+            try:
+                local_result = await ch.action_async(
+                    param.did, param.siid, param.aiid, param.in_
+                )
+            except Exception as e:
+                # local call errored → clearly did not run → retry cloud, no cooldown
+                _LOGGER.warning("local action errored did=%s → cloud: %s", param.did, e)
+            if local_result is None:
+                # 网关吞了异常、连回包结构都拿不到 —— 结果未知,绝不云端重发,否则
+                # 累加型动作(窗帘 +10% / 音量 +1)会走两步。这里必须用"结果未知"
+                # 集合里的码(-10041),让 result_codes.is_result_unknown() 为真:
+                # 规则引擎(rule/runner.py)照常记冷却,agent 台账文案传达"指令
+                # 可能已生效"。-10004 的语义已被收窄为"本地与云端都没给出这一条
+                # 的结果"、与本地路由无关(见 result_codes.py / device-control.md),
+                # 不能复用,否则规则引擎的非幂等冷却判据两侧都为假,下一轮 tick
+                # 立刻把同一条动作再执行一遍。
+                _LOGGER.error("local action returned None for did=%s (result unknown, no cloud fallback)", param.did)
+                # 这一支没有真正发出过请求,量不到往返 → latency 留 None,
+                # net_cost 随之 None(不可编一个数出来)。
+                return build_action_result(
+                    did=param.did,
+                    siid=param.siid,
+                    aiid=param.aiid,
+                    code=MIoTErrorCode.CODE_MIPS_RESULT_UNKNOWN.value,
+                    source=SOURCE_LOCAL_CENTRAL,
+                )
+            if local_result is not _UNSET:
+                code = local_result.get("code") if isinstance(local_result, dict) else None
+                # transport 量到的往返与上游给的设备耗时,下面几处自己拼结果时
+                # 原样带过去——否则路由层一重拼就把这两项丢了。
+                local_exe_time = (
+                    local_result.get("exe_time") if isinstance(local_result, dict) else None
+                )
+                local_latency = (
+                    local_result.get("latency") if isinstance(local_result, dict) else None
+                )
+                if code == _LOCAL_TIMEOUT_CODE:
+                    # timeout — may have run → no cloud retry, cool down
+                    _LOGGER.info("local action timeout did=%s (no cloud fallback)", param.did)
+                    ch.note_local_failure(param.did)
+                    return build_action_result(
+                        did=param.did,
+                        siid=param.siid,
+                        aiid=param.aiid,
+                        code=code,
+                        source=SOURCE_LOCAL_CENTRAL,
+                        exe_time=local_exe_time,
+                        latency=local_latency,
+                    )
+                if code in _LOCAL_AMBIGUOUS_CODES:
+                    # 网关已回包但结构不认识 → 动作可能已执行 → 绝不云端重发,
+                    # 否则累加型动作(窗帘 +10% / 音量 +1)会走两步。不冷却。
+                    _LOGGER.warning(
+                        "local action ambiguous did=%s code=%s (no cloud fallback)",
+                        param.did, code,
+                    )
+                    return build_action_result(
+                        did=param.did,
+                        siid=param.siid,
+                        aiid=param.aiid,
+                        code=code,
+                        source=SOURCE_LOCAL_CENTRAL,
+                        exe_time=local_exe_time,
+                        latency=local_latency,
+                    )
+                if code is not None and code not in _LOCAL_FALLBACK_CODES:
+                    return local_result  # success or device-level rejection → as-is
+                # non-timeout failure → fall through to cloud
+                _LOGGER.info("local action failed did=%s code=%s → cloud", param.did, code)
+        # not locally controllable / in cooldown / non-timeout local failure → cloud
+        try:
+            cloud_result = await self._http_client.action_async(param)
+        except Exception as e:
+            _LOGGER.error("Failed to call device action: %s", e)
+            raise
+        # 云端把 out 的 piid 拍平了,这里按 spec 声明补回来(只读缓存,绝不联网),
+        # 否则下游仍要按"走了哪条通道"写两套解析。
+        await self.__fill_action_out_piids(cloud_result, param)
+        return cloud_result
+
+    async def __fill_action_out_piids(
+        self, result: dict, param: MIoTActionParam
+    ) -> None:
+        """把云端拍平的 ``out`` 按位补回 piid（原地改 ``result``）。
+
+        为什么要补：云端 ``out`` 是裸标量列表、piid 被拍平，本地中枢那条则带
+        ``{"piid", "value"}``。只统一形状而留空 piid，下游照样得为"这条走了哪条
+        通道"写两套解析 —— 那这个兼容就等于没做。
+
+        两个克制之处：
+
+        - spec 走 :meth:`MIoTSpecParser.get_cached_async`（**只读缓存**）。控制热
+          路径绝不能碰 ``parse_async``：它未命中会 ``init_async()`` 去 miot-spec.org
+          拉数百个请求。未命中就放弃补全。
+        - 声明的输出个数与云端返回的个数对不上时整条不补（见
+          :func:`fill_missing_out_piids`）—— 数量不符说明两者对这条 action 的理解
+          不一致，那是在赌顺序。
+
+        **补全失败绝不允许把一次成功的云端动作变成异常。** 它是锦上添花：spec 形态
+        不认识、解析器抛错，都只该降级成「piid 留空」—— 那正是补全之前的行为，
+        下游本来就容忍。所以这里兜住一切异常。
+        """
+        try:
+            await self.__do_fill_action_out_piids(result, param)
+        except Exception as e:
+            _LOGGER.debug("action piid fill raised, giving up: %s", e)
+
+    async def __do_fill_action_out_piids(
+        self, result: dict, param: MIoTActionParam
+    ) -> None:
+        out = result.get("out")
+        if not isinstance(out, list) or not out:
+            return
+        if all(isinstance(it, dict) and it.get("piid") is not None for it in out):
+            return
+        # did → urn 从设备表拿;表还没刷出来(或没有 spec 基建)就放弃。
+        # getattr 而非直接取属性:设备表/spec 解析器都在 __init__ 里才赋值,
+        # 而测试会用 object.__new__ 绕过 __init__ 造最小 client。
+        dev = (getattr(self, "_device_buffer", None) or {}).get(param.did)
+        urn = getattr(dev, "urn", None)
+        spec_parser = getattr(self, "_spec_parser", None)
+        if not urn or spec_parser is None:
+            return
+        try:
+            spec = await spec_parser.get_cached_async(urn)
+        except Exception as e:
+            _LOGGER.debug("action piid fill: spec lookup failed, %s, %s", urn, e)
+            return
+        if spec is None:
+            _LOGGER.debug("action piid fill: spec not cached, %s", urn)
+            return
+        declared = _declared_action_out_piids(spec, param.siid, param.aiid)
+        if not fill_missing_out_piids(out, declared):
+            _LOGGER.debug(
+                "action piid fill: no fill for did=%s action.%s.%s (declared=%d, got=%d)",
+                param.did,
+                param.siid,
+                param.aiid,
+                len(declared),
+                len(out),
+            )
 
     async def __on_lan_device_status_changed(
         self, did: str, info: MIoTLanDeviceInfo, ctx: Any = None
@@ -407,6 +992,14 @@ class MIoTClient:
         # cannot strand the instance in a half-torn-down state. A sub-client
         # may be None if init_async aborted before creating it.
         try:
+            # Central hub (LAN clients + mDNS + cert timer) first; independent
+            # of the cloud clients.
+            await _safe(
+                "central_hub",
+                lambda: (
+                    self._central_hub.deinit_async() if self._central_hub else None
+                ),
+            )
             # mips_cloud must be deinit-ed before oauth_client / http_client
             # so any in-flight subscribe futures see MipsConnectionError
             # rather than hanging on a closed http session.
@@ -477,6 +1070,7 @@ class MIoTClient:
             self._callbacks_lan_device_status_changed = {}
             self._mips_cloud = None
             self._mips_user_sub_error = None
+            self._central_hub = None
             self._callback_user_bind = None
             self._callback_device_meta_changed = None
             self._callback_device_state_changed = None
@@ -485,7 +1079,9 @@ class MIoTClient:
             self._state_sub_dids = set()
             self._scene_sub_home_ids = set()
             self._props_sub_dids = set()
+            self._props_sub_sources = {}
             self._callback_scene_changed = None
+            self._callback_dev_list_changed = None
             self._callback_mips_connect = None
             self._callback_subscription_reset = None
             self._init_done = False
@@ -502,12 +1098,19 @@ class MIoTClient:
         """
         return self._oauth_client.gen_auth_url(redirect_uri=redirect_uri)
 
-    async def get_access_token_async(self, code: str, state: str) -> MIoTOauthInfo:
+    async def get_access_token_async(
+        self,
+        code: str,
+        state: str,
+        persist: Optional[Callable[[MIoTOauthInfo], None]] = None,
+    ) -> MIoTOauthInfo:
         """Get access token by authorization code.
 
         Args:
             code (str): OAuth2 redirect code.
             state (str): Redirect state.
+            persist: 拿到令牌后**立即**调用，用于落盘。授权码同样是一次性的，
+                换取成功后若在落盘前失败，住户得从头再授权一遍。
 
         Returns:
             MIoTOauthInfo: MIoT OAuth2 Info.
@@ -515,45 +1118,140 @@ class MIoTClient:
         if not await self._oauth_client.check_state_async(redirect_state=state):
             raise ValueError("state is invalid")
         self._oauth_info = await self._oauth_client.get_access_token_async(code=code)
-        self._http_client.update_http_header(access_token=self._oauth_info.access_token)
-        await self._camera_client.update_access_token_async(
-            access_token=self._oauth_info.access_token
-        )
+        # 授权码已被消费，先落盘再做副作用——理由同 refresh_access_token_async。
+        self.__persist_oauth_info(persist, "authorize")
+        # 取身份前必须先把新令牌推进 HTTP 客户端——那一步是真实的 HTTP 请求。
+        self.__apply_token_to_http_header()
+        # 这里**刻意不兜**，与续期路径不对称：账号 uid 是建立账号级推送订阅的硬
+        # 前提，拿不到就只会打一条 warning 然后静默地没有推送。首次授权是住户正
+        # 在等结果的动作，当场报错让他重试一次，比留下一个「绑上了但收不到推送」
+        # 的状态更诚实。改这一处之前先想清楚这个取舍。
         await self.get_user_info_async()
-        # First-time OAuth: build the mips_cloud client now that we have a
-        # token and the user uid (loaded by get_user_info_async above). A
-        # later token refresh path goes through refresh_access_token_async →
-        # update_access_token instead of a fresh setup.
-        await self._setup_mips_async()
+        self.__persist_oauth_info(persist, "authorize:user_info")
+        # 重新授权可能换了账号:账号级主题 user/{uid}/g_op/* 只在重建时发出,
+        # 单纯换密码重连会把旧 uid 的订阅原样重放。
+        await self.__apply_access_token_async(rebuild_mips=True)
+        # First-time OAuth: mips_cloud 由 __apply_access_token_async 在
+        # _mips_cloud 尚未建立时负责 setup（需要 user uid，上面已拉到）。
         return self._oauth_info
 
-    async def refresh_access_token_async(self, refresh_token: str) -> MIoTOauthInfo:
+    async def refresh_access_token_async(
+        self,
+        refresh_token: str,
+        persist: Optional[Callable[[MIoTOauthInfo], None]] = None,
+    ) -> MIoTOauthInfo:
         """Refresh access token.
 
         Args:
             refresh_token (str): Refresh token.
+            persist: 拿到新令牌后**立即**调用，用于落盘。小米的 refresh_token 是
+                一次性的（官方文档：一个 Refresh Token 只能刷新一次 Access
+                Token），换取成功的那一刻旧令牌就已作废；若在落盘前进程死掉，
+                新令牌永久丢失、住户只能重新授权。传了这个回调，落盘就发生在
+                任何副作用之前。
 
         Returns:
             MIoTOauthInfo: MIoT OAuth2 Info.
         """
         oauth_info = await self._oauth_client.refresh_access_token_async(refresh_token)
+        # 这一行之后旧令牌在云端已经作废（refresh_token 是一次性的），新令牌只存在
+        # 于内存。**落盘必须先于任何副作用**——下面的相机调用会进原生库，段错误会
+        # 直接带走进程，连 except 都不会执行。
         if self._oauth_info:
             oauth_info.user_info = self._oauth_info.user_info
-            self._oauth_info = oauth_info
-        else:
-            self._oauth_info = oauth_info
-            await self.get_user_info_async()
-        self._http_client.update_http_header(access_token=self._oauth_info.access_token)
-        await self._camera_client.update_access_token_async(
-            access_token=self._oauth_info.access_token
-        )
-        if self._mips_cloud is not None:
-            await self._mips_cloud.update_access_token(self._oauth_info.access_token)
-        else:
-            # mips_cloud not yet set up (e.g. fresh process restored oauth
-            # from KV cache and is doing its first refresh). Set up now.
-            await self._setup_mips_async()
+        self._oauth_info = oauth_info
+        self.__persist_oauth_info(persist, "refresh")
+        # 同上：下面可能要取身份，先把新令牌推进去。
+        self.__apply_token_to_http_header()
+
+        if oauth_info.user_info is None:
+            # 首次刷新时没有可继承的 user_info，补拉一次；拿到后再存一遍，
+            # 让库里那份也带上账号身份（同账号重绑判定要用它）。
+            #
+            # 与相邻两步同款单独兜住：令牌此刻已在库中、续期在语义上已经成功，
+            # 让这一次业务请求的超时或 5xx 冒泡出去，会把下面「把新令牌推给原生
+            # 相机库与云端长连接」那一步整个跳过——它们于是一直持有旧访问令牌，
+            # 直到下一次自然临期续期才被换掉，量级是天。而上层看到的是「续期失败」，
+            # 会按退避再刷三次，每次都再换一对令牌、再在同一处抛。身份缺失本身
+            # 无害，由下一轮刷新补上即可。
+            try:
+                await self.get_user_info_async()
+                self.__persist_oauth_info(persist, "refresh:user_info")
+            except Exception as e:  # noqa: BLE001 - 取身份失败不应判续期失败
+                _LOGGER.error("fetch user info after refresh failed: %s", e)
+
+        await self.__apply_access_token_async()
         return self._oauth_info
+
+    def __persist_oauth_info(
+        self, persist: Optional[Callable[[MIoTOauthInfo], None]], stage: str
+    ) -> None:
+        """把当前令牌交给调用方落盘。
+
+        落盘失败只记日志：令牌至少还在内存里，硬抛会让本次刷新整体失败，反而把
+        「已经拿到新令牌」这件事也一起丢掉。
+        """
+        if persist is None or self._oauth_info is None:
+            return
+        try:
+            persist(self._oauth_info)
+        except Exception as e:  # noqa: BLE001 - 落盘失败不应中断刷新
+            _LOGGER.error("persist oauth info failed at %s: %s", stage, e)
+
+    def __apply_token_to_http_header(self) -> None:
+        """把新令牌推进 HTTP 客户端。
+
+        纯内存赋值，不发请求、不进原生库，因此**必须**排在 get_user_info_async
+        之前：取账号身份本身是一次 HTTP 请求，而它读的正是这里写入的令牌。排在
+        后面的话，首次授权时那里还是空串（客户端构造时传的就是空），uid 换取会
+        撞上「access token is empty」的硬校验，把一次已经成功、授权码已被消费的
+        授权报成失败；换账号重绑时更隐蔽——它会拿回**旧账号**的 uid，让「是否同
+        一账号」的判定恒真，于是该清的接入范围配置永远不清。
+
+        同时也是 __apply_access_token_async 的第一步，重复调用无副作用。
+        """
+        token = self._oauth_info.access_token if self._oauth_info else None
+        if not token:
+            return
+        try:
+            self._http_client.update_http_header(access_token=token)
+        except Exception as e:  # noqa: BLE001
+            _LOGGER.error("update http header failed: %s", e)
+
+    async def __apply_access_token_async(self, *, rebuild_mips: bool = False) -> None:
+        """把新的 access_token 推给各个下游持有者。
+
+        每一项独立 try：任何一项失败都不该影响其余项，更不该冒泡成「刷新失败」
+        ——令牌此刻已经落盘，刷新在语义上已经成功了。
+
+        Args:
+            rebuild_mips: 重建云端长连接，而非只换密码重连。重新授权必须置真:
+                账号级主题 ``user/{uid}/g_op/*`` 只在重建时发出，而重连只会把
+                ``_subs`` 里按 topic 字符串存着的旧 uid 主题原样重放——换了账号
+                就再也订阅不到新账号的绑定/解绑推送。定时续期不换账号，走廉价
+                的重连即可。
+        """
+        token = self._oauth_info.access_token if self._oauth_info else None
+        if not token:
+            return
+        self.__apply_token_to_http_header()
+        # 与本文件既有写法一致地判空——这里原先没判，而 _camera_client 确实
+        # 会被置 None，是刷新链路上最容易踩的一颗雷。
+        if self._camera_client is not None:
+            try:
+                await self._camera_client.update_access_token_async(access_token=token)
+            except Exception as e:  # noqa: BLE001
+                _LOGGER.error("update camera access token failed: %s", e)
+        try:
+            if self._mips_cloud is not None and not rebuild_mips:
+                await self._mips_cloud.update_access_token(token)
+            else:
+                # 两种情况要重建:mips_cloud 还没建起来(进程刚起、从 KV 恢复了
+                # 凭据并做首次续期),或者这是一次重新授权——后者可能换了账号,
+                # 而账号级主题只在重建时发出。
+                await self._setup_mips_async()
+        except Exception as e:  # noqa: BLE001
+            _LOGGER.error("update mips access token failed: %s", e)
 
     async def check_token_async(self) -> bool:
         """Get user information to check if the token is valid.
@@ -670,6 +1368,17 @@ class MIoTClient:
 
         正常路径与骤降守卫的提前返回共用——被守卫拦下的那轮,刚上电的相机仍应可被
         require_lan 发现,lan_online 不能停在上一轮旧值。
+
+        局域网发现对 local_ip 只做**补充**,不做清空:探到就用探到的 IP(更准,反映
+        当前网络实况),没探到**不代表设备没有局域网地址**——
+          1. 小米摄像机 3 Pro 只应答单播探测,从不出现在局域网设备表里
+             (见 knowledge/05-external-deps/sdk-miot.md);
+          2. LAN 客户端未初始化时 get_devices_async() 直接返回 {},那一轮**所有**
+             设备都会走 else 分支。
+        原先在 else 里写 None,把云端刚解析出的 localip 抹掉,而这个字段全仓只有一个
+        生产消费方(API 出参 → `miloco-cli doctor` 的摄像机直连诊断),于是 doctor 恒
+        走 all_missing_ip 分支报 cameras.all_missing。lan_online=False 已经把"当前
+        局域网探不到"这个事实表达清楚了,IP 不必跟着丢。
         """
         lan_devices = await self._lan_client.get_devices_async()
         for did in self._device_buffer:
@@ -685,6 +1394,7 @@ class MIoTClient:
                 self._device_buffer[did].lan_online = False
                 # Keep cloud local_ip — it serves as the unicast probe fallback
                 # for cross-subnet cameras that broadcast can't reach.
+                # local_ip 保持云端解析值不动(见上方注释)
 
     async def get_manual_scenes_async(
         self,
@@ -758,7 +1468,14 @@ class MIoTClient:
             else:
                 camera_info.camera_status = MIoTCameraStatus.DISCONNECTED
 
-        # Merge LAN status into camera buffer.
+        # Merge LAN status into camera buffer. 与 get_devices_async 里那段现在语义一致:
+        # 探到就覆盖,没探到就保留 `_cameras_buffer` 从设备缓冲带过来的云端 localip
+        # (摄像机 3 Pro 只应答单播探测,永远走不到 if 分支)。
+        #
+        # 这里刻意**不加** else 分支去写 lan_online=False:_cameras_buffer 是用
+        # get_devices_async 的输出构造的,那一步已经把探不到的设备置成 False;而
+        # __on_lan_device_status_changed 可能在两次刷新之间把它抬成 True,在这里覆盖
+        # 会把刚到的实时状态压回去。
         lan_devices = await self._lan_client.get_devices_async()
         for did, camera_info in self._cameras_buffer.items():
             if did in lan_devices:
@@ -940,6 +1657,103 @@ class MIoTClient:
         except Exception as e:
             _LOGGER.error("subscription reset callback failed: %s", e)
 
+    async def _setup_central_hub_async(self) -> None:
+        """Build the central hub gateway coordinator once (idempotent, cn-only).
+
+        Requires storage (for cert/virtual-did persistence) and a resolved uid.
+        The manager is region-gated internally, so this is a cheap no-op outside
+        ``SUPPORT_CENTRAL_GATEWAY_CTRL``. Access-token rotation does not affect
+        the already-signed mTLS clients, so we only build it the first time.
+
+        **Account-switch must call ``teardown_central_hub_async()`` first** —
+        the coordinator holds a uid and virtual did fixed at construction and
+        the idempotent guard here would otherwise skip the rebuild, leaving the
+        old identity in place.  Token rotation (same account) does not need this.
+        """
+        # Never let central hub setup break the (independent) cloud MQTT setup.
+        try:
+            if not getattr(self, "_central_hub_enabled", True):
+                _LOGGER.info("central hub disabled by config; skipping setup")
+                return
+            if getattr(self, "_central_hub", None) is not None:
+                return
+            storage = getattr(self, "_storage", None)
+            http_client = getattr(self, "_http_client", None)
+            if not storage:
+                _LOGGER.info("central hub skipped: no cache_path / storage")
+                return
+            uid = (
+                self._oauth_info.user_info.uid
+                if self._oauth_info and self._oauth_info.user_info
+                else None
+            )
+            if not uid or not http_client:
+                return
+            manager = CentralHubManager(
+                storage=storage,
+                http_client=http_client,
+                uid=uid,
+                cloud_server=self._cloud_server,
+                static_gateways=getattr(self, "_central_hub_gateways", None),
+                virtual_did=getattr(self, "_central_hub_virtual_did", None),
+                home_ids_provider=getattr(
+                    self, "_central_hub_home_ids_provider", None
+                ),
+                network=getattr(self, "_network_client", None),
+                loop=self._main_loop,
+            )
+            if not manager.enabled:
+                return
+            self._central_hub = manager
+            # 设备表变化要驱动属性推送的来源重选(见 _sync_props_sources_async)。
+            # 这个槽位由 SDK 占住,业务层的消费方从
+            # register_dev_list_changed_callback 注册、由这里扇出。
+            manager.on_dev_list_changed = self._on_dev_list_changed_from_hub
+            # 新实例起来时设备表可能一字未变,那条路通知不到 —— 见该回调的注释。
+            manager.on_local_transport_reset = self._on_local_transport_reset
+            await manager.init_async()
+            # teardown 会把镜像里标本地的条目作废成「有意图、一条源都没有」(`None`
+            # 哨兵)，而修复入口只有中枢事件。这条重建路径（换号失败但旧账号仍有效）
+            # 不走 mips 重放，若此后没有任何网关连上，那批 did 会一直停在一条源都
+            # 没有 —— 换号前它们是收得到推送的，属于静默退化。补跑一次：此刻
+            # can_push 为假就订回云端。
+            try:
+                await self._sync_props_sources_async()
+            except Exception as e:
+                _LOGGER.error("props source re-route after hub setup failed: %s", e)
+        except Exception as e:
+            _LOGGER.error("central hub setup failed: %s", e)
+
+    async def delete_central_cert_async(self) -> None:
+        """Delete the local central-hub client cert (private key + user cert) of
+        the currently-bound account; the shared CA is kept. No-op when uid or
+        storage is unavailable, or the files are absent. Called on logout /
+        account switch so the next account signs a fresh cert (its CN binds the
+        new uid), and stale key/cert of the old account do not linger on disk.
+        """
+        try:
+            storage = getattr(self, "_storage", None)
+            uid = (
+                self._oauth_info.user_info.uid
+                if self._oauth_info and self._oauth_info.user_info
+                else None
+            )
+            if not storage or not uid:
+                return
+            from .cert import MIoTCert
+
+            cert = MIoTCert(
+                storage=storage,
+                uid=uid,
+                cloud_server=self._cloud_server,
+                loop=self._main_loop,
+            )
+            await cert.remove_user_key_async()
+            await cert.remove_user_cert_async()
+            _LOGGER.info("central hub client cert removed for uid=%s", uid)
+        except Exception as e:
+            _LOGGER.error("delete central hub cert failed: %s", e)
+
     async def _setup_mips_async(self) -> None:
         """Build (or rebuild) the mips_cloud client and attempt user-level subs.
 
@@ -958,6 +1772,11 @@ class MIoTClient:
             # Should not happen — get_user_info_async populates user_info.
             _LOGGER.warning("mips setup skipped: no user uid")
             return
+
+        # Central hub gateway (LAN control) is independent of the cloud MQTT
+        # path — set it up first so a cloud-MQTT connect failure below does not
+        # disable local control. Idempotent + region-gated (no-op outside cn).
+        await self._setup_central_hub_async()
 
         # Tear down any pre-existing instance (re-OAuth scenario).
         if self._mips_cloud is not None:
@@ -996,6 +1815,7 @@ class MIoTClient:
             self._state_sub_dids = set()
             self._scene_sub_home_ids = set()
             self._props_sub_dids = set()
+            self._props_sub_sources = {}
             await self._fire_subscription_reset()
             return
         self._mips_cloud = mips
@@ -1084,17 +1904,28 @@ class MIoTClient:
             )
 
         # Same replay for per-device property push subs.
+        # **只重放非本地那批**:本地订阅挂在中枢的 client 实例上,mips 重建不会让
+        # 它们消失。一并抹掉镜像会让重放把它当「从零重订」,此刻若网关不可用就改判
+        # 到云端,而那条活着的本地订阅既没人退也没人记得 —— 网关回来就是两条通道
+        # 同时在投。本地那批带着镜像留着,换不换源交给搬运入口判。
         if self._props_sub_dids:
-            dids = sorted(self._props_sub_dids)
-            self._props_sub_dids = set()
-            ok = await _replay_subscriptions(
-                dids, self.sub_device_props_async, "device-props"
+            replay_dids = sorted(
+                d
+                for d in self._props_sub_dids
+                if self._props_sub_sources.get(d) != SOURCE_LOCAL_CENTRAL
             )
-            _LOGGER.info(
-                "mips_cloud re-subscribed device-props for %d/%d devices",
-                ok,
-                len(dids),
-            )
+            for d in replay_dids:
+                self._props_sub_dids.discard(d)
+                self._props_sub_sources.pop(d, None)
+            if replay_dids:
+                ok = await _replay_subscriptions(
+                    replay_dids, self.sub_device_props_async, "device-props"
+                )
+                _LOGGER.info(
+                    "mips_cloud re-subscribed device-props for %d/%d devices",
+                    ok,
+                    len(replay_dids),
+                )
 
         # mips 实例被重建 → 上层的订阅意图镜像必须重建为 SDK 重放后的真相:
         # 若镜像里留着"重放失败的 did"(SDK 集合已无它),下次对账算不出重订;
@@ -1231,9 +2062,32 @@ class MIoTClient:
         if asyncio.iscoroutine(ret):
             asyncio.ensure_future(ret)
 
-    async def sub_device_props_async(self, did: str) -> None:
-        """订阅一台设备的属性推送(幂等);契约同 sub_device_state_async。"""
-        if did in self._props_sub_dids:
+    # ------------------------------------------------------- property push source
+    # 属性推送**按设备选一条通道**。判据是网关的 push_available,与控制的
+    # specv2_access 是两套独立标志,所以同一台设备的控制源和推送源可以不同。
+    #
+    # 为什么单源而不是两条都订 + 去重:本地往返比云端短(实测 90ms vs 164ms),
+    # 同一条属性两次变化间隔小于这个差时云端**旧值**会盖在本地新值之后,而两边
+    # 都不带设备时间戳、容器无从仲裁。去重只去得掉同值,去不掉乱序。
+
+    def _props_source_for(self, did: str) -> str:
+        """这台设备的属性推送该走哪条通道。"""
+        ch = getattr(self, "_central_hub", None)
+        if ch is not None and ch.enabled and ch.can_push(did):
+            return SOURCE_LOCAL_CENTRAL
+        return SOURCE_CLOUD
+
+    async def _subscribe_props(self, did: str, source: str) -> None:
+        """按指定通道订上,订不上就抛(调用方据此不记账)。"""
+        if source == SOURCE_LOCAL_CENTRAL:
+            ch = getattr(self, "_central_hub", None)
+            if ch is None:
+                raise MipsConnectionError(
+                    f"central hub unavailable; device-props subscribe not issued did={did}"
+                )
+            # 本地这条也要等网关 SUBACK —— 与云端那条同口径，别把「发出去了」
+            # 当成功（订阅服务端确认前，上层记账会把云端那条退掉）。
+            await ch.sub_device_props_async(did, self._on_device_props_msg)
             return
         mips = self._mips_cloud
         if mips is None or not mips.is_connected:
@@ -1241,15 +2095,282 @@ class MIoTClient:
                 f"mips_cloud unavailable; device-props subscribe not issued did={did}"
             )
         await mips.sub_device_props_async(did, self._on_device_props_msg)
-        self._props_sub_dids.add(did)
 
-    async def unsub_device_props_async(self, did: str) -> None:
-        """Unsubscribe one device's property push subtree."""
-        self._props_sub_dids.discard(did)
+    async def _unsubscribe_props(
+        self, did: str, source: str, keep: Optional[str] = None
+    ) -> None:
+        if source == SOURCE_LOCAL_CENTRAL:
+            ch = getattr(self, "_central_hub", None)
+            if ch is not None:
+                # keep 只在「本地→本地」的搬运里给：那台是刚订上的新实例，得留着；
+                # 其余（旧实例 + 更早的残渣）一并摘掉。不给就全摘。
+                ch.unsub_device_props(did, keep)
+            return
         mips = self._mips_cloud
         if mips is None:
             return
         await mips.unsub_device_props_async(did)
+
+    def _local_props_regroup(self, did: str) -> tuple[bool, Optional[str]]:
+        """本地源的这台设备是否因**改嫁网关**而需要搬运，需要则给出要保留的实例。
+
+        设备会在两台都活着的网关之间迁移（mesh 换代理 / 重新配对）：它从 A 的设备
+        清单消失、出现在 B 的清单里，而**通道还是本地** —— 光比通道名判不出变化，
+        注册却还挂在旧实例的订阅表上。返回 ``(True, cur)`` 表示订到当前归属实例、
+        并退掉**除它以外**的所有注册（旧实例那条 + 更早的残渣）；``(False, None)``
+        表示不用动。
+        """
+        ch = getattr(self, "_central_hub", None)
+        if ch is None:
+            return (False, None)
+        cur = (ch.local_device(did) or {}).get("group_id")
+        if cur is None:
+            # 走不到（`want == LOCAL` 蕴含设备表里有这台），但真走到了就**别动**：
+            # 没有归属实例可订、而退订会 `keep=None` 全摘，等于把这台的注册清掉。
+            return (False, None)
+        if ch.props_sub_groups(did) == {cur}:
+            return (False, None)
+        return (True, cur)
+
+    async def sub_device_props_async(self, did: str) -> None:
+        """订阅一台设备的属性推送(幂等);契约同 sub_device_state_async。
+
+        来源在这里定:`can_push` 为真走本地中枢,否则走云端。
+
+        **镜像改动与搬运互斥,网络阶段不持锁**:一次云端 SUBACK 最长等 10s,上层按
+        `_RECONCILE_CONCURRENCY` 并发对账,跨 I/O 持锁会把那批并发串成一条,还把搬运
+        挡在后面(同 `miloco/miot/client.py::_reconcile_subscriptions` 的论证)。
+        代价是「算来源」与「落地」之间能力可能翻转过 —— 那正是触发搬运的信号,所以
+        提交后按当下判据复查一次,不一致就补跑搬运。
+        """
+        async with self._props_source_lock:
+            if did in self._props_sub_dids:
+                return
+            source = self._props_source_for(did)
+        await self._subscribe_props(did, source)
+        stray = False
+        stale = False
+        async with self._props_source_lock:
+            committed = self._props_sub_sources.get(did)
+            if did in self._props_sub_dids and committed not in (None, source):
+                # 期间别处把它订到了**另一条**通道上：镜像记的是那条，我们刚订的这条
+                # 就是多余的 —— 镜像里没有它、后续对账也扫不到，而单源不变量靠的正是
+                # 任一时刻只有一条。只退自己这条：对方那条在另一条通道上，碰不到。
+                # （同通道时不能退：同一 topic 的注册是幂等的，退一次会把对方的一起
+                # 摘掉，`__reg_broadcast` 见已存在直接返回、`__unreg_broadcast` 删的
+                # 就是那一条。`committed is None` 是「有意图但一条源都没建立」的哨兵，
+                # 也不能当撞车 —— 退了它这台就再也订不回来，函数开头按意图集早退。）
+                # 本地那条订阅现在也要等 SUBACK，所以两个方向都可能落在这里。
+                stray = True
+            else:
+                self._props_sub_dids.add(did)
+                self._props_sub_sources[did] = source
+                # 网络期间能力可能翻转过（那正是触发搬运的信号源）：与当下判据不符
+                # 就补一次搬运，否则这台会一直挂在旧通道/旧实例上直到下一次翻转。
+                stale = self._props_source_for(did) != source or (
+                    source == SOURCE_LOCAL_CENTRAL
+                    and self._local_props_regroup(did)[0]
+                )
+        if stray:
+            await self._unsubscribe_props(did, source)
+            return
+        if stale:
+            await self._sync_props_sources_async()
+
+    async def unsub_device_props_async(self, did: str) -> None:
+        """Unsubscribe one device's property push subtree (whichever channel).
+
+        退**当初订的那条**。来源镜像缺失（``None``：hub 刚被重建过，订阅随旧实例
+        一起没了）时什么都不退 —— 默认成云端会去退一条根本没订过的云端订阅。
+
+        改镜像在锁内、网络退订在锁外:与搬运互斥只要求前者(否则在飞订阅的镜像写回
+        会把来源改谎),而后者的往返可以长到 10s,不该把并发对账串起来。晚退一会儿
+        的代价只是重叠投递,值相同、被状态容器判等吃掉。
+        """
+        async with self._props_source_lock:
+            source = self._props_sub_sources.pop(did, None)
+            self._props_sub_dids.discard(did)
+        if source is not None:
+            await self._unsubscribe_props(did, source)
+
+    async def _sync_props_sources_async(self) -> None:
+        """把每台已订阅设备的推送搬到当前该走的通道上。
+
+        由中枢的两个信号驱动:设备表变化、以及新 client 实例接管(见
+        `_on_local_transport_reset`)。它们都不改「订了哪些 did」,所以 MiotProxy
+        那条按 did 集合对账的路径早退、搬不动 —— 这条路径专治它。
+
+        **先订新、再退旧**:重叠窗口的重复投递值相同、被容器判等吃掉,反过来先退后订
+        的空窗里落地的变更则静默丢掉(见 `__sync_props_sources_locked`)。
+
+        订新失败的那台保留旧订阅(退回「两条都没有」是净损失);退旧失败只告警
+        (残留造成的是重复投递,容器判等吃掉)。
+
+        **整批两阶段跑在锁内**,业务侧的订/退要排在它后面(哪怕只排到取锁那一步)。
+        不这么做,`__try_subscribe` 末尾那句镜像写回会与业务提交交错、把来源写谎 ——
+        这是业务层那条「锁不跨网络 I/O」原则在这里的例外,代价被限在「一次网关断开
+        才会整批换源,`_REPLAY_CONCURRENCY` 并发」。
+        """
+        ch = getattr(self, "_central_hub", None)
+        if ch is None:
+            return
+        async with self._props_source_lock:
+            await self.__sync_props_sources_locked()
+
+    async def __sync_props_sources_locked(self) -> None:
+        ch = getattr(self, "_central_hub", None)
+        # old 取 **None 默认**而不是 SOURCE_CLOUD:两者含义不同 —— None 是「有意图
+        # 但一条都没建立」(hub 刚被重建过,见 _invalidate_local_props_sources),
+        # SOURCE_CLOUD 是「确实订在云端」。混为一谈会去退一条不存在的云端订阅。
+        # 第四项是退旧时**要保留哪台实例**（= 刚订上的新实例），只在「本地→本地」
+        # 的搬运里有值。
+        moves: list[tuple[str, Optional[str], str, Optional[str]]] = []
+        for did in sorted(self._props_sub_dids):
+            old = self._props_sub_sources.get(did)
+            want = self._props_source_for(did)
+            if old != want:
+                moves.append((did, old, want, None))
+                continue
+            if want != SOURCE_LOCAL_CENTRAL or ch is None:
+                continue
+            # 通道没变,但设备可能改嫁了网关:注册挂在旧实例的订阅表上,而设备表已经
+            # 指向新的 —— old == want 判不出变化、差集为空,推送静默停掉且无自愈入口
+            # (旧实例还连着,transport reset 不会发生)。
+            regroup, keep = self._local_props_regroup(did)
+            if not regroup:
+                continue
+            # keep = 当前归属实例：先订到它上面，再退掉其余全部（旧实例那条 + 残渣）。
+            moves.append((did, old, want, keep))
+        if not moves:
+            return
+        # 两阶段、阶段内并发:一次网关断开会让整批设备同时换源,逐个 await 的话
+        # N 次 SUBACK 串起来能把设备表回调阻塞到秒级。阶段边界是语义要的。
+        # 信号量每次现建 —— 它绑当前 loop,而这个 client 的 init/deinit 可能跨 loop。
+        sem = asyncio.Semaphore(_REPLAY_CONCURRENCY)
+        subscribed = await asyncio.gather(
+            *(
+                self.__try_subscribe(sem, did, old, want, keep)
+                for did, old, want, keep in moves
+            )
+        )
+        switched: list[tuple[str, Optional[str], str, Optional[str]]] = [
+            item for item in subscribed if item is not None
+        ]
+        if switched:
+            await asyncio.gather(
+                *(
+                    self.__try_unsubscribe(sem, did, old, keep)
+                    for did, old, _want, keep in switched
+                )
+            )
+            kinds: dict = {}
+            for _did, old, want, _keep in switched:
+                key = "re-established" if old is None else f"{old}→{want}"
+                kinds[key] = kinds.get(key, 0) + 1
+            _LOGGER.info(
+                "props sources switched: %d moved %s", len(switched), kinds
+            )
+
+    async def __try_subscribe(
+        self,
+        sem: asyncio.Semaphore,
+        did: str,
+        old: Optional[str],
+        want: str,
+        keep: Optional[str] = None,
+    ) -> Optional[tuple[str, Optional[str], str, Optional[str]]]:
+        """订上新的。成功且这台仍在意图集里 → ``(did, old, want, 退旧保留的实例)``，否则 ``None``。"""
+        try:
+            async with sem:
+                await self._subscribe_props(did, want)
+        except Exception as e:
+            _LOGGER.warning(
+                "props source switch: subscribe %s failed did=%s (keeping %s): %s",
+                want,
+                did,
+                old,
+                e,
+            )
+            return None
+        if did not in self._props_sub_dids:
+            # 网络往返期间业务层把它退订了。镜像那侧两侧都是同步改的（没有
+            # await 夹在中间），所以这里一定看得见；把刚订上的退掉，别在网关
+            # 上留下一条没人认领的订阅 —— 镜像里已经没有它，下一轮对账也扫不到。
+            try:
+                async with sem:
+                    await self._unsubscribe_props(did, want)
+            except Exception as e:
+                _LOGGER.warning(
+                    "props source switch: undo %s failed did=%s: %s", want, did, e
+                )
+            return None
+        self._props_sub_sources[did] = want
+        return (did, old, want, keep)
+
+    async def __try_unsubscribe(
+        self,
+        sem: asyncio.Semaphore,
+        did: str,
+        old: Optional[str],
+        keep: Optional[str] = None,
+    ) -> None:
+        if old is None:
+            return  # 本来就没建立过（None 哨兵），退它会打到另一条通道上
+        try:
+            async with sem:
+                await self._unsubscribe_props(did, old, keep)
+        except Exception as e:
+            _LOGGER.warning(
+                "props source switch: unsubscribe %s failed did=%s: %s", old, did, e
+            )
+
+    def register_dev_list_changed_callback(
+        self, callback: Optional[Callable[[list, list], Any]]
+    ) -> None:
+        """Register the single business-layer consumer of central hub device-list
+        changes.
+
+        The hub itself carries one callback slot and the SDK owns it (see
+        ``_setup_central_hub_async``) — it re-routes property push sources there.
+        This is the fan-out target for MiotProxy, mirroring the other
+        ``register_*_callback`` slots.
+        """
+        self._callback_dev_list_changed = callback
+
+    async def _on_dev_list_changed_from_hub(self, added: list, removed: list) -> None:
+        """中枢设备表变化 —— 先搬推送来源,再按需通知业务层。
+
+        来源搬运**无条件做**:`can_push` 每一次翻转都要重判,包括 `added`/`removed`
+        都为空、只有能力标志变了那种（设备上下线、push_available 翻转）。
+        业务层只在清单**真增删**时收到通知 —— 它的处理是重拉设备清单（一趟云端往返），
+        标志翻转不改成员,重拉是白花的。
+        """
+        try:
+            await self._sync_props_sources_async()
+        except Exception as e:
+            _LOGGER.error("props source re-route failed: %s", e)
+        cb = self._callback_dev_list_changed
+        if cb is None or not (added or removed):
+            return
+        try:
+            ret = cb(added, removed)
+            if asyncio.iscoroutine(ret):
+                await ret
+        except Exception as e:
+            _LOGGER.error("dev-list-changed callback failed: %s", e)
+
+    async def _on_local_transport_reset(self) -> None:
+        """中枢换了新的本地 MQTT 实例。
+
+        本地订阅挂在那实例的订阅表上,实例一换就全没了,而**设备表可能一字未变**
+        —— 上面那条回调结构上通知不到这件事。不处理的话镜像仍说「订在本地」、
+        `can_push` 也还是真,差集为空、永远重订不上,推送静默停掉。
+        """
+        self._invalidate_local_props_sources()
+        try:
+            await self._sync_props_sources_async()
+        except Exception as e:
+            _LOGGER.error("props source re-route after transport reset failed: %s", e)
 
     def register_scene_changed_callback(
         self, callback: Optional[Callable[[MIoTSceneChangedEvent], Any]]

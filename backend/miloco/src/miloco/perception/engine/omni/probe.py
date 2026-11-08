@@ -3,7 +3,9 @@
 统一被 web preflight (admin/router.py) 与运行时 circuit_breaker HALF_OPEN 复用。
 两阶段探测：GET /models 验鉴权+可达；再用合成红色 JPEG 真校验视觉能力。
 
-返回统一形状 {ok, code, status?, latency_ms?, message}。code 集合与 spec §2 一致。
+返回统一形状 {ok, code, status?, latency_ms?, message}。探测类 code 与 spec §2 的集合一致;
+``fetch_models`` 另有一个 ``list_unsupported``,不参与熔断、不属于该集合(见 error_classifier
+的 docstring),别因为在那边找不到就补进去。
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ import base64
 import io
 import json
 import time
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
@@ -55,6 +58,97 @@ _STRUCTURED_PROBE_MESSAGE = "Responses 服务未通过结构化输出验证"
 _STRUCTURED_PROBE_EMPTY_MESSAGE = "Responses 结构化预检返回空文本"
 _VISUAL_PROBE_EMPTY_MESSAGE = "Responses 视觉预检返回空文本"
 
+# Gemini 原生 generateContent 协议的两条官方接入路径:
+#   generativelanguage.googleapis.com   —— Gemini API
+#   {区域前缀-}aiplatform.googleapis.com —— Vertex AI
+# **两台主机下都是原生协议与 OpenAI 兼容协议并存**,主机名一样,只能靠 path 区分:
+#   Gemini API  原生 版本段如 /v1beta      兼容 /v1beta/openai
+#   Vertex      原生 路径含 /publishers/   兼容 路径含 /endpoints/openapi
+# 兼容那条走 ``Authorization: Bearer``;误判成原生会给它发 x-goog-api-key,被拒后报成
+# 「Key 无效」——正是本模块要消除的那类误报。
+# 两侧策略**故意不同**:
+#   Gemini API 侧用黑名单(只排除含 openai 段的路径)—— 原生的版本段会随 API 版本新增,白名单要跟着改;
+#   Vertex 侧用白名单(只放行含 publishers 段的路径)—— 该主机路径形态多,黑名单挡不住未知的非原生路径。
+_GEMINI_NATIVE_HOST = "generativelanguage.googleapis.com"
+_GEMINI_OPENAI_PATH_SEG = "openai"
+_VERTEX_HOSTS = frozenset({"aiplatform.googleapis.com"})
+_VERTEX_HOST_SUFFIX = "-aiplatform.googleapis.com"
+_VERTEX_NATIVE_PATH_SEG = "publishers"
+
+
+def _parse_model_ids(payload: Any, *, prefer_native: bool) -> list[str]:
+    """从模型列表响应里抽 model id,认识的几种形态都试。
+
+    认识三种形态:Gemini 原生 ``{models:[{name}]}``、Vertex 的 ``{publisherModels:[{name}]}``
+    (name 形如 ``publishers/google/models/xxx``)、OpenAI 兼容 ``{data:[{id}]}``。
+    前缀归一**按形态各配一条**:两种原生形态各剥各的前缀,兼容形态的 id 原样透传
+    (含 ``/`` 合法,如 ``accounts/<org>/models/<name>``,截断后 provider 认不出来)。
+    ``prefer_native`` 只决定**先试哪一种**,不再是唯一依据:绑死单一形态时,端点的形态一旦判错
+    (鉴权仍通过、只是响应形态与预期不符)就会解出空列表,却仍按 200 成功返回。
+
+    产出保证:恒为字符串列表且元素均非空——调用方据此可直接排序,不必再过滤。顶层非 dict、
+    列表位不是 list、条目不是 dict、标识是嵌套结构(dict/list)一律跳过而非抛出;标识为数字等
+    标量时转成字符串。
+    """
+    if not isinstance(payload, dict):
+        return []
+
+    def _pick(key: str, field: str, norm: Callable[[str], str]) -> list[str]:
+        items = payload.get(key)
+        if not isinstance(items, list):
+            return []
+        out: list[str] = []
+        for m in items:
+            if not isinstance(m, dict):
+                continue
+            raw = m.get(field)
+            # 只对标量归一:标识为数字时转字符串,免得调用方排序混排类型抛异常。dict / list
+            # 这类嵌套值 str() 之后是一串垃圾文本,会通过下面的非空过滤、被当成合法 model id
+            # 收进下拉,故与其他异常形态一样跳过。bool 是 int 的子类,一并排除。
+            if isinstance(raw, bool) or not isinstance(raw, (str, int, float)):
+                continue
+            # 归一规则**按形态配**,不能写死一条套到三种上:兼容形态的 id 里含 ``/models/``
+            # 是合法的(如 ``accounts/<org>/models/<name>``),截断后 provider 认不出来。
+            mid = norm(str(raw))
+            if mid:
+                out.append(mid)
+        return out
+
+    native = [
+        # Gemini 原生:name 形如 ``models/<id>``
+        ("models", "name", lambda v: v.removeprefix("models/")),
+        # Vertex:name 形如 ``publishers/<pub>/models/<id>``
+        ("publisherModels", "name", lambda v: v.rsplit("/models/", 1)[-1]),
+    ]
+    # OpenAI 兼容:id 原样透传——含 ``/`` 是合法的,不做任何剥离
+    compat = [("data", "id", lambda v: v)]
+    for key, field, norm in (native + compat if prefer_native else compat + native):
+        ids = _pick(key, field, norm)
+        if ids:
+            return ids
+    return []
+
+
+def _is_gemini_native_endpoint(base: str) -> bool:
+    """按**主机名 + 路径**判是否 Gemini 原生 generateContent 端点。
+
+    主机名取 ``urlparse().hostname`` 比对,不用 ``"…" in base_url`` 子串匹配——子串匹配会被
+    ``https://evil.com/generativelanguage.googleapis.com`` 之类绕过(CodeQL 报的 incomplete
+    URL substring sanitization)。两台主机都还要再过一道路径判断,用途见上方注释。
+    """
+    parsed = urlparse(base)
+    host = (parsed.hostname or "").lower()
+    # 按**路径段**比对而非子串:尾锚定会漏掉 ``…/openai/v1``(不少工具要求 base 以 /v1 结尾),
+    # 裸子串又会把 ``…/myopenai`` 之类误判。两侧同一写法,不再一边尾锚定一边包含。
+    # 与主机名一样做小写归一:URL 路径按 RFC 大小写敏感,但判定不该因大小写差异漏判——
+    # 漏判的后果是给兼容端点发原生鉴权头,正是本模块要消除的那类误报。
+    segments = parsed.path.lower().strip("/").split("/")
+    if host == _GEMINI_NATIVE_HOST:
+        return _GEMINI_OPENAI_PATH_SEG not in segments
+    if host in _VERTEX_HOSTS or host.endswith(_VERTEX_HOST_SUFFIX):
+        return _VERTEX_NATIVE_PATH_SEG in segments
+    return False
+
 
 def _normalize_base_url(base_url: str) -> tuple[str | None, str | None]:
     """校验 base_url 并归一化(去尾斜杠)。
@@ -86,7 +180,14 @@ async def probe_reachable(base_url: str) -> dict | None:
 
     - scheme 非法 / 网络错 → {code: unreachable, ...}
     - 2xx/3xx 或 401/403 → None(URL 没问题,问题在缺 key)
+    - Gemini 原生端点的 404 → None(见下方注释)
     - 其他 4xx/5xx → {code: http_error, ...}
+
+    **已知代价**:原生端点的 404 一律放行,而路径写错同样回 404,两者仅凭状态码分不开。
+    于是同族主机上的路径笔误(如版本段敲多一个字母)在**未填 Key 阶段**会被上层的「缺 key」
+    盖住,提示里一个字都不提地址。这是本函数契约的直接推论——它的既定职责就是让「缺 key」
+    优先于地址错暴露,收紧就得牺牲那个契约。影响只到填 Key 之前:填上 Key 后走拉模型列表
+    那条路,拿到的是并列「端点没有此方法」与「路径可能写错」两种可能的提示。
     """
     base, err = _normalize_base_url(base_url)
     if err is not None:
@@ -100,6 +201,10 @@ async def probe_reachable(base_url: str) -> dict | None:
             "message": f"无法连接 Base URL（{type(e).__name__}）",
         }
     if r.status_code < 400 or r.status_code in (401, 403):
+        return None
+    # Gemini 原生端点未必都有 models.list,404 只说明这条路径没有该方法,不代表
+    # Base URL 写错;判 http_error 会让可用配置在「缺 key」之前先被报成地址错。
+    if r.status_code == 404 and _is_gemini_native_endpoint(base):
         return None
     return {"code": "http_error", "message": f"服务返回异常（HTTP {r.status_code}）"}
 
@@ -136,24 +241,23 @@ async def fetch_models(
             "message": f"无法连接 Base URL（{type(e).__name__}）",
         }
     if r.status_code == 200:
+        # 解析与排序一起放进 try:响应体不是 JSON 时 r.json() 会抛,逃出去会让本接口 500。
+        # 排序本身靠 _parse_model_ids「恒产非空字符串」的产出保证不抛,一并纳入只是防后续改动。
         try:
-            if is_gemini:
-                ids = [
-                    (m.get("name") or "").removeprefix("models/")
-                    for m in (r.json().get("models") or [])
-                    if m.get("name")
-                ]
-            else:
-                ids = [m.get("id") for m in (r.json().get("data") or []) if m.get("id")]
+            models = sorted(_parse_model_ids(r.json(), prefer_native=is_gemini))
         except Exception:  # noqa: BLE001
-            ids = []
-        return {"ok": True, "models": sorted(i for i in ids if i)}
+            models = []
+        return {"ok": True, "models": models}
     if api_protocol == "openai_responses" and r.status_code in (404, 405):
+        return {"ok": True, "code": "unsupported", "models": [], "message": "该协议不支持模型发现，请手动填写模型"}
+    if r.status_code == 404 and is_gemini:
+        # 无法仅凭 404 区分「该端点没有 models.list」与「Base URL 路径写错」,故文案并列
+        # 两种可能,不把不确定说成确定。
         return {
-            "ok": True,
-            "code": "unsupported",
+            "ok": False,
+            "code": "list_unsupported",
             "models": [],
-            "message": "该协议不支持模型发现，请手动填写模型",
+            "message": "该 Base URL 未返回模型列表，请手动填写模型名（并确认 Base URL 路径无误）",
         }
     if r.status_code in (401, 403):
         return {
@@ -294,7 +398,10 @@ async def probe_chat(
     assert base is not None
     # 延迟 import 避免 probe 被 wire 时循环拉起 provider (provider 只依赖标准库,
     # 但保险起见延后到函数内)。
-    from miloco.perception.engine.omni.provider import get_adapter
+    from miloco.perception.engine.omni.provider import (
+        build_request_headers,
+        get_adapter,
+    )
 
     adapter = get_adapter(api_protocol, model)
     body = adapter.build_request_body(
@@ -307,13 +414,8 @@ async def probe_chat(
     )
     forced_stream = body.get("stream", False)
     url = adapter.endpoint(base, model, stream=forced_stream)
-    # adapter.auth_headers 走 provider 特化 —— Gemini 用 ``x-goog-api-key`` 头,
-    # OpenAI 兼容族用 ``Authorization: Bearer``。硬编码 Bearer 会对合法 Gemini
-    # 配置误报失败(401)。
-    headers = {
-        **adapter.auth_headers(api_key),
-        "Content-Type": "application/json",
-    }
+    # 统一走 provider 特化鉴权，并确保 probe 与运行时发送相同的附加头。
+    headers = build_request_headers(adapter, base, api_key)
     t0 = time.monotonic()
     stream_safe_config_code: str | None = None
     try:
@@ -860,6 +962,10 @@ async def probe_omni(
     if not isinstance(adapter, OpenAICompatAdapter):
         return await probe_chat(model, base, api_key, api_protocol)
     try:
+        # 同 fetch_models:预检刻意只发 Authorization、**不**带 x-opencode-session。
+        # 这里的 model 已经能拿到 adapter,但 GET /models 只问「这个 endpoint 认不认我的
+        # key」,不是一次推理,session 头(运行时按 endpoint 派生的进程级路由亲和 ID)在这
+        # 里没有作用;真校验模型的 probe_chat 才按运行时同头发。别"顺手收敛"成半对齐。
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             r = await client.get(
                 f"{base}/models", headers={"Authorization": f"Bearer {api_key}"}

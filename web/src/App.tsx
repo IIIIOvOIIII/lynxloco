@@ -36,6 +36,7 @@ import {
   realEnableCamera,
   realListCameraSummaries,
 } from "./api/real";
+import { miotTone } from "@/lib/miotTone";
 import { Sidebar, MobileTabBar, type TabKey } from "./components/Sidebar";
 import { SettingsDrawer } from "./components/SettingsDrawer";
 import { HomeSwitcher } from "./components/HomeSwitcher";
@@ -61,7 +62,10 @@ import { ToastHost, toast } from "./components/Toast";
 import { UsagePage } from "./components/UsagePage";
 import { UsersPage } from "./components/UsersPage";
 import type { HomeId } from "./lib/types";
-import { hasActivePerceptionCamera } from "./lib/perceptionActivity";
+import {
+  hasActivePerceptionCamera,
+  hasActiveRtspPerceptionCamera,
+} from "./lib/perceptionActivity";
 import { PerfPage } from "./components/PerfPage";
 import { IconMoon, IconSun } from "./lib/icons";
 import { useTheme } from "./hooks/useTheme";
@@ -166,6 +170,10 @@ function MainApp({
   const homeId: HomeId = "primary";
 
   // ── 数据加载（按当前家拉取；mock 家走 empty）─────────
+  // 传 errorLabel：这份状态按固定间隔重拉，但提示是**边沿触发**的——useAsync 的
+  // 闸门只在「转入错误态」时放行一次，后端挂着并不会每轮弹一条。不传的话，页面
+  // 开着时后端中途不可达就完全无声：状态条保持上一份不变（这是刻意的，见下），
+  // 于是住户看到的是一切正常，而实际上已经拉不到任何新状态了。
   const status = useAsync(() => getHomeStatus(homeId), [homeId], {
     errorLabel: t("app.loadHomeStatusFail"),
   });
@@ -174,6 +182,27 @@ function MainApp({
     [homeId],
     { errorLabel: t("app.loadPerceptionRuntimeFail") },
   );
+  // 定时重拉。米家授权可能在页面开着的时候失效（令牌到期 + 云端拒绝续期），
+  // 而 useAsync 只在 deps 变化时拉一次、全站也没有推送通道，不轮询的话状态条
+  // 会一直停在「已连」。30s 与 PerfPage 的既有轮询同档；这个间隔不直接决定
+  // 打云端的频次——后端把那次校验按令牌指纹缓存了一分钟，多开页签也只合并成
+  // 一次。重拉失败时 useAsync 只置 error、不清 data，因此状态条保持上一份而不是
+  // 闪成「未连」——前提是拉取真的抛错，这正是 realHomeStatus 在三路全灭时抛错
+  // 的原因。
+  const reloadStatus = status.reload;
+  useEffect(() => {
+    // 页签在后台时不轮询：这份状态背后是一次真实的云端校验，后台页签攒着打过去
+    // 只是白费配额；切回前台立刻补一次，住户看到的仍是新的。
+    const tick = () => {
+      if (!document.hidden) reloadStatus();
+    };
+    const id = setInterval(tick, 30_000);
+    document.addEventListener("visibilitychange", tick);
+    return () => {
+      clearInterval(id);
+      document.removeEventListener("visibilitychange", tick);
+    };
+  }, [reloadStatus]);
   const persons = useAsync(() => listPersons(homeId), [homeId], {
     errorLabel: t("app.loadPersonsFail"),
   });
@@ -388,6 +417,9 @@ function MainApp({
               miotHasCamera={devices.data.some(
                 (d) => d.category === "camera",
               )}
+              miotAuthDegraded={
+                status.data ? miotTone(status.data.miot) === "degraded" : false
+              }
               /* 投喂上限唯一来源:后端 MAX_ENABLED_CAMERAS，经 /api/miot/status 下发。
                  status 未到/出错时兜底 4，与后端默认一致。 */
               maxStreamCams={status.data?.maxEnabledCameras ?? 4}
@@ -730,9 +762,10 @@ function MainApp({
         <OmniHealthBanner onGoToConfig={() => setActiveTab("usage")} />
 
         {/* 状态条(shrink-0) */}
-        {status.data && (
+        {status.data ? (
           <StatusRibbon
             status={status.data}
+            hasActiveRtspCamera={hasActiveRtspPerceptionCamera(cameraSummaries.data ?? [])}
             allCamerasOff={
               // 未就绪时兜底 false（宁可短暂显"在看家"，不误报"待机中"）
               // 注意：空集在 hasActivePerceptionCamera 中自然为 false——无摄像头家庭
@@ -791,7 +824,15 @@ function MainApp({
               status.reload();
             }}
           />
-        )}
+        ) : status.error ? (
+          // 冷启动时后端整体不可达：没有「上一份」可保留。此处若什么都不渲染，
+          // 该区域会整块空白、数据到达后还有一次布局跳动。给一句「正在重试」，
+          // 而不是像以前那样显示误导性的「米家未连 + 去绑定」——那会把住户引向
+          // 在故障窗口里重新授权。
+          <div className="shrink-0 flex items-center px-5 md:px-8 py-2.5 border-b border-border bg-bg-primary text-body text-text-tertiary">
+            {t("app.homeStatusUnavailable")}
+          </div>
+        ) : null}
 
         {activeTab === "now" && (
           <PerceptionRuntimeCard
@@ -856,14 +897,19 @@ function MainApp({
       <MiotBindDialog
         open={miotBindOpen}
         onClose={() => setMiotBindOpen(false)}
-        onDone={() => {
+        onDone={(scopePreserved) => {
           // 跟切家失败的 cross-reload toast 走同一根管子：直接 toast() 会被
           // 紧跟的 reload unmount ToastHost 立即吞掉,住户看不见绑定成功反馈。
           // 写 sessionStorage,reload 后 ToastHost mount 时 pop 出来显示。
           try {
             sessionStorage.setItem(
               "miloco_pending_toast",
-              JSON.stringify({ text: t("app.miotBound"), tone: "ok" }),
+              JSON.stringify({
+                text: scopePreserved
+                  ? t("app.miotBoundScopeKept")
+                  : t("app.miotBound"),
+                tone: "ok",
+              }),
             );
           } catch {
             /* sessionStorage 不可用降级,不影响 reload */

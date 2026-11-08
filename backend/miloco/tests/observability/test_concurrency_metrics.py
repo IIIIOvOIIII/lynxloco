@@ -106,3 +106,23 @@ def test_http_success_with_cancelled_window_is_not_a_completed_success_cycle(tmp
     assert result["omni_success_cycle_count"] == 0
     assert result["p95_rtf_e2e"] == 0
     conn.close()
+
+
+def test_partial_windows_stay_separate_from_whole_window_coverage(tmp_path):
+    conn = connect(tmp_path / "obs.db")
+    init_schema(conn)
+    conn.execute(
+        "INSERT INTO traces (trace_id,timestamp,device_count,dropped_windows_total,"
+        "partial_windows_total,metric_version) VALUES ('cycle',1000,2,1,4,2)"
+    )
+    for i in range(2):
+        conn.execute(
+            "INSERT INTO traces_device (device_trace_id,cycle_id,timestamp,device_id) "
+            "VALUES (?,'cycle',1000,?)", (f"trace-{i}", f"camera-{i}"),
+        )
+    result = summary(conn, "1h", 1, 2000)
+    assert result["processed_device_window_count"] == 2
+    assert result["expected_window_count"] == 3
+    assert result["partial_windows_count"] == 4
+    assert result["drop_rate"] == pytest.approx(1 / 3)
+    conn.close()

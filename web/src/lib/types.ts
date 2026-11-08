@@ -19,6 +19,13 @@ export interface HomeStatus {
     userIcon?: string;
     /** 小米账号 uid（住户 AccountMenu 展示用），未绑时缺省 */
     userUid?: string;
+    /** 米家授权已被云端拒绝，需要住户重新授权。
+     *
+     *  与 `bound` 正交：令牌续期失败但 access_token 还没到期时 `bound` 仍是 true。
+     *  此时米家设备控制与米家相机感知已停止；HA 与 RTSP 不依赖米家授权。 */
+    authDegraded?: boolean;
+    /** 进入降级态的时刻（秒级 epoch），用于展示「自 X 时起」 */
+    authDegradedSince?: number;
     devicesCount: number;
     roomsCount: number;
   };
@@ -354,6 +361,18 @@ export interface ActivityEvent {
   has_trace?: boolean;
   /** 是否有全景参考帧 ref.jpg(= 本事件走了 Smart Crop);前端据此决定是否请求 /ref/ 并渲染参考卡 */
   has_ref?: boolean;
+  /** 回放载体:视频、图片序列、纯音频或无产物。 */
+  visual_artifact_kind?: "video" | "images" | "audio" | "none";
+  /** 图片模式每个 device 的 canonical frame 数。 */
+  image_frame_counts?: Record<string, number>;
+  /** 是否存在独立持久化的音频产物(图片模式随主画面单独上送的 audio.m4a, 或
+   *  audio-only 事件的 clip.m4a —— 后者在图片模式上线前就存在)。
+   *
+   *  接口透传字段，UI 不消费: 图片模式选中的 VLM 默认不支持音频(多数 VLM 亦如此),
+   *  模型听不到这段音频, 界面也就不给它播放入口 —— 回放区在图片模式下整行走图片序列
+   *  (见 ActivityFeed 的 isImageMode 分支), 不进音频播放分支。保留此字段是为了让接口
+   *  如实反映"这次请求带了什么", 便于排查与两种模态对照。 */
+  has_audio_artifact?: boolean;
   /** 该事件是否已有反馈打包 */
   has_feedback?: boolean;
   feedback_pack_path?: string | null;
@@ -371,6 +390,9 @@ export interface OnDemandLogEntry {
   snapshot_count: number;
   clip_dids: string[];
   clip_kinds: Record<string, "mp4" | "m4a">;
+  visual_artifact_kind?: "video" | "images" | "audio" | "none";
+  image_frame_counts?: Record<string, number>;
+  has_audio_artifact?: boolean;
   has_trace: boolean;
   has_feedback: boolean;
   feedback_pack_path: string | null;
@@ -759,11 +781,182 @@ export interface OmniProfileRef {
 /** 拉取模型列表结果。 */
 export interface OmniModelsResult {
   ok: boolean;
-  /** 失败时的机器码(no_key/unreachable/bad_key/http_error);缺省回退 message。 */
+  /** 失败时的机器码(no_key/unreachable/bad_key/http_error/list_unsupported);缺省回退 message。 */
   code?: string;
   models: string[];
   message?: string;
 }
+
+// ── Generic Graph JSON ───────────────────────────────────
+
+export type GraphSource =
+  | "observed"
+  | "configured"
+  | "model_fixed"
+  | "unknown";
+export type GraphStatus =
+  | "ok"
+  | "warning"
+  | "skipped"
+  | "backpressure"
+  | "error"
+  | "inactive"
+  | "unknown";
+export type GraphFreshness = "fresh" | "stale" | "unknown";
+export type GraphKind =
+  | "source"
+  | "buffer"
+  | "transform"
+  | "filter"
+  | "inference"
+  | "encoder"
+  | "external"
+  | "sink"
+  | "generic";
+export type GraphRole =
+  | "input"
+  | "output"
+  | "config"
+  | "flow"
+  | "state"
+  | "detail";
+export type GraphSeverity = "info" | "warning" | "error";
+export type GraphValue = string | number | boolean;
+
+export interface GraphDatum {
+  value: number | null;
+  source: GraphSource;
+}
+
+export interface GraphMedia {
+  width: GraphDatum | null;
+  height: GraphDatum | null;
+  fps: GraphDatum | null;
+  frame_count: GraphDatum | null;
+  duration_ms: GraphDatum | null;
+}
+
+export interface GraphMetric {
+  key: string;
+  label: string;
+  value: GraphValue | null;
+  unit: string | null;
+  source: GraphSource;
+  role: GraphRole;
+  severity: GraphSeverity | null;
+}
+
+export interface GraphWarning {
+  code: string;
+  message: string;
+  severity: GraphSeverity;
+  params: Record<string, GraphValue>;
+}
+
+export interface GraphEvidence {
+  trace_id: string | null;
+  device_trace_id: string | null;
+  observed_at: number | null;
+  age_ms: number | null;
+}
+
+export interface GraphNode {
+  id: string;
+  kind: GraphKind;
+  label: string;
+  group: string | null;
+  rank: number | null;
+  order: number;
+  status: GraphStatus;
+  freshness: GraphFreshness;
+  last_observed_status: GraphStatus | null;
+  standalone: boolean;
+  metrics: GraphMetric[];
+  input: GraphMedia | null;
+  output: GraphMedia | null;
+  warnings: GraphWarning[];
+  evidence: GraphEvidence | null;
+}
+
+export interface GraphEdge {
+  id: string;
+  from: string;
+  to: string;
+  label: string | null;
+  active: boolean;
+  status: GraphStatus;
+  freshness: GraphFreshness;
+  last_observed_status: GraphStatus | null;
+  media: GraphMedia | null;
+  metrics: GraphMetric[];
+  warnings: GraphWarning[];
+  evidence: GraphEvidence | null;
+}
+
+export interface GraphLayout {
+  rank_separation: number;
+  node_separation: number;
+}
+
+export interface GraphGroup {
+  id: string;
+  label: string;
+  order: number;
+}
+
+export interface GraphDefinition {
+  id: string;
+  label: string;
+  direction: "LR" | "TB";
+  layout: GraphLayout;
+  groups: GraphGroup[];
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+}
+
+export interface GraphScope {
+  device_id: string | null;
+  room_name: string | null;
+}
+
+export interface GraphDeviceSummary {
+  device_id: string;
+  room_name: string | null;
+  trace_id: string | null;
+  device_trace_id: string | null;
+  observed_at: number | null;
+  freshness: GraphFreshness;
+  status: GraphStatus;
+}
+
+export interface GraphSummary {
+  latest_trace_id: string | null;
+  latest_device_trace_id: string | null;
+  observed_at: number | null;
+  freshness: GraphFreshness;
+  devices: GraphDeviceSummary[];
+}
+
+export interface GraphResponse {
+  schema_version: 1;
+  generated_at: number;
+  process_started_at: number;
+  stale_after_sec: number;
+  scope: GraphScope;
+  graph: GraphDefinition;
+  summary: GraphSummary;
+}
+
+export interface GraphProtocolWarning {
+  code: "unknown_kind" | "unknown_status";
+  message: string;
+  path: string;
+  value: string;
+}
+
+export type GraphDecodeResult =
+  | { ok: true; graph: GraphResponse; warnings: GraphProtocolWarning[] }
+  | { ok: false; error: string };
 
 /** 提交给后端的 omni 配置(保存/测试)；档案名 label = 唯一 id。 */
 export interface OmniConfigUpdate {
@@ -816,6 +1009,8 @@ export interface PerfSummary {
   omni_success_cycle_count?: number;
   /** 完整丢弃的摄像头窗口数。 */
   dropped_count: number;
+  /** 窗口内实际处理的设备窗口数。 */
+  processed_device_window_count?: number;
   skip_rate: number;
   /** null 表示只有旧口径历史，无法计算新口径丢弃率。 */
   drop_rate: number | null;
@@ -1144,3 +1339,11 @@ export interface UpgradeStatus {
   /** idle | starting | downloading | installing | done | failed —— 前端据此点亮步骤 / 判完成。 */
   phase: string;
 }
+
+/** 米家授权接口的返回体。老后端不返回这两个字段，消费方需自带缺省。 */
+export type MiotAuthorizeResult = {
+  /** 这次绑的是不是另一个账号。换号时后端已重置接入范围配置。 */
+  accountChanged: boolean;
+  /** 后端是否保留了原有的家庭与摄像头配置（同账号重绑时为真）。 */
+  scopePreserved: boolean;
+};

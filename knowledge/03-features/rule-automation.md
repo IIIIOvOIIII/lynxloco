@@ -79,6 +79,10 @@
   达标（TARGET_FIRED）走同一条链，只是 ① 层不是画面而是记账：record 源按"还差多少"
   排一个定时器，到点重新读账、够了就喂真。"今天通知过没有"由条件本身的值承载 ——
   已经是真就产不出新边沿，跨日归零把它翻假，第二天达标才是新的假→真。
+
+另一条入口：设备属性变化（iot 源）。状态容器里 iot/device/*/prop/* 或 status/online
+一变，IotSource（rule/iot_source.py）按 (did, iid) 索引出引用了这条属性的规则，只把那
+几条放进待算集合重新求值 —— 不走感知那条帧级链路，但汇入上面同一个 ①②③④。
 ```
 
 ### 核心模块
@@ -88,10 +92,13 @@
 | `RuleService`        | `rule/service.py`             | 规则 CRUD + 一致性校验：执行路径矩阵、lifecycle、query 措辞、idempotent/cooldown 配对、task 名下规则组合的合法性、task 存在性与规则重名，均在 create/update 流程强制校验；达标规则由它按 task 配置代建与撤销 |
 | `RuleRunner`         | `rule/runner.py`              | ①②③ 层：per-(rule_id, source_did) 布尔聚合 + 抗抖 + duration 滑窗 + 边沿 diff + 方向映射；STATIC 直调 MiotProxy，DYNAMIC 走 dispatch_event                                                                   |
 | `RecordSource`       | `rule/record_source.py`       | 达标这个源：把"当日累计够没够"算成条件项的布尔，自己按剩余量排定时器                                                                                                                                         |
+| `IotSource`          | `rule/iot_source.py`          | 设备属性这个源：把一条 MIoT 属性的当前值判成条件项的布尔。订阅[设备状态容器](device-state-store.md)，按 (did, iid) 索引只重算受影响的规则；重连后按 iid 从云端补拉它关心的那几条属性                         |
 | `TaskStateMachine`   | `task/state_machine.py`       | ④ 层：per-task 的 runtime_state、幂等消费（多条规则进只执行一次）、方向映射的唯一落点 `slot_for_edge`                                                                                                        |
 | `TerminateEvaluator` | `rule/terminate_evaluator.py` | temporary 规则的后台评估服务；其到期删除实际由 Agent 经 `miloco-terminate-task` 完成                                                                                                                         |
 
 规则 schema 定义见 `rule/schema.py`（`Rule` / `RuleAction` / `RuleDirection` / `RuleEvent` / `RuleLifecycle`）。`RuleMode` 是被 `RuleDirection` 取代的旧字段，expand-contract 阶段 A 期间仍在表上，读侧一律走 `Rule.resolved_direction`。
+
+**条件项的来源（`source_type`）有三条**：`omni`（画面，走感知链路）/ `record`（记账达标）/ `iot`（设备属性）。`RuleRunner` 按它分发到不同的源实现；创建时对不认识的取值直接拒，不静默当 omni。
 
 ### 关键设计决策
 
@@ -114,6 +121,17 @@
 **STATIC 动作两重检查**：执行前做幂等检查（先查当前属性值，已达目标则跳过）和冷却检查（冷却窗口内跳过，适合 TTS 等不宜频繁触发的动作）。`idempotent=false` 的动作必须配 `cooldown_minutes`，service 层在 CRUD 时强制校验。
 
 **STATIC 动作三种形态**：`iid` 决定形态——`prop.<siid>.<piid>` 走属性直控（带 `value`），`action.<siid>.<aiid>` 走 method call（带 `params`，如 TTS），`scene` 触发米家场景（`did` 位置放 scene_id，无 `value`/`params`）。场景读不到当前值，无法做幂等比对，所以强制 `idempotent=false` + `cooldown_minutes`，去重只靠冷却；冷却键是 `(did, iid)`，同一条规则里的多个场景互不干扰。场景执行复用 `MiotService` 的家庭白名单校验和场景台账，与 CLI 手动触发落同一形状，仅 `source` 标成 `rule`、`source_id` 写 rule_id。
+
+**冷却时间戳的落地判据是「指令是否可能已执行」，不是「是否成功」**：
+
+| 动作结果                                                                   | 台账 success | 落冷却 | 为什么                                                                                                                                                                                                                      |
+| -------------------------------------------------------------------------- | ------------ | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 成功                                                                       | true         | 是     | —                                                                                                                                                                                                                           |
+| 结果未知（`-10006` 超时 / `-10041` 回包结构不认识 / `-10040` 回包非 JSON） | **false**    | **是** | 这三个码的前提是请求已到过本地网关、指令**可能已执行**；不落冷却的话人还在动、规则几秒后再触发就会把「窗帘 +10%」又执行一遍，把 SDK 层刻意避开的双发重新引入（见 [设备控制](device-control.md#控制优先走本地中枢云端兜底)） |
+| 空返回 / `None` / 不可判定                                                 | false        | **否** | 请求未必发出去过，误落冷却会压掉用户接下来的真实动作                                                                                                                                                                        |
+| 设备明确拒绝（普通 spec 失败码）                                           | false        | 否     | 确定没执行，压掉后续重试没有收益                                                                                                                                                                                            |
+
+判定函数是 `result_codes.is_result_unknown`。注意「结果未知」仍然算失败——用户必须知道这次没拿到确认，冷却只是关掉重复执行的窗口。
 
 **query 措辞校验**：`RuleService` 在创建和更新规则时拒绝以"检测到"/"识别到"/"感知到"等断言性词汇开头的 query。这类措辞被注入 Omni prompt 后，VLM 会把 query 当成已发生事实而非待判断条件，导致连续误触发。query 应改写为进行时状态描述（如"有人坐在书房桌前"而非"检测到有人进入书房"）。
 

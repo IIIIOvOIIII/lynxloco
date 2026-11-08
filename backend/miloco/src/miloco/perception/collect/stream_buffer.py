@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Generic, Literal, TypeVar
@@ -38,6 +39,9 @@ class ReadyWindow:
     tracks: dict[str, list[StreamFragment]]
     start_ms: int  # wall-clock window start (inclusive)
     end_ms: int  # wall-clock window end (exclusive)
+    last_drain_observed_at: int
+    last_drain_ready_depth_before: int
+    last_drain_ready_depth_after: int
 
 
 @dataclass
@@ -458,6 +462,8 @@ class MultiTrackSyncBuffer:
 
             if mode not in {"latest", "fifo"}:
                 raise ValueError("drain mode must be latest or fifo")
+            drain_observed_at = int(time.time() * 1000)
+            ready_depth_before = len(self._ready_queue)
             ordered_keys = sorted(self._ready_queue)
             if mode == "fifo":
                 ordered_keys = ordered_keys[:1]
@@ -508,6 +514,9 @@ class MultiTrackSyncBuffer:
                 tracks=newest_win.tracks,
                 start_ms=newest_win.window_start_ms,
                 end_ms=newest_win.window_end_ms,
+                last_drain_observed_at=drain_observed_at,
+                last_drain_ready_depth_before=ready_depth_before,
+                last_drain_ready_depth_after=len(self._ready_queue),
             )
 
     # ---- Peek (non-consuming) ----

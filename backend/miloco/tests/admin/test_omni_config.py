@@ -72,7 +72,7 @@ def client(tmp_path, monkeypatch):
                 "model": {
                     "omni": {
                         "label": "",
-                        "model": "xiaomi/mimo-v2.5",
+                        "model": "mimo-v2.6-flash",
                         "base_url": "https://api.xiaomimimo.com/v1",
                         "api_key": "",
                     },
@@ -345,7 +345,7 @@ def test_get_default_active_no_key_not_synthesized(client):
     """出厂未配态:当前生效配置无 key(没有模型在跑),不合成进列表 —— 列表为空,
     前端据此给「未配 API Key」警告,清楚表达「没有模型在跑」。"""
     data = _get(client)
-    assert data["active"]["model"] == "xiaomi/mimo-v2.5"
+    assert data["active"]["model"] == "mimo-v2.6-flash"
     assert data["active"]["has_key"] is False
     assert data["profiles"] == []
 
@@ -795,7 +795,7 @@ def test_delete_active_resets_to_unconfigured(client):
     ]
     # 当前生效重置为出厂未配态(无 key)
     assert out["active"]["has_key"] is False
-    assert out["active"]["model"] == "xiaomi/mimo-v2.5"
+    assert out["active"]["model"] == "mimo-v2.6-flash"
     # 乙已移除;甲 仍在档案列表但非 active;无任何 active 行(无 key 不合成)
     assert not any(p["label"] == "乙" for p in out["profiles"])
     assert any(p["label"] == "甲" for p in out["profiles"])
@@ -1415,7 +1415,8 @@ def _force_breaker_open_config():
 
 def test_test_connection_ok_matching_active_clears_breaker(client):
     """测通 + 三元组与当前 active 完全一致 → 熔断从 OPEN_CONFIG 回 CLOSED。
-    这是「测通即恢复」的最直觉路径,OPEN_CONFIG 下 tick 不自动探测,不清则用户困在红条上。"""
+    这是「测通即恢复」的最直觉路径,OPEN_CONFIG 下 tick 只有慢周期(默认 300s)自动探测,
+    不清则用户测通后最坏还要困在红条上一整个周期。"""
     from miloco.perception.engine.omni.circuit_breaker import (
         get_omni_circuit_breaker,
     )

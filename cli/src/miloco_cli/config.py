@@ -21,6 +21,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import shlex
 import tempfile
 import threading
 from contextlib import contextmanager
@@ -29,8 +30,90 @@ from pathlib import Path
 from typing import Any
 
 
+def _default_runtime_env() -> Path:
+    """返回当前用户的默认 runtime 指针文件路径。"""
+    return Path.home() / ".config" / "miloco" / "default.env"
+
+
+def _read_env_file(path: Path) -> dict[str, str]:
+    """读取格式受限的 ``KEY=VALUE`` 环境文件。
+
+    解析规则需与 ``scripts/install.py::_read_runtime_pointer`` 保持一致；
+    Hermes 安装脚本中也有等价写入逻辑，因为独立安装脚本不能
+    导入 CLI 包。
+    """
+    if not path.is_file():
+        return {}
+    out: dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        try:
+            assignment = shlex.split(line, comments=False, posix=True)
+        except ValueError:
+            continue
+        if len(assignment) != 1 or "=" not in assignment[0]:
+            continue
+        key, _, value = assignment[0].partition("=")
+        key = key.strip()
+        if not key or not (key[0].isalpha() or key[0] == "_"):
+            continue
+        if not all(c.isalnum() or c == "_" for c in key):
+            continue
+        out[key] = value
+    return out
+
+
+def _runtime_env_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    if runtime_env := os.environ.get("MILOCO_RUNTIME_ENV"):
+        candidates.append(Path(runtime_env).expanduser())
+    default = _default_runtime_env()
+    if default not in candidates:
+        candidates.append(default)
+    return candidates
+
+
+def read_runtime_env() -> dict[str, str]:
+    """读取默认指针，并将可选 profile 覆盖到默认值之上。
+
+    Linux supervisord 会接收这里解析出的全部键；macOS LaunchAgent 仅透传
+    ``MILOCO_*`` 及代理/CA 白名单键。跨平台 profile 应优先使用 ``MILOCO_*``。
+    """
+    merged: dict[str, str] = {}
+    for path in reversed(_runtime_env_candidates()):
+        merged.update(_read_env_file(path))
+    return merged
+
+
+def bootstrap_runtime_env() -> None:
+    """在解析配置路径前加载已安装的 runtime 指针。
+
+    ``MILOCO_HOME`` 未设置时无法通过 ``$MILOCO_HOME/.env`` 找到自身，因此
+    安装器会写入稳定的用户级指针 ``~/.config/miloco/default.env``。
+    ``MILOCO_RUNTIME_ENV`` 可用于服务管理器或多平台 profile 的显式覆盖。
+    """
+    if os.environ.get("MILOCO_HOME"):
+        return
+
+    values = read_runtime_env()
+    home = values.get("MILOCO_HOME")
+    if home:
+        for key, value in values.items():
+            os.environ.setdefault(key, value)
+        os.environ["MILOCO_HOME"] = home
+
+
 def miloco_home() -> Path:
-    """返回 ``$MILOCO_HOME``，未设置则落回 ``~/.openclaw/miloco``。"""
+    """加载 runtime 指针后返回 ``$MILOCO_HOME``。"""
+    if env := os.environ.get("MILOCO_HOME"):
+        return Path(env).expanduser()
+    bootstrap_runtime_env()
     if env := os.environ.get("MILOCO_HOME"):
         return Path(env).expanduser()
     return Path.home() / ".openclaw" / "miloco"
@@ -81,7 +164,7 @@ _SCHEMA_PATHS: dict[str, tuple[type, Any, str]] = {
         "",
         "Agent 平台名(hermes/openclaw)；空=webhook 模式,非空则加载 Adapter",
     ),
-    "model.omni.model": (str, "xiaomi/mimo-v2.5", "多模态模型标识"),
+    "model.omni.model": (str, "mimo-v2.6-flash", "多模态模型标识"),
     "model.omni.base_url": (
         str,
         "https://api.xiaomimimo.com/v1",
@@ -114,6 +197,11 @@ _SCHEMA_PATHS: dict[str, tuple[type, Any, str]] = {
         "",
         "仅 Gemini：每帧视觉 token 预算档位（\"\"/\"low\"=省，\"high\"=小目标更清但 4× token），下一周期生效",
     ),
+    "perception.engine.input.omni_visual_input_mode": (
+        str,
+        "video",
+        "Omni 视觉输入模式（video=视频，image=图片）",
+    ),
     # 本表这两个是 Smart Crop 的**全局**闸，相与后仍只是必要条件——还要该机位自己的
     # per-camera 闸也开（`miloco-cli scope camera crop-on/crop-off` 逐路配，默认开），
     # 三闸相与才裁切。默认值同下方注释的对齐约定（yaml 里都是 true）。
@@ -141,6 +229,15 @@ _SCHEMA_PATHS: dict[str, tuple[type, Any, str]] = {
         "自己的逐机位闸（用 miloco-cli scope camera crop-on/crop-off 逐路配，默认开）"
         "三闸相与才裁切，重启生效（在 UI 拨这个开关走 admin API，则热更、下个感知窗口"
         "生效）。某一路到底裁没裁，看 scope camera list 的 crop_effective",
+    ),
+    "perception.engine.person_crop_inject.enabled": (
+        bool,
+        True,
+        "单帧人像注入开关（默认值在随包 settings.yaml）：给每个待识别 track 附一张外观单帧、"
+        "绑定 track_id，提升多人同框的身份召回；关闭即退化为只给 bbox 数字坐标。重启生效"
+        "（后端虽每窗热读，但 get_settings 有进程级缓存、该 key 无 admin 入口去清它，"
+        "故靠本命令默认的顺手重启生效；带 --no-restart 则改了等于没改）。本命令写的是 "
+        "config.json，本机从此固定读它，后续发版改 yaml 对本机不再生效",
     ),
     "perception.collect.window_size": (
         int,
@@ -179,6 +276,24 @@ _SCHEMA_PATHS: dict[str, tuple[type, Any, str]] = {
         "值域 low|medium|high；low=不过滤（默认，向后兼容）。"
         "result.suggestions 保留完整，仅 agent 派发受限；重启生效"
         "（在 UI 拨这个滑条走 admin API，则热更、下个感知周期生效）",
+    ),
+    "miot.central_hub_enabled": (
+        bool,
+        True,
+        "本地中枢网关总开关；false = 完全禁用（不签证书/不 mDNS/不连网关），"
+        "设备控制全部走云端。重启生效",
+    ),
+    "miot.central_hub_gateways": (
+        list,
+        [],
+        "静态中枢网关地址，mDNS 发现不到时用（如容器/跨网段隔离，组播过不去）。"
+        "逗号分隔，每项 'ip' 或 'ip:port'（端口缺省 8883），"
+        "如 192.168.1.152 或 192.168.1.152:8883,192.168.1.153。"
+        "留空则仅靠 mDNS 自动发现。重启生效。"
+        "注意：逗号分隔只在 config set / config.json 通道成立；"
+        "用环境变量覆盖时必须写 JSON 数组"
+        "（MILOCO_MIOT__CENTRAL_HUB_GATEWAYS='[\"192.168.1.152\"]'），"
+        "否则后端 pydantic-settings 解析失败、启动即报 SettingsError",
     ),
 }
 
@@ -325,6 +440,46 @@ def _defaults() -> dict[str, Any]:
     return out
 
 
+def _validate_gateway(path: str, item: str) -> str:
+    """校验单个中枢网关项 ``ip`` / ``ip:port``，原样返回（端口缺省交给后端补 8883）。
+
+    与 backend ``MiotProxy._parse_gateways``（``backend/miloco/src/miloco/miot/client.py``）
+    的解析口径对齐：``partition(":")`` 切 host/port、端口留空取 8883。两点差异：
+
+    1. 那边对脏项**静默 skip + warning**，CLI 这里直接报错——写盘前拦住，免得用户
+       以为配上了、实际被后端悄悄丢掉；
+    2. IPv6 字面量这边显式拒绝：后端按单冒号切分会把它解析错再静默丢弃。
+
+    端口范围（1-65535）两边都校验：后端在 ``_parse_gateways`` 里越界即 skip，与它对
+    非整数端口的处理一致；CLI 这边报错。注意不要只改一边——手工编辑 config.json 绕过
+    CLI 时，只有后端那道能拦住 ``:0`` / ``:99999``。
+
+    这里的 8883 只出现在报错/说明文案里：CLI **不**替用户补默认端口，原样写盘、由后端
+    的 ``MIPS_LOCAL_PORT_DEFAULT`` 决定，所以不存在两份会漂移的默认值。miloco-cli 是
+    独立包、不依赖 miot SDK（见 ``cli/pyproject.toml``），也无法引用那个常量。
+    """
+    if item.count(":") > 1:
+        raise ValueError(
+            f"{path} 不支持 IPv6 字面量（{item!r}）：后端按 'host:port' 单冒号切分，"
+            f"IPv6 会被解析错并静默丢弃。请用 IPv4 或主机名。"
+        )
+    host, _, port = item.partition(":")
+    host = host.strip()
+    if not host:
+        raise ValueError(f"{path} 的条目 {item!r} 缺少主机名/IP")
+    port = port.strip()
+    if port:
+        try:
+            port_num = int(port)
+        except ValueError as exc:
+            raise ValueError(
+                f"{path} 的条目 {item!r} 端口不是整数（端口留空则默认 8883）"
+            ) from exc
+        if not (1 <= port_num <= 65535):
+            raise ValueError(f"{path} 的条目 {item!r} 端口越界（需 1-65535）")
+    return item
+
+
 def _coerce(path: str, raw: str) -> Any:
     """根据 schema 类型把字符串 CLI 输入转成目标类型。"""
     if path not in _SCHEMA_PATHS:
@@ -349,6 +504,26 @@ def _coerce(path: str, raw: str) -> Any:
             return float(raw)
         except ValueError as exc:
             raise ValueError(f"{path} 需要浮点数，收到 {raw!r}") from exc
+    if pytype is list:
+        # CLI 只能递字符串，故约定逗号分隔；同时容忍 JSON 数组，方便脚本直接透传。
+        # 留空 = 清空该项（回到"仅靠自动发现"语义），不是写入 [""]。
+        text = raw.strip()
+        if not text:
+            return []
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path} 的 JSON 数组解析失败：{raw!r}") from exc
+            if not isinstance(parsed, list):
+                raise ValueError(f"{path} 需要数组，收到 {raw!r}")
+            items = [str(x).strip() for x in parsed]
+        else:
+            items = [x.strip() for x in text.split(",")]
+        items = [x for x in items if x]
+        if path == "miot.central_hub_gateways":
+            items = [_validate_gateway(path, x) for x in items]
+        return items
     # timezone 额外做 IANA 名校验（与 backend settings 的 field_validator 对齐），
     # 拦住 "Beijing" / "+08:00" 这类会让 backend 启动期 ValidationError 的脏值。
     if path == "timezone" and raw:
@@ -378,6 +553,13 @@ def _coerce(path: str, raw: str) -> Any:
             raise ValueError(
                 f"{path} 仅支持 low / high（留空=默认 low），收到 {raw!r}。"
                 f"注：Gemini media_resolution 有效档位只有 low/high，medium 等同 low。"
+            )
+        return norm
+    if path == "perception.engine.input.omni_visual_input_mode":
+        norm = raw.strip().lower()
+        if norm not in ("video", "image"):
+            raise ValueError(
+                f"{path} 仅支持 video / image，收到 {raw!r}"
             )
         return norm
     # min_suggestion_urgency 与 backend PerceptionSettings 的 Literal 对齐——CLI 先兜住,

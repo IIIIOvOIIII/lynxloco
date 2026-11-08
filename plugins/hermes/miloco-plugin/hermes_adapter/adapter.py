@@ -13,9 +13,9 @@ Hermes /v1/chat/completions 协议(OpenAI 兼容 Chat Completions API):
 溢出自愈(沿用 279): 识别错误文案含 ``_OVERFLOW_MARKERS`` 时,无 session 头重试一次
 (最佳努力,v0.10.0 api_server 无 session 删除/重置路由)。
 
-trace 文件 IPC(#11): plugin ``trace.py`` 写 ``$MILOCO_HOME/trace/<run_id>.meta.json``,
-本 adapter ``read_trace_meta`` 读盘返回。本 session 暂未重构 ``trace.py``,所以读盘
-通常返回 None —— backend meta_poller 走超时分支,不影响功能。
+trace 文件 IPC(#11): plugin ``trace.py`` 按天写 ``$MILOCO_HOME/trace/agent/<YYYYMMDD>/``
+下的 ``.meta.json``,本 adapter ``read_trace_meta`` 读盘返回。两侧 run_id 口径不同
+(adapter 用 uuid、trace.py 用 session_id),靠发送原文与 meta 的 query 前缀匹配关联。
 """
 
 from __future__ import annotations
@@ -29,7 +29,6 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Optional
-
 
 # ---- 异常类 -------------------------------------------------------------
 # 对齐 backend AgentPlatformAdapter 契约：dispatcher 专 catch 此异常做特殊处理。
@@ -62,16 +61,27 @@ _HTTP_BUFFER_S = 15.0
 _DEFAULT_HERMES_URL = os.environ.get("HERMES_API_URL", "http://127.0.0.1:8642")
 
 
-def _load_api_key() -> str:
-    """拿 API_SERVER_KEY:优先级 env > ~/.hermes/.env > 空。
+def _hermes_home() -> Path:
+    """返回当前 Hermes 数据目录，支持 ``HERMES_HOME=~/...``。
 
-    backend supervisor 一般不会 source ~/.hermes/.env,所以从这里 fallback 读。
-    install-hermes.sh Step 6 已保证 ~/.hermes/.env::API_SERVER_KEY 存在。
+    与 ``paths.hermes_home`` 保持一致；adapter 可独立部署到
+    ``agent_platform/hermes``，此时 paths.py 不一定可导入，故保留本地实现。
+    """
+    return Path(
+        os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")
+    ).expanduser()
+
+
+def _load_api_key() -> str:
+    """拿 API_SERVER_KEY:优先级 env > $HERMES_HOME/.env > 空。
+
+    backend supervisor 一般不会 source Hermes 的 .env，所以从这里 fallback 读。
+    install-hermes.sh 已保证 $HERMES_HOME/.env::API_SERVER_KEY 存在。
     """
     key = os.environ.get("API_SERVER_KEY", "").strip()
     if key:
         return key
-    env_path = Path.home() / ".hermes" / ".env"
+    env_path = _hermes_home() / ".env"
     if env_path.is_file():
         try:
             for line in env_path.read_text(encoding="utf-8").splitlines():
@@ -112,16 +122,24 @@ def _new_run_id() -> str:
     return str(uuid.uuid4())
 
 
+def _mtime_or_zero(path: Path) -> float:
+    """取 mtime；文件刚被 trace.py 淘汰掉时当最旧处理，别让整次读盘抛出去。"""
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def _resolve_trace_dir() -> Path:
     """``$MILOCO_HOME/trace/agent/`` —— plugin trace.py 写盘位置。
 
-    默认 settings.directories.miloco_home 解析失败时回退 ``~/.openclaw/miloco``。
+    默认 settings.directories.miloco_home 解析失败时回退 Hermes 的数据目录。
     """
     try:
         from .paths import miloco_home
         return miloco_home() / "trace" / "agent"
     except Exception:
-        return Path("~/.openclaw/miloco/trace/agent").expanduser()
+        return _hermes_home() / "miloco" / "trace" / "agent"
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +163,7 @@ def _resolve_owner_session() -> tuple[Optional[str], Optional[str]]:
     channel 对象的 ``id`` 字段即为 session_id。返回 (session_id, platform)。
     均为 None 表示还没绑过 IM。
     """
-    channel_file = Path.home() / ".hermes" / "channel_directory.json"
+    channel_file = _hermes_home() / "channel_directory.json"
     try:
         data = json.loads(channel_file.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -271,13 +289,7 @@ class Adapter:
             session_id = None
             owner_chat = owner_session
         else:
-            # suggestion 每个事件独立评估，不用持久 session；
-            # 但需保留 miloco: 前缀让 trace hook 正常落盘。
-            import uuid as _uuid
-
-            session_id = _map_session(session_key, lane) if lane != "miloco-suggest" else (
-                f"{_map_session(session_key, lane)}:{_uuid.uuid4().hex[:8]}"
-            )
+            session_id = _map_session(session_key, lane)
         timeout_s = max(wait_timeout_ms / 1000.0, 1.0) + _HTTP_BUFFER_S
 
         # 组装 messages: <system>(可选) + <user>
@@ -454,6 +466,21 @@ class Adapter:
 
     # ---- read_trace_meta ----------------------------------------------
 
+    def _recent_meta_files(self) -> list[Path]:
+        """以 UTC 日期为中心扫描相邻日期，兼容 gateway 与 backend 时区不同。
+
+        目录按 gateway 本地日期命名；全树扫描会随历史天数增长。
+        """
+        import datetime as _dt
+
+        today = _dt.datetime.now(_dt.timezone.utc).date()
+        files: list[Path] = []
+        for day in (today, today - _dt.timedelta(days=1), today + _dt.timedelta(days=1)):
+            day_dir = self._trace_dir / day.strftime("%Y%m%d")
+            if day_dir.is_dir():
+                files.extend(day_dir.glob("*.meta.json"))
+        return files
+
     async def read_trace_meta(self, run_id: str) -> Optional[Any]:
         """按发送原文反查 trace.py 落盘的 meta.json。
 
@@ -464,10 +491,7 @@ class Adapter:
         text = self._pending_texts.get(run_id)
         if not text:
             return None
-        candidates = sorted(
-            self._trace_dir.rglob("*.meta.json"),
-            key=lambda p: p.stat().st_mtime, reverse=True,
-        )
+        candidates = sorted(self._recent_meta_files(), key=_mtime_or_zero, reverse=True)
         data: dict[str, Any] | None = None
         for meta_path in candidates[:50]:
             try:
@@ -506,15 +530,12 @@ class Adapter:
     ) -> dict[str, Any]:
         """切家庭时批量清理 Hermes 会话。按 (session_key, lane) 映射为 session_id 后逐个删。
 
-        返回 ``{"reset": [...], "failed": [...]}``。suggest 车道每次 turn
-        用一次性会话（带 uuid 后缀），无跨轮状态，跳过重置。
+        返回 ``{"reset": [...], "failed": [...]}``。
         """
         reset, failed, seen = [], [], set()
         import asyncio as _asyncio
         loop = _asyncio.get_running_loop()
         for session_key, lane in routes:
-            if lane == "miloco-suggest":
-                continue
             session_id = _map_session(session_key, lane)
             if session_id in seen:
                 continue

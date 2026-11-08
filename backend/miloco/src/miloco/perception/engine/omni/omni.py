@@ -13,12 +13,15 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 from miloco.database.token_usage_repo import fire_record
-from miloco.perception.engine.config import OmniConfig
+from miloco.perception.engine.config import OmniConfig, VisualInputMode
+from miloco.perception.engine.identity.names import (
+    build_name_lookup,
+    usable_person_name,
+)
 from miloco.perception.engine.omni.circuit_breaker import (
     CircuitOpenError,
     get_omni_circuit_breaker,
 )
-from miloco.perception.engine.omni.constants import MILOCO_USER_AGENT
 from miloco.perception.engine.omni.error_classifier import (
     ClassifiedError,
     ErrorCategory,
@@ -43,6 +46,7 @@ from miloco.perception.engine.omni.prompt_builder import (
     format_person_label,
 )
 from miloco.perception.engine.omni.provider import (
+    build_request_headers,
     get_adapter,
     messages_have_visual_input,
     resolve_api_protocol,
@@ -96,11 +100,12 @@ def _rule_name_to_id(context: OmniContext) -> dict[str, str]:
 
 
 async def run_omni(
-    edge_packet: IdentityPacket, context: OmniContext, config: OmniConfig
+    edge_packet: IdentityPacket, context: OmniContext, config: OmniConfig,
+    visual_input_mode: VisualInputMode = "video",
 ) -> OmniOutput:
     """Run Omni layer: build prompt → call model → parse response."""
     adapter = get_adapter(config.api_protocol, config.model)
-    payload = build_prompt(edge_packet, context, media_mode=adapter.media_mode)
+    payload = build_prompt(edge_packet, context, media_mode=adapter.media_mode, visual_input_mode=visual_input_mode)
     raw_response = await call_omni(payload, config)
     output = parse_omni_response(raw_response, _rule_name_to_id(context))
     output.usage = extract_usage(raw_response)
@@ -108,12 +113,13 @@ async def run_omni(
 
 
 async def run_omni_batch(
-    edge_packets: list[IdentityPacket], context: OmniContext, config: OmniConfig
+    edge_packets: list[IdentityPacket], context: OmniContext, config: OmniConfig,
+    visual_input_mode: VisualInputMode = "video",
 ) -> OmniOutput:
     """Run Omni layer for multiple devices in the same room."""
     adapter = get_adapter(config.api_protocol, config.model)
     payload = build_batch_prompt(
-        edge_packets, context, media_mode=adapter.media_mode
+        edge_packets, context, media_mode=adapter.media_mode, visual_input_mode=visual_input_mode
     )
     raw_response = await call_omni(payload, config)
     output = parse_omni_response(raw_response, _rule_name_to_id(context))
@@ -132,6 +138,7 @@ async def run_omni_fused(
     config: OmniConfig,
     identity_engine: "IdentityEngine",
     fused_prompt_config: FusedPromptConfig | None = None,
+    visual_input_mode: VisualInputMode = "video",
 ) -> OmniOutput:
     """fused 主调用：构 prompt（含 gallery）→ 调 omni → 解 OmniOutput + identity_assignments。
 
@@ -155,8 +162,8 @@ async def run_omni_fused(
     #   name_lookup  —— pid → 纯真名（不含角色），喂给 prompt「已识别人物/陌生人」名册显示。
     #                   名册里只展示真名（如"张三"），不展示"张三(角色:爸爸)"——角色不进名册。
     #   name_to_pid  —— 真名 / 角色 / 完整标签 → pid 反查。omni 输出 name 字段可能是真名、
-    #                   角色, 也可能把 gallery 里看到的完整标签"真名(角色:X)"整串回显。真名与
-    #                   完整标签恒做 key；角色因可空、不唯一，仅在全局唯一时才做 key（否则多人
+    #                   角色, 也可能把 gallery 里看到的完整标签"真名(角色:X)"整串回显。
+    #                   可用真名与完整标签做 key；角色因可空、不唯一，仅在全局唯一时才做 key（否则多人
     #                   同角色，纯角色反查会误命中最早遍历到的那个 pid）。
     name_lookup: dict[str, str] = {}
     name_to_pid: dict[str, str] = {}
@@ -169,15 +176,16 @@ async def run_omni_fused(
     person_lib_empty = False
     try:
         persons = list(identity_engine.library.list_persons())
+        name_lookup = build_name_lookup(persons)
         person_lib_empty = len(persons) == 0
         role_counts = Counter(r.role for r in persons if r.role)
         for ref in persons:
-            if ref.name:
-                name_lookup[ref.person_id] = ref.name
-                label = format_person_label(ref.name, ref.role)
+            name = name_lookup.get(ref.person_id)
+            if name is not None:
+                label = format_person_label(name, ref.role)
                 if label:
                     name_to_pid.setdefault(label, ref.person_id)
-                name_to_pid.setdefault(ref.name, ref.person_id)
+                name_to_pid.setdefault(name, ref.person_id)
                 if ref.role and role_counts[ref.role] == 1:
                     name_to_pid.setdefault(ref.role, ref.person_id)
             name_to_pid.setdefault(ref.person_id, ref.person_id)
@@ -199,6 +207,7 @@ async def run_omni_fused(
             label_lookup=name_lookup,
             adapter=adapter,
             matching_moot=person_lib_empty,
+            visual_input_mode=visual_input_mode,
         )
         raw_response = await _call_omni_messages(payload["messages"], config, adapter=adapter)
         job = current_job()
@@ -239,9 +248,10 @@ async def run_omni_fused(
             # 来源 1 的 library 全局唯一性（role_counts）：来源 1 因不唯一跳过的角色这里不会加回；
             # library 查询整体失败时 role_counts 为空，角色一律不做 key（从严，避免误命中）。
             for pid, samples in gallery_snapshot.items():
-                if samples.name:
-                    name_to_pid.setdefault(samples.name, pid)
-                    lbl = format_person_label(samples.name, samples.role)
+                name = usable_person_name(samples.name)
+                if name is not None:
+                    name_to_pid.setdefault(name, pid)
+                    lbl = format_person_label(name, samples.role)
                     if lbl:
                         name_to_pid.setdefault(lbl, pid)
                 if samples.role and role_counts[samples.role] == 1:
@@ -348,11 +358,7 @@ async def _call_omni_messages(
     raw: dict[str, Any] | None = None
     error: dict[str, Any] | None = None
     short_circuited = False
-    headers = {
-        "Content-Type": "application/json",
-        **adapter.auth_headers(api_key),
-        "User-Agent": MILOCO_USER_AGENT,
-    }
+    headers = build_request_headers(adapter, config.base_url, api_key)
     try:
         await cb.before_call()
         async with model_request(body):
@@ -510,11 +516,12 @@ async def run_omni_stream(
     on_early_matched_rules: Callable[[list[MatchedRule]], Awaitable[None]]
     | None = None,
     on_early_suggestions: Callable[[list[Suggestion]], Awaitable[None]] | None = None,
+    visual_input_mode: VisualInputMode = "video",
 ) -> OmniOutput:
     """Run Omni layer with streaming — extracts actionable fields early via callbacks."""
     adapter = get_adapter(config.api_protocol, config.model)
     payload = build_stream_prompt(
-        edge_packet, context, media_mode=adapter.media_mode
+        edge_packet, context, media_mode=adapter.media_mode, visual_input_mode=visual_input_mode
     )
     return await _stream_and_parse(
         payload,
@@ -534,11 +541,12 @@ async def run_omni_batch_stream(
     on_early_matched_rules: Callable[[list[MatchedRule]], Awaitable[None]]
     | None = None,
     on_early_suggestions: Callable[[list[Suggestion]], Awaitable[None]] | None = None,
+    visual_input_mode: VisualInputMode = "video",
 ) -> OmniOutput:
     """Run Omni layer for multiple devices with streaming — extracts actionable fields early."""
     adapter = get_adapter(config.api_protocol, config.model)
     payload = build_batch_stream_prompt(
-        edge_packets, context, media_mode=adapter.media_mode
+        edge_packets, context, media_mode=adapter.media_mode, visual_input_mode=visual_input_mode
     )
     return await _stream_and_parse(
         payload,

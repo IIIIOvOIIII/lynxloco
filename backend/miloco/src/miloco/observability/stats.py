@@ -300,6 +300,12 @@ def summary(conn, bucket, since, until):
     cycles, skipped, errors, calls, cameras, dropped, legacy, requests, request_errors, partial = row
     cameras, dropped, legacy = cameras or 0, dropped or 0, legacy or 0
     expected = cameras + dropped
+    processed_device_window_count = conn.execute(
+        "SELECT COUNT(*) FROM traces_device td "
+        "JOIN traces t ON t.trace_id = td.cycle_id "
+        "WHERE t.timestamp BETWEEN ? AND ?",
+        (s, u),
+    ).fetchone()[0]
     agent_count = conn.execute(
         "SELECT COUNT(*) FROM agent_runs WHERE timestamp BETWEEN ? AND ?", (s, u),
     ).fetchone()[0]
@@ -312,6 +318,7 @@ def summary(conn, bucket, since, until):
     return {
         "cycle_count": cycles,
         "camera_window_count": cameras,
+        "processed_device_window_count": processed_device_window_count,
         "expected_window_count": expected,
         "legacy_cycle_count": legacy,
         "dropped_count": dropped,

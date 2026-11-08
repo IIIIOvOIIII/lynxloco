@@ -22,12 +22,12 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from datetime import datetime
+
+from .paths import hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +65,7 @@ def _load_channel_directory() -> dict:
             return result
     except Exception:
         pass
-    path = Path.home() / ".hermes" / "channel_directory.json"
+    path = hermes_home() / "channel_directory.json"
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -75,7 +75,7 @@ def _load_channel_directory() -> dict:
 def _detect_im_platforms_simple() -> List[str]:
     """列出当前已连接(非空 channel 列表)的 IM 平台名。
 
-    从 ``~/.hermes/channel_directory.json`` 的 ``platforms`` 下取——
+    从 ``$HERMES_HOME/channel_directory.json`` 的 ``platforms`` 下取——
     而不是 auth.json/config.yaml（后者没有 bot_token 字段，旧假设错误）。
     """
     platforms = _load_channel_directory().get("platforms")
@@ -158,8 +158,7 @@ def _state_path(ctx: Any) -> Path:
         return Path(base) / _STATE_FILENAME
     # install-hermes.sh 把 plugin 装到 $HERMES_HOME/plugins/miloco/miloco-plugin/，
     # state.json 也写这。这是 source of truth。
-    hermes_home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
-    return hermes_home / "plugins" / "miloco" / "miloco-plugin" / _STATE_FILENAME
+    return hermes_home() / "plugins" / "miloco" / "miloco-plugin" / _STATE_FILENAME
 
 
 def load_state(ctx: Any) -> Dict[str, Any]:

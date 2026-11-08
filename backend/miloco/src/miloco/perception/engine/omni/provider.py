@@ -5,8 +5,10 @@
 fire_record / trace）与 provider 无关。
 
 adapter 职责：
-  - build_video_block / build_audio_block —— 构建 OpenAI 规范的多模态 content block
-    （内部 IR 恒为 OpenAI 形态，供 trace / 摘要复用）。
+  - build_video_block / build_audio_block / build_image_block —— 构建 OpenAI 规范的
+    多模态 content block（内部 IR 恒为 OpenAI 形态，供 trace / 摘要复用）。video / audio
+    各 provider 字段有别故由子类覆写；image 块所有 provider 同构（标准 ``image_url``），
+    默认实现落在基类，provider 有特化需求时再覆写。
   - build_request_body —— 把 OpenAI messages 转成 provider 的线上请求体。
   - endpoint / auth_headers —— provider 的请求 URL 与鉴权头。
   - parse_response / parse_stream_chunk —— 把 provider 响应反解析回 OpenAI 形态
@@ -18,13 +20,18 @@ OpenAI 兼容族（MiMo / Qwen）继承 ``OpenAICompatAdapter``，协议方法�
 
 from __future__ import annotations
 
+import base64
 import logging
 import re
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 from miloco.config.settings import OmniApiProtocol
+from miloco.perception.engine.omni.constants import MILOCO_USER_AGENT
 from miloco.utils.common import safe_log
 
 logger = logging.getLogger(__name__)
@@ -48,6 +55,43 @@ def messages_have_visual_input(messages: list[dict[str, Any]]) -> bool:
             }:
                 return True
     return False
+
+
+def _is_opencode_go_base_url(base_url: str) -> bool:
+    """Return whether ``base_url`` is the official OpenCode Go endpoint."""
+    parsed = urlparse(base_url)
+    path = parsed.path.rstrip("/")
+    return (
+        parsed.scheme.lower() == "https"
+        and (parsed.hostname or "").lower() == "opencode.ai"
+        and (path == "/zen/go" or path.startswith("/zen/go/"))
+    )
+
+
+@lru_cache(maxsize=16)
+def _opencode_session_id(base_url: str) -> str:
+    """Return one process-stable, non-secret routing ID per OpenCode Go endpoint."""
+    return f"ses_{uuid.uuid4().hex}"
+
+
+def build_request_headers(
+    adapter: "OmniProviderAdapter", base_url: str, api_key: str
+) -> dict[str, str]:
+    """Build shared provider headers, including OpenCode Go routing affinity.
+
+    OpenCode Go rejects requests without ``x-opencode-session``. Miloco's omni
+    pipeline has no chat-conversation identifier, so the endpoint-scoped ID is
+    stable for the process lifetime and intentionally contains no credential.
+    """
+    headers = {
+        "Content-Type": "application/json",
+        **adapter.auth_headers(api_key),
+        "User-Agent": MILOCO_USER_AGENT,
+    }
+    if _is_opencode_go_base_url(base_url):
+        normalized = base_url.rstrip("/")
+        headers["x-opencode-session"] = _opencode_session_id(normalized)
+    return headers
 
 
 @dataclass(frozen=True)
@@ -74,6 +118,23 @@ class OmniProviderAdapter(ABC):
     @abstractmethod
     def build_audio_block(self, audio_base64: str, media: LocalMediaInfo) -> dict[str, Any]:
         """构建 audio-only content block（恒为 OpenAI 形态）。"""
+
+    def build_image_block(self, data: bytes) -> dict[str, Any]:
+        """构建单帧图片 content block（image 序列模式逐帧调用，恒为 OpenAI 形态）。
+
+        ``data`` 是一张 JPEG 的原始字节（见 ``prompt_builder.EncodedImageFrame.data``），
+        方法内部负责 base64 + data URI 封装。
+
+        与 video / audio 不同，图片块在各 provider 间同构——OpenAI 兼容族原生吃
+        ``image_url``，Gemini 的 ``_content_to_parts`` 也把 ``image_url`` 统一转成
+        ``inline_data``（与 crop 图块同路）。故默认实现落在基类、非抽象；某 provider
+        若要特化（额外字段 / 非 jpeg / 尺寸上限）再在子类覆写。
+        """
+        b64 = base64.b64encode(data).decode()
+        return {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+        }
 
     @abstractmethod
     def build_request_body(
@@ -156,7 +217,7 @@ class OpenAICompatAdapter(OmniProviderAdapter):
 
 
 class MiMoAdapter(OpenAICompatAdapter):
-    """MiMo-v2.5 API adapter。
+    """MiMo API adapter。
 
     - video block: ``video_url`` + ``fps`` + ``media_resolution: "max"``
     - audio block: ``input_audio``（m4a AAC）
@@ -172,9 +233,16 @@ class MiMoAdapter(OpenAICompatAdapter):
         }
 
     def build_audio_block(self, audio_base64: str, media: LocalMediaInfo) -> dict[str, Any]:
+        # OpenAI 规范 input_audio 的 data+format 均必填——本地 mlx-vlm server 严格
+        # 校验,缺 format 直接 422(2026-07-29 感知停摆根因);宽松 provider 忽略
+        # 多余字段无副作用。载荷是 prompt_builder._encode_audio_only_mp4 产出的真 m4a
+        # 容器(ftyp="M4A "),format 报 "m4a",与 data 的 mime 及 QwenOmniAdapter 一致。
         return {
             "type": "input_audio",
-            "input_audio": {"data": f"data:audio/m4a;base64,{audio_base64}"},
+            "input_audio": {
+                "data": f"data:audio/m4a;base64,{audio_base64}",
+                "format": "m4a",
+            },
         }
 
     def build_request_body(
@@ -434,6 +502,9 @@ class GeminiAdapter(OmniProviderAdapter):
         # 刷屏,也弱化"名字不含 flash"这个粗判据对 gemini-3-pro 等大概率可用模型的误报噪音。
         if "flash" not in model.lower() and model not in _warned_non_flash_gemini:
             _warned_non_flash_gemini.add(model)
+            # model 来自用户配置,记日志前清掉 CR/LF 防日志注入(CodeQL log-injection)。
+            # 就地包在实参上而不是先赋给中间变量：这一处只为打日志存在，中间变量会让人
+            # 以为它另有用途。
             logger.warning(
                 "[omni] GeminiAdapter 默认发 thinkingConfig.thinkingBudget=0,仅对 gemini-3-flash "
                 "系列验证过;model=%s 若为强制思考模型(如 gemini-2.5-pro)会 400,需按模型放开此项",

@@ -57,7 +57,7 @@ class MiotCameraSource:
         cap: bool = True,
         **_: object,
     ) -> dict[str, PerceptionDevice]:
-        if not self._miot_proxy.is_authenticated:
+        if not getattr(self._miot_proxy, "is_operational", self._miot_proxy.is_authenticated):
             return {}
         return self._filter_cameras_from_all(
             all_devices if all_devices else await self._miot_proxy.get_cameras(),
@@ -107,7 +107,7 @@ class MiotCameraSource:
         self, *, expected_count: int, connected_count: int, now_ms: int
     ) -> None:
         """Rebuild missing SDK camera managers with the existing throttle."""
-        if not self._miot_proxy.is_authenticated:
+        if not getattr(self._miot_proxy, "is_operational", self._miot_proxy.is_authenticated):
             return
         if expected_count <= connected_count:
             return

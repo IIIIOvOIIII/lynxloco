@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 from miloco.config.settings import OmniApiProtocol
+
+VisualInputMode = Literal["video", "image"]
 
 
 @dataclass
@@ -30,6 +33,14 @@ class InputConfig:
     # 实测:小目标清晰度主要由输入像素分辨率(video_short_edge)决定,本档位只控每帧 token 预算,
     # 故默认 low;identity 等细节敏感场景可经 CLI 切 high。运行时由 GeminiAdapter 实时读 settings。
     media_resolution: str = ""
+    omni_visual_input_mode: VisualInputMode = "video"
+
+    def __post_init__(self) -> None:
+        if self.omni_visual_input_mode not in ("video", "image"):
+            raise ValueError(
+                "omni_visual_input_mode must be 'video' or 'image', got "
+                f"{self.omni_visual_input_mode!r}"
+            )
 
 
 @dataclass
@@ -82,6 +93,44 @@ class CropEnhanceConfig:
     # 放大后 +7.8pp)。
     # 注:crop 视频帧率不设独立配置——crop 逐帧裁切、不抽帧,时序与全景视频完全一致,
     # 编码必须沿用 packet.frame_info.fps(下采样后真实间隔),否则时长/音画错位。
+
+
+@dataclass
+class PersonCropInjectConfig:
+    """单帧人像注入配置。
+
+    能力本身见 ``omni/person_crop_inject.py``:给每个待识别 track 附一张"外观单帧"。
+    与 CropEnhanceConfig 同款,**不**注册进 PerceptionConfig —— 那样会在建引擎时快照、连"下一窗
+    重读"都做不到;运行时由 person_crop_inject.person_crop_inject_config_from_settings() 每窗口
+    热读 settings 字典(perception.engine.person_crop_inject)。
+
+    ⚠️ 「每窗热读」**不等于**「免重启」:get_settings() 背后是进程级 lru_cache,json/yaml 只在
+    构造那一次读盘,进程内唯一清缓存的地方是 admin 配置写入路径(update_shared_config →
+    reset_settings)。本能力没有 admin/UI 入口,所以手改 config.json 或 settings.yaml 不会当场
+    生效。**支持的关闸方式是 CLI**(`miloco-cli config set perception.engine.person_crop_inject.enabled false`)
+    —— 它写 config.json 并默认顺手重启后端,即"写盘 + 重启"后生效;带 `--no-restart` 就同样不生效。
+    这与 crop_enhance 不同:那条有 UI 开关走 admin API,故它确实能热更。
+
+    只设一个闸(不像 Smart Crop 的双闸):双闸的第二层是给 UI 开关用的,本能力没有 UI 入口,
+    多一个 key 只是死配置。要止损改 settings.yaml(随包层)或 config.json(本机层,深合并覆盖)
+    都能关。
+
+    与 CropEnhanceConfig **正交**:那个改造视频本身(裁到活动区域),这个不动画面、额外附一张
+    人像近景。离线评测显示两者收益不可相加(有注入时裁切不再有额外贡献),但目标态是二者同开
+    —— 裁切对场景描述等其它能力的价值不在身份评测范围内。
+    """
+
+    # 产品默认值在随包 settings.yaml,不在这里 —— yaml 是合并的基础层,用户 config.json 缺这
+    # 一块时继承 yaml 的 true。这里的 False 只在连 yaml 都缺 key 时兜底(理论路径),别拿它当
+    # "默认关"的依据。同 CropEnhanceConfig 的惯例。
+    enabled: bool = False
+    # 注入图归一高度。256 是离线评测的效率前沿:往下掉得快且显著(½ 档 −3.36pp、¼ 档 −2.79pp),
+    # 往上检测不到增益(原生档 +0.42pp、ns,置信区间同时含 0 与负值,而 token 要 12.5×)。
+    # 增益靠的是"人像占的像素数"而非高频细节 —— 同尺寸只降清晰度到 50% 仅 −0.10pp(ns)。
+    # 改这个值等于换一个未验证档位,须重跑等价性 A/B。
+    crop_height: int = 256
+    # 原生框高低于此值的帧不参与选帧:远处小框放大只会得到一张糊图,反而误导。
+    min_bbox_height_px: int = 40
 
 
 @dataclass
@@ -394,7 +443,7 @@ class IdentityEngineConfig:
 
 @dataclass
 class OmniConfig:
-    model: str = "xiaomi/mimo-v2.5"
+    model: str = "mimo-v2.6-flash"
     api_key: str = ""  # Set via MILOCO_MODEL__OMNI__API_KEY env var or config
     base_url: str = "https://api.xiaomimimo.com/v1"
     api_protocol: OmniApiProtocol | None = None

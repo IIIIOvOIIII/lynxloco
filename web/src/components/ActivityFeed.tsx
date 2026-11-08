@@ -9,26 +9,39 @@
  * 时间筛选:datetime-local 双输入(自 / 至),非法值守(NaN 不更新 state).
  */
 
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import {
   eventClipUrl,
   eventCropMeta,
+  eventImageUrl,
   eventRefUrl,
   listActivity,
+  listDeviceSpecs,
   listOnDemandLogs,
   onDemandClipUrl,
+  onDemandImageUrl,
   revealDir,
   submitEventFeedback,
   submitOnDemandFeedback,
   subscribeEvents,
+  type BackendPropSpec,
 } from "@/api";
 import {
   humanizeRulesInText,
   splitHumanizedSections,
   type TriggerStatusKind,
 } from "@/lib/eventText";
+import {
+  buildFoldRows,
+  foldCounts,
+  feedLowerBound,
+  inlinedBranches,
+  type FoldBranch,
+} from "@/lib/feedFold";
+import { smartTimeLabel } from "@/lib/relativeTime";
 import type { ActivityEvent, EventCropMeta, HomeId, OnDemandLogEntry } from "@/lib/types";
+import { useFoldEnabled, useFoldStrength } from "@/hooks/useFoldStrength";
 
 /** Lightbox 内容类型:clip 走 <video>,Smart Crop 参考帧走 <img>. */
 type LightboxKind = "video" | "image";
@@ -38,6 +51,17 @@ import {
   fetchActions,
   type BackendActionRow,
 } from "./ActionsFeed";
+import {
+  BranchRow,
+  CHIP_CLASS,
+  FoldBadge,
+  FoldChipPill,
+  FoldMembers,
+  FoldToggle,
+  StrengthToggle,
+  firstMemberIdOf,
+  hostRegionOf,
+} from "./FeedFold";
 import { TimeLabel } from "./TimeLabel";
 import { toast } from "./Toast";
 
@@ -72,39 +96,34 @@ const EMPTY_OD_LOGS: OnDemandLogEntry[] = [];
 // SSE 事件常成串到达(一次 agent 控制伴随多条事件),每条都全量重拉 500 行动作太重。
 // 合并突发:末条到达后 ~1.5s 才拉一次(trailing debounce)。mount / homeId 切换仍即时拉。
 const SSE_ACTIONS_DEBOUNCE_MS = 1500;
+/** 定位过去之后高亮闪一下的时长。够看清"就是这行",又不至于让人等它消失。 */
+const FLASH_MS = 1400;
 
-/** 单流合并后的行:事件 or 动作(tagged union),供渲染层分派 ActivityRow / ActionRow。 */
-export type FeedRow =
-  | { kind: "event"; ts: number; event: ActivityEvent }
-  | { kind: "action"; ts: number; action: BackendActionRow };
+/** 滚过去之后把焦点交给谁。
+ *  - `member`:展开面里的第一条动作——键盘用户不必再从展开面顶上自己找一遍。
+ *  - `control`:该行的开合控件(收起后展开面整个消失,焦点必须有个去处,否则掉回 body)。 */
+type FocusTarget = { kind: "member"; key: string } | { kind: "control"; key: string };
 
-/** 单流的时间下界 —— 两个下界取**较晚**的那个。纯函数,导出供 tests 与截断提示复用。
+/** 一次「滚过去 / 交焦点 / 闪一下」的待办。
  *
- *  两个下界各管一件事,谁都不能替代谁:
- *  - `sinceMs`:用户显式筛的起点。权威硬界,即使一条事件都没有也生效
- *    (修过的老 bug:事件为空时动作曾无下界、混入范围外历史动作)。
- *  - **事件地平线** = 最旧一条**已加载**事件的 ts。事件按 PAGE_SIZE 分页、动作一次
- *    拉 ACTIONS_LIMIT 条,两条流取数深度差着数量级;地平线以下服务端还有事件没拉,
- *    此时若把动作放出来,列表尾部就成了一整段"只有动作、没有事件"的墙。
- *
- *  取 max 而不是 `??` 是这里的关键。老代码写的是 `sinceMs ?? 地平线`,而默认视图的
- *  since 恒为今天 00:00 —— 永远有值,`??` 永远短路,地平线那支是死代码,于是第 50 条
- *  事件以下全是动作。见 tests「sinceMs 已定义时地平线仍生效」。
- *
- *  `hasMoreEvents=false`(该窗口的事件已全部加载)时不设地平线:底下没有未加载的事件,
- *  动作可以一直铺到 sinceMs。默认 true 是保守侧——不知道有没有更多时,宁可裁。
- */
-export function feedLowerBound(
-  events: ActivityEvent[],
-  showEvents: boolean,
-  sinceMs?: number,
-  hasMoreEvents = true,
-): number {
-  const horizon =
-    showEvents && hasMoreEvents && events.length > 0
-      ? Math.min(...events.map((e) => e.timestamp))
-      : -Infinity;
-  return Math.max(sinceMs ?? -Infinity, horizon);
+ *  为什么是待办而不是当场做:目标行与展开面都是**这次渲染之后**才存在的节点 ——
+ *  点开的那一刻去 querySelector,拿到的是 null。记下意图,由 effect 在提交后消费一次。 */
+type PendingMove = {
+  /** 滚进视口的目标:支行的 key、承载它的那一行的 id,或展开面 id(展开面比行精确:
+   *  一行可能有十几屏高)。 */
+  scroll: string;
+  /** 高亮闪一下的行 id。省略则不闪(收起/展开后的焦点交还不该闪,那不是"跳转")。 */
+  flash?: string;
+  focus?: FocusTarget;
+  block: ScrollLogicalPosition;
+};
+
+/** 展开面在不在视口里。徽标的三态(未展开 / 已展开且看得见 / 已展开但滚走了)靠它分,
+ *  判据只能是"眼睛看不看得见",不是"展开没展开"——人滚开了以后,那一枚徽标就该退回
+ *  定位语义,否则点一下是收起一个自己看不见的东西,画面毫无变化。 */
+function isInViewport(el: Element): boolean {
+  const r = el.getBoundingClientRect();
+  return r.top < window.innerHeight && r.bottom > 0;
 }
 
 /** 一次事件取数的三种语义。见 fetchPage。 */
@@ -163,44 +182,6 @@ export function nextEvents(
   fresh: ActivityEvent[],
 ): ActivityEvent[] {
   return mode === "replace" ? fresh : mergeAndSort(prev, fresh);
-}
-
-/** 事件流 + 动作流合并成单条时间倒序流。纯函数,导出供 tests 守 window + 交错顺序。
- *
- *  窗口规则:动作只保留 `[feedLowerBound, beforeMs]` 内的行——即同时受用户筛选段和
- *  事件地平线约束(见 feedLowerBound)。展示事件为空 / 事件 checkbox 关时不设地平线。
- *
- *  同 ts 时事件排在动作前(事件是"发生了什么"、动作是"因此做了什么",因果上事件在先)。
- */
-export function mergeFeedRows(
-  events: ActivityEvent[],
-  actions: BackendActionRow[],
-  showEvents: boolean,
-  showActions: boolean,
-  sinceMs?: number,
-  beforeMs?: number,
-  hasMoreEvents = true,
-): FeedRow[] {
-  const rows: FeedRow[] = [];
-  if (showEvents) {
-    for (const e of events) rows.push({ kind: "event", ts: e.timestamp, event: e });
-  }
-  if (showActions) {
-    const lower = feedLowerBound(events, showEvents, sinceMs, hasMoreEvents);
-    const upper = beforeMs ?? Infinity;
-    for (const a of actions) {
-      if (a.timestamp >= lower && a.timestamp <= upper) {
-        rows.push({ kind: "action", ts: a.timestamp, action: a });
-      }
-    }
-  }
-  // ts DESC;同 ts 事件优先(event 在 action 前)。
-  rows.sort((x, y) => {
-    if (y.ts !== x.ts) return y.ts - x.ts;
-    if (x.kind === y.kind) return 0;
-    return x.kind === "event" ? -1 : 1;
-  });
-  return rows;
 }
 
 /** 合并两段 event 列表:by id dedup(后到的字段优先)+ timestamp DESC 排序.
@@ -297,9 +278,29 @@ export function ActivityFeed({
   const [showActions, setShowActions] = useState(true);
   const [actions, setActions] = useState<BackendActionRow[]>([]);
 
+  /** 设备规格表:did → (iid → spec)。动作行拿它把台账的 iid / value_json 读成人话
+   *  (见 lib/actionText)。与动作流解耦:取不到就不翻,动作行退回原始键。 */
+  const [deviceSpecs, setDeviceSpecs] = useState<
+    Map<string, Record<string, BackendPropSpec>>
+  >(new Map());
+
   /** 动作拉取的 generation token(N1 同款,镜像事件流的 fetchGenRef):首屏先发的
    *  无 home 过滤请求 / 切家前旧请求若晚返回,不得覆盖已按新 home 过滤的结果。 */
   const actionsGenRef = useRef(0);
+
+  // ── 折叠:动作并进它的触发事件(规则见 lib/feedFold)──
+  /** 折叠强度。存在本机、不跟随账号——代价与默认强档的理由见 useFoldStrength。 */
+  const { strength, setStrength } = useFoldStrength();
+  /** 折叠开不开。关掉 = 未折叠态:动作各自成行、各锚在自己的时刻上。**关掉不清空档位**,
+   *  两个键分开存就是为了翻一遍再打开还是原来那档(见 useFoldEnabled)。 */
+  const { folded, setFolded } = useFoldEnabled();
+  /** 就地展开着的支(按支的 key)。**不持久化**:展开面是"我现在要核对这几条",
+   *  离开再回来重新点一次比带着一屏张开的口子回来更符合预期。 */
+  const [openKeys, setOpenKeys] = useState<Set<string>>(new Set());
+  /** 刚被定位到的那一行,闪一圈高亮。 */
+  const [flashKey, setFlashKey] = useState<string | null>(null);
+  /** 待消费的滚动/焦点动作,见 PendingMove。 */
+  const [pending, setPending] = useState<PendingMove | null>(null);
 
   /** 动作重拉:mount / homeId 切换 / 时间窗变化 / 手动 reload 时调,失败静默(不阻断事件流)。
    *  带上当前应用的时间窗(appliedSince/appliedBefore),让动作与事件同段,不混入范围外记录;
@@ -338,6 +339,20 @@ export function ActivityFeed({
   useEffect(() => {
     reloadActions();
   }, [reloadActions, homeId]);
+
+  // 设备规格:切家后重取(规格表是 home 级的)。失败静默——动作行自己会退回原始键,
+  // 这条依赖断掉不该让日志页报错或空转。
+  useEffect(() => {
+    let alive = true;
+    listDeviceSpecs(homeId)
+      .then((m) => {
+        if (alive) setDeviceSpecs(m);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [homeId]);
 
   const filterActive = appliedSince !== undefined || appliedBefore !== undefined;
 
@@ -541,6 +556,9 @@ export function ActivityFeed({
               clip_kind: e.clip_kind ?? prev[idx].clip_kind,
               has_trace: e.has_trace ?? prev[idx].has_trace,
               has_ref: e.has_ref ?? prev[idx].has_ref,
+              visual_artifact_kind: e.visual_artifact_kind ?? prev[idx].visual_artifact_kind,
+              image_frame_counts: e.image_frame_counts ?? prev[idx].image_frame_counts,
+              has_audio_artifact: e.has_audio_artifact ?? prev[idx].has_audio_artifact,
               has_feedback: e.has_feedback ?? prev[idx].has_feedback,
               feedback_pack_path: e.feedback_pack_path ?? prev[idx].feedback_pack_path,
               feedback_pack_size: e.feedback_pack_size ?? prev[idx].feedback_pack_size,
@@ -583,15 +601,36 @@ export function ActivityFeed({
     fetchPage({ mode: "append", pageOffset: offset });
   };
 
-  // 事件 + 动作合并成单条时间倒序流(见 mergeFeedRows 的窗口规则);带上当前应用的时间窗,
-  // 让动作与事件同段约束(即使无事件也按 since/before 卡界)。
-  const feedRows = useMemo(
+  // 事件 + 动作装配成一条时间倒序流:**三种画法**——未折叠(动作各自成行)、弱档(支自己占
+  // 一行)、强档(支并进宿主的事件行)。窗口规则、分组、并列次序全在 lib/feedFold。
+  const rows = useMemo(
     () =>
-      mergeFeedRows(
-        events, actions, showEvents, showActions, appliedSince, appliedBefore, hasMore,
-      ),
-    [events, actions, showEvents, showActions, appliedSince, appliedBefore, hasMore],
+      buildFoldRows({
+        events,
+        actions,
+        showEvents,
+        showActions,
+        strength,
+        folded,
+        sinceMs: appliedSince,
+        beforeMs: appliedBefore,
+        hasMoreEvents: hasMore,
+      }),
+    [
+      events,
+      actions,
+      showEvents,
+      showActions,
+      strength,
+      folded,
+      appliedSince,
+      appliedBefore,
+      hasMore,
+    ],
   );
+
+  /** 宿主事件的取用表:支行要画宿主标题、算退出延迟,都得按 id 回查。 */
+  const eventById = useMemo(() => new Map(events.map((e) => [e.id, e])), [events]);
 
   const noneChecked = !showEvents && !showActions;
   // "查看更早" 仅在展示事件时有意义(动作已一次拉全 500,无分页)。
@@ -609,13 +648,16 @@ export function ActivityFeed({
     ? () => fetchPage({ mode: "replace", pageOffset: 0 })
     : onRetryEvents;
 
-  // 计数按流拆开。老代码用合并后的 feedRows.length 显"已加载 312 条+",那个 + 挂在
-  // 谁身上完全看不出来——恰恰是被截断的事件流被描述成完整的。
-  const shownEvents = useMemo(
-    () => feedRows.reduce((n, r) => n + (r.kind === "event" ? 1 : 0), 0),
-    [feedRows],
-  );
-  const shownActions = feedRows.length - shownEvents;
+  // 计数按流拆开。老代码用合并后的行数显"已加载 312 条+",那个 + 挂在谁身上完全看不出来
+  // ——恰恰是被截断的事件流被描述成完整的。
+  //
+  // 数的是**数据**不是行:强档把一批动作折进徽标、一条行都不占,弱档把同一批动作拆成
+  // 好几行,两种画法下"已加载多少条动作"必须是同一个数,否则切一下档位计数就变,而那批
+  // 数据一个字节都没动。foldCounts 按支 key 去重(弱档下一支同时出现在事件行与自己的
+  // 支行里),别数两遍。
+  const counts = useMemo(() => foldCounts(rows), [rows]);
+  const shownEvents = counts.events;
+  const shownActions = counts.actions;
 
   // 动作为什么可能不全,有两个互相独立的原因,提示语不能混为一谈:
   //  - clippedByHorizon:已取回但被事件地平线压在下面,翻页就能显出来。
@@ -639,6 +681,139 @@ export function ActivityFeed({
   ]
     .filter(Boolean)
     .join(" · ");
+
+  /* ── 折叠的四处动作 ─────────────────────────────────────────
+     都走「先改 state,再由 effect 消费一次 DOM 动作」这条路(理由见 PendingMove)。 */
+
+  /** 就地展开一片支。展开面可能有好几屏高,所以滚的是**展开面**而不是行;焦点直接落到
+   *  第一条动作上(用户点它多半就是要看那几条),同时把承载它的那一行闪一下作为回执。 */
+  const openBranch = useCallback((key: string, regionId: string, rowId: string) => {
+    setOpenKeys((prev) => new Set(prev).add(key));
+    setPending({
+      scroll: regionId,
+      flash: rowId,
+      focus: { kind: "member", key },
+      block: "center",
+    });
+  }, []);
+
+  /** 收起一片支,并把焦点交还它的开合控件。不闪:焦点交还不是跳转,闪一下反而像发生了别的。
+   *
+   *  `hostKey` 是承载这一片的**那一行**的 id。强档下支不占行(装配层直接跳过),`id=key`
+   *  没有元素承载,于是收起后 `getElementById` 必然落空:视口一步不动,而几屏高的成员表
+   *  整段消失,用户眼前换成原本排在它下方的行,刚收起的事件行留在上方几屏之外;焦点则
+   *  落到事件行那枚徽标上,还带着 `preventScroll`——读屏焦点与可见内容因此脱节。
+   *  收起消不掉承载它的那一行,所以拿它当落点。弱档与无宿主支不传:支行行体自己带着
+   *  `id=key`,落点本来就是它。 */
+  const closeBranch = useCallback((key: string, hostKey?: string) => {
+    setOpenKeys((prev) => {
+      if (!prev.has(key)) return prev;
+      const next = new Set(prev);
+      next.delete(key);
+      return next;
+    });
+    setPending({
+      scroll: hostKey ?? key,
+      focus: { kind: "control", key },
+      block: "nearest",
+    });
+  }, []);
+
+  /** 支行上的开合:展开面就在这一行里,滚它、也闪这一行。 */
+  const toggleBranch = useCallback(
+    (key: string) => {
+      if (openKeys.has(key)) closeBranch(key);
+      else openBranch(key, key, key);
+    },
+    [openKeys, openBranch, closeBranch],
+  );
+
+  /** 跳到某一行并闪一下。弱档的徽标、以及"已展开但滚出视口"的徽标都走这里。 */
+  const locate = useCallback((scrollId: string, flashId: string = scrollId) => {
+    setPending({ scroll: scrollId, flash: flashId, block: "center" });
+  }, []);
+
+  /** 事件行上那枚徽标被激活。同一个控件在两种情形下是两件事,判据只能是"看得见吗":
+   *  弱档恒为定位;强档未展开则就地展开,已展开且展开面还在视口里则收起,已展开但滚走了
+   *  则把它滚回来 —— 那时点一下是收起一个自己看不见的东西,画面毫无变化。 */
+  const activateBadge = useCallback(
+    (branch: FoldBranch, hostKey: string) => {
+      if (strength !== "strong") {
+        locate(branch.key);
+        return;
+      }
+      if (!openKeys.has(branch.key)) {
+        openBranch(branch.key, hostRegionOf(branch.key), hostKey);
+        return;
+      }
+      const region = document.getElementById(hostRegionOf(branch.key));
+      if (region && isInViewport(region)) closeBranch(branch.key, hostKey);
+      else locate(hostRegionOf(branch.key), hostKey);
+    },
+    [strength, openKeys, locate, openBranch, closeBranch],
+  );
+
+  /** 「触发事件未加载」那枚 chip:去后端单查这条事件,把结果说出来 —— **只说话,不动窗口**。
+   *  查到了也不把它抓进列表:把它放进来就得连带它周围的事件与动作,那是翻页 / 换时间范围
+   *  的事,而窗口是用户亲手选的;这枚 chip 回答的只是"它到底在哪"。 */
+  const lookupHost = useCallback(
+    (eventId: string) => {
+      listActivity(homeId, { eventId })
+        .then((found) => {
+          const ev = found[0];
+          if (ev) toast(t("actions.lookupFound", { time: smartTimeLabel(ev.timestamp) }), "info");
+          else toast(t("actions.lookupGone"), "warn");
+        })
+        .catch(() => toast(t("actions.lookupFailed"), "warn"));
+    },
+    [homeId, t],
+  );
+
+  // 消费待办:目标节点此时才存在。滚 + 交焦点 + 记下要高亮的那行。
+  useEffect(() => {
+    if (!pending) return;
+    document.getElementById(pending.scroll)?.scrollIntoView({
+      block: pending.block,
+      behavior: "smooth",
+    });
+    if (pending.focus) {
+      const el =
+        pending.focus.kind === "member"
+          ? document.getElementById(firstMemberIdOf(pending.focus.key))
+          : // 支行自己的 chevron 优先;没有(强档的展开面挂在事件行下)就退回那枚徽标。
+            (document.querySelector<HTMLElement>(`[data-toggle="${pending.focus.key}"]`) ??
+             document.querySelector<HTMLElement>(`[data-jump="${pending.focus.key}"]`));
+      // preventScroll:滚动的落点已经由上面那次 scrollIntoView 定了,焦点再滚一次会打架。
+      el?.focus({ preventScroll: true });
+    }
+    if (pending.flash) setFlashKey(pending.flash);
+    setPending(null);
+  }, [pending]);
+
+  // 高亮自己退场。
+  useEffect(() => {
+    if (!flashKey) return;
+    const timer = setTimeout(() => setFlashKey(null), FLASH_MS);
+    return () => clearTimeout(timer);
+  }, [flashKey]);
+
+  // Esc 收起焦点所在的那片展开面。守卫是"焦点真落在某片展开面里"而不是"有展开面":
+  // 全屏播放器 / 反馈表单也吃 Esc,不设这道闸,关掉它们会顺带收掉一片支。
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      const active = document.activeElement;
+      if (!(active instanceof HTMLElement)) return;
+      // 宿主行从**展开面**上溯,不从焦点元素上溯:展开后焦点正落在第一条成员上,而成员行
+      // 自己也带 id(`<key>-m0`),按焦点上溯会抓到它——一个随成员表一起卸载的节点,
+      // 落点照样落空。展开面是它所在那一行的直系后代,从它上溯才稳。
+      const region = active.closest<HTMLElement>("[data-region]");
+      const key = region?.dataset.region;
+      if (region && key) closeBranch(key, region.closest<HTMLElement>("li[id]")?.id);
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [closeBranch]);
 
   return (
     <section
@@ -679,6 +854,15 @@ export function ActivityFeed({
             />
             {t("actions.filterActions")}
           </label>
+          {/* 折叠开关 + 强度。与上面两个 checkbox 不是一回事:那两个决定"有哪些流",
+              这两枚决定"动作怎么画"——勾着事件、勾着动作,动作可以各自一行(关掉折叠),
+              也可以折进事件(开着折叠,再分两档)。三种画法都保留全部数据,所以它们放在
+              筛选旁边而不是筛选里面。
+              关掉折叠时强度控件**整个不渲染**:未折叠态没有"折叠强度"这回事,留着一个
+              不生效的控件就是在问一个当前不成立的问题(它的 aria-controls 也随之不写,
+              见 FeedFold 的 STRENGTH_CTL_ID)。 */}
+          <FoldToggle folded={folded} onChange={setFolded} />
+          {folded && <StrengthToggle strength={strength} onChange={setStrength} />}
           <TimeRangeFilter
             since={since}
             before={before}
@@ -735,11 +919,11 @@ export function ActivityFeed({
         <div className="text-body text-center py-10 text-text-secondary">
           {t("actions.emptyFilter")}
         </div>
-      ) : loading && showEvents && events.length === 0 && feedRows.length === 0 ? (
+      ) : loading && showEvents && events.length === 0 && rows.length === 0 ? (
         <div className="text-body text-center py-10 text-text-secondary">
           {t("activity.loading")}
         </div>
-      ) : feedRows.length === 0 ? (
+      ) : rows.length === 0 ? (
         <div className="text-body text-center py-10 text-text-secondary">
           {filterActive
             ? t("activity.emptyFiltered")
@@ -747,23 +931,113 @@ export function ActivityFeed({
         </div>
       ) : (
         <ul className="divide-y divide-border">
-          {feedRows.map((r) =>
-            r.kind === "event" ? (
-              <ActivityRow
-                key={`e:${r.event.id}`}
-                event={r.event}
-                onOpenLightbox={(src, kind, crop) => setLightbox({ src, kind, crop })}
-                feedbackSet={feedbackSet}
-                feedbackPacks={feedbackPacks}
-                onFeedbackSubmitted={(id, path, size) => {
-                  setFeedbackSet(prev => new Set(prev).add(id));
-                  setFeedbackPacks(prev => new Map(prev).set(id, { path, size }));
-                }}
+          {rows.map((r) => {
+            if (r.kind === "event") {
+              const badges = [
+                // 「范围外·作为宿主显示」排在徽标前面:它说的是这一行**为什么**在这儿,
+                // 是前提;徽标说的是它下面挂了什么。
+                ...(r.hostOutside
+                  ? [
+                      <span key="outside" className={CHIP_CLASS}>
+                        {t("actions.chipHostOutside")}
+                      </span>,
+                    ]
+                  : []),
+                ...r.branches.map((b) => (
+                  <FoldBadge
+                    key={b.key}
+                    branch={b}
+                    strength={strength}
+                    open={openKeys.has(b.key)}
+                    onActivate={() => activateBadge(b, r.key)}
+                  />
+                )),
+              ];
+              const opened = inlinedBranches(strength, r.branches, openKeys);
+              return (
+                <ActivityRow
+                  key={`e:${r.key}`}
+                  domId={r.key}
+                  flash={flashKey === r.key}
+                  event={r.event}
+                  // 空数组不传:传个空片段会让每张事件行都多出一条只占高度的空隙。
+                  badges={badges.length ? badges : undefined}
+                  inner={
+                    opened.length
+                      ? opened.map((b) => (
+                          // 展开面整片吃掉事件行的点击(整行是"看详情"),也靠 data-region
+                          // 让 Esc 认出"焦点正在这一片里"。
+                          <div
+                            key={b.key}
+                            id={hostRegionOf(b.key)}
+                            data-region={b.key}
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            <FoldMembers
+                              branch={b}
+                              specs={deviceSpecs}
+                              onToggle={() => closeBranch(b.key, r.key)}
+                            />
+                          </div>
+                        ))
+                      : undefined
+                  }
+                  onOpenLightbox={(src, kind, crop) => setLightbox({ src, kind, crop })}
+                  feedbackSet={feedbackSet}
+                  feedbackPacks={feedbackPacks}
+                  onFeedbackSubmitted={(id, path, size) => {
+                    setFeedbackSet(prev => new Set(prev).add(id));
+                    setFeedbackPacks(prev => new Map(prev).set(id, { path, size }));
+                  }}
+                />
+              );
+            }
+            if (r.kind === "branch") {
+              return (
+                <BranchRow
+                  key={`b:${r.key}`}
+                  branch={r.branch}
+                  hostEvent={r.branch.eventId ? eventById.get(r.branch.eventId) : undefined}
+                  hostRendered={r.hostRendered}
+                  showEvents={showEvents}
+                  open={openKeys.has(r.key)}
+                  flash={flashKey === r.key}
+                  specs={deviceSpecs}
+                  onToggle={() => toggleBranch(r.key)}
+                  onBack={locate}
+                  onLookupHost={lookupHost}
+                />
+              );
+            }
+            // 单条动作行。**两种来路共用这一个分支**:未折叠态下每条动作都走这儿,折叠态下
+            // 走这儿的只剩挂不上任何支的那几条(无触发源 / 早于链路记录)。两者的信息面本来
+            // 就是同一个,差别只在——未折叠态**多一枚回返角标**(指回宿主事件行),而那正是
+            // 折叠态由支行标题承担的那件事。宿主没加载时给的是那枚可点的「触发事件未加载」,
+            // 点了去问后端(同支行)。
+            const hostId = r.hostId;
+            return (
+              <ActionRow
+                key={`a:${r.key}`}
+                row={r.action}
+                t={t}
+                spec={deviceSpecs.get(r.action.did)}
+                chip={
+                  r.chip ? (
+                    <FoldChipPill
+                      chip={r.chip}
+                      onLookup={
+                        // 只有"有宿主、只是没翻到"那枚可点:去后端单查它在不在。
+                        r.chip === "hostMissing" && hostId ? () => lookupHost(hostId) : undefined
+                      }
+                    />
+                  ) : undefined
+                }
+                back={
+                  r.hostRendered && hostId ? { eventId: hostId, onBack: locate } : undefined
+                }
               />
-            ) : (
-              <ActionRow key={`a:${r.action.id}`} row={r.action} t={t} />
-            ),
-          )}
+            );
+          })}
           {/* 动作拉取达上限(500)**且该上限确实卡住了展示**时才提示 —— 见 actionsTruncated。 */}
           {actionsTruncated && (
             <li className="px-5 py-2 text-caption text-text-tertiary text-center">
@@ -859,7 +1133,15 @@ function Lightbox({
       role="dialog"
       // 必须跟着 kind 走:label 写在 kind 分叉之前,读屏会把参考帧对话框念成"事件回放"
       // ——与屏上内容不符,而读屏用户没有画面可以纠正这句描述。
-      aria-label={kind === "image" ? t("activity.refFrame") : t("activity.playback")}
+      // image 还要再分一层:带 crop 的才是 Smart Crop 全景参考帧,图片序列的主画面帧
+      // 走同一个 kind 但没有 crop,念成"全景参考"同样是错描述。
+      aria-label={
+        kind === "image"
+          ? crop
+            ? t("activity.refFrame")
+            : t("activity.imagePlayback")
+          : t("activity.playback")
+      }
     >
       <button
         type="button"
@@ -884,7 +1166,11 @@ function Lightbox({
         <div className="relative w-full h-full">
           <img
             src={src}
-            alt={t("activity.refFrame")}
+            // 跟对话框 aria 同一判据: 带 crop 的才是 Smart Crop 全景参考帧, 图片序列的
+            // 主画面帧走同一个 kind 但没有 crop. 这里若恒念"全景参考帧", 读屏用户从序列卡
+            // 打开放大就会听见对话框报"图片序列"、紧接着图片本体报"全景参考帧"——同一个
+            // 弹层里两句话互相矛盾(上轮修的是 dialog 层, 错描述从 img 层漏了下来).
+            alt={crop ? t("activity.refFrame") : t("activity.imagePlayback")}
             className="w-full h-full object-contain"
           />
           {crop && <CropBoxOverlay crop={crop} />}
@@ -1047,12 +1333,24 @@ function TriggerStatusBadge({ kind }: { kind: TriggerStatusKind }) {
 
 function ActivityRow({
   event,
+  badges,
+  inner,
+  flash,
+  domId,
   onOpenLightbox,
   feedbackSet,
   feedbackPacks,
   onFeedbackSubmitted,
 }: {
   event: ActivityEvent;
+  /** 宿主行上的相位徽标(强档才有;弱档的支自成一行,不挂在这儿)。 */
+  badges?: ReactNode;
+  /** 就地展开的成员表(强档)。收起时不渲染——见 components/FeedFold 头的不变量。 */
+  inner?: ReactNode;
+  /** 刚被定位到:闪一圈。 */
+  flash?: boolean;
+  /** 定位锚点用的行 id(支的徽标与 ↩ 都指向它)。 */
+  domId?: string;
   onOpenLightbox: (src: string, kind: LightboxKind, crop?: EventCropMeta | null) => void;
   feedbackSet: Set<string>;
   feedbackPacks: Map<string, { path: string; size: number }>;
@@ -1061,6 +1359,11 @@ function ActivityRow({
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
   const hasClips = event.snapshot_count > 0;
+  const isImageMode = event.visual_artifact_kind === "images";
+  const imageDids = event.device_ids.filter(
+    (did) => (event.image_frame_counts?.[did] ?? 0) > 0,
+  );
+  const hasImages = isImageMode && imageDids.length > 0;
   // 区分音频事件 vs 视频事件 — backend stat 落盘文件后缀计算 clip_kind:
   //   "mp4" → 视频路径 (H264+AAC),UI 🎬
   //   "m4a" → audio-only 路径(纯 AAC,画面静止),UI 🎤 音频
@@ -1084,15 +1387,21 @@ function ActivityRow({
   // 展开状态显"收起".audio-only 跟"无 clip"用同一图标 — 都"没视频"语义一致.
   const trailing = expanded
     ? t("activity.collapse")
-    : hasClips && !isAudioOnly
+    : hasImages
+      ? "🖼️"
+      : hasClips && !isAudioOnly
       ? "🎬"
       : "🎤";
 
   return (
     <li
+      id={domId}
+      tabIndex={domId ? -1 : undefined}
       onClick={() => { if (!window.getSelection()?.toString()) setExpanded((x) => !x); }}
       aria-expanded={expanded}
-      className="px-5 py-2.5 hover:bg-bg-tertiary transition-colors cursor-pointer"
+      className={`px-5 py-2.5 hover:bg-bg-tertiary transition-colors cursor-pointer${
+        flash ? " ring-2 ring-brand-ring" : ""
+      }`}
     >
       <div className="flex flex-col gap-1 sm:grid sm:grid-cols-[70px_1fr_auto] sm:gap-x-3 sm:gap-y-1 sm:items-baseline">
         <TimeLabel timestamp={event.timestamp} />
@@ -1118,6 +1427,12 @@ function ActivityRow({
               </span>
             ))
           )}
+          {/* 徽标与展开面都留在正文这一列里:它们说的是"这件事引出了什么",跟着这一行读
+              才对;铺到整行宽会让它们看着像独立的一段。 */}
+          {badges && (
+            <div className="mt-1.5 flex items-center gap-1.5 flex-wrap">{badges}</div>
+          )}
+          {inner}
         </div>
         <span
           className="text-caption-mono text-text-tertiary whitespace-nowrap sm:order-last sm:justify-self-end"
@@ -1127,7 +1442,32 @@ function ActivityRow({
         </span>
       </div>
 
-      {expanded && hasClips && !isAudioOnly && (
+      {expanded && hasImages && (
+        <div
+          className="mt-3 flex gap-2 overflow-x-auto pb-2 sm:ml-[82px]"
+          aria-label={t("activity.imagePlayback", "图片序列")}
+        >
+          {imageDids.map((did) => (
+            <Fragment key={did}>
+              <ImageSequenceCard
+                deviceId={did}
+                frameCount={event.image_frame_counts?.[did] ?? 0}
+                getImageUrl={(frameIndex) => eventImageUrl(event.id, did, frameIndex)}
+                onOpenLightbox={onOpenLightbox}
+              />
+              {event.has_ref && (
+                <RefFrameCard
+                  event_id={event.id}
+                  device_id={did}
+                  onOpenLightbox={onOpenLightbox}
+                />
+              )}
+            </Fragment>
+          ))}
+        </div>
+      )}
+
+      {expanded && !isImageMode && hasClips && !isAudioOnly && (
         <div
           className="mt-3 flex gap-2 overflow-x-auto pb-2 sm:ml-[82px]"
           aria-label={t("activity.videoPlayback")}
@@ -1420,6 +1760,113 @@ function ClipPlayer({
   );
 }
 
+function ImageSequenceCard({
+  deviceId,
+  frameCount,
+  getImageUrl,
+  onOpenLightbox,
+}: {
+  deviceId: string;
+  frameCount: number;
+  getImageUrl: (frameIndex: number) => string;
+  onOpenLightbox: (src: string, kind: LightboxKind, crop?: EventCropMeta | null) => void;
+}) {
+  const { t } = useTranslation();
+  const [frameIndex, setFrameIndex] = useState(0);
+  const [failed, setFailed] = useState(false);
+  const safeFrameCount = Math.max(0, frameCount);
+  const src = getImageUrl(Math.min(frameIndex, Math.max(0, safeFrameCount - 1)));
+
+  useEffect(() => {
+    setFrameIndex(0);
+    setFailed(false);
+  }, [deviceId, frameCount]);
+
+  if (!safeFrameCount) return null;
+
+  // 失败态不整卡早退: 序列卡有 N 帧, 一帧加载失败(瞬时网络抖动/后端偶发 500)不该把整卡
+  // 钉死成"已过期" —— 其余帧在盘上完好; 而且翻页正是从坏帧翻走的唯一入口, 早退会让两个
+  // handler 里的 setFailed(false) 变成死代码(它们本意就是"翻页即重试"). 占位块只顶掉
+  // <img> 的位置, 计数角标与翻页按钮照常渲染; 放大按钮在失败态不渲染, 免得灯箱打开坏 src.
+  return (
+    <div
+      onClick={(e) => e.stopPropagation()}
+      className="flex-shrink-0 relative group"
+    >
+      {failed ? (
+        // 占位块本身可点重试。N≥2 时翻页就是重试入口, 但 frameCount===1 的短窗口下
+        // frameIndex 恒 0 —— prev 的 `frameIndex === 0`、next 的 `0 >= 0` 双双成立,
+        // 两个按钮都 disabled, 两处 setFailed(false) 对这个形状依旧不可达(短窗口/掉帧时
+        // image_frame_counts 可以为 1)。真过期时点按 → <img> 重新挂载 → 再次 onError
+        // → 回到占位, 无副作用。
+        // 用真 <button> 而不是可点 div: 可点 div 不可聚焦、键盘不可达, 且 aria 仍念
+        // "图片已过期" —— 交互元素只报状态、不报动作, 读屏用户不知道它能点。
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            setFailed(false);
+          }}
+          className="w-48 h-48 rounded bg-bg-primary border border-border flex items-center justify-center text-caption-mono text-text-tertiary cursor-pointer"
+          aria-label={t("activity.imageExpiredRetry", "图片已过期，点按重新加载")}
+        >
+          {t("activity.imageExpired", "图片已过期")}
+        </button>
+      ) : (
+        <img
+          src={src}
+          alt={`${deviceId} ${t("activity.imageFrame", "图片帧")} ${frameIndex + 1}`}
+          onError={() => setFailed(true)}
+          onClick={(e) => e.stopPropagation()}
+          className="w-48 h-48 rounded bg-black border border-border object-contain"
+        />
+      )}
+      <span className="absolute bottom-1 left-1 px-1.5 py-0.5 rounded bg-black/60 text-white text-caption-mono pointer-events-none">
+        {frameIndex + 1} / {safeFrameCount}
+      </span>
+      <button
+        type="button"
+        disabled={frameIndex === 0}
+        onClick={(e) => {
+          e.stopPropagation();
+          setFailed(false);
+          setFrameIndex((index) => Math.max(0, index - 1));
+        }}
+        aria-label={t("activity.previousFrame", "上一张")}
+        className="absolute bottom-1 left-1/2 -translate-x-[calc(100%+2px)] w-7 h-7 rounded-full bg-black/60 hover:bg-black/80 text-white text-xs flex items-center justify-center disabled:opacity-30"
+      >
+        ‹
+      </button>
+      <button
+        type="button"
+        disabled={frameIndex >= safeFrameCount - 1}
+        onClick={(e) => {
+          e.stopPropagation();
+          setFailed(false);
+          setFrameIndex((index) => Math.min(safeFrameCount - 1, index + 1));
+        }}
+        aria-label={t("activity.nextFrame", "下一张")}
+        className="absolute bottom-1 left-1/2 translate-x-0 w-7 h-7 rounded-full bg-black/60 hover:bg-black/80 text-white text-xs flex items-center justify-center disabled:opacity-30"
+      >
+        ›
+      </button>
+      {!failed && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onOpenLightbox(src, "image");
+          }}
+          aria-label={t("activity.zoomImage", "放大图片")}
+          className="absolute top-1 right-1 w-7 h-7 rounded-full bg-black/60 hover:bg-black/80 text-white text-xs flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
+        >
+          ⛶
+        </button>
+      )}
+    </div>
+  );
+}
+
 /** Smart Crop 全景参考帧卡:与 crop clip 并排的静态 <img>,叠一层 crop 框.
  *
  *  为什么要这张卡:crop 模式下送 LLM 的视频只是画面里的一小块,单看它无从判断"模型
@@ -1669,7 +2116,7 @@ function OnDemandLogList({ initial, initialLoading, initialError, onRetryInitial
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [hasMore, setHasMore] = useState(initial.length === OD_PAGE_SIZE);
-  const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
+  const [lightbox, setLightbox] = useState<{ src: string; kind: LightboxKind } | null>(null);
 
   useEffect(() => {
     setLogs(initial);
@@ -1759,11 +2206,20 @@ function OnDemandLogList({ initial, initialLoading, initialError, onRetryInitial
       </div>
       <ul className="divide-y divide-border">
         {logs.map((log) => (
-          <OnDemandRow key={log.id} log={log} onOpenLightbox={setLightboxSrc} deviceNames={deviceNames} />
+          <OnDemandRow
+            key={log.id}
+            log={log}
+            onOpenLightbox={(src, kind) => setLightbox({ src, kind })}
+            deviceNames={deviceNames}
+          />
         ))}
       </ul>
-      {lightboxSrc && (
-        <Lightbox src={lightboxSrc} onClose={() => setLightboxSrc(null)} />
+      {lightbox && (
+        <Lightbox
+          src={lightbox.src}
+          kind={lightbox.kind}
+          onClose={() => setLightbox(null)}
+        />
       )}
       {hasMore && (
         <div className="px-5 py-3 border-t border-border flex justify-center">
@@ -1783,7 +2239,7 @@ function OnDemandLogList({ initial, initialLoading, initialError, onRetryInitial
 
 function OnDemandRow({ log, onOpenLightbox, deviceNames }: {
   log: OnDemandLogEntry;
-  onOpenLightbox: (src: string) => void;
+  onOpenLightbox: (src: string, kind: LightboxKind) => void;
   deviceNames: Record<string, string>;
 }) {
   const { t } = useTranslation();
@@ -1795,11 +2251,21 @@ function OnDemandRow({ log, onOpenLightbox, deviceNames }: {
   const packSize = feedbackPack?.size ?? log.feedback_pack_size ?? null;
   const hasClips = log.snapshot_count > 0;
   const clipDids = log.clip_dids ?? [];
+  const isImageMode = log.visual_artifact_kind === "images";
+  // image_frame_counts 的键源自后端的 clip_dids（probe_visual_artifacts 按落产物的设备
+  // 建键），故此处按 clipDids 过滤，与下方 video/音频分支口径一致 —— 不用 sources（查询
+  // 设备全集），避免依赖「clip_dids ⊆ sources」这一隐含不变量。
+  const imageDids = clipDids.filter(
+    (did) => (log.image_frame_counts?.[did] ?? 0) > 0,
+  );
+  const hasImages = isImageMode && imageDids.length > 0;
   const allAudioOnly = hasClips && clipDids.every((did) => (log.clip_kinds?.[did] ?? "mp4") === "m4a");
 
   const trailing = expanded
     ? t("activity.collapse")
-    : hasClips && !allAudioOnly
+    : hasImages
+      ? "🖼️"
+      : hasClips && !allAudioOnly
       ? "🎬"
       : "💬";
 
@@ -1823,7 +2289,24 @@ function OnDemandRow({ log, onOpenLightbox, deviceNames }: {
         </span>
       </div>
 
-      {expanded && hasClips && (
+      {expanded && hasImages && (
+        <div
+          className="mt-3 flex gap-2 overflow-x-auto pb-2 sm:ml-[82px]"
+          aria-label={t("activity.imagePlayback", "图片序列")}
+        >
+          {imageDids.map((did) => (
+            <ImageSequenceCard
+              key={did}
+              deviceId={did}
+              frameCount={log.image_frame_counts?.[did] ?? 0}
+              getImageUrl={(frameIndex) => onDemandImageUrl(log.id, did, frameIndex)}
+              onOpenLightbox={onOpenLightbox}
+            />
+          ))}
+        </div>
+      )}
+
+      {expanded && !isImageMode && hasClips && (
         <div className="mt-3 flex gap-2 overflow-x-auto pb-2 sm:ml-[82px]">
           {clipDids.map((did) =>
             (log.clip_kinds?.[did] ?? "mp4") === "m4a"
@@ -1848,7 +2331,7 @@ function OnDemandRow({ log, onOpenLightbox, deviceNames }: {
 }
 
 function OnDemandClipPlayer({ logId, deviceId, onOpenLightbox }: {
-  logId: string; deviceId: string; onOpenLightbox: (src: string) => void;
+  logId: string; deviceId: string; onOpenLightbox: (src: string, kind: LightboxKind) => void;
 }) {
   const { t } = useTranslation();
   const [failed, setFailed] = useState(false);
@@ -1865,7 +2348,7 @@ function OnDemandClipPlayer({ logId, deviceId, onOpenLightbox }: {
     <div onClick={(e) => e.stopPropagation()} className="flex-shrink-0 relative group">
       <video src={src} controls preload="metadata" onError={() => setFailed(true)} onClick={(e) => e.stopPropagation()} className="w-48 h-48 rounded bg-black border border-border object-contain"
         aria-label={`${deviceId} clip`} />
-      <button type="button" onClick={(e) => { e.stopPropagation(); onOpenLightbox(src); }} aria-label={t("activity.zoomPlay")}
+      <button type="button" onClick={(e) => { e.stopPropagation(); onOpenLightbox(src, "video"); }} aria-label={t("activity.zoomPlay")}
         className="absolute top-1 right-1 w-7 h-7 rounded-full bg-black/60 hover:bg-black/80 text-white text-xs flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
         ⛶
       </button>

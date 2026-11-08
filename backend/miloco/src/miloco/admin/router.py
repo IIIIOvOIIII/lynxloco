@@ -54,7 +54,7 @@ async def get_system_status(current_user: str = Depends(verify_token)):
     - Perception model: whether a vision_understanding model is activated
     - Rule engine: whether running and how many rules are loaded
     """
-    logger.info("Get system status API called - User: %s", current_user)
+    logger.info("Get system status API called - User: %s", safe_log(current_user))
 
     # MiOT login status
     try:
@@ -246,7 +246,13 @@ def _write_dismissed(version: str) -> None:
     try:
         _dismiss_file().write_text(version.strip(), encoding="utf-8")
     except Exception as e:
-        logger.warning("failed to persist dismissed version %s: %s", safe_log(version), e)
+        # 版本串来自请求体，异常消息可能把它原样嵌回来，两个都要中和——只包前一个
+        # 等于从旁路把换行重新带回日志。
+        logger.warning(
+            "failed to persist dismissed version %s: %s",
+            safe_log(version),
+            safe_log(e),
+        )
 
 
 def _deploy_kind() -> str:
@@ -458,14 +464,9 @@ async def upgrade_run(current_user: str = Depends(verify_token)):
         #    可达），单看版本变更会误判完成。故脚本在**全部跑完 + 最后一次 service start 之后**
         #    才 echo AGENT_UPGRADE_DONE/FAILED 到日志——这是整个升级唯一可靠的终态信号，
         #    /upgrade/status 据此报 done/failed，前端只认这个标记才判完成，不看中途版本变更。
-        #  - `export MILOCO_HOME` + `--agent-platform`：安装器**不会**从已装环境反推这两者。
-        #    install.py 的 _decide_agent_platform 在非交互 agent 模式下不读已持久化的
-        #    agent.platform，缺参即 fallback "openclaw"；MILOCO_HOME 缺失时又按该平台推默认
-        #    路径（hermes 部署实际在 ~/.hermes/miloco）。两者都靠继承 backend 环境不可靠 →
-        #    hermes 部署会被当成 openclaw 升级：插件步走 openclaw 分支（主机多半无 openclaw
-        #    CLI → 整体失败），hermes 的 adapter 部署 / config set / plugins enable /
-        #    post-install 对账整段被跳过。故显式读本端平台透传、并把本端实际 MILOCO_HOME
-        #    钉进子进程环境。
+        #  - `export MILOCO_HOME` + `MILOCO_AGENT_PLATFORM` + `--agent-platform`：升级脚本
+        #    显式携带 backend 当前确认的平台和数据目录。安装器会优先读取该环境变量，平台
+        #    探测只作为诊断，不得因为 macOS、非默认 HERMES_HOME 或残留 runtime 阻断升级。
         q_url = shlex.quote(_INSTALL_SH_URL)
         q_sh = shlex.quote(str(tmp_sh))
         q_home = shlex.quote(str(home))
@@ -473,8 +474,13 @@ async def upgrade_run(current_user: str = Depends(verify_token)):
         # 传其它值 argparse 直接 exit(2)、整次升级失败。空/未知值不传，退回安装器默认。
         platform = (settings.agent.platform or "").strip()
         plat_flag = f" --agent-platform={platform}" if platform in ("openclaw", "hermes") else ""
+        platform_env = (
+            f" export MILOCO_AGENT_PLATFORM={shlex.quote(platform)};"
+            if platform in ("openclaw", "hermes")
+            else ""
+        )
         script = (
-            f"export MILOCO_HOME={q_home}; export MILOCO_LANG=zh; rc=0; "
+            f"export MILOCO_HOME={q_home};{platform_env} export MILOCO_LANG=zh; rc=0; "
             f"curl -fsSL {q_url} -o {q_sh} || rc=$?; "
             'if [ "$rc" = "0" ]; then '
             f"bash {q_sh} --agent-prepare{plat_flag} && "
@@ -1376,8 +1382,8 @@ async def test_omni_config(
     result = await _probe.probe_omni(model, base_url, api_key, api_protocol)
     # 测通 + 完整 active identity / runtime 最终 key 匹配 + 熔断非 ok → 主动清熔断,与 put/activate/retry
     # 恢复路径对齐。护栏:测别的档案 / 未保存的新配置时不动状态。
-    # OPEN_CONFIG 下 tick 不会自动探测(只探 OPEN_RECOVERABLE),不清则用户测通了红条仍不消失,
-    # 只能靠横条上的「立即重试」或改配置重存才能恢复——「测通即恢复」是最直觉的路径。
+    # OPEN_CONFIG 下 tick 虽有慢周期自动探测(config_probe_interval_sec,默认 300s),但不清则
+    # 用户测通后最坏还要等一整个周期红条才消失——「测通即恢复」是最直觉的路径。
     if result.get("ok"):
         from miloco.perception.engine.config import OmniConfig
         from miloco.perception.engine.omni.circuit_breaker import (
@@ -1577,29 +1583,36 @@ async def retry_omni_probe(current_user: str = Depends(verify_token)):
         if elapsed_ms < int(RETRY_COOLDOWN_SEC * 1000):
             return NormalResponse(code=0, message="ok", data=_full_omni_payload())
 
-    await cb.retry_now()
-    omni = get_settings().model.omni
-    protocol = resolve_api_protocol(omni.api_protocol, omni.model)
-    if not omni.api_key and protocol != "openai_responses":
-        # 无 key:直接标记 probe 失败,回 OPEN_CONFIG
-        await cb.record_probe_result(
-            False,
-            ClassifiedError(
-                "no_key",
-                "未配置 API Key",
-                ErrorCategory.CONFIG,
-            ),
-        )
-        return NormalResponse(code=0, message="ok", data=_full_omni_payload())
-
     try:
-        result = await _probe.probe_omni(
-            omni.model, omni.base_url, omni.api_key, protocol
-        )
+        await cb.retry_now()
+        omni = get_settings().model.omni
+        protocol = resolve_api_protocol(omni.api_protocol, omni.model)
+        if not omni.api_key and protocol != "openai_responses":
+            await cb.record_probe_result(
+                False,
+                ClassifiedError("no_key", "未配置 API Key", ErrorCategory.CONFIG),
+            )
+        else:
+            result = await _probe.probe_omni(
+                omni.model, omni.base_url, omni.api_key, protocol
+            )
+            if result.get("ok"):
+                await cb.record_probe_result(True, None)
+            else:
+                code = result.get("code", "unreachable")
+                await cb.record_probe_result(
+                    False,
+                    ClassifiedError(
+                        code,
+                        result.get("message", ""),
+                        category_for_code(code),
+                        result.get("retry_after_seconds"),
+                    ),
+                )
     except asyncio.CancelledError:
         # 客户端断开 HTTP(用户切页/关 tab/网络抖动)时 FastAPI 抛 CancelledError。
         # 此前 retry_now() 已把 state 置 HALF_OPEN,若不复位则 before_call 永久短路、
-        # tick 只 arm OPEN_RECOVERABLE 也不会驱动新 probe,只能改配置或重启。
+        # tick 只 arm OPEN_*(HALF_OPEN 不在其列)也不会驱动新 probe,只能改配置或重启。
         # 走 record_probe_result(fail, RECOVERABLE) 回落到 OPEN_RECOVERABLE 让 tick 接管。
         await cb.record_probe_result(
             False,
@@ -1610,22 +1623,20 @@ async def retry_omni_probe(current_user: str = Depends(verify_token)):
             ),
         )
         raise
-    if result.get("ok"):
-        await cb.record_probe_result(True, None)
-    else:
-        code = result.get("code", "unreachable")
-        cat = category_for_code(code)
+    except Exception as exc:
+        # URL parsing can fail before the probe's internal exception handler.
         await cb.record_probe_result(
             False,
             ClassifiedError(
-                code,
-                result.get("message", ""),
-                cat,
-                # rate_limited 时 probe_chat 会在 result 里回带 retry_after_seconds,
-                # 传给 _grow_backoff_locked 让 backoff 尊重 server Retry-After。
-                result.get("retry_after_seconds"),
+                "unreachable",
+                f"probe 抛异常({type(exc).__name__})",
+                ErrorCategory.RECOVERABLE,
             ),
         )
+        raise
+    finally:
+        # 配置读取、无 key 分支及失败记账本身抛异常时,也必须释放探测占位。
+        cb.clear_probe_in_flight()
     return NormalResponse(code=0, message="ok", data=_full_omni_payload())
 
 
@@ -1680,6 +1691,7 @@ async def omni_health_stream():
 class PerceptionConfigBody(BaseModel):
     video_short_edge: int | None = Field(default=None, ge=64, le=2160)
     omni_fps: int | None = Field(default=None, ge=1, le=30)
+    omni_visual_input_mode: Literal["video", "image"] | None = None
     window_size: int | None = Field(default=None, ge=1, le=60)
     # Smart Crop 用户开关。与 video_short_edge 正交:裁不裁看这个,多清晰看 video_short_edge。
     # 写进 perception.engine.crop_enhance.user_enabled;发版级开关 enabled 不由 API 写。
@@ -1731,6 +1743,7 @@ def _perception_config_payload() -> dict:
     return {
         "video_short_edge": inp.get("video_short_edge", 512),
         "omni_fps": inp.get("omni_fps", 1),
+        "omni_visual_input_mode": inp.get("omni_visual_input_mode", "video"),
         "window_size": s.perception.collect.window_size,
         # 双闸分开暴露:smart_crop_enabled = 用户态(开关位置,取 user_enabled)vs
         # smart_crop_available = 决定开关能不能点(取发版级开关 enabled)。
@@ -1768,6 +1781,10 @@ async def put_perception_config(body: PerceptionConfigBody, current_user: str = 
         update.setdefault("perception", {}).setdefault("engine", {}).setdefault("input", {})["video_short_edge"] = body.video_short_edge
     if body.omni_fps is not None:
         update.setdefault("perception", {}).setdefault("engine", {}).setdefault("input", {})["omni_fps"] = body.omni_fps
+    if body.omni_visual_input_mode is not None:
+        update.setdefault("perception", {}).setdefault("engine", {}).setdefault("input", {})[
+            "omni_visual_input_mode"
+        ] = body.omni_visual_input_mode
     if body.window_size is not None:
         update.setdefault("perception", {}).setdefault("collect", {})["window_size"] = body.window_size
     if body.smart_crop_enabled is not None:

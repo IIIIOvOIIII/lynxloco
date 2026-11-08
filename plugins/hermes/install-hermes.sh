@@ -7,7 +7,7 @@
 #   3. 复制 miloco 插件到 ~/.hermes/plugins/miloco/（架构 #1+#2 后不再复制独立 adapter 进程,入站走 backend AgentPlatformAdapter）
 #   4. 自动 patch ${MILOCO_HOME}/config.json 的 agent 段（webhook_url + auth_bearer，备份原文件）
 #   5. 自动给 ~/.hermes/.env 补 API_SERVER_KEY（如缺失则生成；存在则复用）
-#   6. 重启 miloco-backend（supervisord 管理），确保适配器收敛到 backend AgentPlatformAdapter
+#   6. 重启 miloco-backend（进程管理器托管：Linux=supervisord / macOS=launchd），确保适配器收敛到 backend AgentPlatformAdapter
 #   7. 打印终态：后端 PID / 日志路径 / 后续唯一要做的步骤
 #
 # 幂等：再跑一次不会破坏现有配置，会重启 backend 保留同一 Bearer。
@@ -59,7 +59,15 @@ done
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
-MILOCO_HOME="${MILOCO_HOME:-$HOME/.hermes/miloco}"
+# 默认随 HERMES_HOME 走（hermes runtime 决定 home → miloco home 跟随），
+# 不再写死 $HOME/.hermes/miloco；上层显式 export MILOCO_HOME 仍然透传。
+# 插件层 fallback (~/.hermes/miloco) 是另一回事——是 launchd 拉 gateway 读
+# 不到环境变量时的 split-brain 防护，由 miloco-plugin/paths.py 保留。
+# 必须 export ——install 内部会调用 miloco-cli 子命令（service start/config set 等），
+# 子进程不继承非 export 变量。没 export MILOCO_HOME → miloco-cli fallback 到
+# ~/.openclaw/miloco（symlink 已删会建空目录）→ get_value 读不到 config.json →
+# 报 "server.python_bin 未配置"（即便 config 实际存在）。
+export MILOCO_HOME="${MILOCO_HOME:-$HERMES_HOME/miloco}"
 HERMES_PLUGINS_DIR="$HERMES_HOME/plugins/miloco"
 
 # 从 config.json 动态读取 backend 端口（不写死 1810）
@@ -146,17 +154,26 @@ if [ "$DIAGNOSE_ONLY" -eq 1 ]; then
     MILOCO_VER="$("$PY" -c 'import subprocess,json; r=subprocess.run(["miloco-cli","version"],capture_output=True,text=True,timeout=5); v=(json.loads(r.stdout).get("version") if r.stdout.strip().startswith("{") else r.stdout.strip()); print(v)' 2>/dev/null || echo unknown)"
     diag "miloco-cli 在 PATH" 1 "$MILOCO_VER"
   else
-    diag "miloco-cli 在 PATH" 0 "上游装：curl -LsSf https://github.com/XiaoMi/xiaomi-miloco/releases/latest/download/install.sh | bash -s -- --agent-prepare"
+    diag "miloco-cli 在 PATH" 0 "上游装：curl -LsSf https://github.com/XiaoMi/xiaomi-miloco/releases/latest/download/install.sh | bash -s -- --agent-prepare --agent-platform=hermes"
   fi
 
   # 4. miloco backend 在跑
   if command -v miloco-cli >/dev/null 2>&1; then
-    ML_OUT="$(miloco-cli service status 2>&1 || true)"
-    if echo "$ML_OUT" | grep -qiE "running|active|ok|started"; then
-      # 提取 PID + 端口（如果有）
-      ML_PID="$(echo "$ML_OUT" | grep -oE 'pid[=:]?[ ]*[0-9]+' | grep -oE '[0-9]+' | head -1 || echo '')"
-      ML_PORT="$(echo "$ML_OUT" | grep -oE 'port[=:]?[ ]*[0-9]+' | grep -oE '[0-9]+' | head -1 || echo '1810')"
-      [ -n "$ML_PID" ] && diag "miloco backend 在跑" 1 "PID=$ML_PID 端口=$ML_PORT" || diag "miloco backend 在跑" 1
+    # 必须解析 JSON，不能 grep 关键词：后端停止时输出就是 {"running": false}，
+    # 字面含 "running" → 松 grep 恒命中，检查 #4 永远 ✓。与检查 #10 用同一口径，
+    # 否则 agent 会拿到 #4 ✓ / #10 ✗ 自相矛盾的验收报告（同一个坑在本文件
+    # "1.5 自动拉起 miloco backend" 那段的注释里也记了一次）。
+    ML_OUT="$(miloco-cli service status 2>/dev/null || true)"
+    ML_RUNNING="$(printf '%s' "$ML_OUT" | "$PY" -c 'import sys,json
+r=sys.stdin.read().strip()
+d=json.loads(r) if r[:1]=="{" else {}
+print("1" if d.get("running") else "0")' 2>/dev/null || echo 0)"
+    if [ "$ML_RUNNING" = "1" ]; then
+      ML_PID="$(printf '%s' "$ML_OUT" | "$PY" -c 'import sys,json
+r=sys.stdin.read().strip()
+d=json.loads(r) if r[:1]=="{" else {}
+print(d.get("pid") or "")' 2>/dev/null || echo '')"
+      [ -n "$ML_PID" ] && diag "miloco backend 在跑" 1 "PID=$ML_PID" || diag "miloco backend 在跑" 1
     else
       diag "miloco backend 在跑" 0 "upstream install 退出时 atexit 杀了 → miloco-cli service start（install-hermes.sh 会自动拉起，传 --no-start-backend 跳过）"
     fi
@@ -211,26 +228,21 @@ if [ "$DIAGNOSE_ONLY" -eq 1 ]; then
     diag "plugin enabled" 0 "找不到 hermes CLI"
   fi
 
-  # 10. miloco-backend 在跑（supervisord 管理）
-  # 架构 #1+#2 后适配器收敛到 backend AgentPlatformAdapter，
-  # 不再需要独立 adapter 进程。
-  sv_running=0
-  if pgrep -f "supervisord.*$MILOCO_HOME" >/dev/null 2>&1; then
-    sv_running=1
+  # 10. miloco-backend 由进程管理器托管（Linux=supervisord / macOS=launchd）
+  # 架构 #1+#2 后适配器收敛到 backend AgentPlatformAdapter，不再需要独立 adapter 进程。
+  # 不直接探 supervisord（macOS 走 launchd、没有 supervisord），统一用
+  # miloco-cli service status 的 managed+running（跨平台，与真实管理器一致）。
+  backend_managed=0
+  if command -v miloco-cli >/dev/null 2>&1; then
+    backend_managed="$(miloco-cli service status 2>/dev/null | "$PY" -c 'import sys,json
+r=sys.stdin.read().strip()
+d=json.loads(r) if r[:1]=="{" else {}
+print("1" if d.get("running") and d.get("managed") else "0")' 2>/dev/null || echo 0)"
   fi
-  backend_running=0
-  if [ "$sv_running" -eq 1 ] && command -v supervisorctl >/dev/null 2>&1; then
-    st="$(SKIP_PLUGIN_CHECK=0 supervisorctl -c "$MILOCO_HOME/supervisord.conf" status miloco-backend 2>/dev/null || echo "")"
-    if [[ "$st" == *RUNNING* ]]; then
-      backend_running=1
-    fi
-  fi
-  if [ "$backend_running" -eq 1 ]; then
-    diag "miloco-backend (supervisord)" 1 "RUNNING"
-  elif [ "$sv_running" -eq 1 ]; then
-    diag "miloco-backend (supervisord)" 0 "supervisord 在跑但 miloco-backend 未启动 → 重跑 install-hermes.sh"
+  if [ "$backend_managed" = "1" ]; then
+    diag "miloco-backend 托管中" 1 "RUNNING"
   else
-    diag "miloco-backend (supervisord)" 0 "supervisord 未在跑 → 重跑 install-hermes.sh"
+    diag "miloco-backend 托管中" 0 "未由进程管理器托管 → miloco-cli service restart（macOS=launchd / Linux=supervisord）"
   fi
 
   # 11. 检查旧 launchd adapter 是否残留（旧架构遗留）
@@ -277,7 +289,7 @@ if [ "$DIAGNOSE_ONLY" -eq 1 ]; then
   else
     printf " %b通过 %d / 失败 %d%b\n" "$R" "$DIAG_OK" "$DIAG_FAIL" "$N"
     echo "═══════════════════════════════════════════════════════════════"
-    echo " 修法：按上面 ✗ 项的提示操作；不确定先看 $HERE/INSTALL_KNOWN_ISSUES.md"
+    echo " 修法：按上面 ✗ 项的提示操作；不确定先看 $HERE/README.md 与 knowledge/06-dev-guide/troubleshooting.md"
     exit 1
   fi
 fi
@@ -286,7 +298,7 @@ fi
 # tarball 里没有的 scripts/sync-skills.py / skills/，必须整段跳）；
 # step 5 (config set) / 6 (.env) / 7 (backend 重启) / 8 (enable plugin) 主体幂等，
 # 会重跑一次以保证 config/enable/backend 状态收敛（step 7 会多一次 stop+sleep 3s+start）。
-# 重点补齐的是 1.6/1.75/1.9 env 持久化 + 4.7 感知模型 + 8.5 disable 残留清理 +
+# 重点补齐环境变量持久化、感知模型配置和 disable 残留清理，以及
 # 9 版本记录 + 10 cron reconcile + 收尾 banner。
 if [ "$POST_INSTALL_ONLY" -eq 1 ]; then
   info "post-install 模式: 跳过 step 3/4 前端部署；step 5-8 幂等重跑；补 env / cron / 收尾"
@@ -344,9 +356,17 @@ json.dump(cfg, open(path, 'w'), indent=2, ensure_ascii=False)
 print(f"  config.json 已创建 (python_bin={py})")
 PY
   # 启 backend 让它初始化 DB、填充 server.token
+  #
+  # elif 的匹配必须容空白：CLI 的紧凑 JSON 是 `{"running": true, …}`（output.py 的
+  # json.dumps 没传 separators，冒号后有一个空格），无空格字面量 '"running":true'
+  # 恒不匹配 —— 于是「已在运行」被误判成「起不来」并 exit 1 中止安装。触发路径：
+  # MILOCO_HOME 指到还没有 config.json 的新目录，而机器上已有旧安装的后端在跑
+  # （LaunchAgent 的 label 固定、不随 MILOCO_HOME 变），service start 打
+  # {"code": 1, "message": "already running (pid=…)"} 并 exit 1，本该由这条 elif
+  # 兜住。与本文件下方"没 jq：用严格 grep 匹配 \"running\": true"那个退化分支同口径。
   if miloco-cli service start 2>&1 | tail -3; then
     info "  backend 初始化完成"
-  elif miloco-cli service status 2>&1 | grep -q '"running":true'; then
+  elif miloco-cli service status 2>&1 | grep -qE '"running"[[:space:]]*:[[:space:]]*true'; then
     info "  backend 已在运行"
   else
     err "miloco-cli service start 失败，backend 无法启动"
@@ -355,7 +375,7 @@ PY
   fi
 fi
 
-# 1.5 自动拉起 miloco backend（upstream install.py 注册了 atexit._stop_service，
+# 自动拉起 miloco backend（upstream install.py 注册了 atexit._stop_service，
 # 装完会停 backend；fork 集成必须自己再 service start，否则 Step 2 OAuth 会 502 假错误）
 # 用 --no-start-backend flag 可跳过（用户在外部管理 backend 时）。
 # --post-install 场景下 install.py 主流程已经启动了 backend，跳过避免 miloco-cli
@@ -394,12 +414,12 @@ if [ "$NO_START_BACKEND" -eq 0 ] && [ "$POST_INSTALL_ONLY" -eq 0 ]; then
       done
     else
       warn "miloco-cli service start 失败 — 继续装但后续 Step 2 OAuth 一定会 502"
-      warn "手动修：miloco-cli service start  或  重跑上游：curl -LsSf https://github.com/XiaoMi/xiaomi-miloco/releases/latest/download/install.sh | bash -s -- --agent-prepare"
+      warn "手动修：miloco-cli service start  或  重跑上游：curl -LsSf https://github.com/XiaoMi/xiaomi-miloco/releases/latest/download/install.sh | bash -s -- --agent-prepare --agent-platform=hermes"
     fi
   fi
 fi
 
-# --- 1.6 半装残留检测 + 清理（upstream --agent-prepare 异常退出时可能留下） ---
+# --- 半装残留检测与清理（upstream --agent-prepare 异常退出时可能留下） ---
 # 现象：supervisord 进程在跑但 supervisord.conf 已被删（半装态）。
 # 后果：miloco service status 永远说"在跑"，但实际接不上 / 行为异常。
 # 修法：检测到这种状态就 warn + 提示用户怎么清理，**不**擅自 kill supervisord（它可能管着别的服务）。
@@ -426,35 +446,42 @@ SUPERVISORD_CONF="$MILOCO_HOME/supervisord.conf"
   # 情况 3: config.json 缺失（upstream --agent-prepare 没成功或被误删）
   if [ ! -f "$MILOCO_HOME/config.json" ]; then
     warn "半装残留：config.json 缺失（upstream --agent-prepare 似乎没成功）"
-    warn "  修复：curl -LsSf https://github.com/XiaoMi/xiaomi-miloco/releases/latest/download/install.sh | bash -s -- --agent-prepare"
+    warn "  修复：curl -LsSf https://github.com/XiaoMi/xiaomi-miloco/releases/latest/download/install.sh | bash -s -- --agent-prepare --agent-platform=hermes"
   fi
 fi
 
-# --- 1.75 MILOCO_HOME 也写进 ~/.hermes/.env ---
+# --- Hermes 环境文件持久化 ---
 # Hermes gateway 由 launchd plist 直接拉起，不 source shell rc，
 # 但会通过 load_hermes_dotenv 加载 $HERMES_HOME/.env。
-# 消费方：gateway 里的 miloco-plugin/paths.py fallback = ~/.hermes/miloco
-# （见 plugins/hermes/miloco-plugin/paths.py::miloco_home）。只有 MILOCO_HOME 恰好
-# 等于 plugin fallback 时才可省略 .env（gateway 读不到 env 也 fallback 到同一路径）。
-# 注意：跟上面 1.7 的判断不同——两个消费方的 fallback 不同，判断也要各自对齐。
-if [ -n "$MILOCO_HOME" ] && [ "$MILOCO_HOME" != "$HOME/.hermes/miloco" ]; then
+# 消费方：gateway 里的 miloco-plugin/paths.py fallback =
+# $HERMES_HOME/miloco，HERMES_HOME 未设置时才是 ~/.hermes/miloco（见
+# plugins/hermes/miloco-plugin/paths.py::miloco_home）。只有 MILOCO_HOME 同时
+# 等于两个 fallback 时才可省略 .env（gateway 读不到 env 也 fallback 到同一路径）。
+# 注意：这里与前面的环境变量判断不同，两个消费方的 fallback 不同，判断也要分别对齐。
+# 只有 MILOCO_HOME 同时等于两个 fallback 时才可省略 .env；HERMES_HOME
+# 非默认值时两个 fallback 不同，因此必须写入，避免 gateway 与 backend 分裂。
+if [ -n "$MILOCO_HOME" ] && {
+  [ "$MILOCO_HOME" != "$HOME/.hermes/miloco" ] ||
+  [ "$MILOCO_HOME" != "$HERMES_HOME/miloco" ]
+}; then
   touch "$HERMES_HOME/.env"
   chmod 600 "$HERMES_HOME/.env"
   if grep -q '^MILOCO_HOME=' "$HERMES_HOME/.env" 2>/dev/null; then
     "$PYTHON" - "$HERMES_HOME/.env" "$MILOCO_HOME" <<'PY'
+import shlex
 import sys
 lines = open(sys.argv[1]).readlines()
 with open(sys.argv[1], 'w') as f:
     for ln in lines:
-        f.write(f'MILOCO_HOME={sys.argv[2]}\n' if ln.startswith('MILOCO_HOME=') else ln)
+        f.write(f'MILOCO_HOME={shlex.quote(sys.argv[2])}\n' if ln.startswith('MILOCO_HOME=') else ln)
 PY
   else
-    echo "MILOCO_HOME=$MILOCO_HOME" >> "$HERMES_HOME/.env"
+    printf 'MILOCO_HOME=%s\n' "$("$PYTHON" -c 'import shlex, sys; print(shlex.quote(sys.argv[1]))' "$MILOCO_HOME")" >> "$HERMES_HOME/.env"
   fi
   info "MILOCO_HOME 已持久化到 $HERMES_HOME/.env"
 fi
 
-# --- 1.8 config.json::server.python_bin auto-fix ---
+# --- 修复 config.json::server.python_bin ---
 # 现象：miloco 用 uv 装时 backend 装在 ~/.local/share/uv/tools/miloco/bin/python，
 # 但 miloco service start 用的是 system python3，找不到 miloco 模块 → backend 装包失败。
 # 修法：扫 uv venv + pyenv venv，找到 miloco 包所在 python，patch 进 config.json。
@@ -519,13 +546,19 @@ fi
 
 mark_done 1
 
-# --- 1.9 MILOCO_HOME 显式持久化 ---
-# 架构：agent runtime 决定路径（hermes → ~/.hermes/miloco，openclaw → ~/.openclaw/miloco），
+# --- supervisor 配置中的 MILOCO_HOME 持久化 ---
+# 架构：MILOCO_HOME 默认随 HERMES_HOME 走（HERMES_HOME=/data/hermes → /data/hermes/miloco），
 # env override（用户/CI 显式 export MILOCO_HOME）也支持并原样传递，不做 symlink / 数据迁移。
+# 插件层 fallback 仍是 ~/.hermes/miloco（miloco-plugin/paths.py 保留,launchd 防护）。
 # 三个消费方拿到同一个 MILOCO_HOME 靠：
 #   1. shell rc （~/.zshrc / ~/.bashrc） — 新 shell 里 miloco-cli / hermes 都能读到
-#   2. supervisord.conf::environment — supervisord 拉起 backend 时的 env 兜底
-#   3. supervisorctl reread + update — 下次 backend 重启应用
+#   2. 进程管理器的环境快照 —— Linux: supervisord.conf::environment；
+#      macOS: LaunchAgent plist 的 EnvironmentVariables（由 miloco-cli service
+#      start/restart 每次重新生成，见 service.py::_generate_launchagent_plist）
+#   3. 重启应用新值 —— Linux: supervisorctl reread + update；
+#      macOS: 步骤 7 的 miloco-cli service restart 会重写 plist 后 bootstrap
+# 下面对 supervisord.conf / supervisorctl 的改写只在 Linux 命中（两道守卫保证
+# macOS 上安静空转），mac 上真生效的是 shell rc + plist 重新生成。
 step 1.9 "MILOCO_HOME 显式持久化 → ${MILOCO_HOME}"
 # 写用户 shell rc
 SHELL_RC_LIST=()
@@ -534,20 +567,28 @@ SHELL_RC_LIST=()
 if [ ${#SHELL_RC_LIST[@]} -gt 0 ]; then
   for _rc in "${SHELL_RC_LIST[@]}"; do
     if grep -q "^export MILOCO_HOME=" "$_rc" 2>/dev/null; then
-      "$PYTHON" - "$_rc" "$MILOCO_HOME" <<'PY'
-import re, sys
-rc, new = sys.argv[1], sys.argv[2]
-text = open(rc, encoding='utf-8').read()
-text = re.sub(r'^export MILOCO_HOME=.*$', f'export MILOCO_HOME="{new}"', text, flags=re.MULTILINE)
-open(rc, 'w', encoding='utf-8').write(text)
-PY
-      info "  $_rc: export MILOCO_HOME 已更新"
+      _rc_action="已更新"
     else
-      echo "" >> "$_rc"
-      echo "# miloco (MILOCO_HOME=$MILOCO_HOME)" >> "$_rc"
-      echo "export MILOCO_HOME=\"$MILOCO_HOME\"" >> "$_rc"
-      info "  $_rc: export MILOCO_HOME 已追加"
+      _rc_action="已追加"
     fi
+    "$PYTHON" - "$_rc" "$MILOCO_HOME" <<'PY'
+import re
+import shlex
+import sys
+
+rc, new = sys.argv[1], sys.argv[2]
+text = open(rc, encoding="utf-8").read()
+rendered = f"export MILOCO_HOME={shlex.quote(new)}"
+pattern = r"^export MILOCO_HOME=.*$"
+if re.search(pattern, text, flags=re.MULTILINE):
+    text = re.sub(pattern, lambda _m: rendered, text, flags=re.MULTILINE)
+else:
+    if text and not text.endswith("\n"):
+        text += "\n"
+    text += f"\n# miloco runtime path\n{rendered}\n"
+open(rc, "w", encoding="utf-8").write(text)
+PY
+    info "  $_rc: export MILOCO_HOME $_rc_action"
   done
 else
   warn "  ~/.zshrc / ~/.bashrc 都不存在,无法持久化 MILOCO_HOME"
@@ -561,7 +602,18 @@ if [ -f "$SUPERVISORD_CONF" ]; then
 import re, sys
 path, new_home = sys.argv[1], sys.argv[2]
 text = open(path, encoding='utf-8').read()
-text = re.sub(r'MILOCO_HOME="[^"]*"', f'MILOCO_HOME="{new_home}"', text)
+if "\n" in new_home or "\r" in new_home:
+    raise SystemExit("MILOCO_HOME 不能包含换行符")
+if "'" in new_home and '"' in new_home:
+    raise SystemExit("MILOCO_HOME 不能同时包含单引号和双引号")
+if re.search(r"\s[#;]", new_home):
+    raise SystemExit("MILOCO_HOME 不能在空白字符后包含 # 或 ;")
+escaped = new_home.replace('%', '%%')
+if "'" not in escaped and ('"' in escaped or '\\' in escaped):
+    rendered = f"MILOCO_HOME='{escaped}'"
+else:
+    rendered = 'MILOCO_HOME="' + escaped.replace('\\', '\\\\') + '"'
+text = re.sub(r'''MILOCO_HOME=(?:"[^"]*"|'[^']*')''', lambda _m: rendered, text)
 open(path, 'w', encoding='utf-8').write(text)
 print(f"  supervisord.conf::MILOCO_HOME = {new_home}")
 PY
@@ -573,6 +625,51 @@ if command -v supervisorctl >/dev/null 2>&1 && [ -S "$MILOCO_HOME/supervisor.soc
   supervisorctl -c "$SUPERVISORD_CONF" update 2>&1 | head -3 || true
 fi
 mark_done 1.9
+
+# --- CLI runtime 指针 ---
+# shell rc 只对新 shell 生效；项目 .env 又不能在 MILOCO_HOME 缺失时发现自身。
+# 写一个稳定的用户级 pointer，让独立执行 miloco-cli 时也能 bootstrap 到正确目录。
+# 格式需与 cli/src/miloco_cli/config.py 和 scripts/install.py 保持一致。
+RUNTIME_ENV_DIR="$HOME/.config/miloco"
+RUNTIME_ENV_FILE="$RUNTIME_ENV_DIR/default.env"
+mkdir -p "$RUNTIME_ENV_DIR"
+chmod 700 "$RUNTIME_ENV_DIR"
+"$PYTHON" - "$RUNTIME_ENV_FILE" "$MILOCO_HOME" <<'PY'
+import os
+import shlex
+import sys
+
+path, home = sys.argv[1:]
+updates = {
+    "MILOCO_HOME": home,
+    "MILOCO_AGENT_PLATFORM": "hermes",
+}
+try:
+    with open(path, encoding="utf-8") as f:
+        lines = f.readlines()
+except FileNotFoundError:
+    lines = []
+
+seen = set()
+out = []
+for line in lines:
+    stripped = line.strip()
+    key = stripped.split("=", 1)[0].strip() if "=" in stripped else ""
+    if key in updates:
+        if key not in seen:
+            out.append(f"{key}={shlex.quote(updates[key])}\n")
+            seen.add(key)
+    else:
+        out.append(line)
+for key, value in updates.items():
+    if key not in seen:
+        out.append(f"{key}={shlex.quote(value)}\n")
+
+with open(path, "w", encoding="utf-8") as f:
+    f.writelines(out)
+os.chmod(path, 0o600)
+PY
+info "CLI runtime pointer 已写入 $RUNTIME_ENV_FILE"
 
 # --- 2. 拿/复用 Bearer ---
 [ "$POST_INSTALL_ONLY" -eq 1 ] || step 2 "拿/复用 adapter Bearer"
@@ -622,7 +719,7 @@ find "$HERMES_PLUGINS_DIR" -type d -name __pycache__ -prune -exec rm -rf {} + 2>
 fi
 mark_done 4
 
-# --- 4.x 部署 AgentPlatformAdapter 到 MILOCO_HOME ---
+# --- 部署 AgentPlatformAdapter 到 MILOCO_HOME ---
 # backend loader (backend/miloco/src/miloco/agent_platform/loader.py) 按
 # settings.agent.platform 从 $MILOCO_HOME/agent_platform/<name>/ 加载 adapter.py,
 # submodule_search_locations 指向该目录,所以 adapter.py 内 from .xxx import 的
@@ -667,7 +764,7 @@ mkdir -p "$HERMES_HOME/memory"
 
 PLUGIN_STATE="$HERMES_PLUGINS_DIR/miloco-plugin/state.json"
 
-# --- 4.7 同步本地感知模型到 MILOCO_HOME/models/ ---
+# --- 同步本地感知模型到 MILOCO_HOME/models/ ---
 # 对应上游 install.sh --agent-finish 里的"下载感知模型"步骤：fork 走"plugin in fork
 # 仓库"路线，复用不了上游那套下载，但 fork 仓库的
 # backend/miloco/src/miloco/perception/models/ 里带着模型，从那儿同步即可。
@@ -721,7 +818,7 @@ fi
 # 者都放行，而装完感知引擎必然报 models_missing，继续装是交付空壳。
 # 清单的出处是 resource_validator.MODELS 的非 optional 项，两边一致由仓库体检测试守。
 # 安装期一律装到 $MILOCO_HOME/models（install.py 也写死这个目录），所以查的也是它；
-# 用户把 config.json::directories.models 指到别处时 4.7 管不到那个目录，不中止。
+# 用户把 config.json::directories.models 指到别处时，本步骤管不到那个目录，不中止。
 MODELS_ELSEWHERE=$("$PYTHON" -c '
 import json, os, sys
 home = sys.argv[1]
@@ -740,11 +837,11 @@ missing_models=""
 for m in $REQUIRED_MODELS; do
   [ -s "$MILOCO_HOME/models/$m" ] || missing_models="$missing_models $m"
 done
-# 生效目录不是默认目录时，4.7 装到的地方就不是引擎读的地方，不管默认目录里够不够都
+# 生效目录不是默认目录时，本步骤写入的位置就不是引擎读取的位置，不管默认目录里够不够都
 # 得先说一声。放进下面那道闸里面等于只在默认目录也缺模型时才提醒，而从 checkout 跑时
 # 上面的同步必然把默认目录填满，那条路走不到。
 if [ -n "$MODELS_ELSEWHERE" ]; then
-  warn "config.json::directories.models 指向 ${MODELS_ELSEWHERE}，4.7 只往 $MILOCO_HOME/models/ 装，请自行确认那边模型齐全"
+  warn "config.json::directories.models 指向 ${MODELS_ELSEWHERE}，这里只往 $MILOCO_HOME/models/ 装，请自行确认那边模型齐全"
 fi
 
 if [ -n "$missing_models" ]; then
@@ -832,12 +929,13 @@ mark_done 6
 # Step 5 写了 agent.platform，必须重启 backend 才能加载新的 HermesAdapter（缓存刷新）。
 # 否则旧进程缓存的是 WebhookAdapter fallback → onboarding 走 webhook → 405。
 [ "$POST_INSTALL_ONLY" -eq 1 ] || step 7 "重启 backend 加载 HermesAdapter（agent.platform 刚写入）"
-info "  停止旧 backend"
-miloco-cli service stop 2>/dev/null || true
-sleep 3
-info "  启动新 backend"
-if ! START_OUTPUT=$(miloco-cli service start 2>&1); then
-  err "backend 启动失败: $START_OUTPUT"
+# 不用 stop + sleep 3 + start：固定 3s 赌不赢 launchd 卸载旧 job 的耗时（后端要收
+# 感知管线/中枢连接/在途请求，退到个位数秒都算正常），旧 job 卸得慢时 start 会
+# 撞见残留 pid 报 already-running 而失败。service restart 内部按
+# _LAUNCHD_BOOTOUT_WAIT_S 轮询等旧 job 真正卸载完再拉起新的，直接复用它。
+info "  重启 backend"
+if ! START_OUTPUT=$(miloco-cli service restart 2>&1); then
+  err "backend 重启失败: $START_OUTPUT"
   exit 1
 else
   if [ -n "$START_OUTPUT" ]; then
@@ -879,7 +977,7 @@ else
 fi
 mark_done 8
 
-# --- 8.5 兜底清掉 hermes namespace disable 漏写 ---
+# --- 兜底清理 Hermes namespace disable 残留 ---
 # upstream hermes plugins enable 用 manifest.name="miloco" discard disabled 集合，
 # 但 nested plugin key="miloco/miloco-plugin" 不会被清 → install 显示成功但 runtime 仍 disabled。
 # 这里手动从 ~/.hermes/config.yaml 删掉 miloco* 残留（幂等，no-op if 没残留）。
@@ -1000,7 +1098,7 @@ cat <<EOF
     hermes chat -q "把客厅灯打开" -Q
 
 [backend 状态]
-    miloco-cli service status    # 看 supervisord / backend
+    miloco-cli service status    # 看进程管理器（Linux=supervisord / macOS=launchd）与 backend 状态
     miloco-cli service logs      # tail 日志
     miloco-cli service restart   # 重启
     miloco-cli service stop      # 停

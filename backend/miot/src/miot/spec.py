@@ -1292,6 +1292,19 @@ class MIoTSpecParser:
                 _LOGGER.error("parse error, retry, %d, %s, %s", index, urn, err)
         return None
 
+    async def get_cached_async(self, urn: str) -> Optional[MIoTSpecDevice]:
+        """**只读缓存**的 spec 取法：未命中返回 ``None``，绝不联网。
+
+        与 :meth:`parse_async` 的唯一区别就在"未命中"这一支：``parse_async`` 会
+        走 ``init_async()`` 拉标准库 + 设备类型目录（数百请求），那是批量解析该付
+        的代价；而控制热路径（补 action 的 ``out`` piid）绝不能把它拖进来 ——
+        一次云端动作调用换来数百个 spec 请求，比不补还糟。
+        """
+        cache_result = await self.__cache_get(urn=urn)
+        if isinstance(cache_result, Dict):
+            return MIoTSpecDevice(**cache_result)
+        return None
+
     async def parse_lite_async(
         self,
         urn: str,

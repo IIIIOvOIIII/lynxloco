@@ -10,6 +10,7 @@ Endpoints:
 - `GET /api/events`                              — list_events
 - `GET /api/events/{event_id}/clip/{device_id}`  — locate_clip + FileResponse(Range/206)
 - `GET /api/events/{event_id}/ref/{device_id}`   — locate_ref + FileResponse(全景参考帧)
+- `GET /api/events/{event_id}/images/{device_id}/{frame_index}` — 图片模式主画面 JPEG
 - `GET /api/events/{event_id}/crop/{device_id}`  — read_crop_meta(crop 区域坐标,画框用)
 - `GET /api/events/stream`                       — SSE
 """
@@ -54,16 +55,30 @@ async def list_events(
     ),
     limit: int = Query(50, ge=1, le=200, description="每页条数,上限 200"),
     offset: int = Query(0, ge=0, description="分页偏移"),
+    event_id: str | None = Query(
+        None,
+        description=(
+            "按主键单查(反查动作的宿主事件):命中即不看 since/before/limit/offset"
+            "(参数本身仍照常校验), 至多返回一条;查不到返回空列表而非报错"
+        ),
+    ),
     svc: EventsService = Depends(get_events_service),
 ):
     """拉取有意义事件列表,按 timestamp DESC 排序.
 
     响应不含 payload_json / schema_version / created_at(都是后端内部字段).
     前端按 "返回长度 < limit" 判断到尾,无 has_more 字段.
+
+    ``event_id`` 是给动作台账反查宿主事件用的, 走的是同一张表的另一条取法: 时间窗
+    参数在这条路上不参与取数, 因为要反查的场景正是"这条事件已经翻出当前窗口了".
     """
-    events = await svc.list_events(
-        since=since, before=before, limit=limit, offset=offset
-    )
+    if event_id:
+        one = await svc.get_event(event_id)
+        events = [one] if one is not None else []
+    else:
+        events = await svc.list_events(
+            since=since, before=before, limit=limit, offset=offset
+        )
     return NormalResponse(
         code=0, message="ok", data=EventListResponse(events=events)
     )
@@ -154,6 +169,38 @@ async def get_event_ref(
         )
     if status == "gone":
         raise HTTPException(message="ref frame not available", status_code=410)
+    raise HTTPException(message="not found", status_code=404)
+
+
+@router.get(
+    "/{event_id}/images/{device_id}/{frame_index}",
+    summary="Get one image-mode visual frame",
+    dependencies=[Depends(verify_token_query_fallback)],
+)
+async def get_event_image(
+    event_id: str,
+    device_id: str,
+    frame_index: int,
+    svc: EventsService = Depends(get_events_service),
+) -> FileResponse:
+    """返回图片模式 canonical sequence 的一张 JPEG。"""
+    status, path, timestamp_ms = await svc.locate_image_frame(
+        event_id, device_id, frame_index
+    )
+    if status == "found":
+        assert path is not None and timestamp_ms is not None
+        from miloco.perception.snapshot_writer import clip_download_name
+
+        return FileResponse(
+            path=path,
+            media_type="image/jpeg",
+            filename=clip_download_name(
+                timestamp_ms, "jpg", prefix=f"frame-{frame_index:03d}"
+            ),
+            content_disposition_type="inline",
+        )
+    if status == "gone":
+        raise HTTPException(message="image frame not available", status_code=410)
     raise HTTPException(message="not found", status_code=404)
 
 

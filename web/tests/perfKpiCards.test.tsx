@@ -25,7 +25,7 @@ beforeEach(async () => { await i18n.changeLanguage("en"); });
 describe("performance metric definitions", () => {
   it("uses processed camera windows and expected windows independently of batches", () => {
     const text = rendered(summary());
-    expect(text).toContain("Camera windows processed 12 Expected 15 Batches 3");
+    expect(text).toContain("Camera windows processed 12 Expected windows 15 Batches 3");
     expect(text).toContain("20.0%");
     expect(text).toContain("Completed agent runs 2");
     expect(text).toContain("actual Omni requests");
@@ -37,7 +37,7 @@ describe("performance metric definitions", () => {
       camera_window_count: 0, expected_window_count: 0, legacy_cycle_count: 3,
       drop_rate: null, omni_success_cycle_count: 0, omni_request_count: 0,
     }));
-    expect(text).toContain("Camera windows processed — Expected — Batches 3");
+    expect(text).toContain("Camera windows processed — Expected windows — Batches 3");
     expect(text).toContain("Window drop rate —");
     expect(text).toContain("Legacy metrics");
     expect(text).toContain("no corrected data");
@@ -46,7 +46,7 @@ describe("performance metric definitions", () => {
 
   it("keeps corrected data and displays a warning for mixed history", () => {
     const text = rendered(summary({ legacy_cycle_count: 2 }));
-    expect(text).toContain("Camera windows processed 12 Expected 15");
+    expect(text).toContain("Camera windows processed 12 Expected windows 15");
     expect(text).toContain("Legacy metrics");
   });
 
@@ -56,8 +56,16 @@ describe("performance metric definitions", () => {
     delete data.expected_window_count;
     delete data.legacy_cycle_count;
     const text = rendered(data);
-    expect(text).toContain("Cycles 3 Expected 6");
+    expect(text).toContain("Cycles 3 Expected windows 6");
     expect(text).toContain("Legacy metrics");
+  });
+
+  it("uses upstream processed windows when corrected expected windows are absent", () => {
+    const data = summary({ processed_device_window_count: 12 });
+    delete data.camera_window_count;
+    delete data.expected_window_count;
+    delete data.legacy_cycle_count;
+    expect(rendered(data)).toContain("Cycles 3 Expected windows 15");
   });
 
   it("does not present successful latency when no actual Omni call succeeded", () => {

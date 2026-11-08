@@ -148,6 +148,7 @@ knowledge/
   - [感知流水线](03-features/perception-pipeline.md)
   - [身份识别](03-features/person-identity.md)
   - [设备控制](03-features/device-control.md)
+  - [设备状态容器](03-features/device-state-store.md)
   - [规则自动化](03-features/rule-automation.md)
   - [任务管理](03-features/task-management.md)
   - [家庭记忆](03-features/home-profile.md)
@@ -156,6 +157,7 @@ knowledge/
   - [设备欢迎](03-features/device-welcome.md)
   - [事件反馈打包](03-features/event-feedback.md)
   - [一键升级](03-features/one-click-upgrade.md)
+  - [macOS LaunchAgent 与本地网络权限](03-features/macos-launchagent-lnp.md)
 - **04-testing** — [评测方法论](04-testing/README.md)
 - **05-external-deps**
   - [MiOT SDK](05-external-deps/sdk-miot.md)
@@ -189,6 +191,7 @@ knowledge/
 | tier_a / tier_c / tier_u            | 身份样本三层：用户登记样本 / 系统沉淀样本 / 陌生人未确认池（即陌生人池，见下行）                                                                                             |
 | 陌生人池                            | 未识别身形的暂存与聚类区，供主动注册抽样（对应 tier_u）                                                                                                                      |
 | Skill                               | OpenClaw 插件提供给 Agent 的能力单元（`miloco-*` 前缀）                                                                                                                      |
+| 设备状态容器                        | 存米家设备**当前值**的分层 KV（路径词表 `iot/device/<did>/…`），多来源写入、按路径模式订阅；只装状态不装事件，定义见 [设备状态容器](03-features/device-state-store.md)       |
 | STATIC / DYNAMIC 规则               | 静态规则直接执行设备动作；动态规则通过插件回调让 Agent 决策                                                                                                                  |
 | task / task_record                  | 任务是持久意图主体（生命周期 + 挂载规则 / 定时 / 记录）；任务记录是其行为统计载体（做了多少 / 多久 / 几次），定义见 [任务管理](03-features/task-management.md)               |
 | kind（progress / duration / event） | 任务记录的三种统计形态：进度型（目标累积）/ 时长型（计时累积）/ 事件型（次数留痕）                                                                                           |

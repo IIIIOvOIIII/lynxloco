@@ -222,23 +222,32 @@ def test_adapter_media_modes_are_explicit() -> None:
     assert OpenAIResponsesAdapter().media_mode == "image_sequence"
 
 
-def test_responses_prompt_has_images_and_no_video_or_audio() -> None:
+@pytest.mark.parametrize("visual_input_mode", ["video", "image"])
+def test_responses_prompt_has_images_and_no_video_or_audio(visual_input_mode) -> None:
     packet = _packet([_image(10), _image(20)])
 
-    payload = build_prompt(packet, OmniContext(), media_mode="image_sequence")
+    payload = build_prompt(packet, OmniContext(), media_mode="image_sequence", visual_input_mode=visual_input_mode)
 
+    from miloco.perception.engine.omni.omni_client import _build_messages
+
+    messages = _build_messages(payload, OpenAIResponsesAdapter())
+    assert sum(block["type"] == "image_url" for block in messages[-1]["content"]) == 2
     assert len(payload["images"]) == 2
     assert "video_base64" not in payload
     assert "audio_base64" not in payload
 
 
-def test_responses_audio_only_prompt_is_text_only() -> None:
+@pytest.mark.parametrize("visual_input_mode", ["video", "image"])
+def test_responses_audio_only_prompt_is_text_only(visual_input_mode) -> None:
     packet = _packet([], audio_only=True)
 
     payload = build_prompt(
-        packet, OmniContext(current_time="12:00"), media_mode="image_sequence"
+        packet, OmniContext(current_time="12:00"), media_mode="image_sequence", visual_input_mode=visual_input_mode
     )
 
+    from miloco.perception.engine.omni.omni_client import _build_messages
+
+    _build_messages(payload, OpenAIResponsesAdapter())
     assert payload["images"] == []
     assert payload["text_only"] is True
     assert "当前时间" in payload["user_content"]

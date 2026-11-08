@@ -21,10 +21,12 @@ touch — no OAuth / camera / network stack required.
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from miot.action_result import SOURCE_CLOUD, SOURCE_LOCAL_CENTRAL
 from miot.client import MIoTClient
 from miot.types import MipsConnectionError
 
@@ -53,6 +55,8 @@ def _bare_client(mips: _FakeMips | None) -> MIoTClient:
     client._scene_sub_home_ids = set()
     client._state_sub_dids = set()
     client._props_sub_dids = set()
+    client._props_sub_sources = {}
+    client._props_source_lock = asyncio.Lock()
     client._mips_cloud = mips
     client._callback_device_meta_changed = None
     client._callback_scene_changed = None
@@ -218,6 +222,8 @@ def _setup_client(
     client._scene_sub_home_ids = set(scene_home_ids)
     client._state_sub_dids = set(state_dids)
     client._props_sub_dids = set(props_dids)
+    client._props_sub_sources = {d: SOURCE_CLOUD for d in props_dids}
+    client._props_source_lock = asyncio.Lock()
     client._callback_device_meta_changed = None
     client._callback_scene_changed = None
     client._callback_device_state_changed = None
@@ -631,3 +637,39 @@ async def test_get_devices_partial_shrink_triggers_guard(monkeypatch):
     res = await client.get_devices_async()
     assert set(res) == {"d1", "d2"}  # merged normally
     assert client._device_shrink_streak == 0
+
+
+@pytest.mark.asyncio
+async def test_setup_replay_leaves_local_props_subs_alone(monkeypatch):
+    """mips 重建只该重放**非本地**那批。
+
+    本地订阅挂在中枢的 client 实例上，mips 重建不会让它们消失。一并抹掉镜像
+    会让重放把它当「从零重订」：此刻若网关不可用（can_push 假）就改判到云端，
+    而「它原来在本地」这个事实已随镜像消失 —— 那条活着的本地订阅既没人退也没人
+    记得，网关回来重放 _broadcasts 就是两条通道同时在投。
+    """
+    fake = _SetupFakeMips()
+    client = _setup_client(
+        monkeypatch,
+        fake,
+        meta_dids=set(),
+        scene_home_ids=set(),
+        props_dids={"dev-cloud", "dev-local"},
+    )
+    client._props_sub_sources = {
+        "dev-cloud": SOURCE_CLOUD,
+        "dev-local": SOURCE_LOCAL_CENTRAL,
+    }
+
+    await client._setup_mips_async()
+
+    # 只重放云端那台
+    assert [c.args[0] for c in fake.sub_device_props_async.await_args_list] == [
+        "dev-cloud"
+    ]
+    # 本地那台原样留着，镜像也没被动
+    assert client._props_sub_dids == {"dev-cloud", "dev-local"}
+    assert client._props_sub_sources == {
+        "dev-cloud": SOURCE_CLOUD,
+        "dev-local": SOURCE_LOCAL_CENTRAL,
+    }

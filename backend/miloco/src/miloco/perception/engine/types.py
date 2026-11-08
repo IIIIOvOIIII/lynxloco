@@ -9,6 +9,10 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
+from miloco.observability.perception_flow import (
+    PerceptionFlowCycleDiagnostics,
+    PerDeviceFlowDiagnostics,
+)
 from miloco.perception.types import DeviceSnapshot
 
 # =============================================================================
@@ -80,6 +84,7 @@ class GateTiming:
     # 诊断用:cross >> intra 持续高,基本是 ISP 长周期漂移(AGC/IR/AWB)误判 motion。
     video_intra_score: float = 0.0
     video_cross_score: float = 0.0
+    checked_frame_count: int = 0
 
     @property
     def total_ms(self) -> float:
@@ -151,6 +156,19 @@ class TrackingResponse:
     #     所以需要逐帧、且需要不成 track 的类别(tracker 只跟 HUMAN,宠物永远进不了 box_info)
     # 无 tracker 的实现(Mock)留空 → crop 侧退化为只用运动块。
     main_det_boxes: list[tuple[int, int, int, int]] = field(default_factory=list)
+    # 本窗口**每一抽帧**上各 track 的框(xyxy 像素);下标 = 帧序,与喂给 analyze 的帧列表同序
+    # (即 IdentityPacket.all_frames,identity.py 把同一个 list 同时交给两边)。
+    # 这是与上面两者并列的**第三套**需求,三者互不能替代:
+    #   - object_info/box_info  逐 track 但只有末帧一个框 —— 贴名字、抽 ReID 够用
+    #   - main_det_boxes        逐帧但**不带 track_id** —— Smart Crop 只要空间并集
+    #   - 本字段                逐帧**且带 track_id** —— 单帧人像注入要回答"某个 track 在窗内
+    #                           哪一帧裁出来最大",上面两者都答不了
+    # **只收本帧真匹配到检测的框**(get_tracking_results 的 detected_this_frame):coasting 帧上
+    # 框是上一次真匹配时的检测框、原地冻结,拿它去裁**当前**帧会裁到人已离开的背景、甚至隔壁
+    # 那个人 —— 而注入是把图绑到 track_id 上,绑错等于直接喂一个错身份证据。同 IdentityEngine
+    # 内各 coasting 闸的口径(见 TrackedObject.detected_this_frame)。
+    # 无 tracker 的实现(Mock)留空 → 注入侧退化为用候选自带的末帧 body_crop。
+    per_frame_track_boxes: list[dict[int, tuple[int, int, int, int]]] = field(default_factory=list)
 
 
 @dataclass
@@ -188,9 +206,9 @@ class IdentityTarget:
     needs_omni_verify: bool
     box_info: list[TrackingBoxInfo]
     # 末帧归一化 [0,1000] bbox (x1,y1,x2,y2)，与 IdentityQueryItem 同源同坐标系；
-    # 供 prompt 在"已识别人物/陌生人"名册里注入位置，多人时让 omni 把姓名挂到
-    # 视频里的人。None = 本帧未被真实检测（coasting，框是上一次真匹配时的检测框），
-    # 名册退化为纯名。
+    # 供 prompt 在"已识别人物/陌生人"名册里注入位置，定位名册项对应的目标
+    # （名册是定位线索，不断言当前画面有人）。None = 本帧未被真实检测（coasting，
+    # 框是上一次真匹配时的检测框），名册退化为纯名。
     bbox_xyxy_norm: tuple[int, int, int, int] | None = None
     # 翻身份黏旧名期(reverted_from_confirmed)的 track：显示仍黏旧成员名，但**不可作先验**进
     # 名册锚定 omni 重审（与 candidate_tids 同类去先验）。coasting（本窗未派发）时不在
@@ -268,6 +286,10 @@ class IdentityPacket:
     # 透传 TrackingResponse.main_det_boxes（窗口内每抽帧的 human/cat/dog 框，xyxy 像素），
     # 供 Smart Crop 算裁切区域并集。见该字段注释：与 targets/box_info 是两套需求。
     main_det_boxes: list[tuple[int, int, int, int]] = field(default_factory=list)
+    # 透传 TrackingResponse.per_frame_track_boxes(逐抽帧、带 track_id 的框),供单帧人像注入
+    # 选"该 track 窗内裁出面积最大的一帧"。见该字段注释:与 main_det_boxes / box_info 三者
+    # 各服务一套需求。下标与 all_frames 同序。
+    per_frame_track_boxes: list[dict[int, tuple[int, int, int, int]]] = field(default_factory=list)
 
 
 # =============================================================================
@@ -354,6 +376,7 @@ class DevicePipelineResult:
     identity_packet: IdentityPacket | None = None
     omni_output: OmniOutput | None = None
     skipped: bool = False
+    flow_diagnostics: PerDeviceFlowDiagnostics | None = None
 
 
 @dataclass
@@ -400,3 +423,4 @@ class BatchPipelineResult:
 
     rooms: dict[str, RoomPipelineResult] = field(default_factory=dict)
     timing: dict[str, Any] | None = None
+    flow_diagnostics: PerceptionFlowCycleDiagnostics | None = None

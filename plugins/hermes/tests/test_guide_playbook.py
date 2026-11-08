@@ -27,7 +27,12 @@ def test_guide_has_3_step_quick_install():
     text = GUIDE.read_text(encoding="utf-8")
     # 新统一入口
     assert "install.sh" in text
-    assert "--agent-platform=hermes" in text
+    quick_install = (
+        text.split("## 一行安装", 1)[1].split("```bash", 1)[1].split("```", 1)[0]
+    )
+    install_lines = [line for line in quick_install.splitlines() if "install.sh" in line]
+    assert len(install_lines) == 2
+    assert all("--agent-platform=hermes" in line for line in install_lines)
     # fork 回退路径（PR合并前）
     assert "git clone https://github.com/n0tssss/xiaomi-miloco.git" in text
     assert "install-hermes.sh" in text
@@ -47,7 +52,7 @@ def test_guide_has_status_report_with_local_urls():
     """状态报告必须含关键本地链接。"""
     text = GUIDE.read_text(encoding="utf-8")
     assert "127.0.0.1:1810" in text
-    assert ".hermes/miloco/config.json" in text
+    assert "$MILOCO_HOME/config.json" in text
 
 
 def test_guide_has_active_test_suggestion():

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -16,6 +17,11 @@ from miot.types import MipsConnectionError
 def _client(*, connected=True):
     client = object.__new__(MIoTClient)
     client._props_sub_dids = set()
+    client._props_sub_sources = {}
+    client._props_source_lock = asyncio.Lock()
+    # 无中枢 → 一律云端，这一组用例只钉「不换通道」那半边。
+    # 来源选择本身见 test_client_props_source.py。
+    client._central_hub = None
     client._callback_device_props_changed = None
     client._mips_cloud = SimpleNamespace(
         is_connected=connected,

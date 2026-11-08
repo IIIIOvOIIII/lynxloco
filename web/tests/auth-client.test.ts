@@ -5,6 +5,10 @@ import {
   setCsrfToken,
   subscribeSessionExpired,
 } from "@/api/client";
+import {
+  realEventImageUrl,
+  realOnDemandImageUrl,
+} from "@/api/real";
 import { authHeaders, extractCandidates } from "@/api/register";
 
 describe("auth-aware apiFetch", () => {
@@ -25,6 +29,16 @@ describe("auth-aware apiFetch", () => {
     const [, init] = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(init.credentials).toBe("same-origin");
     expect(new Headers(init.headers).has("Authorization")).toBe(false);
+  });
+
+  it("uses same-origin session cookies for image inference artifacts", () => {
+    (window as unknown as { __MILOCO_TOKEN__?: string }).__MILOCO_TOKEN__ = "service-token-secret";
+    expect(realEventImageUrl("event/1", "rtsp:camera/1", 2)).toBe(
+      "/api/events/event%2F1/images/rtsp%3Acamera%2F1/2",
+    );
+    expect(realOnDemandImageUrl("log/1", "rtsp:camera/1", 3)).toBe(
+      "/api/perception/on-demand-logs/log%2F1/images/rtsp%3Acamera%2F1/3",
+    );
   });
 
   it("adds csrf header to unsafe methods after login state is set", async () => {

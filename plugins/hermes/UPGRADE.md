@@ -62,7 +62,7 @@ hermes -z "miloco_test_push"  # 实际推送一次（仍是 LLM-mediated；或�
 
 ```bash
 # 1. 重装 miloco 后端（上游 release）
-curl -LsSf https://github.com/XiaoMi/xiaomi-miloco/releases/latest/download/install.sh | bash -s -- --agent-finish --skip-openclaw
+curl -LsSf https://github.com/XiaoMi/xiaomi-miloco/releases/latest/download/install.sh | bash -s -- --agent-finish --agent-platform=hermes --skip-openclaw
 
 # 2. 验证新版 miloco-cli / config.json
 miloco-cli --version

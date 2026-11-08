@@ -39,6 +39,11 @@ V5_COLUMNS = {
     },
     "traces_device": {"partial_windows_count": "INTEGER"},
 }
+V7_COLUMNS = {
+    **V5_COLUMNS,
+    "action_ledger": {"phase": "TEXT", "trigger_event_id": "TEXT", "auth_state": "TEXT"},
+}
+SUPPORTED_OBSERVABILITY_VERSIONS = (4, 5, 7)
 ALLOWLIST = (
     "Dockerfile", "compose.yaml", "container-entrypoint.sh", "remote-release.sh",
     "requirements/backend.txt", "requirements/cli.txt", "requirements/acceptance.txt",
@@ -257,22 +262,31 @@ def prepare_payload(archive, plugin, sha, output):
             bundle.add(stage, arcname=".")
 
 
+def validate_observability_schema(connection):
+    current = connection.execute("PRAGMA user_version").fetchone()[0]
+    require(current in SUPPORTED_OBSERVABILITY_VERSIONS, "unsupported observability schema")
+    columns_by_table = V7_COLUMNS if current == 7 else V5_COLUMNS if current == 5 else {}
+    for table, columns in columns_by_table.items():
+        actual = {row[1]: row[2].upper() for row in connection.execute(f"PRAGMA table_info({table})")}
+        require(all(actual.get(name) == kind for name, kind in columns.items()),
+                f"observability v{current} additive columns do not match")
+    return current
+
+
 def compatible_observability_marker(path, prior_version, *, check_only=False):
-    """Retain all rows/additive columns; only the known v5 -> v4 marker may change."""
+    """Retain rows and columns when restoring a known additive schema marker."""
     if not path.exists():
         require(prior_version is None, "observability database is missing")
         return
     mode = "ro" if check_only else "rw"
     with closing(sqlite3.connect(f"{path.as_uri()}?mode={mode}", uri=True)) as connection:
-        current = connection.execute("PRAGMA user_version").fetchone()[0]
+        current = validate_observability_schema(connection)
+        require(prior_version in SUPPORTED_OBSERVABILITY_VERSIONS, "unsupported prior observability schema")
         if current == prior_version:
             return
-        require(prior_version == 4 and current == 5, "unsupported observability rollback schema")
-        for table, columns in V5_COLUMNS.items():
-            actual = {row[1]: row[2].upper() for row in connection.execute(f"PRAGMA table_info({table})")}
-            require(all(actual.get(name) == kind for name, kind in columns.items()), "observability v5 additive columns do not match")
+        require((current, prior_version) in ((5, 4), (7, 4), (7, 5)), "unsupported observability rollback schema")
         if not check_only:
-            connection.execute("PRAGMA user_version=4")
+            connection.execute(f"PRAGMA user_version={prior_version}")
 
 
 class Controller:
@@ -434,7 +448,7 @@ class Controller:
         require(section.get("user", "root") == "root", "supervisor service owner mismatch")
         require(self.observability.is_file(), "registered observability database is missing")
         with closing(sqlite3.connect(f"{self.observability.as_uri()}?mode=ro", uri=True)) as connection:
-            require(connection.execute("PRAGMA user_version").fetchone()[0] in (4, 5), "native rollback supports only observability schema v4 or v5")
+            validate_observability_schema(connection)
         required = max(MIN_FREE_BYTES, 2 * sum(path.stat().st_size for folder in (self.tools / "miloco", self.tools / "miloco-cli") for path in folder.rglob("*") if path.is_file()))
         require(shutil.disk_usage(self.home).free >= required, "insufficient disk for native release and rollback")
         require(shutil.disk_usage(self.root if self.root.exists() else self.root.parent).free >= required, "insufficient disk for native backup")

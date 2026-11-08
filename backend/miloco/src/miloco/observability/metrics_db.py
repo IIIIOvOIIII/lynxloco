@@ -6,13 +6,20 @@ v0(无版本号老 db) → 要求删 db(无法判断列集)。
 
 v2:新增 action_ledger 表(agent 控制设备 / 播 TTS / 触发场景的持久审计)。
 纯 additive CREATE,对 v1 老库走 _MIGRATIONS 步进补表,无需删 db。
+
+fork v5:并发请求耗时和完整/部分窗口计数。
+upstream v5:action_ledger 补链路两列 phase / trigger_event_id,并把迁移前的老行回填
+phase='legacy'——「写在链路记录之前」与「确实没有触发源」必须能分开。
+v6:action_ledger 补 auth_state(下发当时的米家授权状态)——只看 success /
+result_code 分不清「设备真的没响应」与「当时授权已失效、根本没发」。
+v7:合并两条发布历史,按现有列补齐链路、授权和并发指标,不重复回填链路标记。
 """
 from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
 
 _TRACES_SCHEMA = """
 CREATE TABLE IF NOT EXISTS traces (
@@ -138,6 +145,13 @@ CREATE INDEX IF NOT EXISTS idx_agent_runs_success ON agent_runs(success) WHERE s
 # source ∈ {cli, rule} 区分触发源(v3)：cli=control_device 路径 / rule=RuleRunner 直控
 # (source_id=rule_id)。trace_id 目前是**预留槽**(NULL)——尚未实际串联 agent turn,
 # 后续经 CLI --trace-id / X-Miloco-Trace-Id → ContextVar 串联(见 PR 后续工作)。
+# phase / trigger_event_id 是链路两列(v5)：phase ∈ {enter, exit} 标这条动作属于
+# 触发时还是退出时的那一支;trigger_event_id 指向触发它的事件行,是「动作折叠到
+# 事件之下」的唯一依据。非规则路径(人手直控、动态槽走 agent)两列均 NULL;
+# phase='legacy' 专指迁移前写入的老行——那时还没有链路可记。
+# auth_state 是下发当时的米家授权状态(v6)：ok | degraded。degraded 表示授权已被
+# 云端拒绝、下发被拒、请求根本没发出——只看 success/result_code 与「设备没响应」
+# 长得一样。迁移前的老行留 NULL,查询侧不得据此推断当时授权正常。
 _ACTION_LEDGER_SCHEMA = """
 CREATE TABLE IF NOT EXISTS action_ledger (
   id            TEXT    NOT NULL PRIMARY KEY,
@@ -155,11 +169,15 @@ CREATE TABLE IF NOT EXISTS action_ledger (
   trace_id      TEXT,
   source        TEXT,
   source_id     TEXT,
-  home_id       TEXT
+  home_id       TEXT,
+  auth_state    TEXT,
+  phase         TEXT,
+  trigger_event_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_action_ledger_ts ON action_ledger(timestamp);
 CREATE INDEX IF NOT EXISTS idx_action_ledger_source_ts ON action_ledger(source, timestamp);
 CREATE INDEX IF NOT EXISTS idx_action_ledger_home_ts ON action_ledger(home_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_action_ledger_trigger ON action_ledger(trigger_event_id);
 """
 
 _TRACES_V_VIEW = """
@@ -238,8 +256,9 @@ def init_schema(conn: sqlite3.Connection) -> None:
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         return
 
-    # cur ∈ (0, SCHEMA_VERSION):步进迁移。每步是 additive DDL(建表/加列),
+    # cur ∈ (0, SCHEMA_VERSION):步进迁移。每步以 additive DDL(建表/加列)为主,
     # 幂等(CREATE ... IF NOT EXISTS),做完把 user_version 推到目标步。
+    # v7 仅在引入链路列时回填历史行;已有链路列的库不重跑回填。
     for step, migrate in sorted(_MIGRATIONS.items()):
         if cur < step:
             migrate(conn)
@@ -311,10 +330,80 @@ def _migrate_v5_concurrency_metrics(conn: sqlite3.Connection) -> None:
     conn.executescript(_TRACES_V_VIEW)
 
 
-# 步进迁移注册表:{target_version: fn}。fn 只做 additive DDL,须幂等。
+def _migrate_v5_action_link(conn: sqlite3.Connection) -> None:
+    """v4 → v5:给 action_ledger 补链路两列 phase / trigger_event_id(幂等)。
+
+    ``phase`` ∈ {enter, exit} 标这条动作落在触发支还是退出支;``trigger_event_id``
+    指向触发它的那条事件行——两者合起来才够把动作折回它的事件之下。
+
+    与本文件其余迁移不同,这一步**会写数据**:把迁移前的老行回填
+    ``phase='legacy'``。老行没有链路可补(两列恒 NULL),而 NULL 与新写入的
+    「确实没有触发源」(人手直控 / 动态槽走 agent)撞在同一个值上——不作标记,
+    前端只能把整段历史说成「无触发事件」,那是一句我们并不掌握的话。
+    ``legacy`` 只声明「这行写于链路记录之前」,对老行恒真。
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(action_ledger)")}
+    if "phase" not in cols:
+        conn.execute("ALTER TABLE action_ledger ADD COLUMN phase TEXT")
+    if "trigger_event_id" not in cols:
+        conn.execute("ALTER TABLE action_ledger ADD COLUMN trigger_event_id TEXT")
+    # 回填只适用于引入链路记录之前的库。v7 通过列集判断是否首次引入,
+    # 不能在已有链路列的 upstream v5/v6 上重跑,否则会误标无触发源的动作。
+    conn.execute(
+        "UPDATE action_ledger SET phase = 'legacy' "
+        "WHERE phase IS NULL AND trigger_event_id IS NULL"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_action_ledger_trigger "
+        "ON action_ledger(trigger_event_id)"
+    )
+
+
+def _migrate_v6_action_auth_state(conn: sqlite3.Connection) -> None:
+    """v5 → v6:给 action_ledger 补下发时的米家授权状态列 auth_state(幂等)。
+
+    授权被云端拒绝后设备控制会被直接拒绝、请求不再发出。只看 success/result_code
+    无法区分「设备真的没响应」与「当时授权已失效、根本没发」——事后排查「那晚灯
+    到底开没开」会卡在这里。老行为 NULL,表示写入时还没有这个维度,查询侧不得据此
+    推断当时授权正常。
+
+    单独占一个版本号,不并进上面那一步:v5 已经被链路两列用掉了,而 init_schema
+    在 ``cur == SCHEMA_VERSION`` 时直接返回、根本不进迁移——并进 v5 的话,已经被
+    链路那次迁移推到 5 的库会连这一步一起跳过,auth_state 永远补不上。缺这一列
+    不会报错:``_write_action_ledger`` 整体裹着 fail-open 的 try/except,写入失败
+    只留一条 warning,台账静默停记——而「分清被拒与没响应」正是加这一列的全部理由。
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(action_ledger)")}
+    if "auth_state" not in cols:
+        conn.execute("ALTER TABLE action_ledger ADD COLUMN auth_state TEXT")
+
+
+def _migrate_v7_merge_histories(conn: sqlite3.Connection) -> None:
+    """Reconcile fork v5 concurrency with upstream v5/v6 ledger migrations.
+
+    Both histories used version 5. Only databases without the link columns
+    predate link recording; existing upstream NULL phases must stay NULL.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(action_ledger)")}
+    if "phase" not in cols:
+        _migrate_v5_action_link(conn)
+    else:
+        if "trigger_event_id" not in cols:
+            conn.execute("ALTER TABLE action_ledger ADD COLUMN trigger_event_id TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_action_ledger_trigger "
+            "ON action_ledger(trigger_event_id)"
+        )
+    _migrate_v6_action_auth_state(conn)
+    _migrate_v5_concurrency_metrics(conn)
+
+
+# Version 5 retains the fork history; version 7 converges both released schemas.
 _MIGRATIONS = {
     2: _migrate_v2_action_ledger,
     3: _migrate_v3_action_source,
     4: _migrate_v4_action_home,
     5: _migrate_v5_concurrency_metrics,
+    6: _migrate_v6_action_auth_state,
+    7: _migrate_v7_merge_histories,
 }

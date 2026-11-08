@@ -340,7 +340,7 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
                             now_ms = _monotonic_ms()
                             if (
                                 missing
-                                and self._miot_proxy.is_authenticated
+                                and getattr(self._miot_proxy, "is_operational", self._miot_proxy.is_authenticated)
                                 and now_ms - self._last_ondemand_refresh_ms
                                 >= _ONDEMAND_REFRESH_MIN_INTERVAL_MS
                             ):
@@ -478,6 +478,9 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
             if camera_source is None and len(self._sources) == 1:
                 camera_source = self._sources[0]
             if camera_source is None or camera_source.source_type != "miot":
+                continue
+            proxy = getattr(camera_source, "_miot_proxy", None)
+            if proxy is not None and not getattr(proxy, "is_operational", getattr(proxy, "is_authenticated", True)):
                 continue
             # 首帧未到 → 用「订阅时刻」判，阈值放宽到 _FIRST_FRAME_THRESHOLD_MS
             # （连接刚建立确实要等十几秒）；首帧已到 → 用「最后一帧时刻」判，
@@ -783,6 +786,9 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
                 overflow_count=ovf_cnt,
                 max_buffer_depth=max_depth,
                 last_overflow_action=last_action,
+                last_drain_observed_at=ready.last_drain_observed_at,
+                last_drain_ready_depth_before=ready.last_drain_ready_depth_before,
+                last_drain_ready_depth_after=ready.last_drain_ready_depth_after,
             )
         else:
             collect_ms = get_settings().perception.collect.window_size * 1000
@@ -853,6 +859,9 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
         overflow_count: int = 0,
         max_buffer_depth: int = 0,
         last_overflow_action: str | None = None,
+        last_drain_observed_at: int | None = None,
+        last_drain_ready_depth_before: int | None = None,
+        last_drain_ready_depth_after: int | None = None,
     ) -> DeviceData | None:
         """Build DeviceData from decoded frame track fragments.
 
@@ -901,6 +910,9 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
             overflow_count=overflow_count,
             max_buffer_depth=max_buffer_depth,
             last_overflow_action=last_overflow_action,
+            last_drain_observed_at=last_drain_observed_at,
+            last_drain_ready_depth_before=last_drain_ready_depth_before,
+            last_drain_ready_depth_after=last_drain_ready_depth_after,
         )
 
     def get_connected_devices(self) -> dict[str, PerceptionDevice]:

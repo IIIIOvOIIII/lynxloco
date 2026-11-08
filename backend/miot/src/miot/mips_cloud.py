@@ -29,13 +29,12 @@ import threading
 from typing import Any, Awaitable, Callable, Optional, Union
 
 from paho.mqtt.client import (
-    CallbackAPIVersion,
     Client,
     MQTTMessage,
     MQTTv5,
     topic_matches_sub,
 )
-from paho.mqtt.enums import MQTTErrorCode
+from paho.mqtt.enums import CallbackAPIVersion, MQTTErrorCode
 
 from .const import (
     MIHOME_MQTT_BROKER_HOST_SUFFIX,
@@ -44,6 +43,7 @@ from .const import (
     MIHOME_MQTT_RECONNECT_MAX_SEC,
     MIHOME_MQTT_RECONNECT_MIN_SEC,
     MIHOME_MQTT_SUBSCRIBE_TIMEOUT,
+    SUBACK_SUCCESS_CODES,
 )
 from .types import (
     MIoTDeviceBindEvent,
@@ -62,10 +62,6 @@ _LOGGER = logging.getLogger(__name__)
 # publishes. Cloud broker bandwidth is not our bottleneck, and bind/unbind
 # events are unsafe to deduplicate at the app layer.
 _DEFAULT_QOS: int = 2
-
-# MQTT v5 SUBACK reason codes that count as success per spec §3.9.3.
-# (Granted QoS 0/1/2 == codes 0x00/0x01/0x02.)
-_SUBACK_SUCCESS_CODES = frozenset({0x00, 0x01, 0x02})
 
 # SUBACK rejections that retry can't fix; other failures (incl. timeout) are
 # kept in _subs so the next reconnect retries automatically.
@@ -595,7 +591,7 @@ class MIoTMipsCloud:
                     )
 
             for code in reason_codes:
-                if code not in _SUBACK_SUCCESS_CODES:
+                if code not in SUBACK_SUCCESS_CODES:
                     if code in _PERMANENT_SUBACK_FAILURES:
                         with self._subs_lock:
                             self._subs.pop(topic, None)
@@ -979,6 +975,16 @@ class MIoTMipsCloud:
                         "properties_changed payload iid contradicts topic did=%s", did
                     )
                     return None
+            # debug 级逐条记：归一到与本地中枢同形之后，下游分不出这条推送来自哪条
+            # 通道。两边各留一行同形的接收日志，排查「这条属性到底走没走通」时把日志
+            # 级别放开，是哪条通道一看便知（本地那条见 mips_local.sub_device_props_async）。
+            for change in changes:
+                _LOGGER.debug(
+                    "mips_cloud prop push did=%s iid=prop.%s.%s",
+                    did,
+                    change.siid,
+                    change.piid,
+                )
             return MIoTDevicePropsEvent(
                 did=did, changes=changes, timestamp_ms=_now_ms(), raw=raw
             )
