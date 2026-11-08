@@ -1,4 +1,6 @@
 import { spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import {
   chmodSync,
   mkdtempSync,
@@ -52,6 +54,7 @@ const TEMP_MODE_WATCHER = String.raw`
 import os, stat, sys, time
 directory, prefix = sys.argv[1:]
 deadline = time.monotonic() + 3
+print("READY", file=sys.stderr, flush=True)
 while time.monotonic() < deadline:
     for name in os.listdir(directory):
         if name.startswith("." + prefix) and name.endswith(".tmp"):
@@ -61,15 +64,18 @@ while time.monotonic() < deadline:
 sys.exit(2)
 `;
 
-function waitForReady(child: ReturnType<typeof spawn>): Promise<void> {
+function waitForReady(
+  child: ReturnType<typeof spawn>,
+  channel: "stdout" | "stderr" = "stdout",
+): Promise<void> {
   return new Promise((resolve, reject) => {
     let output = "";
-    child.stdout?.on("data", (chunk: Buffer) => {
+    child[channel]?.on("data", (chunk: Buffer) => {
       output += chunk.toString("utf8");
       if (output.includes("READY")) resolve();
     });
     child.once("error", reject);
-    child.once("exit", (code) => {
+    child.once("close", (code) => {
       if (!output.includes("READY")) reject(new Error(`writer exited: ${code}`));
     });
   });
@@ -80,7 +86,8 @@ function waitForExit(child: ReturnType<typeof spawn>): Promise<string> {
     let output = "";
     child.stdout?.on("data", (chunk: Buffer) => (output += chunk.toString("utf8")));
     child.once("error", reject);
-    child.once("exit", (code) => {
+    // Process exit may precede the final stdout data event.
+    child.once("close", (code) => {
       if (code === 0) resolve(output.trim());
       else reject(new Error(`writer exited: ${code}`));
     });
@@ -130,6 +137,20 @@ describe("shared config security transaction", () => {
     rmSync(home, { recursive: true, force: true });
   });
 
+  it("collects stdout when process exit arrives before pipe closure", async () => {
+    const child = new EventEmitter() as ReturnType<typeof spawn>;
+    const stdout = new PassThrough();
+    Object.defineProperty(child, "stdout", { value: stdout });
+    const finished = waitForExit(child);
+
+    child.emit("exit", 0, null);
+    stdout.write("0o600\n");
+    stdout.end();
+    child.emit("close", 0, null);
+
+    expect(await finished).toBe("0o600");
+  });
+
   it("waits for the backend flock writer and preserves both agent and RTSP updates", async () => {
     writeFileSync(configPath, JSON.stringify({ server: { token: "existing" } }));
     const backend = spawn(PYTHON, ["-c", BACKEND_COMPATIBLE_WRITER, configPath], {
@@ -159,6 +180,7 @@ describe("shared config security transaction", () => {
         stdio: ["ignore", "pipe", "pipe"],
       });
       const watched = waitForExit(watcher);
+      await waitForReady(watcher, "stderr");
 
       const { updateSharedConfig } = await import("../src/miloco/config.js");
       updateSharedConfig({ agent: { webhook_url: "http://plugin.local/webhook" } });
