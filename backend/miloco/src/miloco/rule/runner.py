@@ -2144,9 +2144,9 @@ class RuleRunner:
         except HomeAssistantError as e:
             logger.error(
                 "Failed to execute Home Assistant action %s %s: %s",
-                action.did,
-                action.iid,
-                e,
+                safe_log(action.did),
+                safe_log(action.iid),
+                safe_log(e),
             )
             return RuleActionExecuteResult(
                 action=action,
@@ -2156,9 +2156,9 @@ class RuleRunner:
         except Exception as e:
             logger.error(
                 "Failed to execute Home Assistant action %s %s: %s",
-                action.did,
-                action.iid,
-                e,
+                safe_log(action.did),
+                safe_log(action.iid),
+                safe_log(e),
             )
             return RuleActionExecuteResult(
                 action=action,

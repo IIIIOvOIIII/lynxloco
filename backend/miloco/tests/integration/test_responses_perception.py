@@ -253,7 +253,8 @@ async def test_persisted_keyless_responses_ignores_generic_env_across_all_paths(
             omni_client._maybe_reset_breaker_on_config_change,
             "_last_triple",
         )
-        assert breaker_identity[-1] == ""
+        assert breaker_identity[3] == ""
+        assert sentinel not in breaker_identity
 
         preflight = await probe_omni(
             active.model,
